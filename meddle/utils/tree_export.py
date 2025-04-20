@@ -42,21 +42,21 @@ def cfg_to_tree_struct(cfg, jou: Journal):
     edges = list(get_edges(jou))
     layout = normalize_layout(generate_layout(len(jou), edges))
 
-    # metrics = np.array([n.metric.value_npsafe for n in jou])
-    # metrics = (metrics - np.nanmin(metrics)) / (np.nanmax(metrics) - np.nanmin(metrics))
-    # metrics = np.nan_to_num(metrics, nan=1)
-    # metrics[:] = 0
-    metrics = np.array([0 for n in jou])
+    metrics = np.array([str(n.metric.value_npsafe) for n in jou])
+
+    plan_with_metric_list = [textwrap.fill(
+        f"metric:{m}\n|"+n.plan, 
+        width=80) for n, m in zip(jou.nodes, metrics)] 
 
     return dict(
         edges=edges,
         layout=layout.tolist(),
-        plan=[textwrap.fill(n.plan, width=80) for n in jou.nodes],
+        plan=plan_with_metric_list,
         code=[n.code for n in jou],
         term_out=[n.term_out for n in jou],
         analysis=[n.analysis for n in jou],
         exp_name=cfg.exp_name,
-        metrics=metrics.tolist(),
+        metrics=np.array([0 for n in jou]).tolist(),
     )
 
 
