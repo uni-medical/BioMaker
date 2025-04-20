@@ -1,7 +1,9 @@
 # Med-DLE: Agentic Medical Deep Learning Engineer 
 
+MedDLE is designed to be a codegen agentic system for medical deep learning tasks. 
+
 # Quick Start
-## Basic
+## Basic codegen
 ```
 pip install -r requirements.txt
 ```
@@ -9,17 +11,17 @@ You need to get data from [link](https://ug.link/haoyushare/filemgr/share-downlo
 
 Then you can use `bash run.sh` to run the demo experiment.
 
-## Advanced
-We support MONAI with prompt/RAG
-### prompt
+## MONAI-based codegen
+We support MONAI with Prompt/RAG mode:
+### Prompt mode
 ```
-meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt-odir5k_2d_mlc"\
+meddle data_dir="med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt-odir5k_2d_mlc"\
      goal="Classify 2D Medical images into different categories in a multi-label setting" \
      eval="Use the average of kappa score, F-1 score, and AUC value metric between the predicted and ground-truth values." \
      agent.steps=20 agent.force_monai_with_prompt=true 
 ```
-### RAG
-### Create the knowledge database
+### RAG mode
+#### 1. Create the knowledge database
 Firstly, download the persisted database into `meddle/monai_rag` from [link](http://ug.link/haoyushare/filemgr/share-download/?id=0114fe77cb51407ba873896a004d1b9e). 
 Or you can create the db with this cmd:
 ```
@@ -28,7 +30,7 @@ python create_monai_rag_db.py
 ```
 You could use `python -m meddle.monai_rag.query_rag_db` to check whether the creation succeeds.
 
-### enable the feature in agent
+#### 2. enable the feature in agent
 Here's some example:
 ```
 meddle data_dir="med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt_kb-odir5k_2d_mlc"\
@@ -42,3 +44,9 @@ meddle data_dir="med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt_kb_q2d-odir5
      agent.steps=20 agent.force_monai_with_prompt=false agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
 ```
 
+
+## 🙏 Acknowledgement
+- We thank all medical workers and dataset owners for making public datasets available to the community.
+- Thanks to the open-source of the following projects:
+     - [aideml](https://github.com/WecoAI/aideml)
+     - [monai](https://github.com/Project-MONAI)
