@@ -74,12 +74,12 @@ class Agent:
         """Select a node to work on (or None to draft a new node)."""
         search_cfg = self.acfg.search
 
-        # initial drafting
+        # initial drafting (stop drafting if we have enough draft nodes)
         if len(self.journal.draft_nodes) < search_cfg.num_drafts:
             logger.debug("[search policy] drafting new node (not enough drafts)")
             return None
 
-        # debugging
+        # debugging (set default prob to 1.0 to forcely debug)
         if random.random() < search_cfg.debug_prob:
             # nodes that are buggy + leaf nodes + debug depth < max debug depth
             debuggable_nodes = [
@@ -270,7 +270,7 @@ class Agent:
                 "Take the Memory section into consideration when proposing the improvement.",
                 "The solution sketch should be 3-5 sentences.",
                 "Don't suggest to do EDA.",
-                f"The improved soultion should **run suitable training epoch** to help get best performance **within {humanize.naturaldelta(self.cfg.exec.timeout)}**.",
+                f"The improved soultion should **run suitable training epochs (no more than 10)** to help get best performance **within {humanize.naturaldelta(self.cfg.exec.timeout)}**.",
             ],
         }
         prompt["Instructions"] |= self._prompt_impl_guideline

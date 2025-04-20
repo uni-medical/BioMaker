@@ -41,7 +41,8 @@ def get_goal_from_config(file_path):
 
 
 if __name__ == "__main__":
-    log_dir_list = sorted(glob(osp.join(osp.dirname(__file__), "logs", "*-*_*")), key=lambda x: int(osp.basename(x).split("-")[0]))
+    code_root_dir = osp.dirname(osp.dirname(__file__))
+    log_dir_list = sorted(glob(osp.join(code_root_dir, "logs", "*-*_*")), key=lambda x: int(osp.basename(x).split("-")[0]))
     for log_dir in log_dir_list:
         # print(log_dir)
         log_file = osp.join(log_dir, "journal.json")

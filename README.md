@@ -32,8 +32,8 @@ export OPENAI_API_KEY="<your key>"
 
 Use `bash run.sh` to run the demo experiment.
 
-## MONAI-based codegen
-We support MONAI with Prompt/RAG mode:
+## MONAI-enhanced codegen
+We highlight MONAI as a helpful candidate for medical DL codegen with Prompt/RAG mode:
 ### Prompt mode
 ```
 meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt-odir5k_2d_mlc"\
