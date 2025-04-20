@@ -261,13 +261,5 @@ def generate(base_path, include_file_details=True, simple=False):
 
 
 if __name__ == "__main__":
-    # prev = preview_xlsx(Path("/root/code/meddleml/meddle/med_dl_tasks/odir5k_2d_mlc/data.xlsx"), "data.xlsx")
-    # prev = preview_csv(Path("/root/code/meddleml/meddle/example_tasks/house_prices/train.csv"), "train.csv")
-    # prev = preview_directory(Path("/root/code/meddleml/meddle/med_dl_tasks/odir5k_2d_mlc/Training Images"), "Training Images")
-    # prev = preview_directory(Path("/root/code/meddleml/meddle/med_dl_tasks/mednist_2d_cls/train"), "train")
-    # prev = generate(Path("/root/code/meddleml/meddle/example_tasks/house_prices"))
-    # prev = generate(Path("/root/code/meddleml/meddle/example_tasks/bitcoin_price"))
-    # prev = generate(Path("/root/code/meddleml/meddle/med_dl_tasks/odir5k_2d_mlc"))
-    # prev = generate(Path("/root/code/meddleml/meddle/med_dl_tasks/mednist_2d_cls"))
     prev = generate(Path("/root/Med-DL-Agent/meddle/med_dl_tasks/odir5k_2d_mlc"))
     print(prev)

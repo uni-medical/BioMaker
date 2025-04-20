@@ -7,6 +7,8 @@ test_monai_mednist
 test_monai_odir
 meddle/monai_rag/docs*
 meddle/monai_rag/*db
+meddle/example_tasks/
+meddle/example_tasks.zip
 
 # C extensions
 *.so
