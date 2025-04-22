@@ -39,7 +39,7 @@ We highlight MONAI as a helpful candidate for medical DL codegen with Prompt/RAG
 meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt-odir5k_2d_mlc"\
      goal="Classify 2D Medical images into different categories in a multi-label setting" \
      eval="Use the average of kappa score, F-1 score, and AUC value metric between the predicted and ground-truth values." \
-     agent.steps=20 agent.force_monai_with_prompt=true 
+     agent.force_monai_with_prompt=true 
 ```
 ### RAG mode
 #### 1. Create the knowledge database
@@ -54,15 +54,15 @@ You could use `python -m meddle.monai_rag.query_rag_db` to check whether the cre
 #### 2. enable the feature in agent
 Here's some example:
 ```
-meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt_kb-odir5k_2d_mlc"\
+meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_rag-odir5k"\
      goal="Classify 2D Medical images into different categories in a multi-label setting" \
      eval="Use the average of kappa score, F-1 score, and AUC value metric between the predicted and ground-truth values." \
-     agent.steps=20 agent.force_monai_with_prompt=false agent.enable_monai_knowledge_base=true
+     agent.enable_monai_knowledge_base=true
 
-meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt_kb_q2d-odir5k_2d_mlc"\
+meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_q2d-odir5k_2d_mlc"\
      goal="Classify 2D Medical images into different categories in a multi-label setting" \
      eval="Use the average of kappa score, F-1 score, and AUC value metric between the predicted and ground-truth values." \
-     agent.steps=20 agent.force_monai_with_prompt=false agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
+     agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
 ```
 
 
