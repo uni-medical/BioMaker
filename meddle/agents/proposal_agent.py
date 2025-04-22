@@ -70,27 +70,6 @@ class ProposalAgent(BaseAgent):
         plan, code = self.plan_and_code_query(prompt)
         return Node(plan=plan, code=code)
 
-    def step(self, exec_callback: ExecCallbackType):
-        if not self.journal.nodes or self.data_preview is None:
-            self.update_data_preview()
-
-        parent_node = self.search_policy()
-        logger.debug(f"Agent is generating code, parent node type: {type(parent_node)}")
-
-        if parent_node is None:
-            result_node = self._draft()
-        elif parent_node.is_buggy:
-            result_node = self._debug(parent_node)
-        else:
-            result_node = self._improve(parent_node)
-
-        self.parse_exec_result(
-            node=result_node,
-            exec_result=exec_callback(result_node.code, True),
-        )
-        self.journal.append(result_node)
-        return result_node
-
     def _debug(self, parent_node: Node) -> Node:
         prompt: Any = {
             "Introduction": (
@@ -179,3 +158,24 @@ class ProposalAgent(BaseAgent):
             code=code,
             parent=parent_node,
         )
+
+    def step(self, exec_callback: ExecCallbackType):
+        if not self.journal.nodes or self.data_preview is None:
+            self.update_data_preview()
+
+        parent_node = self.search_policy()
+        logger.debug(f"Agent is generating code, parent node type: {type(parent_node)}")
+
+        if parent_node is None:
+            result_node = self._draft()
+        elif parent_node.is_buggy:
+            result_node = self._debug(parent_node)
+        else:
+            result_node = self._improve(parent_node)
+
+        self.parse_exec_result(
+            node=result_node,
+            exec_result=exec_callback(result_node.code, True),
+        )
+        self.journal.append(result_node)
+        return result_node

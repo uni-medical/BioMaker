@@ -42,18 +42,22 @@ class SearchConfig:
 @dataclass
 class AgentConfig:
     steps: int
+    steps_for_tuning: int
     k_fold_validation: int
+
+    search: SearchConfig
+    
     expose_prediction: bool
     data_preview: bool
+    
     force_monai_with_prompt: bool
     enable_monai_knowledge_base: bool
     enable_query2doc: bool
 
     code: StageConfig
+    tuning: StageConfig
     feedback: StageConfig
     knowledge_base: StageConfig
-
-    search: SearchConfig
 
 
 @dataclass
@@ -66,6 +70,7 @@ class ExecConfig:
 @dataclass
 class Config(Hashable):
     data_dir: Path
+    proposed_solution_file: Path | None
     desc_file: Path | None
 
     goal: str | None

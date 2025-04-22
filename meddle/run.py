@@ -70,14 +70,19 @@ def run():
     atexit.register(cleanup)
 
     journal = Journal()
+    interpreter = Interpreter(
+        cfg.workspace_dir, **OmegaConf.to_container(cfg.exec)  # type: ignore
+    )
+
     agent = MeddleAgentSys(
         task_desc=task_desc,
         cfg=cfg,
         journal=journal,
     )
-    interpreter = Interpreter(
-        cfg.workspace_dir, **OmegaConf.to_container(cfg.exec)  # type: ignore
-    )
+
+    # Check if a proposed solution file is provided
+    if cfg.proposed_solution_file is not None and len(agent.solution_node_to_be_exec) > 0:
+        cfg.agent.steps += len(agent.solution_node_to_be_exec)
 
     global_step = len(journal)
     prog = Progress(
