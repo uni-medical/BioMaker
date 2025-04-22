@@ -47,6 +47,7 @@ Firstly, download the persisted database into `meddle/monai_rag` from [link](htt
 Or you can create the db with this cmd:
 ```
 cd meddle/monai_rag
+bash wget_monai_doc.sh
 python create_monai_rag_db.py
 ```
 You could use `python -m meddle.monai_rag.query_rag_db` to check whether the creation succeeds.
