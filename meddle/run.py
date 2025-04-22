@@ -4,7 +4,7 @@ import shutil
 
 from . import backend
 
-from .agent import Agent
+from .agent import MeddleAgentSys
 from .interpreter import Interpreter
 from .journal import Journal, Node
 from .journal2report import journal2report
@@ -70,7 +70,7 @@ def run():
     atexit.register(cleanup)
 
     journal = Journal()
-    agent = Agent(
+    agent = MeddleAgentSys(
         task_desc=task_desc,
         cfg=cfg,
         journal=journal,
