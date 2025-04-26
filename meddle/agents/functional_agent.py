@@ -54,11 +54,11 @@ class FunctionalAgent(BaseAgent):
     def _functional_fix(self, parent_node: Node) -> Node:
         prompt: Any = {
             "Introduction": (
-                self.profile + "You are provided with a previously developed solution below."
-                "Your task is to check the code and give minor modification to ensure the core functionality is okay."
-                "You need to check the following points and make sure they are oaky: "
-                "1. The epoch number is 1, so the code should be able to run in a short time."
-                "2. The submission of test data is generated and saved in the code. If not, add the saving code."
+                self.profile + "Below, you will find a previously developed solution. "
+                "Your task is to review the code and make minor modifications if necessary to ensure that it meets the following requirements:\n\n"
+                "- The number of epochs is set to 1, which should allow the code to run quickly.\n"
+                "- The code includes the functionality to generate predictions on the test data and save them to `working/submission.csv`.\n\n"
+                "Please verify these points and make any necessary adjustments to the code."
             ),
             "Task description": self.task_desc,
             "Memory": self.journal.generate_summary(),

@@ -46,21 +46,24 @@ if __name__ == "__main__":
     for log_dir in log_dir_list:
         # print(log_dir)
         log_file = osp.join(log_dir, "journal.json")
-        metric, term_out = get_metric_from_json(log_file)
 
-        goal = get_goal_from_config(osp.join(log_dir, "config.yaml"))
-        if ("odir" in log_dir):
-            goal = "ODIR-5K"
-        else:
-            goal = "MedNIST"
+        try:
+            metric, term_out = get_metric_from_json(log_file)
+            goal = get_goal_from_config(osp.join(log_dir, "config.yaml"))
+            if ("odir" in log_dir):
+                goal = "ODIR-5K"
+            else:
+                goal = "MedNIST"
 
-        # print key metrics
-        log_dir = osp.basename(log_dir)
-        # print(log_dir, goal, " ".join([str(m) for m in metric]))
-        # print(log_dir.replace("2-base-", "").replace("_2d", ""), goal)
-        metric, term_out = get_metric_from_json(log_file, term_key="Acc")
-        print(f"[{log_dir}]", term_out[:])
-        metric, term_out = get_metric_from_json(log_file, term_key="AUC")
-        print(f"[{log_dir}]", term_out[:])
-        print(f"[{log_dir}]", goal, max([0.0] + [float(m) for m in metric if m is not None]))
-        print("----")
+            # print key metrics
+            log_dir = osp.basename(log_dir)
+            # print(log_dir, goal, " ".join([str(m) for m in metric]))
+            # print(log_dir.replace("2-base-", "").replace("_2d", ""), goal)
+            # metric, term_out = get_metric_from_json(log_file, term_key="Acc")
+            # print(f"[{log_dir}]", term_out[:])
+            # metric, term_out = get_metric_from_json(log_file, term_key="AUC")
+            # print(f"[{log_dir}]", term_out[:])
+            print(f"[{log_dir}]", goal, max([0.0] + [float(m) for m in metric if m is not None]))
+            print("----")
+        except:
+            continue

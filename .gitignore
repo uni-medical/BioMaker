@@ -10,6 +10,7 @@ meddle/monai_rag/*db
 meddle/example_tasks/
 meddle/example_tasks.zip
 exp_summary
+scripts/*
 
 # C extensions
 *.so

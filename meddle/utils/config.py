@@ -11,6 +11,7 @@ from rich.syntax import Syntax
 import shutup
 from rich.logging import RichHandler
 import logging
+import shutil
 
 from . import tree_export
 from . import copytree, preproc_data, serialize
@@ -206,3 +207,13 @@ def save_run(cfg: Config, journal):
     best_node = journal.get_best_node(only_good=False)
     with open(cfg.log_dir / "best_solution.py", "w") as f:
         f.write(best_node.code)
+
+    # Copy submission file if it exists
+    submission_path = Path(cfg.workspace_dir) / "working/submission.csv"
+    if submission_path.is_file():
+        shutil.copy2(submission_path, cfg.log_dir / "submission.csv")
+    
+    # Copy checkpoint file if it exists
+    ckpt_path = Path(cfg.workspace_dir) / "working/best_ckpt.pth"
+    if ckpt_path.is_file():
+        shutil.copy2(ckpt_path, cfg.log_dir / "best_ckpt.pth")
