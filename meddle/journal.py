@@ -149,6 +149,15 @@ class Journal(DataClassJsonMixin):
         """Append a new node to the journal."""
         node.step = len(self.nodes)
         self.nodes.append(node)
+    
+    def pop(self) -> Optional['Node']:
+        """
+        Remove and return the last node from the journal.
+        Returns None if the journal is empty.
+        """
+        if not self.nodes:
+            return None
+        return self.nodes.pop()
 
     @property
     def draft_nodes(self) -> list[Node]:

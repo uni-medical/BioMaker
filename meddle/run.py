@@ -2,29 +2,26 @@ import atexit
 import logging
 import shutil
 
-from . import backend
-
-from .agent import MeddleAgentSys
-from .interpreter import Interpreter
-from .journal import Journal, Node
-from .journal2report import journal2report
 from omegaconf import OmegaConf
 from rich.columns import Columns
 from rich.console import Group
 from rich.live import Live
 from rich.padding import Padding
 from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    TextColumn,
-    TimeRemainingColumn,
-)
-from rich.text import Text
+from rich.progress import (BarColumn, MofNCompleteColumn, Progress, TextColumn,
+                           TimeRemainingColumn)
 from rich.status import Status
+from rich.text import Text
 from rich.tree import Tree
-from .utils.config import load_task_desc, prep_agent_workspace, save_run, load_cfg
+
+from . import backend
+from .agent import MeddleAgentSys
+from .interpreter import Interpreter
+from .journal import Journal, Node
+from .journal2report import journal2report
+from .utils.config import (load_cfg, load_task_desc, prep_agent_workspace,
+                           save_run)
+from .utils.timer import Timer
 
 logger = logging.getLogger("meddle")
 
@@ -127,26 +124,40 @@ def run():
             subtitle="Press [b]Ctrl+C[/b] to stop the run",
         )
 
+    def agent_loop_exit_handler():
+        logger.info("Exiting agent loop...")
+
+        if cfg.generate_report:
+            print("Generating final report from journal...")
+            report = journal2report(journal, task_desc, cfg.report)
+            print(report)
+            report_file_path = cfg.log_dir / "report.md"
+            with open(report_file_path, "w") as f:
+                f.write(report)
+            print("Report written to file:", report_file_path)
+
+    timeout_seconds = OmegaConf.select(cfg, 'agent.total_time_limit', default=None)
+    total_timer = Timer(timeout_seconds=timeout_seconds)
+
     with Live(
         generate_live(),
         refresh_per_second=16,
         screen=True,
     ) as live:
-        while global_step < cfg.agent.steps:
+        total_timer.reset()
+        # Continue to the next step only when both the step limit and time limit are not reached
+        while global_step < cfg.agent.steps and not total_timer.is_timeout():
             agent.step(exec_callback=exec_callback)
+            # If the total time limit is reached, remove the last node from the journal
+            if total_timer.is_timeout(tolerance=5):
+                print("Total time limit reached, stopping the run.")
+                journal.pop()
+                break
             save_run(cfg, journal)
             global_step = len(journal)
             live.update(generate_live())
-    interpreter.cleanup_session()
-
-    if cfg.generate_report:
-        print("Generating final report from journal...")
-        report = journal2report(journal, task_desc, cfg.report)
-        print(report)
-        report_file_path = cfg.log_dir / "report.md"
-        with open(report_file_path, "w") as f:
-            f.write(report)
-        print("Report written to file:", report_file_path)
+        interpreter.cleanup_session()
+    agent_loop_exit_handler()
 
 
 if __name__ == "__main__":

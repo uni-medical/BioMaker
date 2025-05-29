@@ -44,8 +44,9 @@ class SearchConfig:
 class AgentConfig:
     steps: int
     steps_for_tuning: int
-    k_fold_validation: int
+    total_time_limit: int # total time limit for all steps (second)
 
+    k_fold_validation: int
     search: SearchConfig
     
     expose_prediction: bool
