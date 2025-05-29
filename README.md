@@ -66,6 +66,15 @@ meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_q2d-odir5k_2
      agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
 ```
 
+### Details
+To test with a total time limit, you can set config `agent.total_time_limit`:
+```
+meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="test_timelimit-example_task_retina"\
+     goal="Predict the category of each given Fundus Camera image by selecting the most appropriate one from the 5 available classes." \
+     eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
+     agent.force_monai_with_prompt=false agent.enable_monai_knowledge_base=false agent.expose_prediction=true \
+     agent.steps=100 agent.total_time_limit=60
+```
 
 ## 🙏 Acknowledgement
 - We thank all medical workers and dataset owners for making public datasets available to the community.
