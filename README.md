@@ -20,7 +20,7 @@ pip install -e .
 > uv pip install -r requirements.txt
 > uv pip install -e .
 > ```
-3. Get data from [link](https://ug.link/haoyushare/filemgr/share-download/?id=7a3a2c6beacb4d5e91a2d801bc653bce) and move the data into `med_dl_tasks`
+3. Get data from [link](http://ug.link/haoyushare/filemgr/share-download/?id=a14cf769efb649f8a099ee6fb876abb6) and move the data into `med_dl_tasks`
 
 4. remember to set up your private api key of OPENAI/ANTROPIC/OPENROUNTER
 ```
@@ -43,8 +43,7 @@ meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt-odir5
 ```
 ### RAG mode
 #### 1. Create the knowledge database
-Firstly, download the persisted database into `meddle/monai_rag` from [link](http://ug.link/haoyushare/filemgr/share-download/?id=0114fe77cb51407ba873896a004d1b9e). 
-Or you can create the db with this cmd:
+You can create the db with this cmd (or download from [link](http://ug.link/haoyushare/filemgr/share-download/?id=b8c77eb1346c4ecca4dfb510253d32fe)):
 ```
 cd meddle/monai_rag
 bash wget_monai_doc.sh
