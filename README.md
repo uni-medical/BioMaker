@@ -20,13 +20,14 @@ pip install -e .
 > uv pip install -r requirements.txt
 > uv pip install -e .
 > ```
-3. Get data from [link](http://ug.link/haoyushare/filemgr/share-download/?id=a14cf769efb649f8a099ee6fb876abb6) and move the data into `med_dl_tasks`
-
-4. remember to set up your private api key of OPENAI/ANTROPIC/OPENROUNTER
+3. remember to set up your private api key of OPENAI/ANTROPIC/OPENROUNTER
 ```
 export OPENAI_BASE_URL="<your base url>" # (e.g. https://api.openai.com/v1)
 export OPENAI_API_KEY="<your key>"
 ```
+## Setup dataset
+1. Get data from [link](http://ug.link/haoyushare/filemgr/share-download/?id=a14cf769efb649f8a099ee6fb876abb6) and move the data into `med_dl_tasks`
+2. The goal and eval target of MedMNIST dataset can be found in [scripts](https://github.com/uni-medical/MedDLE/blob/main/scripts/run_all_mnist_rag.sh).
 
 ## Basic codegen
 
