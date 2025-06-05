@@ -84,7 +84,7 @@ backoff
 streamlit==1.40.2
 python-dotenv
 openpyxl
-html2text
+
 
 monai==1.4.0
 langchain
@@ -93,3 +93,6 @@ beautifulsoup4
 chromadb
 SimpleITK
 nibabel
+
+html2text
+tiktoken
