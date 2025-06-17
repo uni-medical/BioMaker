@@ -3,6 +3,7 @@ import random
 from typing import Callable, cast
 
 import humanize
+
 from ..backend import FunctionSpec, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
@@ -91,6 +92,7 @@ class BaseAgent:
 
     @property
     def _prompt_environment(self):
+        is_medical_code_lib_enabled = self.acfg.force_monai_with_prompt or self.acfg.enable_monai_knowledge_base
         pkgs = [
             "numpy",
             "pandas",
@@ -103,14 +105,21 @@ class BaseAgent:
             "torch-geometric",
             "bayesian-optimization",
             "timm",
-            "monai",
         ]
+        if is_medical_code_lib_enabled:
+            pkgs += ["monai",]
+            
         random.shuffle(pkgs)
         pkg_str = ", ".join([f"`{p}`" for p in pkgs])
-
-        env_prompt = {
-            "Installed Packages": f"Your solution can use any relevant deep learning packages such as: {pkg_str}. Feel free to use any other packages too (all packages are already installed!). For neural networks training on medical images, we suggest using MONAI rather than PyTorch/TensorFlow."
-        }
+        
+        if is_medical_code_lib_enabled:
+            env_prompt = {
+                "Installed Packages": f"Your solution can use any relevant deep learning packages such as: {pkg_str}. Feel free to use any other packages too (all packages are already installed!). For neural networks training on medical images, we suggest using MONAI rather than PyTorch/TensorFlow."
+            }
+        else:
+            env_prompt = {
+                "Installed Packages": f"Your solution can use any relevant deep learning packages such as: {pkg_str}. Feel free to use any other packages too (all packages are already installed!)."
+            }
         return env_prompt
 
     @property
