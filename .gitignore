@@ -11,6 +11,7 @@ meddle/example_tasks/
 meddle/example_tasks.zip
 exp_summary
 scripts/*
+AutoMLDev
 
 # C extensions
 *.so

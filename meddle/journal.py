@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 from dataclasses_json import DataClassJsonMixin
+
 from .interpreter import ExecutionResult
 from .utils.metric import MetricValue
 from .utils.response import trim_long_string

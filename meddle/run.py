@@ -15,7 +15,7 @@ from rich.text import Text
 from rich.tree import Tree
 
 from . import backend
-from .agent import MeddleAgentSys
+from .agent import MeddleWorkflow
 from .interpreter import Interpreter
 from .journal import Journal, Node
 from .journal2report import journal2report
@@ -60,28 +60,26 @@ def run():
     with Status("Preparing agent workspace (copying and extracting files) ..."):
         prep_agent_workspace(cfg)
 
-    def cleanup():
-        if global_step == 0:
-            shutil.rmtree(cfg.workspace_dir)
-
-    atexit.register(cleanup)
 
     journal = Journal()
     interpreter = Interpreter(
         cfg.workspace_dir, **OmegaConf.to_container(cfg.exec)  # type: ignore
     )
 
-    agent = MeddleAgentSys(
+    agent = MeddleWorkflow(
         task_desc=task_desc,
         cfg=cfg,
         journal=journal,
     )
 
-    # Check if a proposed solution file is provided
-    if cfg.proposed_solution_file is not None and len(agent.solution_node_to_be_exec) > 0:
-        cfg.agent.steps += len(agent.solution_node_to_be_exec)
+    # update the validated steps count
+    cfg.agent.steps = agent.recompute_steps_left()
 
     global_step = len(journal)
+    def cleanup():
+        if global_step == 0:
+            shutil.rmtree(cfg.workspace_dir)
+    atexit.register(cleanup)
     prog = Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(bar_width=20),
