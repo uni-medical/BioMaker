@@ -60,36 +60,6 @@ class TuningAgent(BaseAgent):
         logger.debug("[search policy] best-as-known node selected")
         return best_node
 
-    # def _tuning_batch_size_in_code(self, code, exec_callback: ExecCallbackType):
-    #     prompt = {
-    #         "Introduction": (
-    #             self.profile + "You are provided with a previously developed solution below."
-    #             "Your task is to generate a debug version of the code which only runs 10 iterations then break."
-    #             "Notice that the generated code should report the GPU memory usage of model and data and then report current batch size of the code."
-    #         ),
-    #         "Previous Solution": wrap_code(code),
-    #     }
-
-    #     response = cast(
-    #         dict,
-    #         query(
-    #             system_message=prompt,
-    #             user_message=None,
-    #             func_spec=hardware_func_spec,
-    #             model=self.acfg.feedback.model,
-    #             temperature=self.acfg.feedback.temp,
-    #         ),
-    #     )
-    #     # get gpu memory usage & current batch size of the code
-    #     # TODO
-
-    #     # get available gpu memory of the machine
-    #     # TODO
-        
-    #     # compute 
-    #     # TODO
-    #     return code
-
     def _tuning(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
         prompt: Any = {
             "Introduction": (

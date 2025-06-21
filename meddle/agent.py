@@ -68,13 +68,16 @@ class MeddleAgentSys(BaseAgent):
             refined_solution_node.parent = None
             self.tuning_agent.journal.append(refined_solution_node)
             self.journal.append(refined_solution_node)
+
         elif self.steps_left.proposal > 0:
             self.steps_left.proposal -= 1
             proposal_node = self.proposal_agent.step(exec_callback=exec_callback)
             self.journal.append(proposal_node)
+
         elif self.steps_left.tuning > 0:
             self.steps_left.tuning -= 1
             tuning_node = self.tuning_agent.step(exec_callback=exec_callback)
             self.journal.append(tuning_node)
+            
         else:
             pass

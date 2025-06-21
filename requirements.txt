@@ -96,3 +96,5 @@ nibabel
 
 html2text
 tiktoken
+optuna
+autogluon
