@@ -2,6 +2,7 @@
 
 import logging
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Hashable, cast
@@ -10,18 +11,45 @@ import coolname
 import rich
 import shutup
 from omegaconf import OmegaConf
+from rich.console import Console
 from rich.logging import RichHandler
+from rich.padding import Padding
 from rich.syntax import Syntax
+from rich.text import Text
+from rich.tree import Tree
 
 from . import copytree, preproc_data, serialize, tree_export
 
+
+class RichLogHandler(RichHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.console = Console(file=sys.stderr, stderr=True)
+    
+    def emit(self, record):
+        # Check if the message is a Rich object
+        if isinstance(record.msg, (Tree, Text)):
+            # Add padding to match the log message indentation (11 spaces)
+            padded_content = Padding(record.msg, (0, 0, 0, 11))
+            self.console.print(padded_content)
+        else:
+            # Use the default RichHandler behavior for regular messages
+            super().emit(record)
+
 shutup.mute_warnings()
 logging.basicConfig(
-    level="WARNING", format="%(message)s", datefmt="[%X]", handlers=[RichHandler()]
+    level="WARNING", 
+    format="%(message)s", 
+    datefmt="[%X]", 
+    handlers=[RichLogHandler(
+        show_time=True,
+        show_level=True,
+        show_path=False,
+        markup=True
+    )]
 )
 logger = logging.getLogger("meddle")
 logger.setLevel(logging.WARNING)
-
 
 """ these dataclasses are just for type hinting, the actual config is in config.yaml """
 

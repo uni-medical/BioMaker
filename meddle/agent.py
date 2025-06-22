@@ -46,7 +46,7 @@ class MeddleWorkflow(BaseAgent):
             WorkflowAgent(name="tuning", steps_left=cfg.agent.steps_for_tuning, agent=self.tuning_agent),
         ]
     
-    def recompute_steps_left(self) -> int:
+    def update_steps_left(self) -> int:
         """Return the number of steps left in the workflow."""
         return sum(node.steps_left for node in self.workflow)
 

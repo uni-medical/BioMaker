@@ -4,14 +4,6 @@ import shutil
 import sys
 
 from omegaconf import OmegaConf
-from rich.columns import Columns
-from rich.console import Group
-from rich.live import Live
-from rich.padding import Padding
-from rich.panel import Panel
-from rich.progress import (BarColumn, MofNCompleteColumn, Progress, TextColumn,
-                           TimeRemainingColumn)
-from rich.status import Status
 from rich.text import Text
 from rich.tree import Tree
 
@@ -23,13 +15,6 @@ from .journal2report import journal2report
 from .utils.config import (load_cfg, load_task_desc, prep_agent_workspace,
                            save_run)
 from .utils.timer import Timer
-
-# Set up logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stderr)],
-)
 
 logger = logging.getLogger("meddle")
 logger.setLevel(logging.INFO)
@@ -65,8 +50,8 @@ def run():
     task_desc = load_task_desc(cfg)
     task_desc_str = backend.compile_prompt_to_md(task_desc)
 
-    with Status("Preparing agent workspace (copying and extracting files) ..."):
-        prep_agent_workspace(cfg)
+    logger.info("Preparing agent workspace (copying and extracting files) ...")
+    prep_agent_workspace(cfg)
 
 
     journal = Journal()
@@ -81,26 +66,18 @@ def run():
     )
 
     # update the validated steps count
-    cfg.agent.steps = agent.recompute_steps_left()
+    cfg.agent.steps = agent.update_steps_left()
 
     global_step = len(journal)
     def cleanup():
         if global_step == 0:
             shutil.rmtree(cfg.workspace_dir)
     atexit.register(cleanup)
-    prog = Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=20),
-        MofNCompleteColumn(),
-        TimeRemainingColumn(),
-    )
-    status = Status("[green]Generating code...")
-    prog.add_task("Progress:", total=cfg.agent.steps, completed=global_step)
 
     def exec_callback(*args, **kwargs):
-        status.update("[magenta]Executing code...")
+        logger.info(Text("Executing code...", style="magenta"))
         res = interpreter.run(*args, **kwargs)
-        status.update("[green]Generating code...")
+        logger.info(Text("Generating code...", style="green"))
         return res
 
     def agent_loop_exit_handler():
@@ -117,12 +94,13 @@ def run():
 
     timeout_seconds = OmegaConf.select(cfg, 'agent.total_time_limit', default=None)
     total_timer = Timer(timeout_seconds=timeout_seconds)
-
+    
+    logger.info(f'Starting MedDLE workflow')
     total_timer.reset()
     # Continue to the next step only when both the step limit and time limit are not reached
     global_step = 0
     while global_step < cfg.agent.steps and not total_timer.is_timeout():
-        logger.info(f"MedDLE Workflow Step {global_step + 1} / {cfg.agent.steps}")
+        logger.info(f"MedDLE workflow step: {global_step + 1} / {cfg.agent.steps}")
         try:
             agent.step(exec_callback=exec_callback)
         except Exception as e:
@@ -134,6 +112,8 @@ def run():
             journal.pop()
             break
         save_run(cfg, journal)
+        tree = journal_to_rich_tree(journal)
+        logger.info(tree)
         global_step += 1
     interpreter.cleanup_session()
     agent_loop_exit_handler()

@@ -27,8 +27,8 @@ class TuningAgent(BaseAgent):
     
     def update_with_external_journal(self, external_journal: Journal):
         super().update_with_external_journal(external_journal)
-        # prune the journal to keep only the last 3 nodes to save memory
-        self.journal.nodes = self.journal.nodes[-3:]
+        # prune the journal to keep only the last nodes to save memory
+        self.journal.nodes = self.journal.nodes[-1:]
         for node in self.journal.nodes:
             node.parent = None
             node.children = set()
