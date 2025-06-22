@@ -1,20 +1,19 @@
 """configuration and setup utils"""
 
+import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Hashable, cast
 
 import coolname
 import rich
-from omegaconf import OmegaConf
-from rich.syntax import Syntax
 import shutup
+from omegaconf import OmegaConf
 from rich.logging import RichHandler
-import logging
-import shutil
+from rich.syntax import Syntax
 
-from . import tree_export
-from . import copytree, preproc_data, serialize
+from . import copytree, preproc_data, serialize, tree_export
 
 shutup.mute_warnings()
 logging.basicConfig(
@@ -57,7 +56,6 @@ class AgentConfig:
     enable_query2doc: bool
 
     code: StageConfig
-    tuning: StageConfig
     feedback: StageConfig
     knowledge_base: StageConfig
 

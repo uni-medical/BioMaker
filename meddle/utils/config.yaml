@@ -54,6 +54,7 @@ agent:
     model: gpt-4o
     temp: 0.5
 
+
   # LLM settings for knowledge base embedding
   knowledge_base:
     model: gpt-4o

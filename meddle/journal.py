@@ -26,6 +26,7 @@ class Node(DataClassJsonMixin):
     # ---- code & plan ----
     code: str
     plan: str = field(default=None, kw_only=True)  # type: ignore
+    agent_name: str = field(default=None, kw_only=True)  # type: ignore
 
     # ---- general attrs ----
     step: int = field(default=None, kw_only=True)  # type: ignore
@@ -54,7 +55,7 @@ class Node(DataClassJsonMixin):
             self.parent.children.add(self)
 
     @property
-    def stage_name(self) -> Literal["draft", "debug", "improve"]:
+    def node_status(self) -> Literal["draft", "debug", "improve"]:
         """
         Return the stage of the node:
         - "stage" if the node is an initial solution draft
@@ -97,7 +98,7 @@ class Node(DataClassJsonMixin):
         - 1 if the parent is buggy but the skip parent isn't
         - n if there were n consecutive debugging steps
         """
-        if self.stage_name != "debug":
+        if self.node_status != "debug":
             return 0
         return self.parent.debug_depth + 1  # type: ignore
 

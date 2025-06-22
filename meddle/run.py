@@ -1,6 +1,7 @@
 import atexit
 import logging
 import shutil
+import sys
 
 from omegaconf import OmegaConf
 from rich.columns import Columns
@@ -23,8 +24,15 @@ from .utils.config import (load_cfg, load_task_desc, prep_agent_workspace,
                            save_run)
 from .utils.timer import Timer
 
-logger = logging.getLogger("meddle")
+# Set up logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
+)
 
+logger = logging.getLogger("meddle")
+logger.setLevel(logging.INFO)
 
 def journal_to_rich_tree(journal: Journal):
     best_node = journal.get_best_node()
@@ -95,33 +103,6 @@ def run():
         status.update("[green]Generating code...")
         return res
 
-    def generate_live():
-        tree = journal_to_rich_tree(journal)
-        prog.update(prog.task_ids[0], completed=global_step)
-
-        file_paths = [
-            f"Result visualization:\n[yellow]▶ {str((cfg.log_dir / 'tree_plot.html'))}",
-            f"Agent workspace directory:\n[yellow]▶ {str(cfg.workspace_dir)}",
-            f"Experiment log directory:\n[yellow]▶ {str(cfg.log_dir)}",
-        ]
-        left = Group(
-            Panel(Text(task_desc_str.strip()), title="Task description"), prog, status
-        )
-        right = tree
-        wide = Group(*file_paths)
-
-        return Panel(
-            Group(
-                Padding(wide, (1, 1, 1, 1)),
-                Columns(
-                    [Padding(left, (1, 2, 1, 1)), Padding(right, (1, 1, 1, 2))],
-                    equal=True,
-                ),
-            ),
-            title=f'[b]MedDLE is working on experiment: [bold green]"{cfg.exp_name}[/b]"',
-            subtitle="Press [b]Ctrl+C[/b] to stop the run",
-        )
-
     def agent_loop_exit_handler():
         logger.info("Exiting agent loop...")
 
@@ -137,24 +118,24 @@ def run():
     timeout_seconds = OmegaConf.select(cfg, 'agent.total_time_limit', default=None)
     total_timer = Timer(timeout_seconds=timeout_seconds)
 
-    with Live(
-        generate_live(),
-        refresh_per_second=16,
-        screen=True,
-    ) as live:
-        total_timer.reset()
-        # Continue to the next step only when both the step limit and time limit are not reached
-        while global_step < cfg.agent.steps and not total_timer.is_timeout():
+    total_timer.reset()
+    # Continue to the next step only when both the step limit and time limit are not reached
+    global_step = 0
+    while global_step < cfg.agent.steps and not total_timer.is_timeout():
+        logger.info(f"MedDLE Workflow Step {global_step + 1} / {cfg.agent.steps}")
+        try:
             agent.step(exec_callback=exec_callback)
-            # If the total time limit is reached, remove the last node from the journal
-            if total_timer.is_timeout(tolerance=5):
-                print("Total time limit reached, stopping the run.")
-                journal.pop()
-                break
-            save_run(cfg, journal)
-            global_step = len(journal)
-            live.update(generate_live())
-        interpreter.cleanup_session()
+        except Exception as e:
+            logger.error(f"Exception during agent step: {e}")
+            break
+        # If the total time limit is reached, remove the last node from the journal
+        if total_timer.is_timeout(tolerance=5):
+            logger.error("Total time limit reached, stopping the run.")
+            journal.pop()
+            break
+        save_run(cfg, journal)
+        global_step += 1
+    interpreter.cleanup_session()
     agent_loop_exit_handler()
 
 

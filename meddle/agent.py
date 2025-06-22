@@ -24,13 +24,6 @@ class WorkflowAgent:
         assert isinstance(self.steps_left, int), "steps_left must be an integer"
         assert self.steps_left >= 0, "steps_left must be >= 0"
     
-    def step(self, exec_callback: ExecCallbackType) -> Node:
-        """Run the agent for one step and return the solution node."""
-        solution_node = self.agent.step(exec_callback)
-        steps_left -= 1
-        return solution_node
-
-
 class MeddleWorkflow(BaseAgent):
     def __init__(
         self,
@@ -48,9 +41,9 @@ class MeddleWorkflow(BaseAgent):
         # create the squenetial workflow of agents
         func_val_steps = 1 if (cfg.agent.steps_for_tuning>0) else 0
         self.workflow = [
-            WorkflowAgent("proposal", steps_left=cfg.agent.steps - cfg.agent.steps_for_tuning, agent=self.proposal_agent),
-            WorkflowAgent("proposal_func_val", steps_left=func_val_steps, agent=self.func_agent),
-            WorkflowAgent("tuning", steps_left=cfg.agent.steps_for_tuning, agent=self.tuning_agent),
+            WorkflowAgent(name="proposal", steps_left=cfg.agent.steps - cfg.agent.steps_for_tuning, agent=self.proposal_agent),
+            WorkflowAgent(name="proposal_func_val", steps_left=func_val_steps, agent=self.func_agent),
+            WorkflowAgent(name="tuning", steps_left=cfg.agent.steps_for_tuning, agent=self.tuning_agent),
         ]
     
     def recompute_steps_left(self) -> int:
@@ -62,10 +55,16 @@ class MeddleWorkflow(BaseAgent):
         # walkthrough the workflow and run the first node that has steps left
         for idx, workflow_agent in enumerate(self.workflow):
             if workflow_agent.steps_left > 0:
+                logger.info("Current agent: %s, steps left: %d", workflow_agent.name, workflow_agent.steps_left)
                 solution_node = workflow_agent.agent.step(exec_callback)
+                solution_node.agent_name = workflow_agent.name
+                workflow_agent.steps_left -= 1
+                
+                # update global journal
                 self.journal.append(solution_node)
 
-                if workflow_agent.steps_left == 0 and idx < len(self.workflow) - 1:
+                if workflow_agent.steps_left == 0 and idx < len(self.workflow)-1:
                     # for workflow node switch, update the journal for the next agent
-                    self.workflow[idx + 1].agent.journal = self.journal
+                    logger.info("Passing journal (%d nodes) to the next agent: %s", len(self.journal), self.workflow[idx + 1].name)
+                    self.workflow[idx + 1].agent.update_with_external_journal(self.journal)
                 break

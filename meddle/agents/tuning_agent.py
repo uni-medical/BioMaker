@@ -1,36 +1,19 @@
+import copy
 import logging
 from typing import Any, Callable, cast
 
 import humanize
+
 from ..backend import FunctionSpec, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
+from ..monai_rag.query_rag_db import MONAI_RAG
 from ..utils.config import Config
 from ..utils.response import wrap_code
-from ..monai_rag.query_rag_db import MONAI_RAG
 from .base_agent import BaseAgent
 
 logger = logging.getLogger("meddle-tuning")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
-
-# hardware_func_spec = FunctionSpec(
-#     name="submit_review",
-#     json_schema={
-#         "type": "object",
-#         "properties": {
-#             "model_gpu_ua": {
-#                 "type": "boolean",
-#                 "description": "true if the output log shows that the execution failed or has some bug, otherwise false.",
-#             },
-#             "code": {
-#                 "type": "string",
-#                 "description": "if there is a bug, propose a fix. Otherwise, write a short summary (2-3 sentences) describing the empirical findings.",
-#             },
-#         },
-#         "required": ["is_bug", "summary", "metric", "lower_is_better"],
-#     },
-#     description="Submit a hardware evaluating the output of the training script.",
-# )
 
 class TuningAgent(BaseAgent):
     def __init__(
@@ -40,32 +23,30 @@ class TuningAgent(BaseAgent):
         journal: Journal,
     ):
         super().__init__(task_desc, cfg, journal)
-        self.profile = "You are an expert for optimizing training code for maximum performance. "
-        self.knowledge_base = MONAI_RAG(model=self.acfg.knowledge_base.model)
-
-    def query_knowledge_base(self, query: str, topk: int=3) -> str: 
-        result = ""
-        if self.acfg.enable_monai_knowledge_base:
-            try:
-                result = self.knowledge_base.search(query, k=topk, enable_query2doc=self.acfg.enable_query2doc)
-            except:
-                print("Retrieve Failed! Plz check the knowledge base status")
-        return result
-
+        self.profile = "You are an expert for optimizing deep learning model training pipelines, especially for medical imaging tasks. "
+    
+    def update_with_external_journal(self, external_journal: Journal):
+        super().update_with_external_journal(external_journal)
+        # prune the journal to keep only the last 3 nodes to save memory
+        self.journal.nodes = self.journal.nodes[-3:]
+        for node in self.journal.nodes:
+            node.parent = None
+            node.children = set()
+    
     def search_policy(self) -> Node | None:
         # always choose the best-as-known node for further tuning
         best_node = self.journal.get_best_node(only_good=True)
         if best_node is None:
             best_node = self.journal.get_best_node(only_good=False)
-        logger.debug("[search policy] best-as-known node selected")
         return best_node
 
     def _tuning(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
         prompt: Any = {
             "Introduction": (
                 self.profile + "You are provided with a previously developed solution below."
-                "Your task is to improve the provided solution by refining data augmentation (transforms) and training hyperparameters. "
-                "Focus exclusively on these aspects, ignoring data preparation or model architecture changes. "
+                "Your task is to improve the provided solution by refining training hyper-parameters (e.g. learning rate, optimizers). "
+                "If the model has not use a pretrain, consider using a suitable pretrain model. "
+                "Focus exclusively on these aspects, ignoring data preparation."
                 "Use feedback from training results and validation metric of previous solutions in your memory to guide your improvements. "
             ),
             "Task description": self.task_desc,
@@ -75,17 +56,6 @@ class TuningAgent(BaseAgent):
         prompt["Previous solution"] = {
             "Code": wrap_code(parent_node.code),
         }
-
-        if self.acfg.enable_monai_knowledge_base:
-            knowledge_retrieve_context = prompt.copy()
-            knowledge_retrieve_context["Query"] = "What topic should be queried to improve this code by refining data augmentation (transforms) and training hyperparameters?"
-            topic_of_knowledge_for_debug = query(
-                system_message=knowledge_retrieve_context,
-                user_message=None,
-                model=self.acfg.knowledge_base.model,
-                temperature=self.acfg.knowledge_base.temp,
-            )
-            prompt["Dependent Knowledge"] = self.query_knowledge_base(topic_of_knowledge_for_debug)
 
         prompt["Instructions"] |= self._prompt_resp_fmt
         prompt["Instructions"] |= {

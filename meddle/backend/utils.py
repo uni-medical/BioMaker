@@ -1,10 +1,10 @@
+import logging
 from dataclasses import dataclass
+from typing import Callable
 
+import backoff
 import jsonschema
 from dataclasses_json import DataClassJsonMixin
-import backoff
-import logging
-from typing import Callable
 
 PromptType = str | dict | list
 FunctionCallType = dict
@@ -18,6 +18,7 @@ logger = logging.getLogger("meddle")
     wait_gen=backoff.expo,
     max_value=60,
     factor=1.5,
+    max_tries=5,
 )
 def backoff_create(
     create_fn: Callable, retry_exceptions: list[Exception], *args, **kwargs
