@@ -27,7 +27,7 @@ class TuningAgent(BaseAgent):
     
     def update_with_external_journal(self, external_journal: Journal):
         super().update_with_external_journal(external_journal)
-        # prune the journal to keep only the last nodes to save memory
+        # prune the journal and keep only the last nodes to save memory
         self.journal.nodes = self.journal.nodes[-1:]
         for node in self.journal.nodes:
             node.parent = None
@@ -43,11 +43,13 @@ class TuningAgent(BaseAgent):
     def _tuning(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
         prompt: Any = {
             "Introduction": (
-                self.profile + "You are provided with a previously developed solution below."
-                "Your task is to improve the provided solution by refining training hyper-parameters (e.g. learning rate, optimizers). "
-                "If the model has not use a pretrain, consider using a suitable pretrain model. "
-                "Focus exclusively on these aspects, ignoring data preparation."
-                "Use feedback from training results and validation metric of previous solutions in your memory to guide your improvements. "
+                self.profile + " You are provided with a previously developed solution below."
+                " Your task is to improve this solution by refining training hyperparameters (e.g., learning rate, optimizers)."
+                " 1. If the model has not used a pretrain, consider using a suitable one. Libraries like `timm` are recommended."
+                " 2. If you want to tune hyperparameters, **only tune fewer than 3 at a time**. Libraries like `optuna` are recommended."
+                " 3. If hyperparameter optimization shows minor improvement, you are encouraged to try other tricks you know."
+                " Focus exclusively on these aspects, ignoring data preparation."
+                " Use feedback from the training results and validation metrics of previous solutions in your memory to guide your improvements."
             ),
             "Task description": self.task_desc,
             "Memory": self.journal.generate_summary(),
@@ -59,10 +61,10 @@ class TuningAgent(BaseAgent):
 
         prompt["Instructions"] |= self._prompt_resp_fmt
         prompt["Instructions"] |= {
-            "Solution improvement sketch guideline": [
+            "Solution performance tuning sketch guideline": [
                 "The solution sketch should be a brief natural language description of how the previous solution can be improved."
                 "You should be very specific and should only propose a single actionable improvement."
-                "This improvement should be atomic so that we can experimentally evaluate the effect of the proposed change."
+                "This tuning plan should be atomic so that we can experimentally evaluate the effect of the proposed change."
                 "Take the Memory section into consideration when proposing the improvement."
                 "The solution sketch should be 3-5 sentences."
                 "Don't suggest to do EDA."
@@ -73,7 +75,6 @@ class TuningAgent(BaseAgent):
         prompt["Instructions"] |= self._prompt_impl_guideline
 
         plan, code = self.plan_and_code_query(prompt)
-        # code = self._tuning_batch_size_in_code(code, exec_callback)
         return Node(
             plan=plan,
             code=code,
