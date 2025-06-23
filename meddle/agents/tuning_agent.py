@@ -44,9 +44,9 @@ class TuningAgent(BaseAgent):
         prompt: Any = {
             "Introduction": (
                 self.profile + " You are provided with a previously developed solution below."
-                " Your task is to improve this solution by refining training hyperparameters (e.g., learning rate, optimizers)."
+                " Your task is to improve this solution by refining training codes (e.g., learning rate, optimizers, epoch, ...)."
                 " 1. If the model has not used a pretrain, consider using a suitable one. Libraries like `timm` are recommended."
-                " 2. If you want to tune hyperparameters, **only tune fewer than 3 at a time**. Libraries like `optuna` are recommended."
+                " 2. If you want to tune hyperparameters, **only tune fewer than 3 hyperparameters at a time**. Libraries like `optuna` are recommended."
                 " 3. If hyperparameter optimization shows minor improvement, you are encouraged to try other tricks you know."
                 " Focus exclusively on these aspects, ignoring data preparation."
                 " Use feedback from the training results and validation metrics of previous solutions in your memory to guide your improvements."
