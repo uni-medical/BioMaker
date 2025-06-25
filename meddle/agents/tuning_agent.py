@@ -7,7 +7,6 @@ import humanize
 from ..backend import FunctionSpec, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
-from ..monai_rag.query_rag_db import MONAI_RAG
 from ..utils.config import Config
 from ..utils.response import wrap_code
 from .base_agent import BaseAgent
@@ -27,28 +26,30 @@ class TuningAgent(BaseAgent):
     
     def update_with_external_journal(self, external_journal: Journal):
         super().update_with_external_journal(external_journal)
-        # prune the journal and keep only the last nodes to save memory
-        self.journal.nodes = self.journal.nodes[-1:]
-        for node in self.journal.nodes:
-            node.parent = None
-            node.children = set()
+        # prune the journal and keep only the best-as-known node
+        best_node = self.journal.get_best_node(only_good=True)
+        self.journal.nodes = [best_node] if best_node is not None else self.journal.nodes[-1:]
+        for idx in range(len(self.journal.nodes)):
+            self.journal.nodes[idx] = copy.deepcopy(self.journal.nodes[idx])
+            self.journal.nodes[idx].parent = None
+            self.journal.nodes[idx].children = set()
     
     def search_policy(self) -> Node | None:
-        # always choose the best-as-known node for further tuning
+        # get the best-as-known node for further tuning
         best_node = self.journal.get_best_node(only_good=True)
-        if best_node is None:
-            best_node = self.journal.get_best_node(only_good=False)
         return best_node
 
-    def _tuning(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
+    def _refine_pipeline(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
         prompt: Any = {
             "Introduction": (
-                self.profile + " You are provided with a previously developed solution below."
-                " Your task is to improve this solution by refining training codes (e.g., learning rate, optimizers, epoch, ...)."
-                " 1. If the model has not used a pretrain, consider using a suitable one. Libraries like `timm` are recommended."
-                " 2. If you want to tune hyperparameters, **only tune fewer than 3 hyperparameters at a time**. Libraries like `optuna` are recommended."
-                " 3. If hyperparameter optimization shows minor improvement, you are encouraged to try other tricks you know."
-                " Focus exclusively on these aspects, ignoring data preparation."
+                self.profile + " You are provided with a developed solution below."
+                " Your task is to improve this solution by refining the training pipeline."
+                " You should prioritize the following tricks:"
+                " 1. If the model has not used a pretrain, use a suitable one. Libraries like `timm` are recommended."
+                " 2. If only the final epoch checkpoint is used, add early-stopping/greedy-soup to get a better checkpoint."
+                " 3. Analyze the optimizer / scheduler and try to find a better one."
+                " 4. If you have tried all the above tricks, try to propose new plan based on your knowledge."
+                " Please focus exclusively on these aspects, ignoring data preparation."
                 " Use feedback from the training results and validation metrics of previous solutions in your memory to guide your improvements."
             ),
             "Task description": self.task_desc,
@@ -61,15 +62,12 @@ class TuningAgent(BaseAgent):
 
         prompt["Instructions"] |= self._prompt_resp_fmt
         prompt["Instructions"] |= {
-            "Solution performance tuning sketch guideline": [
+            "Solution sketch guideline": [
                 "The solution sketch should be a brief natural language description of how the previous solution can be improved."
-                "You should be very specific and should only propose a single actionable improvement."
+                "You should be very specific and should **only propose a single actionable improvement**."
                 "This tuning plan should be atomic so that we can experimentally evaluate the effect of the proposed change."
                 "Take the Memory section into consideration when proposing the improvement."
                 "The solution sketch should be 3-5 sentences."
-                "Don't suggest to do EDA."
-                "If the epoch number is 1, change it to a suitable epoch number according to the previous execution time in Memory."
-                f"The improved soultion should run **suitable epoch numbers within {humanize.naturaldelta(self.cfg.exec.timeout)}**."
             ],
         }
         prompt["Instructions"] |= self._prompt_impl_guideline
@@ -79,16 +77,18 @@ class TuningAgent(BaseAgent):
             plan=plan,
             code=code,
             parent=parent_node,
+            tag="refine_pipeline",
         )
 
     def step(self, exec_callback: ExecCallbackType):
         if not self.journal.nodes or self.data_preview is None:
             self.update_data_preview()
 
+        logger.info(f"start to search")
         parent_node = self.search_policy()
         logger.debug(f"Agent is generating code, parent node type: {type(parent_node)}")
 
-        result_node = self._tuning(parent_node, exec_callback)
+        result_node = self._refine_pipeline(parent_node, exec_callback)
 
         self.parse_exec_result(
             node=result_node,

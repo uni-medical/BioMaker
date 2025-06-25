@@ -17,7 +17,7 @@ from .utils.config import (load_cfg, load_task_desc, prep_agent_workspace,
 from .utils.timer import Timer
 
 logger = logging.getLogger("meddle")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 def journal_to_rich_tree(journal: Journal):
     best_node = journal.get_best_node()
@@ -77,7 +77,6 @@ def run():
     def exec_callback(*args, **kwargs):
         logger.info(Text("Executing code...", style="magenta"))
         res = interpreter.run(*args, **kwargs)
-        logger.info(Text("Generating code...", style="green"))
         return res
 
     def agent_loop_exit_handler():
@@ -102,6 +101,7 @@ def run():
     while global_step < cfg.agent.steps and not total_timer.is_timeout():
         logger.info(f"MedDLE workflow step: {global_step + 1} / {cfg.agent.steps}")
         try:
+            logger.info(Text("Generating code...", style="green"))
             agent.step(exec_callback=exec_callback)
         except Exception as e:
             logger.error(f"Exception during agent step: {e}")
@@ -111,8 +111,8 @@ def run():
             logger.error("Total time limit reached, stopping the run.")
             journal.pop()
             break
-        save_run(cfg, journal)
         tree = journal_to_rich_tree(journal)
+        save_run(cfg, journal, tree)
         logger.info(tree)
         global_step += 1
     interpreter.cleanup_session()

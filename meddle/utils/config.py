@@ -1,5 +1,6 @@
 """configuration and setup utils"""
 
+import io
 import logging
 import shutil
 import sys
@@ -66,11 +67,16 @@ class SearchConfig:
     debug_prob: float
     num_drafts: int
 
+@dataclass
+class StepConfig:
+    proposal: int
+    tuning: int
+    hpo: int
 
 @dataclass
 class AgentConfig:
     steps: int
-    steps_for_tuning: int
+    step_plan: StepConfig | None
     total_time_limit: int # total time limit for all steps (second)
 
     k_fold_validation: int
@@ -174,6 +180,14 @@ def prep_cfg(cfg: Config):
     cfg.log_dir = (top_log_dir / cfg.exp_name).resolve()
     cfg.workspace_dir = (top_workspace_dir / cfg.exp_name).resolve()
 
+    # update the step plan if no detailed plan is provided
+    # if the step <= 10, use all steps for proposal
+    # if the step > 10, use 5 step for tuning, others for proposal
+    if (cfg.agent.step_plan is None):
+        cfg.agent.step_plan.tuning = 5 if (cfg.agent.steps > 10) else 0
+        cfg.agent.step_plan.proposal = cfg.agent.steps - cfg.agent.step_plan.tuning
+        cfg.agent.step_plan.hpo = 0
+
     # validate the config
     cfg_schema: Config = OmegaConf.structured(Config)
     cfg = OmegaConf.merge(cfg_schema, cfg)
@@ -221,7 +235,7 @@ def prep_agent_workspace(cfg: Config):
         preproc_data(cfg.workspace_dir / "input")
 
 
-def save_run(cfg: Config, journal):
+def save_run(cfg: Config, journal, solution_tree: Tree=None):
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
     # save journal
@@ -244,3 +258,11 @@ def save_run(cfg: Config, journal):
     ckpt_path = Path(cfg.workspace_dir) / "working/best_ckpt.pth"
     if ckpt_path.is_file():
         shutil.copy2(ckpt_path, cfg.log_dir / "best_ckpt.pth")
+
+    if solution_tree is not None:
+        # save the solution tree
+        console = Console(file=io.StringIO(), record=True)
+        console.print(solution_tree)
+        html_output = console.export_html(inline_styles=True)
+        with open(cfg.log_dir / "tree_snapshot.html", "w") as f:
+            f.write(html_output)

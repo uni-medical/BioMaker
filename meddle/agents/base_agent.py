@@ -111,6 +111,7 @@ class BaseAgent:
             "torch-geometric",
             "bayesian-optimization",
             "timm",
+            "optuna",
         ]
         if is_medical_code_lib_enabled:
             pkgs += ["monai",]

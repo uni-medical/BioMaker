@@ -8,7 +8,6 @@ from ..journal import Journal, Node
 from ..utils.config import Config
 from ..utils.response import wrap_code
 from ..utils.metric import ZeroMetricValue
-from ..monai_rag.query_rag_db import MONAI_RAG
 from .base_agent import BaseAgent
 
 logger = logging.getLogger("meddle-functional")

@@ -24,7 +24,7 @@ exp_name: null # a random experiment name will be generated if not provided
 agent:
   # how many improvement iterations to run
   steps: 20
-  steps_for_tuning: 0
+  step_plan: null
   # total time limit for all steps, default with a large number (1000 hours)
   total_time_limit: 3600000 
   # whether to instruct the agent to use CV (set to 1 to disable)
@@ -49,14 +49,13 @@ agent:
     model: gpt-4o
     temp: 0.5
 
-  # LLM settings for evaluating program output / tracebacks
-  feedback:
-    model: gpt-4o
-    temp: 0.5
-
-
   # LLM settings for knowledge base embedding
   knowledge_base:
+    model: gpt-4o
+    temp: 0.0
+
+  # LLM settings for evaluating program output / tracebacks
+  feedback:
     model: gpt-4o
     temp: 0.0
 
