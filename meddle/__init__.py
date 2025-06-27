@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from .agent import MeddleAgentSys
+from .agent import MeddleWorkflow
 from .interpreter import Interpreter
 from .journal import Journal
 from omegaconf import OmegaConf
@@ -43,7 +43,7 @@ class Experiment:
             prep_agent_workspace(self.cfg)
 
         self.journal = Journal()
-        self.agent = MeddleAgentSys(
+        self.agent = MeddleWorkflow(
             task_desc=self.task_desc,
             cfg=self.cfg,
             journal=self.journal,

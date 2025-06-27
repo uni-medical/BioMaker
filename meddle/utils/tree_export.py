@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from igraph import Graph
+
 from ..journal import Journal
 
 
@@ -31,7 +32,13 @@ def generate_layout(n_nodes, edges, layout_type="rt"):
 
 def normalize_layout(layout: np.ndarray):
     """Normalize layout to [0, 1]"""
-    layout = (layout - layout.min(axis=0)) / (layout.max(axis=0) - layout.min(axis=0))
+    min_vals = layout.min(axis=0)
+    max_vals = layout.max(axis=0)
+    range_vals = max_vals - min_vals
+
+    # 避免除以0
+    nonzero_mask = range_vals != 0
+    layout[:, nonzero_mask] = (layout[:, nonzero_mask] - min_vals[nonzero_mask]) / range_vals[nonzero_mask]
     layout[:, 1] = 1 - layout[:, 1]
     layout[:, 1] = np.nan_to_num(layout[:, 1], nan=0)
     layout[:, 0] = np.nan_to_num(layout[:, 0], nan=0.5)
@@ -43,10 +50,11 @@ def cfg_to_tree_struct(cfg, jou: Journal):
     layout = normalize_layout(generate_layout(len(jou), edges))
 
     metrics = np.array([str(n.metric.value_npsafe) for n in jou])
+    agent_names = np.array([str(n.agent_name) for n in jou])
 
     plan_with_metric_list = [textwrap.fill(
-        f"metric:{m}\n|"+n.plan, 
-        width=80) for n, m in zip(jou.nodes, metrics)] 
+        f"agent:{a}\n|metric:{m}\n|"+n.plan, 
+        width=80) for n, m, a in zip(jou.nodes, metrics, agent_names)] 
 
     return dict(
         edges=edges,

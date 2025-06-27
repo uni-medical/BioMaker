@@ -7,7 +7,7 @@ from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
 from ..utils.config import Config
 from ..utils.response import wrap_code
-from ..monai_rag.query_rag_db import MONAI_RAG
+from ..utils.metric import ZeroMetricValue
 from .base_agent import BaseAgent
 
 logger = logging.getLogger("meddle-functional")
@@ -19,9 +19,11 @@ class FunctionalAgent(BaseAgent):
         task_desc: str,
         cfg: Config,
         journal: Journal,
+        solution_file: str | None = None,
     ):
         super().__init__(task_desc, cfg, journal)
         self.profile = "You are an expert for optimizing training code for maximum performance. "
+        self.solution_file = solution_file
 
     def search_policy(self) -> Node | None:
         # always choose the best-as-known node for further tuning
@@ -78,18 +80,31 @@ class FunctionalAgent(BaseAgent):
             parent=parent_node,
         )
 
-    def step(self, exec_callback: ExecCallbackType):
-        if not self.journal.nodes or self.data_preview is None:
-            self.update_data_preview()
-
-        parent_node = self.search_policy()
-        logger.debug(f"Agent is generating code, parent node type: {type(parent_node)}")
-
-        result_node = self._functional_fix(parent_node)
-        self.parse_exec_result(
-            node=result_node,
-            exec_result=exec_callback(result_node.code, True),
+    def _validate_existed_solution_code(self) -> bool:
+        code = open(self.solution_file, "r").read()
+        solution_node = Node(
+            plan="Try to validate this existed solution code to check whether it is suitable for this task.", 
+            code=code
         )
-        self.journal.append(result_node)
-        return result_node
+        solution_node.metric = ZeroMetricValue()
+        return solution_node
+
+    def step(self, exec_callback: ExecCallbackType):
+        # if a solution file is provided, validate it
+        if self.solution_file is not None:
+            solution_node = self._validate_existed_solution_code()
+            self.solution_file = None
+        else:
+            if not self.journal.nodes or self.data_preview is None:
+                self.update_data_preview()
+            parent_node = self.search_policy()
+            logger.debug(f"Agent is generating code, parent node type: {type(parent_node)}")
+            solution_node = self._functional_fix(parent_node)
+
+        self.parse_exec_result(
+            node=solution_node,
+            exec_result=exec_callback(solution_node.code, True),
+        )
+        self.journal.append(solution_node)
+        return solution_node
         

@@ -1,28 +1,56 @@
 """configuration and setup utils"""
 
+import io
+import logging
+import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Hashable, cast
 
 import coolname
 import rich
-from omegaconf import OmegaConf
-from rich.syntax import Syntax
 import shutup
+from omegaconf import OmegaConf
+from rich.console import Console
 from rich.logging import RichHandler
-import logging
-import shutil
+from rich.padding import Padding
+from rich.syntax import Syntax
+from rich.text import Text
+from rich.tree import Tree
 
-from . import tree_export
-from . import copytree, preproc_data, serialize
+from . import copytree, preproc_data, serialize, tree_export
+
+
+class RichLogHandler(RichHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.console = Console(file=sys.stderr, stderr=True)
+    
+    def emit(self, record):
+        # Check if the message is a Rich object
+        if isinstance(record.msg, (Tree, Text)):
+            # Add padding to match the log message indentation (11 spaces)
+            padded_content = Padding(record.msg, (0, 0, 0, 11))
+            self.console.print(padded_content)
+        else:
+            # Use the default RichHandler behavior for regular messages
+            super().emit(record)
 
 shutup.mute_warnings()
 logging.basicConfig(
-    level="WARNING", format="%(message)s", datefmt="[%X]", handlers=[RichHandler()]
+    level="WARNING", 
+    format="%(message)s", 
+    datefmt="[%X]", 
+    handlers=[RichLogHandler(
+        show_time=True,
+        show_level=True,
+        show_path=False,
+        markup=True
+    )]
 )
 logger = logging.getLogger("meddle")
 logger.setLevel(logging.WARNING)
-
 
 """ these dataclasses are just for type hinting, the actual config is in config.yaml """
 
@@ -39,11 +67,16 @@ class SearchConfig:
     debug_prob: float
     num_drafts: int
 
+@dataclass
+class StepConfig:
+    proposal: int
+    tuning: int
+    hpo: int
 
 @dataclass
 class AgentConfig:
     steps: int
-    steps_for_tuning: int
+    step_plan: StepConfig | None
     total_time_limit: int # total time limit for all steps (second)
 
     k_fold_validation: int
@@ -57,7 +90,6 @@ class AgentConfig:
     enable_query2doc: bool
 
     code: StageConfig
-    tuning: StageConfig
     feedback: StageConfig
     knowledge_base: StageConfig
 
@@ -148,6 +180,19 @@ def prep_cfg(cfg: Config):
     cfg.log_dir = (top_log_dir / cfg.exp_name).resolve()
     cfg.workspace_dir = (top_workspace_dir / cfg.exp_name).resolve()
 
+    # update the step plan if no detailed plan is provided
+    # if the step <= 10, use all steps for proposal
+    # if the step > 10, use 5 step for tuning, others for proposal
+    if (cfg.agent.step_plan is None):
+        tuning_step = 5 if (cfg.agent.steps > 10) else 0
+        hpo_step = 2 if (cfg.agent.steps > 25) else 0
+        proposal_step = cfg.agent.steps - tuning_step - hpo_step
+        cfg.agent.step_plan = StepConfig(
+            proposal=proposal_step,
+            tuning=tuning_step,
+            hpo=hpo_step,
+        )
+
     # validate the config
     cfg_schema: Config = OmegaConf.structured(Config)
     cfg = OmegaConf.merge(cfg_schema, cfg)
@@ -195,7 +240,7 @@ def prep_agent_workspace(cfg: Config):
         preproc_data(cfg.workspace_dir / "input")
 
 
-def save_run(cfg: Config, journal):
+def save_run(cfg: Config, journal, solution_tree: Tree=None):
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
     # save journal
@@ -218,3 +263,11 @@ def save_run(cfg: Config, journal):
     ckpt_path = Path(cfg.workspace_dir) / "working/best_ckpt.pth"
     if ckpt_path.is_file():
         shutil.copy2(ckpt_path, cfg.log_dir / "best_ckpt.pth")
+
+    if solution_tree is not None:
+        # save the solution tree
+        console = Console(file=io.StringIO(), record=True)
+        console.print(solution_tree)
+        html_output = console.export_html(inline_styles=True)
+        with open(cfg.log_dir / "tree_snapshot.html", "w") as f:
+            f.write(html_output)

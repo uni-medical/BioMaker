@@ -7,12 +7,14 @@ The journal is the core datastructure in MedDLE that contains:
 ...
 """
 
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 from dataclasses_json import DataClassJsonMixin
+
 from .interpreter import ExecutionResult
 from .utils.metric import MetricValue
 from .utils.response import trim_long_string
@@ -25,6 +27,8 @@ class Node(DataClassJsonMixin):
     # ---- code & plan ----
     code: str
     plan: str = field(default=None, kw_only=True)  # type: ignore
+    agent_name: str = field(default=None, kw_only=True)  # type: ignore
+    tag: str = field(default=None, kw_only=True)  # type: ignore
 
     # ---- general attrs ----
     step: int = field(default=None, kw_only=True)  # type: ignore
@@ -53,7 +57,7 @@ class Node(DataClassJsonMixin):
             self.parent.children.add(self)
 
     @property
-    def stage_name(self) -> Literal["draft", "debug", "improve"]:
+    def node_status(self) -> Literal["draft", "debug", "improve"]:
         """
         Return the stage of the node:
         - "stage" if the node is an initial solution draft
@@ -96,7 +100,7 @@ class Node(DataClassJsonMixin):
         - 1 if the parent is buggy but the skip parent isn't
         - n if there were n consecutive debugging steps
         """
-        if self.stage_name != "debug":
+        if self.node_status != "debug":
             return 0
         return self.parent.debug_depth + 1  # type: ignore
 
@@ -178,15 +182,31 @@ class Journal(DataClassJsonMixin):
         """Return a list of all metric values in the journal."""
         return [n.metric for n in self.nodes]
 
-    def get_best_node(self, only_good=True) -> None | Node:
-        """Return the best solution found so far (node with the highest validation metric)."""
+    def get_best_node(self, only_good=True, topk=1) -> None | Node:
+        """Return one of the top-k best solutions found so far (randomly chosen)."""
+
         if only_good:
             nodes = self.good_nodes
             if not nodes:
                 return None
         else:
             nodes = self.nodes
-        return max(nodes, key=lambda n: n.metric)
+
+        top_nodes = sorted(nodes, key=lambda n: n.metric, reverse=True)[:topk]
+        return random.choice(top_nodes) if top_nodes else None
+
+    def get_topk_node_list(self, only_good=True, topk=3) -> None | Node:
+        """Return one of the top-k best solutions found so far (randomly chosen)."""
+
+        if only_good:
+            nodes = self.good_nodes
+            if not nodes:
+                return None
+        else:
+            nodes = self.nodes
+
+        top_nodes = sorted(nodes, key=lambda n: n.metric, reverse=True)[:topk]
+        return top_nodes
 
     def generate_summary(self, include_code: bool = False) -> str:
         """Generate a summary of the journal for the agent."""

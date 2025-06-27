@@ -1,21 +1,14 @@
 import atexit
 import logging
 import shutil
+import sys
 
 from omegaconf import OmegaConf
-from rich.columns import Columns
-from rich.console import Group
-from rich.live import Live
-from rich.padding import Padding
-from rich.panel import Panel
-from rich.progress import (BarColumn, MofNCompleteColumn, Progress, TextColumn,
-                           TimeRemainingColumn)
-from rich.status import Status
 from rich.text import Text
 from rich.tree import Tree
 
 from . import backend
-from .agent import MeddleAgentSys
+from .agent import MeddleWorkflow
 from .interpreter import Interpreter
 from .journal import Journal, Node
 from .journal2report import journal2report
@@ -24,21 +17,23 @@ from .utils.config import (load_cfg, load_task_desc, prep_agent_workspace,
 from .utils.timer import Timer
 
 logger = logging.getLogger("meddle")
-
+logger.setLevel(logging.INFO)
 
 def journal_to_rich_tree(journal: Journal):
     best_node = journal.get_best_node()
+    new_node = None if len(journal.nodes) < 1 else journal.nodes[-1]
 
     def append_rec(node: Node, tree):
         if node.is_buggy:
             s = "[red]◍ bug"
         else:
             style = "bold " if node is best_node else ""
-
+            color = "blue" if node is new_node else "green"
+            s = f"[{style}{color}]● {node.metric.value:.3f}"
             if node is best_node:
-                s = f"[{style}green]● {node.metric.value:.3f} (best)"
-            else:
-                s = f"[{style}green]● {node.metric.value:.3f}"
+                s += " (best)"
+        if node is new_node:
+            s += " (new)"
 
         subtree = tree.add(s)
         for child in node.children:
@@ -57,72 +52,35 @@ def run():
     task_desc = load_task_desc(cfg)
     task_desc_str = backend.compile_prompt_to_md(task_desc)
 
-    with Status("Preparing agent workspace (copying and extracting files) ..."):
-        prep_agent_workspace(cfg)
+    logger.info("Preparing agent workspace (copying and extracting files) ...")
+    prep_agent_workspace(cfg)
 
-    def cleanup():
-        if global_step == 0:
-            shutil.rmtree(cfg.workspace_dir)
-
-    atexit.register(cleanup)
 
     journal = Journal()
     interpreter = Interpreter(
         cfg.workspace_dir, **OmegaConf.to_container(cfg.exec)  # type: ignore
     )
 
-    agent = MeddleAgentSys(
+    agent = MeddleWorkflow(
         task_desc=task_desc,
         cfg=cfg,
         journal=journal,
     )
 
-    # Check if a proposed solution file is provided
-    if cfg.proposed_solution_file is not None and len(agent.solution_node_to_be_exec) > 0:
-        cfg.agent.steps += len(agent.solution_node_to_be_exec)
+    # update the validated steps count
+    cfg.agent.steps = agent.update_steps_left()
 
     global_step = len(journal)
-    prog = Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=20),
-        MofNCompleteColumn(),
-        TimeRemainingColumn(),
-    )
-    status = Status("[green]Generating code...")
-    prog.add_task("Progress:", total=cfg.agent.steps, completed=global_step)
+    def cleanup():
+        if global_step == 0:
+            shutil.rmtree(cfg.workspace_dir)
+    atexit.register(cleanup)
 
     def exec_callback(*args, **kwargs):
-        status.update("[magenta]Executing code...")
+        logger.info(Text("Executing code...", style="magenta"))
         res = interpreter.run(*args, **kwargs)
-        status.update("[green]Generating code...")
+        logger.info(Text("Execution done.", style="magenta"))
         return res
-
-    def generate_live():
-        tree = journal_to_rich_tree(journal)
-        prog.update(prog.task_ids[0], completed=global_step)
-
-        file_paths = [
-            f"Result visualization:\n[yellow]▶ {str((cfg.log_dir / 'tree_plot.html'))}",
-            f"Agent workspace directory:\n[yellow]▶ {str(cfg.workspace_dir)}",
-            f"Experiment log directory:\n[yellow]▶ {str(cfg.log_dir)}",
-        ]
-        left = Group(
-            Panel(Text(task_desc_str.strip()), title="Task description"), prog, status
-        )
-        right = tree
-        wide = Group(*file_paths)
-
-        return Panel(
-            Group(
-                Padding(wide, (1, 1, 1, 1)),
-                Columns(
-                    [Padding(left, (1, 2, 1, 1)), Padding(right, (1, 1, 1, 2))],
-                    equal=True,
-                ),
-            ),
-            title=f'[b]MedDLE is working on experiment: [bold green]"{cfg.exp_name}[/b]"',
-            subtitle="Press [b]Ctrl+C[/b] to stop the run",
-        )
 
     def agent_loop_exit_handler():
         logger.info("Exiting agent loop...")
@@ -138,25 +96,30 @@ def run():
 
     timeout_seconds = OmegaConf.select(cfg, 'agent.total_time_limit', default=None)
     total_timer = Timer(timeout_seconds=timeout_seconds)
-
-    with Live(
-        generate_live(),
-        refresh_per_second=16,
-        screen=True,
-    ) as live:
-        total_timer.reset()
-        # Continue to the next step only when both the step limit and time limit are not reached
-        while global_step < cfg.agent.steps and not total_timer.is_timeout():
+    
+    logger.info(f'Starting MedDLE workflow')
+    logger.info(f"Step plan:\n{agent.step_plan}")
+    total_timer.reset()
+    # Continue to the next step only when both the step limit and time limit are not reached
+    global_step = 0
+    while global_step < cfg.agent.steps and not total_timer.is_timeout():
+        logger.info(f"MedDLE workflow step: {global_step + 1} / {cfg.agent.steps}")
+        try:
+            logger.info(Text("Generating code...", style="green"))
             agent.step(exec_callback=exec_callback)
-            # If the total time limit is reached, remove the last node from the journal
-            if total_timer.is_timeout(tolerance=5):
-                print("Total time limit reached, stopping the run.")
-                journal.pop()
-                break
-            save_run(cfg, journal)
-            global_step = len(journal)
-            live.update(generate_live())
-        interpreter.cleanup_session()
+        except Exception as e:
+            logger.error(f"Exception during agent step: {e}")
+            break
+        # If the total time limit is reached, remove the last node from the journal
+        if total_timer.is_timeout(tolerance=5):
+            logger.error("Total time limit reached, stopping the run.")
+            journal.pop()
+            break
+        tree = journal_to_rich_tree(journal)
+        save_run(cfg, journal, tree)
+        logger.info(tree)
+        global_step += 1
+    interpreter.cleanup_session()
     agent_loop_exit_handler()
 
 

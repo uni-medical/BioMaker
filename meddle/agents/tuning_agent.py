@@ -1,36 +1,18 @@
+import copy
 import logging
 from typing import Any, Callable, cast
 
 import humanize
+
 from ..backend import FunctionSpec, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
 from ..utils.config import Config
 from ..utils.response import wrap_code
-from ..monai_rag.query_rag_db import MONAI_RAG
 from .base_agent import BaseAgent
 
 logger = logging.getLogger("meddle-tuning")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
-
-# hardware_func_spec = FunctionSpec(
-#     name="submit_review",
-#     json_schema={
-#         "type": "object",
-#         "properties": {
-#             "model_gpu_ua": {
-#                 "type": "boolean",
-#                 "description": "true if the output log shows that the execution failed or has some bug, otherwise false.",
-#             },
-#             "code": {
-#                 "type": "string",
-#                 "description": "if there is a bug, propose a fix. Otherwise, write a short summary (2-3 sentences) describing the empirical findings.",
-#             },
-#         },
-#         "required": ["is_bug", "summary", "metric", "lower_is_better"],
-#     },
-#     description="Submit a hardware evaluating the output of the training script.",
-# )
 
 class TuningAgent(BaseAgent):
     def __init__(
@@ -40,63 +22,31 @@ class TuningAgent(BaseAgent):
         journal: Journal,
     ):
         super().__init__(task_desc, cfg, journal)
-        self.profile = "You are an expert for optimizing training code for maximum performance. "
-        self.knowledge_base = MONAI_RAG(model=self.acfg.knowledge_base.model)
-
-    def query_knowledge_base(self, query: str, topk: int=3) -> str: 
-        result = ""
-        if self.acfg.enable_monai_knowledge_base:
-            try:
-                result = self.knowledge_base.search(query, k=topk, enable_query2doc=self.acfg.enable_query2doc)
-            except:
-                print("Retrieve Failed! Plz check the knowledge base status")
-        return result
-
+        self.profile = "You are an expert for optimizing deep learning model training pipelines, especially for medical imaging tasks. "
+    
+    def update_with_external_journal(self, external_journal: Journal):
+        super().update_with_external_journal(external_journal)
+        # prune the journal and keep the topk node
+        best_node_list = self.journal.get_topk_node_list(only_good=True, topk=3)
+        self.journal.nodes = [n for n in best_node_list]
+    
     def search_policy(self) -> Node | None:
-        # always choose the best-as-known node for further tuning
-        best_node = self.journal.get_best_node(only_good=True)
-        if best_node is None:
-            best_node = self.journal.get_best_node(only_good=False)
-        logger.debug("[search policy] best-as-known node selected")
+        # get the best-as-known node for further tuning
+        best_node = self.journal.get_best_node(only_good=True, topk=3)
         return best_node
 
-    # def _tuning_batch_size_in_code(self, code, exec_callback: ExecCallbackType):
-    #     prompt = {
-    #         "Introduction": (
-    #             self.profile + "You are provided with a previously developed solution below."
-    #             "Your task is to generate a debug version of the code which only runs 10 iterations then break."
-    #             "Notice that the generated code should report the GPU memory usage of model and data and then report current batch size of the code."
-    #         ),
-    #         "Previous Solution": wrap_code(code),
-    #     }
-
-    #     response = cast(
-    #         dict,
-    #         query(
-    #             system_message=prompt,
-    #             user_message=None,
-    #             func_spec=hardware_func_spec,
-    #             model=self.acfg.feedback.model,
-    #             temperature=self.acfg.feedback.temp,
-    #         ),
-    #     )
-    #     # get gpu memory usage & current batch size of the code
-    #     # TODO
-
-    #     # get available gpu memory of the machine
-    #     # TODO
-        
-    #     # compute 
-    #     # TODO
-    #     return code
-
-    def _tuning(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
+    def _refine_pipeline(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
         prompt: Any = {
             "Introduction": (
-                self.profile + "You are provided with a previously developed solution below."
-                "Your task is to improve the provided solution by refining data augmentation (transforms) and training hyperparameters. "
-                "Focus exclusively on these aspects, ignoring data preparation or model architecture changes. "
-                "Use feedback from training results and validation metric of previous solutions in your memory to guide your improvements. "
+                self.profile + " You are provided with a developed solution below."
+                " Your task is to improve this solution by refining the training pipeline."
+                " You should prioritize the following tricks:"
+                " 1. If the model has not used a pretrain, use a suitable one. Libraries like `timm` are recommended."
+                " 2. If only the final epoch checkpoint is used, add early-stopping/greedy-soup to get a better checkpoint."
+                " 3. Analyze the optimizer / scheduler / model and try to find a better alternative."
+                " 4. If you have tried all the above tricks, try to propose new plan based on your knowledge."
+                " Please focus exclusively on these aspects, ignoring data preparation."
+                " Use feedback from the training results and validation metrics of previous solutions in your memory to guide your improvements."
             ),
             "Task description": self.task_desc,
             "Memory": self.journal.generate_summary(),
@@ -106,48 +56,35 @@ class TuningAgent(BaseAgent):
             "Code": wrap_code(parent_node.code),
         }
 
-        if self.acfg.enable_monai_knowledge_base:
-            knowledge_retrieve_context = prompt.copy()
-            knowledge_retrieve_context["Query"] = "What topic should be queried to improve this code by refining data augmentation (transforms) and training hyperparameters?"
-            topic_of_knowledge_for_debug = query(
-                system_message=knowledge_retrieve_context,
-                user_message=None,
-                model=self.acfg.knowledge_base.model,
-                temperature=self.acfg.knowledge_base.temp,
-            )
-            prompt["Dependent Knowledge"] = self.query_knowledge_base(topic_of_knowledge_for_debug)
-
         prompt["Instructions"] |= self._prompt_resp_fmt
         prompt["Instructions"] |= {
-            "Solution improvement sketch guideline": [
+            "Solution sketch guideline": [
                 "The solution sketch should be a brief natural language description of how the previous solution can be improved."
-                "You should be very specific and should only propose a single actionable improvement."
-                "This improvement should be atomic so that we can experimentally evaluate the effect of the proposed change."
+                "You should be very specific and should **only propose a single actionable improvement**."
+                "This tuning plan should be atomic so that we can experimentally evaluate the effect of the proposed change."
                 "Take the Memory section into consideration when proposing the improvement."
                 "The solution sketch should be 3-5 sentences."
-                "Don't suggest to do EDA."
-                "If the epoch number is 1, change it to a suitable epoch number according to the previous execution time in Memory."
-                f"The improved soultion should run **suitable epoch numbers within {humanize.naturaldelta(self.cfg.exec.timeout)}**."
             ],
         }
         prompt["Instructions"] |= self._prompt_impl_guideline
 
         plan, code = self.plan_and_code_query(prompt)
-        # code = self._tuning_batch_size_in_code(code, exec_callback)
         return Node(
             plan=plan,
             code=code,
             parent=parent_node,
+            tag="refine_pipeline",
         )
 
     def step(self, exec_callback: ExecCallbackType):
         if not self.journal.nodes or self.data_preview is None:
             self.update_data_preview()
 
+        logger.info(f"start to search")
         parent_node = self.search_policy()
         logger.debug(f"Agent is generating code, parent node type: {type(parent_node)}")
 
-        result_node = self._tuning(parent_node, exec_callback)
+        result_node = self._refine_pipeline(parent_node, exec_callback)
 
         self.parse_exec_result(
             node=result_node,
