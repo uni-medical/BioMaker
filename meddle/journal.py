@@ -7,6 +7,7 @@ The journal is the core datastructure in MedDLE that contains:
 ...
 """
 
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,7 +18,6 @@ from dataclasses_json import DataClassJsonMixin
 from .interpreter import ExecutionResult
 from .utils.metric import MetricValue
 from .utils.response import trim_long_string
-import random
 
 
 @dataclass(eq=False)
@@ -194,6 +194,19 @@ class Journal(DataClassJsonMixin):
 
         top_nodes = sorted(nodes, key=lambda n: n.metric, reverse=True)[:topk]
         return random.choice(top_nodes) if top_nodes else None
+
+    def get_topk_node_list(self, only_good=True, topk=3) -> None | Node:
+        """Return one of the top-k best solutions found so far (randomly chosen)."""
+
+        if only_good:
+            nodes = self.good_nodes
+            if not nodes:
+                return None
+        else:
+            nodes = self.nodes
+
+        top_nodes = sorted(nodes, key=lambda n: n.metric, reverse=True)[:topk]
+        return top_nodes
 
     def generate_summary(self, include_code: bool = False) -> str:
         """Generate a summary of the journal for the agent."""

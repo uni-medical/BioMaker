@@ -6,7 +6,7 @@ import humanize
 from ..backend import FunctionSpec, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
-from ..monai_rag.query_rag_db import MONAI_RAG
+from ..monai_rag.query_rag_db import MED_KNOWLEDGE_RAG
 from ..utils.config import Config
 from ..utils.response import wrap_code
 from .base_agent import BaseAgent
@@ -23,7 +23,7 @@ class ProposalAgent(BaseAgent):
     ):
         super().__init__(task_desc, cfg, journal)
         self.profile = "You are a medical deep learning grandmaster attending a competition. "
-        self.knowledge_base = MONAI_RAG(model=self.acfg.knowledge_base.model)
+        self.knowledge_base = MED_KNOWLEDGE_RAG(model=self.acfg.knowledge_base.model)
 
     def query_knowledge_base(self, query: str, topk: int=3) -> str: 
         result = ""
@@ -117,6 +117,7 @@ class ProposalAgent(BaseAgent):
             "Introduction": (
                 self.profile + "You are provided with a previously developed "
                 "solution below and should improve it in order to further increase the (test time) performance. "
+                "You should pay more attention on data preparation/augmentation and model architecture."
                 "For this you should first outline a brief plan in natural language for how the solution can be improved and "
                 "then implement this improvement in Python based on the provided previous solution. "
             ),

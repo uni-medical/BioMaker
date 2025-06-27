@@ -85,9 +85,9 @@ streamlit==1.40.2
 python-dotenv
 openpyxl
 
-
 monai==1.4.0
 langchain
+langchain-openai
 langchain-community
 beautifulsoup4
 chromadb

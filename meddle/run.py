@@ -17,21 +17,23 @@ from .utils.config import (load_cfg, load_task_desc, prep_agent_workspace,
 from .utils.timer import Timer
 
 logger = logging.getLogger("meddle")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 def journal_to_rich_tree(journal: Journal):
     best_node = journal.get_best_node()
+    new_node = None if len(journal.nodes) < 1 else journal.nodes[-1]
 
     def append_rec(node: Node, tree):
         if node.is_buggy:
             s = "[red]◍ bug"
         else:
             style = "bold " if node is best_node else ""
-
+            color = "blue" if node is new_node else "green"
+            s = f"[{style}{color}]● {node.metric.value:.3f}"
             if node is best_node:
-                s = f"[{style}green]● {node.metric.value:.3f} (best)"
-            else:
-                s = f"[{style}green]● {node.metric.value:.3f}"
+                s += " (best)"
+        if node is new_node:
+            s += " (new)"
 
         subtree = tree.add(s)
         for child in node.children:
@@ -77,6 +79,7 @@ def run():
     def exec_callback(*args, **kwargs):
         logger.info(Text("Executing code...", style="magenta"))
         res = interpreter.run(*args, **kwargs)
+        logger.info(Text("Execution done.", style="magenta"))
         return res
 
     def agent_loop_exit_handler():
@@ -95,6 +98,7 @@ def run():
     total_timer = Timer(timeout_seconds=timeout_seconds)
     
     logger.info(f'Starting MedDLE workflow')
+    logger.info(f"Step plan:\n{agent.step_plan}")
     total_timer.reset()
     # Continue to the next step only when both the step limit and time limit are not reached
     global_step = 0

@@ -28,13 +28,9 @@ class HPOAgent(BaseAgent):
     
     def update_with_external_journal(self, external_journal: Journal):
         super().update_with_external_journal(external_journal)
-        # prune the journal and keep only the best-as-known node
-        best_node = self.journal.get_best_node(only_good=True)
-        self.journal.nodes = [best_node] if best_node is not None else self.journal.nodes[-1:]
-        for idx in range(len(self.journal.nodes)):
-            self.journal.nodes[idx] = copy.deepcopy(self.journal.nodes[idx])
-            self.journal.nodes[idx].parent = None
-            self.journal.nodes[idx].children = set()
+        # prune the journal and keep the topk node
+        best_node_list = self.journal.get_topk_node_list(only_good=True, topk=3)
+        self.journal.nodes = [n for n in best_node_list]
     
     def search_policy(self) -> Node | None:
         # choose from the top-k best-as-known node for further tuning

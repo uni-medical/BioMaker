@@ -57,6 +57,10 @@ class BaseAgent:
         self.data_preview: str | None = None
         self.profile = "You are a helpful assistance. "
 
+    def has_empty_journal(self) -> bool:
+        """Check if the journal is empty."""
+        return not self.journal.nodes or len(self.journal.nodes) <= 0
+
     def update_with_external_journal(self, external_journal: Journal):
         if not isinstance(external_journal, Journal):
             raise ValueError("external_journal must be an instance of Journal")

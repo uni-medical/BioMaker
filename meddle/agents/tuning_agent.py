@@ -26,17 +26,13 @@ class TuningAgent(BaseAgent):
     
     def update_with_external_journal(self, external_journal: Journal):
         super().update_with_external_journal(external_journal)
-        # prune the journal and keep only the best-as-known node
-        best_node = self.journal.get_best_node(only_good=True)
-        self.journal.nodes = [best_node] if best_node is not None else self.journal.nodes[-1:]
-        for idx in range(len(self.journal.nodes)):
-            self.journal.nodes[idx] = copy.deepcopy(self.journal.nodes[idx])
-            self.journal.nodes[idx].parent = None
-            self.journal.nodes[idx].children = set()
+        # prune the journal and keep the topk node
+        best_node_list = self.journal.get_topk_node_list(only_good=True, topk=3)
+        self.journal.nodes = [n for n in best_node_list]
     
     def search_policy(self) -> Node | None:
         # get the best-as-known node for further tuning
-        best_node = self.journal.get_best_node(only_good=True)
+        best_node = self.journal.get_best_node(only_good=True, topk=3)
         return best_node
 
     def _refine_pipeline(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
@@ -47,7 +43,7 @@ class TuningAgent(BaseAgent):
                 " You should prioritize the following tricks:"
                 " 1. If the model has not used a pretrain, use a suitable one. Libraries like `timm` are recommended."
                 " 2. If only the final epoch checkpoint is used, add early-stopping/greedy-soup to get a better checkpoint."
-                " 3. Analyze the optimizer / scheduler and try to find a better one."
+                " 3. Analyze the optimizer / scheduler / model and try to find a better alternative."
                 " 4. If you have tried all the above tricks, try to propose new plan based on your knowledge."
                 " Please focus exclusively on these aspects, ignoring data preparation."
                 " Use feedback from the training results and validation metrics of previous solutions in your memory to guide your improvements."

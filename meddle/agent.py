@@ -47,6 +47,11 @@ class MeddleWorkflow(BaseAgent):
             WorkflowAgent(name="hpo", steps_left=cfg.agent.step_plan.hpo, agent=self.hpo_agent),
         ]
     
+    @property
+    def step_plan(self) -> int:
+        step_plan = [f"{wa.name}-step:{wa.steps_left}" for wa in self.workflow]
+        return " | ".join(step_plan)
+
     def update_steps_left(self) -> int:
         """Return the number of steps left in the workflow."""
         return sum(node.steps_left for node in self.workflow)
@@ -56,16 +61,14 @@ class MeddleWorkflow(BaseAgent):
         # walkthrough the workflow and run the first node that has steps left
         for idx, workflow_agent in enumerate(self.workflow):
             if workflow_agent.steps_left > 0:
-                logger.info("Current agent: %s, steps left: %d", workflow_agent.name, workflow_agent.steps_left)
+                if workflow_agent.agent.has_empty_journal() and idx > 0:
+                    logger.info("Agent '%s' has no memory, getting initial memory from global memory.", workflow_agent.name)
+                    workflow_agent.agent.update_with_external_journal(self.journal)
+
+                logger.info("Current Agent: '%s', steps left: %d", workflow_agent.name, workflow_agent.steps_left)
                 solution_node = workflow_agent.agent.step(exec_callback)
                 solution_node.agent_name = workflow_agent.name
                 workflow_agent.steps_left -= 1
-                
-                # update global journal
-                self.journal.append(solution_node)
+                self.journal.append(solution_node) # update global journal
                 break
-            
-            # for workflow node switch, update the journal for the next agent
-            if workflow_agent.steps_left == 0 and idx < len(self.workflow)-1:
-                logger.info("Passing journal (%d nodes) to the next agent: %s", len(self.journal), self.workflow[idx + 1].name)
-                self.workflow[idx + 1].agent.update_with_external_journal(self.journal)
+

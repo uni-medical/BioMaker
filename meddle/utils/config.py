@@ -184,9 +184,14 @@ def prep_cfg(cfg: Config):
     # if the step <= 10, use all steps for proposal
     # if the step > 10, use 5 step for tuning, others for proposal
     if (cfg.agent.step_plan is None):
-        cfg.agent.step_plan.tuning = 5 if (cfg.agent.steps > 10) else 0
-        cfg.agent.step_plan.proposal = cfg.agent.steps - cfg.agent.step_plan.tuning
-        cfg.agent.step_plan.hpo = 0
+        tuning_step = 5 if (cfg.agent.steps > 10) else 0
+        hpo_step = 2 if (cfg.agent.steps > 25) else 0
+        proposal_step = cfg.agent.steps - tuning_step - hpo_step
+        cfg.agent.step_plan = StepConfig(
+            proposal=proposal_step,
+            tuning=tuning_step,
+            hpo=hpo_step,
+        )
 
     # validate the config
     cfg_schema: Config = OmegaConf.structured(Config)
