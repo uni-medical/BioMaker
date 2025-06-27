@@ -91,7 +91,7 @@ class MED_KNOWLEDGE_RAG:
         else:
             final_documents = documents
         if (convert_to_str):
-            return "\n".join([d.page_content[:] for d in final_documents])
+            return "\n".join([d.page_content[:].replace("AddChanneld", "") for d in final_documents])
         return final_documents
 
 if __name__ == "__main__":
