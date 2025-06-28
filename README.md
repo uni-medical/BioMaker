@@ -2,6 +2,10 @@
 
 MedDLE is designed to be a codegen agentic system for medical deep learning tasks. 
 
+> **Alert**: For current version, monai prompt & rag (q2d+rerank) are defaultly enabled. 
+> 
+> Since we update the Auto-Tuning Pipeline with many changes, please refer to branch `v0` if you wanna use the old settings.
+
 # Quick Start
 ## Setup environment
 1. we recommand use `conda` to create a virtual environment:
@@ -11,22 +15,17 @@ conda activate meddle
 ```
 2. Then install `meddle` via:
 ```
-pip install -r requirements.txt
-pip install -e .
+pip install uv
+uv pip install -r requirements.txt
+uv pip install -e .
 ```
-> optional: use `uv` to speedup installation
-> ```
-> pip install uv
-> uv pip install -r requirements.txt
-> uv pip install -e .
-> ```
 3. remember to set up your private api key of OPENAI/ANTROPIC/OPENROUNTER
 ```
 export OPENAI_BASE_URL="<your base url>" # (e.g. https://api.openai.com/v1)
 export OPENAI_API_KEY="<your key>"
 ```
 ### Setup knowledge base for RAG
-You can create the db with `create_monai_knowledge_base.sh` or download from [link](http://ug.link/haoyushare/filemgr/share-download/?id=b8c77eb1346c4ecca4dfb510253d32fe).
+You can create the knowledge base with `create_monai_knowledge_base.sh` or download from [link](http://ug.link/haoyushare/filemgr/share-download/?id=b8c77eb1346c4ecca4dfb510253d32fe).
 
 You could use this command to check whether the creation succeeds.
 ```
@@ -48,38 +47,20 @@ here's a detailed example:
 ```
 meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="torch-example_task_retina"\
      goal="Predict the category of each given Fundus Camera image by selecting the most appropriate one from the 5 available classes." \
-     eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
-     agent.step_plan.proposal=20 agent.step_plan.tuning=10 agent.step_plan.hpo=5  \
-     agent.enable_monai_knowledge_base=true agent.expose_prediction=true 
+     eval="Use the accuracy and the AUC between the predicted and ground-truth class." \
+     agent.step_plan.proposal=20 agent.step_plan.tuning=10 agent.step_plan.hpo=5
 ```
-You can set general `steps` (MedDLE with auto schedule multiple agents' step) or detailed `step_plan` for 
+You can set general `steps` (MedDLE with auto-schedule steps for multiple agents) or detailed `step_plan` for 
 each agent.
 
-## MONAI-enhanced codegen
-We highlight MONAI as a helpful candidate for medical DL codegen with Prompt/RAG mode:
-### Prompt mode
-```
-meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_prompt-odir5k_2d_mlc"\
-     goal="Classify 2D Medical images into different categories in a multi-label setting" \
-     eval="Use the average of kappa score, F-1 score, and AUC value metric between the predicted and ground-truth values." \
-     agent.force_monai_with_prompt=true 
-```
+## Advanced features
 ### RAG mode
-#### 1. enable the feature in agent
-We support both basic RAG and advanced (query2doc) mode.
+We support both basic RAG and advanced (query2doc) mode. They are controlled with the following options.
 ```
-meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_rag-odir5k"\
-     goal="Classify 2D Medical images into different categories in a multi-label setting" \
-     eval="Use the average of kappa score, F-1 score, and AUC value metric between the predicted and ground-truth values." \
-     agent.enable_monai_knowledge_base=true
-
-meddle data_dir="meddle/med_dl_tasks/odir5k_2d_mlc" exp_name="monai_q2d-odir5k_2d_mlc"\
-     goal="Classify 2D Medical images into different categories in a multi-label setting" \
-     eval="Use the average of kappa score, F-1 score, and AUC value metric between the predicted and ground-truth values." \
-     agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
+agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
 ```
 
-### Details
+### Total Time Limit
 To test with a total time limit, you can set config `agent.total_time_limit`:
 ```
 meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="test_timelimit-example_task_retina"\
