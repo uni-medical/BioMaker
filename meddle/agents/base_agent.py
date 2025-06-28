@@ -154,7 +154,7 @@ class BaseAgent:
                 "     * Spatial transforms: EnsureChannelFirstd, Resized, RandRotate90d, RandZoomd, RandFlipd"
                 "     * Intensity transforms: ScaleIntensityd, NormalizeIntensityd"    
                 "     * Remember to use appropriate spatial_size with Resized when the image sizes are different"
-                "2. **Network Design**:"
+                "2. **Network Design** (if your task is 3D):"
                 "- Select from monai.networks.nets (DenseNet121/UNet for classification/segmentation)"
             )
         if self.acfg.expose_prediction:

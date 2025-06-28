@@ -34,9 +34,9 @@ agent:
   # whether to provide the agent with a preview of the data
   data_preview: True
   # whether to force the agent to use MONAI to train the model
-  force_monai_with_prompt: False
-  enable_monai_knowledge_base: False
-  enable_query2doc: False
+  force_monai_with_prompt: True
+  enable_monai_knowledge_base: True
+  enable_query2doc: True
 
   # hyperparameters for the tree search
   search:
