@@ -3,20 +3,20 @@
 #      eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
 #      agent.steps=30 agent.enable_monai_knowledge_base=true agent.expose_prediction=true 
      
-meddle data_dir="meddle/med_dl_tasks/organmnist3d_64" exp_name="all_pipeline-organmnist3d_64"\
-     goal="Predict the category of each given 3D Abdominal CT image by selecting the most appropriate one from the 11 available classes." \
-     eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
-     agent.step_plan.proposal=20 agent.step_plan.tuning=10 agent.step_plan.hpo=5 agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
+# meddle data_dir="meddle/med_dl_tasks/organmnist3d_64" exp_name="all_pipeline-organmnist3d_64"\
+#      goal="Predict the category of each given 3D Abdominal CT image by selecting the most appropriate one from the 11 available classes." \
+#      eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
+#      agent.step_plan.proposal=20 agent.step_plan.tuning=10 agent.step_plan.hpo=5 agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
 
 meddle data_dir="meddle/med_dl_tasks/nodulemnist3d_64" exp_name="all_pipeline-nodulemnist3d_64"\
      goal="Predict the category of each given 3D Chest CT image by selecting the most appropriate one from the 2 available classes." \
      eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
      agent.step_plan.proposal=20 agent.step_plan.tuning=10 agent.step_plan.hpo=5 agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
      
-meddle data_dir="meddle/med_dl_tasks/breastmnist_224" exp_name="all_pipeline-breastmnist_224"\
-     goal="Predict the category of each given Breast Ultrasound image by selecting the most appropriate one from the 2 available classes." \
-     eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
-     agent.step_plan.proposal=20 agent.step_plan.tuning=10 agent.step_plan.hpo=5 agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
+# meddle data_dir="meddle/med_dl_tasks/breastmnist_224" exp_name="all_pipeline-breastmnist_224"\
+#      goal="Predict the category of each given Breast Ultrasound image by selecting the most appropriate one from the 2 available classes." \
+#      eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
+#      agent.step_plan.proposal=20 agent.step_plan.tuning=10 agent.step_plan.hpo=5 agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
 
 # meddle data_dir="meddle/med_dl_tasks/retinamnist_224" exp_name="all_pipeline-example_task_retina"\
 #      goal="Predict the category of each given Fundus Camera image by selecting the most appropriate one from the 5 available classes." \

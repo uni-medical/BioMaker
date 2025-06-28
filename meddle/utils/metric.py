@@ -29,8 +29,6 @@ class MetricValue(DataClassJsonMixin):
         if other.value is None:
             return True
 
-        assert type(self) is type(other) and (self.maximize == other.maximize)
-
         if self.value == other.value:
             return False
 
