@@ -53,15 +53,15 @@ meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="torch-example_t
 You can set general `steps` (MedDLE with auto-schedule steps for multiple agents) or detailed `step_plan` for 
 each agent.
 
-## Advanced features
-### RAG mode
-We support both basic RAG and advanced (query2doc) mode. They are controlled with the following options.
+# Advanced Features
+## RAG Mode
+We support both basic RAG and advanced (query2doc) mode. They are controlled with the following configs.
 ```
 agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
 ```
 
-### Total Time Limit
-To test with a total time limit, you can set config `agent.total_time_limit`:
+## Total time limit
+To test with a total time limit for all steps, you can set config `agent.total_time_limit`:
 ```
 meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="test_timelimit-example_task_retina"\
      goal="Predict the category of each given Fundus Camera image by selecting the most appropriate one from the 5 available classes." \
@@ -70,7 +70,7 @@ meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="test_timelimit-
      agent.steps=100 agent.total_time_limit=60
 ```
 
-## 🙏 Acknowledgement
+# 🙏 Acknowledgement
 - We thank all medical workers and dataset owners for making public datasets available to the community.
 - Thanks to the open-source of the following projects, our code is developed based on their contributions:
      - [aideml](https://github.com/WecoAI/aideml)
