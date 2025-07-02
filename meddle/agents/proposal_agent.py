@@ -11,7 +11,7 @@ from ..utils.config import Config
 from ..utils.response import wrap_code
 from .base_agent import BaseAgent
 
-logger = logging.getLogger("meddle-proposal")
+logger = logging.getLogger("meddle")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
 
 class ProposalAgent(BaseAgent):
@@ -28,7 +28,9 @@ class ProposalAgent(BaseAgent):
     def query_knowledge_base(self, query: str, topk: int=3) -> str: 
         result = ""
         if self.acfg.enable_monai_knowledge_base:
+            logger.debug(f"Querying knowledge base with query: {query}")
             result = self.knowledge_base.search(query, k=topk, enable_query2doc=self.acfg.enable_query2doc)
+            logger.debug("Querying knowledge base get result:\n", result)
         return result
 
     def _draft(self) -> Node:

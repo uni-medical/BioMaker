@@ -12,7 +12,7 @@ from ..utils.config import Config
 from ..utils.metric import MetricValue, WorstMetricValue
 from ..utils.response import extract_code, extract_text_up_to_code, wrap_code
 
-logger = logging.getLogger("meddle-base")
+logger = logging.getLogger("meddle")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
 
 review_func_spec = FunctionSpec(

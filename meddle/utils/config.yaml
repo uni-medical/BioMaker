@@ -72,3 +72,5 @@ generate_report: True
 report:
   model: gpt-4o
   temp: 1.0
+  
+log_level: INFO

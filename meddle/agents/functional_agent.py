@@ -10,7 +10,7 @@ from ..utils.response import wrap_code
 from ..utils.metric import ZeroMetricValue
 from .base_agent import BaseAgent
 
-logger = logging.getLogger("meddle-functional")
+logger = logging.getLogger("meddle")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
 
 class FunctionalAgent(BaseAgent):

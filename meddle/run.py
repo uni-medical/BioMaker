@@ -47,6 +47,13 @@ def journal_to_rich_tree(journal: Journal):
 
 def run():
     cfg = load_cfg()
+    if cfg.log_level == "DEBUG":
+        logger.setLevel(logging.DEBUG)
+        backend.logger.setLevel(logging.DEBUG)
+    elif cfg.log_level == "WARNING":
+        logger.setLevel(logging.WARNING)
+        backend.logger.setLevel(logging.WARNING)
+        
     logger.info(f'Starting run "{cfg.exp_name}"')
     logger.info(f'Config: "{cfg}"')
 
@@ -112,7 +119,7 @@ def run():
         except Exception as e:
             end_with_exception = True
             logger.error(f"Exception during agent step: {e}")
-            break
+            raise e
         # If the total time limit is reached, remove the last node from the journal
         if total_timer.is_timeout(tolerance=5):
             logger.error("Total time limit reached, stopping the run.")

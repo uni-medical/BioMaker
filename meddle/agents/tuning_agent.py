@@ -11,7 +11,7 @@ from ..utils.config import Config
 from ..utils.response import wrap_code
 from .base_agent import BaseAgent
 
-logger = logging.getLogger("meddle-tuning")
+logger = logging.getLogger("meddle")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
 
 class TuningAgent(BaseAgent):

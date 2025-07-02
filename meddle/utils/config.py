@@ -124,6 +124,7 @@ class Config(Hashable):
     agent: AgentConfig
 
     model_for_all_agents: str | None
+    log_level: str
 
 
 def _get_next_logindex(dir: Path) -> int:
