@@ -28,10 +28,7 @@ class ProposalAgent(BaseAgent):
     def query_knowledge_base(self, query: str, topk: int=3) -> str: 
         result = ""
         if self.acfg.enable_monai_knowledge_base:
-            try:
-                result = self.knowledge_base.search(query, k=topk, enable_query2doc=self.acfg.enable_query2doc)
-            except:
-                raise ValueError("Retrieve Failed! Plz check the knowledge base status")
+            result = self.knowledge_base.search(query, k=topk, enable_query2doc=self.acfg.enable_query2doc)
         return result
 
     def _draft(self) -> Node:

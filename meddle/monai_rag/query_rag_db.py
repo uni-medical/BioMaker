@@ -16,14 +16,13 @@ def query2doc_search(search_query, model="gpt-4o"):
              "query: what's the usage of ImageDataset in MONAI\n" + \
              "passage: ### ImageDataset[#](data.html#imagedataset 'Link to this heading') _class _monai.data.ImageDataset(_image_files_ , _seg_files=None_ , _labels=None_ , _transform=None_ , _seg_transform=None_ , _label_transform=None_ , _image_only=True_ , _transform_with_metadata=False_ , _dtype= <class 'numpy.float32'>_, _reader=None_ , _*args_ , _**kwargs_)[[source]](https://github.com/Project- MONAI/MONAI/blob/dev/monai/data/image_dataset.py#L26-L155)[#](data.html#monai.data.ImageDataset 'Link to this definition')" +"\n"+\
              "query: ImageDataset\n" + \
-             "passage: ### ImageDataset[#](data.html#imagedataset 'Link to this heading') _class _monai.data.ImageDataset(_image_files_ , _seg_files=None_ , _labels=None_ , _transform=None_ , _seg_transform=None_ , _label_transform=None_ , _image_only=True_ , _transform_with_metadata=False_ , _dtype= <class 'numpy.float32'>_, _reader=None_ , _*args_ , _**kwargs_)[[source]](https://github.com/Project- MONAI/MONAI/blob/dev/monai/data/image_dataset.py#L26-L155)[#](data.html#monai.data.ImageDataset 'Link to this definition')" +"\n\n"+\
-             f"Write a passage that answers the given query: {search_query}\n\n"
+             "passage: ### ImageDataset[#](data.html#imagedataset 'Link to this heading') _class _monai.data.ImageDataset(_image_files_ , _seg_files=None_ , _labels=None_ , _transform=None_ , _seg_transform=None_ , _label_transform=None_ , _image_only=True_ , _transform_with_metadata=False_ , _dtype= <class 'numpy.float32'>_, _reader=None_ , _*args_ , _**kwargs_)[[source]](https://github.com/Project- MONAI/MONAI/blob/dev/monai/data/image_dataset.py#L26-L155)[#](data.html#monai.data.ImageDataset 'Link to this definition')"
+             
     pseudo_doc = query(
         system_message=prompt,
-        user_message=None,
+        user_message=f"Write a passage that answers the given query: {search_query}\n\n",
         model=model,
         temperature=0.0,
-        max_tokens=128,
     )
     return pseudo_doc
 
@@ -35,7 +34,6 @@ class MED_KNOWLEDGE_RAG:
             embedding_function=self.embeddings
         )
         self.model = model
-        self.llm = ChatOpenAI(model=self.model, temperature=0)
     
     def _rerank_documents(self, original_query: str, documents: list[Document], k: int) -> list[Document]:
         """
@@ -48,21 +46,18 @@ class MED_KNOWLEDGE_RAG:
         reranked_docs_with_scores = []
         for doc in documents:
             # Create a prompt for the LLM to score the relevance
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", "You are an expert at evaluating the relevance of text. Assign a relevance score between 0 and 10 to the provided document based on the given query. Output only the score."),
-                    ("human", "Query: {query}\nDocument: {document}\nRelevance Score:"),
-                ]
-            )
-            
-            chain = prompt | self.llm | StrOutputParser()
-            
             try:
-                score_str = chain.invoke({"query": original_query, "document": doc.page_content})
+                score_str = query(
+                    system_message="You are an expert at evaluating the relevance of text."+\
+                                   "Assign a relevance score between 0 and 10 to the provided document based on the given query."+\
+                                   "Output only the score.",
+                    user_message=f"Query: {original_query}\nDocument: {doc.page_content}\nRelevance Score:",
+                    model=self.model,
+                    temperature=0.0,
+                )
                 score = float(score_str.strip())
             except Exception as e:
-                print(f"Error reranking document: {e}. Assigning a default score of 0.")
-                score = 0
+                score = 0.0
             
             reranked_docs_with_scores.append((score, doc))
         

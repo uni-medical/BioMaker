@@ -51,10 +51,25 @@ def cfg_to_tree_struct(cfg, jou: Journal):
 
     metrics = np.array([str(n.metric.value_npsafe) for n in jou])
     agent_names = np.array([str(n.agent_name) for n in jou])
+    term_outs = [n.term_out for n in jou]
 
-    plan_with_metric_list = [textwrap.fill(
-        f"agent:{a}\n|metric:{m}\n|"+n.plan, 
-        width=80) for n, m, a in zip(jou.nodes, metrics, agent_names)] 
+    plan_with_metric_list = []
+    for n, t, m, a in zip(jou.nodes, term_outs, metrics, agent_names):
+        # 构建原始字符串
+        original_string = [
+            f"agent:{a}",
+            f"metric:{m}",
+            f"plan:{n.plan}",
+            f"term_out:{t}",
+        ]
+
+        # 按换行符分割字符串，然后对每一行进行换行处理
+        wrapped_lines = []
+        for line in original_string: # 按 \n 分割
+            wrapped_lines.append(textwrap.fill(line, width=80)) # 对每一行进行 fill
+
+        # 将处理过的行用 \n 重新连接
+        plan_with_metric_list.append('\n'.join(wrapped_lines))
 
     return dict(
         edges=edges,

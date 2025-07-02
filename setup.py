@@ -8,7 +8,7 @@ with open("requirements.txt", "r") as f:
 
 setup(
     name="meddle",
-    version="0.1.0.post1",
+    version="0.1.1",
     author="Haoyu Wang",
     author_email="small_dark@sina.com",
     description="Agentic Medical Deep Learning Engineer",

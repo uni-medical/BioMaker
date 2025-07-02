@@ -1,5 +1,4 @@
 # MedDLE requirements
-black==24.3.0
 funcy==2.0
 humanize==4.8.0
 jsonschema==4.19.2
@@ -14,7 +13,6 @@ dataclasses_json>=0.6.4
 omegaconf>=2.3.0
 loguru==0.7.2
 shutup>=0.2.0
-tqdm==4.66.2
 coolname>=2.2.0
 igraph>=0.11.3
 genson>=1.2.0
@@ -32,7 +30,6 @@ seaborn
 gensim
 
 scikit-learn
-scikit-image
 opencv-python
 scipy
 biopython
@@ -62,7 +59,6 @@ Pillow
 pyparsing
 pytz
 PyYAML
-tqdm
 fastai
 gym
 optuna
@@ -83,7 +79,6 @@ streamlit==1.40.2
 python-dotenv
 openpyxl
 
-monai==1.4.0
 langchain
 langchain-openai
 langchain-community
@@ -96,3 +91,35 @@ html2text
 tiktoken
 optuna
 autogluon
+
+# MONAI requirements
+monai==1.4.0
+pytorch-ignite==0.4.11
+scipy>=1.12.0; python_version >= '3.9'
+itk>=5.2
+nibabel
+scikit-image>=0.19.0
+tqdm>=4.47.0
+lmdb
+mccabe
+pep8-naming
+pycodestyle
+pyflakes
+black>=25.1.0
+isort>=5.1, <6.0
+ruff
+types-setuptools
+mypy>=1.5.0, <1.12.0
+ninja
+psutil
+openslide-python
+openslide-bin
+einops
+mlflow>=2.12.2
+clearml>=1.10.0rc0
+pyyaml
+fire
+jsonschema
+pynrrd
+pydicom
+h5py

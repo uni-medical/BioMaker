@@ -7,6 +7,7 @@ import time
 from .utils import FunctionSpec, OutputType, opt_messages_to_list, backoff_create
 from funcy import notnone, once, select_values
 import openai
+import os
 
 logger = logging.getLogger("meddle")
 
@@ -19,34 +20,13 @@ OPENAI_TIMEOUT_EXCEPTIONS = (
     openai.InternalServerError,
 )
 
-# (docs) https://platform.openai.com/docs/guides/function-calling/supported-models
-SUPPORTED_FUNCTION_CALL_MODELS = {
-    "gpt-4o",
-    "gpt-4o-2024-08-06",
-    "gpt-4o-2024-05-13",
-    "gpt-4o-mini",
-    "gpt-4o-mini-2024-07-18",
-    "gpt-4-turbo",
-    "gpt-4-turbo-2024-04-09",
-    "gpt-4-turbo-preview",
-    "gpt-4-0125-preview",
-    "gpt-4-1106-preview",
-    "gpt-3.5-turbo",
-    "gpt-3.5-turbo-0125",
-    "gpt-3.5-turbo-1106",
-}
-
 
 @once
 def _setup_openai_client():
     global _client
-    _client = openai.OpenAI(max_retries=0)
-
-
-def is_function_call_supported(model_name: str) -> bool:
-    """Return True if the model supports function calling."""
-    return model_name in SUPPORTED_FUNCTION_CALL_MODELS
-
+    _client = openai.OpenAI(
+        max_retries=0
+    )
 
 def query(
     system_message: str | None,
@@ -68,16 +48,8 @@ def query(
     if func_spec is not None:
         # Only check function call support for feedback/search operations
         if func_spec.name == "submit_review":
-            if not is_function_call_supported(model_name):
-                logger.warning(
-                    f"Review function calling was requested, but model '{model_name}' "
-                    "does not support function calling. Falling back to plain text generation."
-                )
-                filtered_kwargs.pop("tools", None)
-                filtered_kwargs.pop("tool_choice", None)
-            else:
-                filtered_kwargs["tools"] = [func_spec.as_openai_tool_dict]
-                filtered_kwargs["tool_choice"] = func_spec.openai_tool_choice_dict
+            filtered_kwargs["tools"] = [func_spec.as_openai_tool_dict]
+            filtered_kwargs["tool_choice"] = func_spec.openai_tool_choice_dict
 
     t0 = time.time()
     completion = backoff_create(

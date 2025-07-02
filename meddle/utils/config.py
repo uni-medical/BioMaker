@@ -123,6 +123,8 @@ class Config(Hashable):
     report: StageConfig
     agent: AgentConfig
 
+    model_for_all_agents: str | None
+
 
 def _get_next_logindex(dir: Path) -> int:
     """Get the next available index for a log directory."""
@@ -192,6 +194,13 @@ def prep_cfg(cfg: Config):
             tuning=tuning_step,
             hpo=hpo_step,
         )
+
+    # if `model_for_all_agents` is set
+    # override all model settings with the same model
+    if cfg.model_for_all_agents is not None:
+        cfg.agent.code.model = cfg.model_for_all_agents
+        cfg.agent.knowledge_base.model = cfg.model_for_all_agents
+        cfg.report.model = cfg.model_for_all_agents
 
     # validate the config
     cfg_schema: Config = OmegaConf.structured(Config)

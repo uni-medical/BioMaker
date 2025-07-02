@@ -48,6 +48,7 @@ def journal_to_rich_tree(journal: Journal):
 def run():
     cfg = load_cfg()
     logger.info(f'Starting run "{cfg.exp_name}"')
+    logger.info(f'Config: "{cfg}"')
 
     task_desc = load_task_desc(cfg)
     task_desc_str = backend.compile_prompt_to_md(task_desc)
@@ -82,10 +83,10 @@ def run():
         logger.info(Text("Execution done.", style="magenta"))
         return res
 
-    def agent_loop_exit_handler():
+    def agent_loop_exit_handler(end_with_exception: bool):
         logger.info("Exiting agent loop...")
 
-        if cfg.generate_report:
+        if cfg.generate_report and not end_with_exception:
             print("Generating final report from journal...")
             report = journal2report(journal, task_desc, cfg.report)
             print(report)
@@ -102,12 +103,14 @@ def run():
     total_timer.reset()
     # Continue to the next step only when both the step limit and time limit are not reached
     global_step = 0
+    end_with_exception = False
     while global_step < cfg.agent.steps and not total_timer.is_timeout():
         logger.info(f"MedDLE workflow step: {global_step + 1} / {cfg.agent.steps}")
         try:
             logger.info(Text("Generating code...", style="green"))
             agent.step(exec_callback=exec_callback)
         except Exception as e:
+            end_with_exception = True
             logger.error(f"Exception during agent step: {e}")
             break
         # If the total time limit is reached, remove the last node from the journal
@@ -120,7 +123,7 @@ def run():
         logger.info(tree)
         global_step += 1
     interpreter.cleanup_session()
-    agent_loop_exit_handler()
+    agent_loop_exit_handler(end_with_exception=end_with_exception)
 
 
 if __name__ == "__main__":

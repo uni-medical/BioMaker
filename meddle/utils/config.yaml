@@ -20,6 +20,8 @@ copy_data: False
 
 exp_name: null # a random experiment name will be generated if not provided
 
+model_for_all_agents: null # override the default model setting for all agents
+
 # agent hyperparams
 agent:
   # how many improvement iterations to run

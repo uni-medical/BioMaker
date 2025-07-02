@@ -19,7 +19,7 @@ pip install uv
 uv pip install -r requirements.txt
 uv pip install -e .
 ```
-3. remember to set up your private api key of OPENAI/ANTROPIC/OPENROUNTER
+3. remember to set up your private api key of OPENAI/ANTROPIC/OPENROUNTER for openai-compatible endpoint
 ```
 export OPENAI_BASE_URL="<your base url>" # (e.g. https://api.openai.com/v1)
 export OPENAI_API_KEY="<your key>"

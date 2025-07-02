@@ -7,13 +7,8 @@ logger = logging.getLogger("meddle")
 
 
 def determine_provider(model: str) -> str:
-    if model.startswith("gpt-") or re.match(r"^o\d", model):
-        return "openai"
-    elif model.startswith("claude-"):
-        return "anthropic"
-    # all other models are handle by openrouter
-    else:
-        return "openrouter"
+    # force to use openai backend for all openai-compatible backend
+    return "openai"
 
 
 provider_to_query_func = {
@@ -66,7 +61,7 @@ def query(
     query_func = provider_to_query_func[provider]
     output, req_time, in_tok_count, out_tok_count, info = query_func(
         system_message=compile_prompt_to_md(system_message) if system_message else None,
-        user_message=compile_prompt_to_md(user_message) if user_message else None,
+        user_message=compile_prompt_to_md(user_message) if user_message else "Please complete the task as described above.",
         func_spec=func_spec,
         **model_kwargs,
     )

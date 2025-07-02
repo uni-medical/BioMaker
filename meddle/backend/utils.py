@@ -18,7 +18,7 @@ logger = logging.getLogger("meddle")
     wait_gen=backoff.expo,
     max_value=60,
     factor=1.5,
-    max_tries=5,
+    max_tries=20,
 )
 def backoff_create(
     create_fn: Callable, retry_exceptions: list[Exception], *args, **kwargs
