@@ -30,7 +30,7 @@ class ProposalAgent(BaseAgent):
         if self.acfg.enable_monai_knowledge_base:
             logger.debug(f"Querying knowledge base with query: {query}")
             result = self.knowledge_base.search(query, k=topk, enable_query2doc=self.acfg.enable_query2doc)
-            logger.debug("Querying knowledge base get result:\n", result)
+            logger.debug(f"Querying knowledge base get result:\n {result}")
         return result
 
     def _draft(self) -> Node:
@@ -64,8 +64,8 @@ class ProposalAgent(BaseAgent):
         if self.acfg.data_preview:
             prompt["Data Overview"] = self.data_preview
 
-        if self.acfg.enable_monai_knowledge_base:
-            prompt["Dependent Knowledge"] = self.query_knowledge_base("The basic knowledge of MONAI Data Pipeline usage")
+        # if self.acfg.enable_monai_knowledge_base:
+        #     prompt["Dependent Knowledge"] = self.query_knowledge_base("The basic knowledge of MONAI Data Pipeline usage")
 
         plan, code = self.plan_and_code_query(prompt)
         return Node(plan=plan, code=code)
