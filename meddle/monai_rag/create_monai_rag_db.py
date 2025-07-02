@@ -7,7 +7,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import OpenAIEmbeddings
 from tqdm import tqdm  # Import tqdm
 
-def parse_monai_docs(root_dir="docs.monai.io/en/latest"):
+def parse_monai_docs(root_dir="docs.monai.io/en/1.4.0"):
     docs = []
     # Wrap the outer loop with tqdm to show progress
     for root, _, files in tqdm(list(os.walk(root_dir)), desc="Parsing HTML files"):
