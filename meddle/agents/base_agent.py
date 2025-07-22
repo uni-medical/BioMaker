@@ -118,7 +118,7 @@ class BaseAgent:
             "optuna",
         ]
         if is_medical_code_lib_enabled:
-            pkgs += ["monai",]
+            pkgs += ["monai","lifelines"]
             
         random.shuffle(pkgs)
         pkg_str = ", ".join([f"`{p}`" for p in pkgs])
@@ -208,7 +208,7 @@ class BaseAgent:
 
     def parse_exec_result(self, node: Node, exec_result: ExecutionResult):
         ''' core function for feedback for this Agent'''
-        logger.info(f"Agent is parsing execution results for node {node.id}")
+        logger.debug(f"Agent is parsing execution results for node {node.id}")
 
         node.absorb_exec_result(exec_result)
 
