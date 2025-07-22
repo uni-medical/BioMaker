@@ -85,3 +85,7 @@ autogluon
 
 # MONAI requirements
 monai[all]==1.4.0
+
+# additional medical task requirements
+pydicom
+lifelines
