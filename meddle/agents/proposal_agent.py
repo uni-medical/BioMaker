@@ -28,9 +28,9 @@ class ProposalAgent(BaseAgent):
     def query_knowledge_base(self, query: str, topk: int=3) -> str: 
         result = ""
         if self.acfg.enable_monai_knowledge_base:
-            logger.debug(f"Querying knowledge base with query: {query}")
+            logger.trace(f"Querying knowledge base with query: {query}")
             result = self.knowledge_base.search(query, k=topk, enable_query2doc=self.acfg.enable_query2doc)
-            logger.debug(f"Querying knowledge base get result:\n {result}")
+            logger.trace(f"Querying knowledge base get result:\n {result}")
         return result
 
     def _draft(self) -> Node:

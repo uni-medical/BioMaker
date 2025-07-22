@@ -39,3 +39,4 @@ for fname in knowledge_files:
 if __name__ == "__main__":
     print(knowledge_manager.get_knowledge("hpo_with_optuna"), end="\n\n\n----\n")
     print(knowledge_manager.get_knowledge("sth_not_existed"), end="\n\n\n----\n")
+    print(knowledge_manager.get_knowledge("wsi_tricks"), end="\n\n\n----\n")

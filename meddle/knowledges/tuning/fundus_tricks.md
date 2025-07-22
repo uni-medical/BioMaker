@@ -1,0 +1,3 @@
+- Apply decoupled color-space augmentation (e.g., HSV, LAB) to make models robust to lighting changes without distorting essential color features.
+- Enable Monte Carlo (MC) dropout at inference with multiple forward passes to estimate model uncertainty.
+- Use Retinex-based normalization (e.g., Retinex-Net) at test time to decompose images into illumination and reflectance for improved generalization across domains.

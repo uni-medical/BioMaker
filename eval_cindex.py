@@ -186,14 +186,16 @@ def compute_multilabel_metrics(submission_file, ground_truth_file, primary_key_c
 
 
 # --- New function for C-index ---
-def compute_cindex_metrics(submission_file, ground_truth_file, primary_key_candidates=['WSI_ID']):
+def compute_cindex_metrics(submission_file, ground_truth_file, primary_key_candidates=['WSI_ID'], time_col='OS_Months', event_col='Death_Event'):
     """
     Compute Concordance Index (C-index) for a survival prediction submission CSV file.
 
     Parameters:
     submission_file (str): Path to submission CSV file with columns ['WSI_ID', 'Hazard_Score']
-    ground_truth_file (str): Path to ground truth CSV file with columns ['WSI_ID', 'OS_Months', 'Death_Event']
-    primary_key_candidates (list): List of possible primary key column names (default to WSI_ID for consistency)
+    ground_truth_file (str): Path to ground truth CSV file.
+    primary_key_candidates (list): List of possible primary key column names.
+    time_col (str): Column name for event times (e.g., 'OS_Months').
+    event_col (str): Column name for event status (e.g., 'Death_Event', 'Cancer_Death_Event').
 
     Returns:
     dict: Dictionary containing 'c_index' score
@@ -215,17 +217,17 @@ def compute_cindex_metrics(submission_file, ground_truth_file, primary_key_candi
         # Validating required columns for survival
         if 'Hazard_Score' not in submission_df.columns:
             raise ValueError("Submission file must contain 'Hazard_Score' column")
-        if 'OS_Months' not in ground_truth_df.columns:
-            raise ValueError("Ground truth file must contain 'OS_Months' column")
-        if 'Death_Event' not in ground_truth_df.columns:
-            raise ValueError("Ground truth file must contain 'Death_Event' column (1 for event, 0 for censored)")
+        if time_col not in ground_truth_df.columns:
+            raise ValueError(f"Ground truth file must contain '{time_col}' column")
+        if event_col not in ground_truth_df.columns:
+            raise ValueError(f"Ground truth file must contain '{event_col}' column (1 for event, 0 for censored)")
 
         # Merging dataframes on primary_key to align predictions and ground truth
         merged_df = pd.merge(
             submission_df[[primary_key, 'Hazard_Score']],
-            ground_truth_df[[primary_key, 'OS_Months', 'Death_Event']],
+            ground_truth_df[[primary_key, time_col, event_col]],
             on=primary_key,
-            how='inner' # Use inner join to only include common IDs
+            how='inner'  # Use inner join to only include common IDs
         )
 
         # Checking for missing matches
@@ -233,11 +235,9 @@ def compute_cindex_metrics(submission_file, ground_truth_file, primary_key_candi
             raise ValueError("No matching IDs found between submission and ground truth for C-index calculation.")
 
         # Extract data for C-index calculation
-        # The lifelines concordance_index expects higher scores for higher risk (shorter survival)
-        # and event_observed as 1 for event, 0 for censored.
-        event_times = merged_df['OS_Months'].values
+        event_times = merged_df[time_col].values
         predictions = merged_df['Hazard_Score'].values
-        event_observed = merged_df['Death_Event'].values
+        event_observed = merged_df[event_col].values
 
         # Ensure all data types are correct for concordance_index
         event_times = event_times.astype(float)
@@ -245,7 +245,6 @@ def compute_cindex_metrics(submission_file, ground_truth_file, primary_key_candi
         event_observed = event_observed.astype(int)
         
         # Calculate C-index
-        # lifelines.utils.concordance_index(event_times, predicted_scores, event_observed)
         c_index = concordance_index(event_times, predictions, event_observed)
 
         return {
@@ -257,8 +256,9 @@ def compute_cindex_metrics(submission_file, ground_truth_file, primary_key_candi
     except Exception as e:
         raise Exception(f"Error computing C-index metrics: {str(e)}")
 
+
 # --- Modified compute_all_metrics to use C-index ---
-def compute_all_metrics(dataset_gt_path, experiment_list):
+def compute_all_metrics(dataset_gt_path, experiment_list, is_css_survival_gt=False):
     """
     Compute metrics for all experiments and print results.
     Detects if an experiment is for survival or classification/multilabel.
@@ -266,15 +266,20 @@ def compute_all_metrics(dataset_gt_path, experiment_list):
     Parameters:
     dataset_gt_path (str): Path to the ground truth CSV file
     experiment_list (list): List of experiment directory names
+    is_css_survival_gt (bool): Flag to manually specify a cancer-specific survival task.
     """
     print(f"Ground Truth Path: {dataset_gt_path}")
     
     results = []
     
-    # Pre-read ground truth to determine its type (survival, classification, multilabel)
+    # Pre-read ground truth to determine its type
     try:
         gt_df_peek = pd.read_csv(dataset_gt_path)
-        is_survival_gt = 'OS_Months' in gt_df_peek.columns and 'Death_Event' in gt_df_peek.columns
+        is_os_survival_gt = 'OS_Months' in gt_df_peek.columns and 'Death_Event' in gt_df_peek.columns
+        
+        # If manually set to CSS, we consider it a survival task.
+        is_survival_gt = is_os_survival_gt or is_css_survival_gt
+        
         is_multilabel_gt = any(col.startswith('class_') for col in gt_df_peek.columns) and not is_survival_gt
         is_single_label_gt = 'class' in gt_df_peek.columns and not is_survival_gt and not is_multilabel_gt
         
@@ -286,18 +291,16 @@ def compute_all_metrics(dataset_gt_path, experiment_list):
 
     except Exception as e:
         print(f"Error peeking into ground truth file '{dataset_gt_path}': {e}")
-        return # Cannot proceed without understanding GT type
+        return
 
     for exp in experiment_list:
         exp_pred_path = f"logs/{exp}/submission.csv"
         print(f"\nEvaluating: {exp_pred_path}")
         
         try:
-            # Check if submission file exists
             if not os.path.exists(exp_pred_path):
                 raise FileNotFoundError(f"Submission file not found: {exp_pred_path}")
 
-            # Try to infer task type from submission file if not clear from GT
             submission_df_peek = pd.read_csv(exp_pred_path)
             
             current_task_is_survival = is_survival_gt or ('Hazard_Score' in submission_df_peek.columns and 'WSI_ID' in submission_df_peek.columns)
@@ -306,14 +309,24 @@ def compute_all_metrics(dataset_gt_path, experiment_list):
 
             metrics = {}
             if current_task_is_survival:
-                print(f"[{exp}] -> Survival Task (C-index)")
-                metrics = compute_cindex_metrics(exp_pred_path, dataset_gt_path)
+                if is_css_survival_gt:
+                    print(f"[{exp}] -> Cancer-Specific Survival Task (C-index)")
+                    metrics = compute_cindex_metrics(exp_pred_path, dataset_gt_path, event_col='Cancer_Death_Event')
+                elif is_os_survival_gt:
+                    print(f"[{exp}] -> Overall Survival Task (C-index)")
+                    metrics = compute_cindex_metrics(exp_pred_path, dataset_gt_path, event_col='Death_Event')
+                else:
+                    # Fallback for when GT doesn't have the columns but submission suggests survival
+                    print(f"[{exp}] -> Survival Task (C-index, fallback)")
+                    # This will use the default 'Death_Event' and may fail if not present, which is expected.
+                    metrics = compute_cindex_metrics(exp_pred_path, dataset_gt_path)
+
                 print(f"[{exp}] C-Index: {metrics['c_index']:.4f}")
                 results.append({
                     'Experiment': exp,
                     'C-Index': metrics['c_index'],
-                    'Accuracy': None, # Explicitly None for survival
-                    'AUC': None,     # Explicitly None for survival
+                    'Accuracy': None,
+                    'AUC': None,
                     'Error': None
                 })
             elif current_task_is_multilabel:
@@ -323,7 +336,7 @@ def compute_all_metrics(dataset_gt_path, experiment_list):
                 print(f"[{exp}] Macro AUC: {metrics['macro_auc']:.4f}")
                 results.append({
                     'Experiment': exp,
-                    'C-Index': None, # Explicitly None for classification
+                    'C-Index': None,
                     'Accuracy': metrics['macro_accuracy'],
                     'AUC': metrics['macro_auc'],
                     'Error': None
@@ -335,7 +348,7 @@ def compute_all_metrics(dataset_gt_path, experiment_list):
                 print(f"[{exp}] AUC: {metrics['auc']:.4f}")
                 results.append({
                     'Experiment': exp,
-                    'C-Index': None, # Explicitly None for classification
+                    'C-Index': None,
                     'Accuracy': metrics['accuracy'],
                     'AUC': metrics['auc'],
                     'Error': None
@@ -361,6 +374,7 @@ def compute_all_metrics(dataset_gt_path, experiment_list):
                 'AUC': None,
                 'Error': str(e)
             })
+
     
     # Optionally, save results to a summary CSV if needed
     # pd.DataFrame(results).to_csv("evaluation_summary.csv", index=False)
@@ -378,16 +392,31 @@ automl_config = [
     {
         'dataset': 'mco_os_prediction',
         'dataset_gt_path': 'meddle/med_dl_tasks/mco_wsi_gigapath/test_meta.csv',
+        'is_css_survival_gt': False,  # Set to True for Cancer-Specific Survival
         'experiment_list': [
             "1-debug-gemini_baseline-mco_os_conch",
             "1-debug-gemini_baseline-mco_os_prediction",
             "1-debug-gemini_ablation_fc-mco_os_conch",
             "1-debug-gemini_ablation_attenMIL-mco_os_conch",
             "344-all_pipeline-mco_os_conch",
+            "345-all_pipeline-mco_os_conch",
+            "345-manual_rerun",
+            "348-all_pipeline-mco_os_conch",
+            "350-all_pipeline-mco_os_conch",
             # "338-debug-mco_os_prediction",
             # "339-all_pipeline-mco_os_prediction",
             # "339-all_pipeline-mco_os_prediction_negative_loss",
             # "342-all_pipeline-mco_os_conch",
+        ]
+    },
+    {
+        'dataset': 'mco_css_prediction',
+        'dataset_gt_path': 'meddle/med_dl_tasks/mco_wsi_gigapath/test_meta.csv',
+        'is_css_survival_gt': True,  # Set to True for Cancer-Specific Survival
+        'experiment_list': [
+            "1-css_attenMIL_baseline",
+            "349-all_pipeline-mco_css_conch",
+            "1-css-354"
         ]
     },
 ]
@@ -399,7 +428,8 @@ if __name__ == "__main__":
         dataset = exp_for_dataset['dataset']
         dataset_gt_path = exp_for_dataset['dataset_gt_path']
         experiment_list = exp_for_dataset['experiment_list']
+        is_css = exp_for_dataset.get('is_css_survival_gt', False)  # Check for manual override
         print(f"\n[{dataset}]")
-        compute_all_metrics(dataset_gt_path, experiment_list)
+        compute_all_metrics(dataset_gt_path, experiment_list, is_css_survival_gt=is_css)
         print(f"===========================================")
     print("--- Evaluation Script Finished ---")

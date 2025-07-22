@@ -8,6 +8,7 @@ from ..backend import FunctionSpec, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
 from ..utils.config import Config
+from ..knowledges import knowledge_manager
 from ..utils.response import wrap_code
 from .base_agent import BaseAgent
 
@@ -23,6 +24,7 @@ class TuningAgent(BaseAgent):
     ):
         super().__init__(task_desc, cfg, journal)
         self.profile = "You are an expert for optimizing deep learning model training pipelines, especially for medical imaging tasks. "
+        self.knowledge_base = knowledge_manager
     
     def update_with_external_journal(self, external_journal: Journal):
         super().update_with_external_journal(external_journal)
@@ -40,21 +42,21 @@ class TuningAgent(BaseAgent):
             "Introduction": (
                 self.profile + " You are provided with a developed solution below."
                 " Your task is to improve this solution by refining the training pipeline."
-                " You should prioritize the following tricks:"
-                " 1. If the model has not used a pretrain, use a suitable one. Libraries like `timm` are recommended."
-                " 2. If only the final epoch checkpoint is used, add early-stopping/greedy-soup to get a better checkpoint."
-                " 3. Analyze the optimizer / scheduler / model and try to find a better alternative."
-                " 4. If you have tried all the above tricks, try to propose new plan based on your knowledge."
+                " You should prioritize the following tricks:"+self.knowledge_base.get_knowledge("general_tricks")+\
+                " If you have tried all useful ones in the above tricks, try to propose new plan based on your knowledge."
                 " Please focus exclusively on these aspects, ignoring data preparation."
                 " Use feedback from the training results and validation metrics of previous solutions in your memory to guide your improvements."
             ),
             "Task description": self.task_desc,
             "Memory": self.journal.generate_summary(),
-            "Instructions": {},
+            "Instructions": {}
         }
         prompt["Previous solution"] = {
             "Code": wrap_code(parent_node.code),
         }
+        if self.acfg.use_deep_research_knowledge is not None:
+            logger.debug("getting knowledge from deep_research knowledge base: %s", self.acfg.use_deep_research_knowledge)
+            prompt["Dependent Knowledge"] = self.knowledge_base.get_knowledge(self.acfg.use_deep_research_knowledge)
 
         prompt["Instructions"] |= self._prompt_resp_fmt
         prompt["Instructions"] |= {

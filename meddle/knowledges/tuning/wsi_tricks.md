@@ -1,0 +1,8 @@
+- If slide-level label is weak, wrap tiles in Multiple Instance Learning (MIL) with attention pooling (ABMIL) instead of mean/max.
+- If domain shift hurts, run Macenko stain normalization on raw tiles and add stain-augment (+elastic, flip, 90° rot).
+- If survival is the target, replace binary head with DeepSurv/Cox-PH head from lifelines on pooled slide embedding.
+- If you need a compact slide vector without labels, fit GMM on tile embeddings → concatenate (μ, Σ, π) as PANTHER embedding.
+- If attention heatmaps collapse to few tiles, plug ACMIL: add Multi-Branch Attention + Stochastic Top-K Masking.
+- If spatial context is lost, build a k-NN graph over tiles and run a shallow GNN before global pooling.
+- If tile set is huge, cluster embeddings (K-means) and sample fixed N per cluster to balance morphology.
+- If negatives overwhelm positives, mine “hard negatives” each epoch: add top false-positive tiles to training set.

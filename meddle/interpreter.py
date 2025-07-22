@@ -296,7 +296,8 @@ class Interpreter:
                 output.append(self.result_outq.get(timeout=1))
             except queue.Empty:
                 continue
-        output.pop()  # remove the EOF marker
+        if (len(output)>0):
+            output.pop()  # remove the EOF marker
 
         e_cls_name, exc_info, exc_stack = state[1:]
 
