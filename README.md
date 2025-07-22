@@ -75,3 +75,5 @@ meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="test_timelimit-
 - Thanks to the open-source of the following projects, our code is developed based on their contributions:
      - [aideml](https://github.com/WecoAI/aideml)
      - [monai](https://github.com/Project-MONAI)
+     - [AutoGluon](https://github.com/autogluon/autogluon)
+     

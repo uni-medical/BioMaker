@@ -1,0 +1,7 @@
+- Resample CT volume to isotropic 1 mm³ before any CNN/UNet training.
+- Clip Hounsfield units with a task-specific window then z-score normalize.
+- Replace Cross-Entropy with Dice + Focal (γ=2) hybrid loss; add topology-aware term for organ continuity.
+- Fine-tune from an in-domain 3-D pretrained encoder (e.g., Med3D).
+- Apply elastic deformation + random intensity shift to CT volumes.
+- Ensemble 3 diverse backbones (e.g., 3-D U-Net, Swin-UNETR, SegResNet) via learnable meta-fusion.
+- Validate on full-volume metrics, not patch-level Dice.

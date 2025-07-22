@@ -16,6 +16,16 @@ from .utils.config import (load_cfg, load_task_desc, prep_agent_workspace,
                            save_run)
 from .utils.timer import Timer
 
+
+# Add TRACE level
+TRACE_LEVEL_NUM = 5
+logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
+def trace(self, message, *args, **kws):
+    if self.isEnabledFor(TRACE_LEVEL_NUM):
+        self._log(TRACE_LEVEL_NUM, message, args, **kws)
+logging.Logger.trace = trace
+
+
 logger = logging.getLogger("meddle")
 logger.setLevel(logging.INFO)
 
@@ -47,12 +57,17 @@ def journal_to_rich_tree(journal: Journal):
 
 def run():
     cfg = load_cfg()
-    if cfg.log_level == "DEBUG":
-        logger.setLevel(logging.DEBUG)
-        backend.logger.setLevel(logging.DEBUG)
-    elif cfg.log_level == "WARNING":
-        logger.setLevel(logging.WARNING)
-        backend.logger.setLevel(logging.WARNING)
+    log_level = cfg.log_level.upper()
+    level = getattr(logging, log_level, None)
+    if log_level == "TRACE":
+        level = TRACE_LEVEL_NUM
+
+    if not isinstance(level, int):
+        logger.warning(f"Invalid log level: {cfg.log_level}, defaulting to INFO")
+        level = logging.INFO
+
+    logger.setLevel(level)
+    backend.logger.setLevel(level)
         
     logger.info(f'Starting run "{cfg.exp_name}"')
     logger.info(f'Config: "{cfg}"')

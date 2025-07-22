@@ -88,6 +88,7 @@ class AgentConfig:
     force_monai_with_prompt: bool
     enable_monai_knowledge_base: bool
     enable_query2doc: bool
+    use_deep_research_knowledge: str | None
 
     code: StageConfig
     feedback: StageConfig

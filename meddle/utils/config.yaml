@@ -39,6 +39,7 @@ agent:
   force_monai_with_prompt: True
   enable_monai_knowledge_base: True
   enable_query2doc: True
+  use_deep_research_knowledge: null
 
   # hyperparameters for the tree search
   search:
