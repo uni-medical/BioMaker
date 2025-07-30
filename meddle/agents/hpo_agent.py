@@ -39,47 +39,6 @@ class HPOAgent(BaseAgent):
             node = self.journal.get_best_node(only_good=True, topk=3)
         return node
 
-    def _debug(self, parent_node: Node) -> Node:
-        prompt: Any = {
-            "Introduction": (
-                self.profile + 
-                "Your previous solution had a bug, so based on the information below, you should revise it in order to fix this bug. "
-                "Your response should be an implementation outline in natural language,"
-                " followed by a single markdown code block which implements the bugfix/solution."
-            ),
-            "Task description": self.task_desc,
-            "Previous (buggy) implementation": wrap_code(parent_node.code),
-            "Execution output": wrap_code(parent_node.term_out, lang=""),
-            "Instructions": {},
-        }
-
-        if self.acfg.enable_monai_knowledge_base:
-            knowledge_retrieve_context = prompt.copy()
-            knowledge_retrieve_context["Query"] = "What topic should be queried to debug this code?"
-            topic_of_knowledge_for_debug = query(
-                system_message=knowledge_retrieve_context,
-                user_message=None,
-                model=self.acfg.knowledge_base.model,
-                temperature=self.acfg.knowledge_base.temp,
-            )
-            prompt["Dependent Knowledge"] = self.query_knowledge_base(topic_of_knowledge_for_debug)
-
-        prompt["Instructions"] |= self._prompt_resp_fmt
-        prompt["Instructions"] |= {
-            "Bugfix improvement sketch guideline": [
-                "You should write a brief natural language description (3-5 sentences) of how the issue in the previous implementation can be fixed.",
-                "Don't suggest to do EDA.",
-                "The debugged soultion should **only run 1 training epoch** to help validate the code quickly.",
-            ],
-        }
-        prompt["Instructions"] |= self._prompt_impl_guideline
-
-        if self.acfg.data_preview:
-            prompt["Data Overview"] = self.data_preview
-
-        plan, code = self.plan_and_code_query(prompt)
-        return Node(plan=plan, code=code, parent=parent_node)
-
     def _optimize_hyperparameters(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
         prompt: Any = {
             "Introduction": (
