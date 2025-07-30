@@ -64,7 +64,7 @@ agent:
 
 # settings for code execution
 exec:
-  timeout: 1800
+  timeout: 3600
   agent_file_name: runfile.py
   format_tb_ipython: False
 

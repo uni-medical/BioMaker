@@ -41,7 +41,7 @@ def objective(trial):
 
 ```python
 study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner(n_warmup_steps=2))
-study.optimize(objective, n_trials=30, timeout=1800)
+study.optimize(objective, n_trials=10, timeout=180)
 print("Best Hyperparameters:", study.best_trial.params)
 ```
 

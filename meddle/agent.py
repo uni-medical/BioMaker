@@ -31,8 +31,11 @@ class MeddleWorkflow(BaseAgent):
         task_desc: str,
         cfg: Config,
         journal: Journal,
+        interpreter: Any = None,  # type: ignore
     ):
         super().__init__(task_desc, cfg, journal)
+        self.interpreter = interpreter
+        self.cfg = cfg
 
         # initialize all agents needed for the workflow        
         self.proposal_agent = ProposalAgent(task_desc=task_desc, cfg=cfg, journal=Journal())
@@ -60,6 +63,9 @@ class MeddleWorkflow(BaseAgent):
         """Step the agent forward by one step."""
         # walkthrough the workflow and run the first node that has steps left
         for idx, workflow_agent in enumerate(self.workflow):
+            if workflow_agent.name == "hpo":
+                self.interpreter.timeout = self.cfg.exec.timeout * 2 
+                logger.info("Setting interpreter timeout to %d seconds for HPO agent.", self.interpreter.timeout)
             if workflow_agent.steps_left > 0:
                 if workflow_agent.agent.has_empty_journal() and idx > 0:
                     logger.info("Agent '%s' has no memory, getting initial memory from global memory.", workflow_agent.name)

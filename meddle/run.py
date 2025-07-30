@@ -16,7 +16,6 @@ from .utils.config import (load_cfg, load_task_desc, prep_agent_workspace,
                            save_run)
 from .utils.timer import Timer
 
-
 # Add TRACE level
 TRACE_LEVEL_NUM = 5
 logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
@@ -88,6 +87,7 @@ def run():
         task_desc=task_desc,
         cfg=cfg,
         journal=journal,
+        interpreter=interpreter,
     )
 
     # update the validated steps count
