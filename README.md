@@ -60,8 +60,12 @@ We support both basic RAG and advanced (query2doc) mode. They are controlled wit
 agent.enable_monai_knowledge_base=true agent.enable_query2doc=true
 ```
 
-## Total time limit
-To test with a total time limit for all steps, you can set config `agent.total_time_limit`:
+## Time Limits
+MedDLE supports configurable timeouts for code execution. The default timeout is 3600 seconds, which can be adjusted via:
+- `exec.timeout`: Base timeout for all agents (default: 3600s)
+- HPO agent automatically gets 2x timeout: 7200s when running hyperparameter optimization
+
+To set a total time limit for all steps, use `agent.total_time_limit`:
 ```
 meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="test_timelimit-example_task_retina"\
      goal="Predict the category of each given Fundus Camera image by selecting the most appropriate one from the 5 available classes." \
