@@ -242,6 +242,8 @@ def compute_cindex_metrics(submission_file, ground_truth_file, primary_key_candi
         # Ensure all data types are correct for concordance_index
         event_times = event_times.astype(float)
         predictions = predictions.astype(float)
+        if event_col == 'Cancer_Death_Event':
+            predictions = -predictions  # Invert predictions if using hazard scores
         event_observed = event_observed.astype(int)
         
         # Calculate C-index
@@ -403,10 +405,8 @@ automl_config = [
             "345-manual_rerun",
             "348-all_pipeline-mco_os_conch",
             "350-all_pipeline-mco_os_conch",
-            # "338-debug-mco_os_prediction",
-            # "339-all_pipeline-mco_os_prediction",
-            # "339-all_pipeline-mco_os_prediction_negative_loss",
-            # "342-all_pipeline-mco_os_conch",
+            "353-all_pipeline-mco_os_conch",
+            "355-all_pipeline-mco_os_conch",
         ]
     },
     {
@@ -416,7 +416,10 @@ automl_config = [
         'experiment_list': [
             "1-css_attenMIL_baseline",
             "349-all_pipeline-mco_css_conch",
-            "1-css-354"
+            # "1-css-354"
+            "352-all_pipeline-mco_css_conch",
+            "354-all_pipeline-mco_css_conch",
+            "356-all_pipeline-mco_css_conch",
         ]
     },
 ]
