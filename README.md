@@ -1,6 +1,6 @@
 # Med-DLE: Agentic Medical Deep Learning Engineer 
 
-MedDLE is designed to be a codegen agentic system for medical deep learning tasks. 
+MedDLE (**Med**ical **D**eep **L**earning **E**ngineer who's a little bit *Agentic*) is designed to be a codegen agentic system for medical deep learning tasks. 
 
 # Quick Start
 ## Setup environment
