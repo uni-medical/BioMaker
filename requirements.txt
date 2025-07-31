@@ -26,7 +26,6 @@ scipy
 biopython
 imbalanced-learn
 h5py
-biopython
 numba
 arrow
 markovify
@@ -80,7 +79,6 @@ nibabel
 
 html2text
 tiktoken
-optuna
 autogluon
 
 # MONAI requirements

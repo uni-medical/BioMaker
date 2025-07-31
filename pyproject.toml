@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meddle"
+version = "0.1.2"
+authors = [
+    {name = "Haoyu Wang", email = "small_dark@sina.com"},
+]
+description = "Agentic Medical Deep Learning Engineer"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["dependencies"]
+
+[project.urls]
+"Homepage" = "https://github.com/uni-medical/MedDLE"
+
+[project.scripts]
+meddle = "meddle.run:run"
+
+[tool.setuptools]
+package-data = {meddle = ["../requirements.txt", "utils/config.yaml", "utils/viz_templates/*"]}
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["meddle*"]
+exclude = ["logs*", "workspaces*", "exp_summary*"]

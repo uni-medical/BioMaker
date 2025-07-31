@@ -2,10 +2,6 @@
 
 MedDLE is designed to be a codegen agentic system for medical deep learning tasks. 
 
-> **Alert**: For current version, monai prompt & rag (q2d+rerank) are defaultly enabled. 
-> 
-> Since we update the Auto-Tuning Pipeline with many changes, please refer to branch `v0` if you wanna use the old settings.
-
 # Quick Start
 ## Setup environment
 1. we recommand use `conda` to create a virtual environment:
