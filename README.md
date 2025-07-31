@@ -33,8 +33,10 @@ python -m meddle.monai_rag.query_rag_db
 ``` 
 
 ### Setup dataset
-1. Get data from [link](http://ug.link/haoyushare/filemgr/share-download/?id=a14cf769efb649f8a099ee6fb876abb6) and move the data into `med_dl_tasks`
-2. The goal and eval target of MedMNIST dataset can be found in [scripts](https://github.com/uni-medical/MedDLE/blob/main/scripts/run_all_mnist_rag.sh).
+1. Get data from [link](https://drive.google.com/file/d/1-EE5ib7xfq9q0luiixgtnyYCkBh21Gxe/view?usp=drive_link) and move the data into `med_dl_tasks`. This zip file contains both MedMNIST only.
+2. The goals and evaluation targets for each dataset can be found in the corresponding shell scripts:
+   - For MedMNIST datasets, see `run_medmnist_all.sh`.
+   - For MCO (Molecular and Cellular Oncology) datasets, see `run_mco_all.sh`.
 
 ## Try MedDLE
 ```
@@ -47,9 +49,10 @@ here's a detailed example:
 ```
 meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="torch-example_task_retina"\
      goal="Predict the category of each given Fundus Camera image by selecting the most appropriate one from the 5 available classes." \
-     eval="Use the accuracy and the AUC between the predicted and ground-truth class." \
+     eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
      agent.step_plan.proposal=20 agent.step_plan.tuning=10 agent.step_plan.hpo=5
 ```
+
 You can set general `steps` (MedDLE with auto-schedule steps for multiple agents) or detailed `step_plan` for 
 each agent.
 
