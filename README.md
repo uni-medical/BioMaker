@@ -11,9 +11,8 @@ conda activate meddle
 ```
 2. Then install `meddle` via:
 ```
-pip install uv
-uv pip install -r requirements.txt
-uv pip install -e .
+pip install -r requirements.txt
+pip install -e .
 ```
 3. remember to set up your private api key of OPENAI/ANTROPIC/OPENROUNTER for openai-compatible endpoint
 ```
