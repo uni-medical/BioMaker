@@ -101,6 +101,7 @@ class ProposalAgent(BaseAgent):
                 "You should write a brief natural language description (3-5 sentences) of how the issue in the previous implementation can be fixed.",
                 "Don't suggest to do EDA.",
                 "The debugged soultion should **only run 1 training epoch** to help validate the code quickly.",
+                "If the error is due to missing packages (ImportError/ModuleNotFoundError), DO NOT attempt to install. Instead, replace the missing package with an alternative approach using available packages."
             ],
         }
         prompt["Instructions"] |= self._prompt_impl_guideline
