@@ -77,15 +77,9 @@ class Node(DataClassJsonMixin):
         self.exc_stack = exec_result.exc_stack
 
     @property
-    def term_out_trim(self) -> str:
-        """Get the terminal output of the code execution (after truncating it)."""
-        return trim_long_string("".join(self._term_out))
-
-    @property
     def term_out(self) -> str:
         """Get the terminal output of the code execution (after truncating it)."""
-        # trim_long_string may be too aggressive to hide the useful debug information
-        return "".join(self._term_out)
+        return trim_long_string("".join(self._term_out))
 
     @property
     def is_leaf(self) -> bool:
