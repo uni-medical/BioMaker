@@ -47,6 +47,7 @@ def file_tree(path: Path, depth=0) -> str:
     dirs = [p for p in Path(path).iterdir() if p.is_dir()]
     max_n = 4 if len(files) > 30 else 8
     for p in sorted(files)[:max_n]:
+        if p.name == "MedDLE.md": continue
         result.append(f"{' '*depth*4}{p.name} ({get_file_len_size(p)[1]})")
     if len(files) > max_n:
         result.append(f"{' '*depth*4}... and {len(files)-max_n} other files")
@@ -212,7 +213,12 @@ def generate(base_path, include_file_details=True, simple=False):
         for fn in _walk(base_path):
             file_name = str(fn.relative_to(base_path))
 
-            if fn.suffix == ".csv":
+            if fn.name == "MedDLE.md":
+                # 特殊处理 MedDLE.md 文件，读取全部内容
+                with open(fn) as f:
+                    content = f.read()
+                    out.append(f"Memory of Dataset Details:\n\n```\n{content}\n```")
+            elif fn.suffix == ".csv":
                 out.append(preview_csv(fn, file_name, simple=simple))
             elif fn.suffix == ".json":
                 out.append(preview_json(fn, file_name))
@@ -261,5 +267,7 @@ def generate(base_path, include_file_details=True, simple=False):
 
 
 if __name__ == "__main__":
-    prev = generate(Path("/root/Med-DL-Agent/meddle/med_dl_tasks/odir5k_2d_mlc"))
+    # prev = generate(Path("../med_dl_tasks/odir5k_2d_mlc"))
+    # prev = generate(Path("../med_dl_tasks/mco_wsi_conch"))
+    prev = generate(Path("../med_dl_tasks/hancock_wsi_uni"))
     print(prev)

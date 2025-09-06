@@ -38,7 +38,7 @@ def extract_jsons(text):
     return json_objects
 
 
-def trim_long_string(string, threshold=5100, k=2500):
+def trim_long_string(string, threshold=10000, k=2500):
     # Check if the length of the string is longer than the threshold
     if len(string) > threshold:
         # Output the first k and last k characters
