@@ -26,7 +26,7 @@ logging.Logger.trace = trace
 
 
 logger = logging.getLogger("meddle")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO) # set default level
 
 def journal_to_rich_tree(journal: Journal):
     best_node = journal.get_best_node()
@@ -65,8 +65,23 @@ def run():
         logger.warning(f"Invalid log level: {cfg.log_level}, defaulting to INFO")
         level = logging.INFO
 
+    # 设置日志级别
     logger.setLevel(level)
     backend.logger.setLevel(level)
+
+    # 创建文件处理器
+    cfg.log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = cfg.log_dir / f"{cfg.exp_name}.log"
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler.setLevel(level)
+    
+    # 创建格式化器
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    
+    # 添加文件处理器到logger
+    logger.addHandler(file_handler)
+    backend.logger.addHandler(file_handler)
         
     logger.info(f'Starting run "{cfg.exp_name}"')
     logger.info(f'Config: "{cfg}"')

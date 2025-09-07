@@ -6,6 +6,7 @@ Usage: python calculate_hancock_auc.py
 
 import json
 import pandas as pd
+import os
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 
 # Load ground truth
@@ -29,6 +30,9 @@ def load_predictions(fname='logs/361-all_pipeline-hancock_wsi_uni/submission.csv
 # Calculate AUC
 def calculate_auc(pred_fname):
     gt = load_ground_truth()
+    if os.path.exists(pred_fname) is False:
+        print(f"Prediction file {pred_fname} does not exist.")
+        return None, None, None
     pred = load_predictions(pred_fname)
     
     # Merge on patient_id
@@ -57,15 +61,22 @@ def calculate_auc(pred_fname):
 
 if __name__ == "__main__":
     for fname in [
-        'logs/361-all_pipeline-hancock_wsi_uni/submission.csv',
-        'logs/362-all_pipeline-hancock_wsi_uni/submission.csv',
+        'logs/0-hancock-wsi_clam_baseline/submission.csv',
+        # baseline
+        # 'logs/361-all_pipeline-hancock_wsi_uni/submission.csv',
+        # 'logs/362-all_pipeline-hancock_wsi_uni/submission.csv',
         # new version
-        'logs/373-all_pipeline-hancock_wsi_uni/submission.csv',
-        'logs/374-all_pipeline-hancock_wsi_uni/submission.csv',
+        # 'logs/373-all_pipeline-hancock_wsi_uni/submission.csv',
+        # 'logs/374-all_pipeline-hancock_wsi_uni/submission.csv',
+        # 'logs/385-all_pipeline-debug-hancock_wsi_uni/submission.csv',
+        # 'logs/386-all_pipeline-debug-hancock_wsi_uni/submission.csv',
         # add tuning + hpo
-        'logs/375-all_pipeline-hancock_wsi_uni/submission.csv',
-        'logs/376-all_pipeline-hancock_wsi_uni/submission.csv',
-        'logs/377-all_pipeline-hancock_wsi_uni/submission.csv',
+        'logs/388-all_pipeline-debug-hancock_wsi_uni/submission.csv',
+        # add tuning + hpo
+        'logs/389-all_pipeline-hancock_wsi_uni/submission.csv',
+        'logs/391-all_pipeline-hancock_wsi_uni/submission.csv',
+        'logs/392-all_pipeline-hancock_wsi_uni/submission.csv',
+        'logs/393-all_pipeline-hancock_wsi_uni/submission.csv',
     ]:
         print(f"Evaluating {fname}")
         calculate_auc(fname)

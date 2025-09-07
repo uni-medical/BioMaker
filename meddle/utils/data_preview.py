@@ -218,6 +218,8 @@ def generate(base_path, include_file_details=True, simple=False):
                 with open(fn) as f:
                     content = f.read()
                     out.append(f"Memory of Dataset Details:\n\n```\n{content}\n```")
+            elif fn.name.endswith("submission.csv"):
+                out.append(preview_csv(fn, file_name, simple=False))
             elif fn.suffix == ".csv":
                 out.append(preview_csv(fn, file_name, simple=simple))
             elif fn.suffix == ".json":

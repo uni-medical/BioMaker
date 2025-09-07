@@ -82,7 +82,7 @@ class BaseAgent:
             debuggable_nodes = [
                 n
                 for n in self.journal.buggy_nodes
-                if (n.is_leaf and n.debug_depth <= search_cfg.max_debug_depth)
+                if (n.is_leaf and n.debug_depth < search_cfg.max_debug_depth)
             ]
             if debuggable_nodes:
                 logger.debug("[search policy] debugging")
@@ -96,8 +96,8 @@ class BaseAgent:
             return None
 
         # greedy
-        greedy_node = self.journal.get_best_node()
-        logger.debug("[search policy] greedy node selected")
+        greedy_node = self.journal.get_best_node(topk=3)
+        logger.debug("[search policy] greedy node selected from top-3")
         return greedy_node
 
     @property
@@ -142,6 +142,7 @@ class BaseAgent:
             "Your response should only contain a single code block.",
             f"Be aware of the running time of the code, it should complete within {humanize.naturaldelta(self.cfg.exec.timeout)}.",
             'All the provided input data is stored in "./input" directory.',
+            'When building the Dataset, it should be based on the actual existing data files, rather than relying entirely on the annotation file.',
             '**If there is test data provided for this task, please save the test predictions in a `submission.csv` file in the "./working" directory as described in the task description** This is extremely important since this file is used for grading/evaluation. DO NOT FORGET THE submission.csv file!',
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
         ]

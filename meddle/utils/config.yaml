@@ -45,7 +45,7 @@ agent:
   search:
     num_drafts: 3
     debug_prob: 1.0
-    max_debug_depth: 10
+    max_debug_depth: 4
 
   # LLM settings for coding
   code:

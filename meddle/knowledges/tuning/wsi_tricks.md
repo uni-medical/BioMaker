@@ -1,4 +1,5 @@
 - If slide-level label is weak, wrap tiles in Multiple Instance Learning (MIL) with attention pooling (ABMIL) instead of mean/max.
+- If you need clustering-aware attention with interpretability, run CLAM: MIL with attention pooling + pseudo-label clustering loss to separate high-attention vs low-attention instances.
 - If domain shift hurts, run Macenko stain normalization on raw tiles and add stain-augment (+elastic, flip, 90° rot).
 - If survival is the target, replace binary head with DeepSurv/Cox-PH head from lifelines on pooled slide embedding.
 - If you need a compact slide vector without labels, fit GMM on tile embeddings → concatenate (μ, Σ, π) as PANTHER embedding.
