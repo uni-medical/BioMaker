@@ -44,6 +44,7 @@ class FunctionalAgent(BaseAgent):
             'All the provided input data is stored in "./input" directory.',
             'When building the Dataset, it should be based on the actual existing data files, rather than relying entirely on the annotation file.',
             '**If there is test data provided for this task, please save the test predictions in a `submission.csv` file in the "./working" directory as described in the task description** This is extremely important since this file is used for grading/evaluation. DO NOT FORGET THE submission.csv file!',
+            '**Do Not use progress bar like tqdm.**'
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
         ]
         impl_guideline.append(

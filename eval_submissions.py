@@ -224,7 +224,8 @@ from scripts.config_to_be_eval import *
 # ]
 
 if __name__ == "__main__":
-    for exp_for_dataset in automl_config[:]:
+    for exp_for_dataset in full_config[:]:
+    # for exp_for_dataset in ablation_config[:]:
         dataset = exp_for_dataset['dataset']
         dataset_gt_path = exp_for_dataset['dataset_gt_path']
         experiment_list = exp_for_dataset['experiment_list']

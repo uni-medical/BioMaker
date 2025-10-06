@@ -29,7 +29,7 @@ class TuningAgent(BaseAgent):
     def update_with_external_journal(self, external_journal: Journal):
         super().update_with_external_journal(external_journal)
         # prune the journal and keep the topk node
-        best_node_list = self.journal.get_topk_node_list(only_good=True, topk=3)
+        best_node_list = self.journal.get_topk_node_list(only_good=False, topk=3)
         self.journal.nodes = [n for n in best_node_list]
     
     def search_policy(self) -> Node | None:
@@ -42,7 +42,7 @@ class TuningAgent(BaseAgent):
             "Introduction": (
                 self.profile + " You are provided with a developed solution below."
                 " Your task is to improve this solution by refining the training pipeline."
-                " You should prioritize the following tricks:"+self.knowledge_base.get_knowledge("general_tricks")+\
+                f" You should prioritize the following tricks:{self.knowledge_base.get_knowledge('general_tricks')}"
                 " If you have tried all useful ones in the above tricks, try to propose new plan based on your knowledge."
                 " Please focus exclusively on these aspects, ignoring data preparation."
                 " Use feedback from the training results and validation metrics of previous solutions in your memory to guide your improvements."
