@@ -71,7 +71,8 @@ if __name__ == "__main__":
     # exp_name = "2-hancock-MultiModal_MedDLE_solution"
     # exp_name = "2-hancock-MultiModal_MedDLE_solution418"
     # exp_name = "2-hancock-MultiModal_MedDLE_solution429"
-    exp_name = "2-hancock-MultiModal_MedDLE_solution435"
+    # exp_name = "2-hancock-MultiModal_MedDLE_solution435"
+    exp_name = "2-hancock-MultiModal_MedDLE_solution435_modified"
     for fname in [
         f'logs/{exp_name}/run1/submission.csv',
         # f'logs/{exp_name}/run2/submission.csv',
@@ -93,6 +94,7 @@ if __name__ == "__main__":
         # f'logs/{exp_name}/run18/submission.csv',
         # f'logs/{exp_name}/run19/submission.csv',
         # f'logs/{exp_name}/run20/submission.csv',
+        'logs/2-hancock-MultiModal_CLAM_baseline_v2/run1/submission.csv',
         # baseline
         # 'logs/361-all_pipeline-hancock_wsi_uni/submission.csv',
         # 'logs/362-all_pipeline-hancock_wsi_uni/submission.csv',
@@ -132,12 +134,16 @@ if __name__ == "__main__":
         # "logs/422-all_pipeline-hancock_multimodal/submission.csv",
         # "logs/423-all_pipeline-hancock_multimodal/submission.csv",
 
-        # "logs/427-CLAM_MedDLE-hancock_multimodal/submission.csv",
-        # "logs/428-CLAM_MedDLE-hancock_multimodal/submission.csv",
-        # "logs/429-CLAM_MedDLE-hancock_multimodal/submission.csv",
-        # "logs/430-CLAM_MedDLE-hancock_multimodal/submission.csv",
-        # "logs/431-CLAM_MedDLE-hancock_multimodal/submission.csv",
+        "logs/427-CLAM_MedDLE-hancock_multimodal/submission.csv",
+        "logs/428-CLAM_MedDLE-hancock_multimodal/submission.csv",
+        "logs/429-CLAM_MedDLE-hancock_multimodal/submission.csv",
+        "logs/430-CLAM_MedDLE-hancock_multimodal/submission.csv",
+        "logs/431-CLAM_MedDLE-hancock_multimodal/submission.csv",
 
+        "logs/432-start_from_CLAM_MedDLE-hancock_multimodal/submission.csv",
+        "logs/433-start_from_CLAM_MedDLE-hancock_multimodal/submission.csv",
+        "logs/434-start_from_CLAM_MedDLE-hancock_multimodal/submission.csv",
         "logs/435-start_from_CLAM_MedDLE-hancock_multimodal/submission.csv",
+        "logs/436-start_from_CLAM_MedDLE-hancock_multimodal/submission.csv",
     ]:
         calculate_auc(fname)
