@@ -55,22 +55,28 @@ def compute_submission_metrics(submission_file, ground_truth_file, primary_key_c
         
         # Computing Accuracy
         accuracy = accuracy_score(y_true, y_pred)
-        
+
+        # Computing per-sample standard error (s.e.)
+        N = len(y_true)
+        p_hat = accuracy  # overall accuracy
+        per_sample_se = np.sqrt(p_hat * (1 - p_hat) / N)
+
         # Computing AUC (multi-class, one-vs-rest)
         classes = np.unique(y_true)
         if len(classes) < 2:
             raise ValueError("At least two classes are required for AUC computation")
-        
+
         # Binarizing labels for multi-class ROC AUC
         y_true_bin = label_binarize(y_true, classes=classes)
         y_pred_bin = label_binarize(y_pred, classes=classes)
-        
+
         # Calculating AUC using one-vs-rest and macro averaging
         auc = roc_auc_score(y_true_bin, y_pred_bin, average='macro', multi_class='ovr')
-        
+
         return {
             'accuracy': round(accuracy, 4),
             'auc': round(auc, 4),
+            'per_sample_se': round(per_sample_se, 4),
         }
     
     except FileNotFoundError as e:
@@ -135,18 +141,18 @@ def compute_multilabel_metrics(submission_file, ground_truth_file, primary_key_c
         per_class_auc = {}
         accuracy_scores = []
         auc_scores = []
-        
+
         # Compute metrics for each class
         for class_col in class_columns:
             # Extract true and predicted labels for the class
             y_true = merged_df[f'{class_col}_true'].astype(int)
             y_pred = merged_df[f'{class_col}_pred'].astype(int)
-            
+
             # Compute accuracy for the class
             accuracy = accuracy_score(y_true, y_pred)
             per_class_accuracy[class_col] = round(accuracy, 4)
             accuracy_scores.append(accuracy)
-            
+
             # Compute AUC for the class
             # Ensure there are at least two classes (0 and 1) for AUC
             if len(np.unique(y_true)) > 1:
@@ -155,11 +161,31 @@ def compute_multilabel_metrics(submission_file, ground_truth_file, primary_key_c
                 auc_scores.append(auc)
             else:
                 per_class_auc[class_col] = None  # AUC not defined for single class
-                
+
         # Compute macro-averaged metrics
         macro_accuracy = round(np.mean(accuracy_scores), 4)
         macro_auc = round(np.mean([auc for auc in auc_scores if auc is not None]), 4) if auc_scores else None
-        
+
+        # Compute per-sample standard error for multi-label
+        # For each class, compute standard error, then average across classes
+        per_class_se = []
+        N = len(merged_df)
+
+        for class_col in class_columns:
+            # Extract true and predicted labels for the class
+            y_true = merged_df[f'{class_col}_true'].astype(int)
+            y_pred = merged_df[f'{class_col}_pred'].astype(int)
+
+            # Compute accuracy for this class
+            class_accuracy = accuracy_score(y_true, y_pred)
+
+            # Compute standard error for this class
+            class_se = np.sqrt(class_accuracy * (1 - class_accuracy) / N)
+            per_class_se.append(class_se)
+
+        # Average standard error across all classes
+        per_sample_se = np.mean(per_class_se)
+
         return {
             'per_class_accuracy': per_class_accuracy,
             'macro_accuracy': macro_accuracy,
@@ -167,6 +193,7 @@ def compute_multilabel_metrics(submission_file, ground_truth_file, primary_key_c
             'per_class_auc': per_class_auc,
             'macro_auc': macro_auc,
             'auc': macro_auc,
+            'per_sample_se': round(per_sample_se, 4),
         }
     
     except FileNotFoundError as e:
@@ -194,10 +221,12 @@ def compute_all_metrics(dataset_gt_path, experiment_list):
                 metrics = compute_submission_metrics(exp_pred_path, dataset_gt_path)
             print(f"[{exp}] ACC: {metrics['accuracy']:.4f}")
             print(f"[{exp}] AUC: {metrics['auc']:.4f}")
+            print(f"[{exp}] Per-sample STD: {metrics['per_sample_se']:.4f}")
             results.append({
                 'Experiment': exp,
                 'Accuracy': metrics['accuracy'],
                 'AUC': metrics['auc'],
+                'PerSampleStd': metrics['per_sample_se'],
                 'Error': None
             })
         except Exception as e:
@@ -206,6 +235,7 @@ def compute_all_metrics(dataset_gt_path, experiment_list):
                 'Experiment': exp,
                 'Accuracy': None,
                 'AUC': None,
+                'PerSampleStd': None,
                 'Error': str(e)
             })
 
@@ -224,7 +254,8 @@ from scripts.config_to_be_eval import *
 # ]
 
 if __name__ == "__main__":
-    for exp_for_dataset in full_config[:]:
+    for exp_for_dataset in integrated_config[:]:
+    # for exp_for_dataset in full_config[:]:
     # for exp_for_dataset in ablation_config[:]:
         dataset = exp_for_dataset['dataset']
         dataset_gt_path = exp_for_dataset['dataset_gt_path']
