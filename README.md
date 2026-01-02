@@ -1,6 +1,6 @@
-# Med-DLE: Agentic Medical Deep Learning Engineer 
+# Med-CReA
 
-MedDLE (**Med**ical **D**eep **L**earning **E**ngineer who's a little bit *Agentic*) is designed to be a codegen agentic system for medical deep learning tasks. 
+**CReA** is designed to be a **C**ollaborative Failure-aware **Re**asoning **A**gent for Biomedical AutoML.
 
 # Quick Start
 ## Setup environment
