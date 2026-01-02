@@ -1,4 +1,4 @@
-# Med-CReA
+# CReA
 
 **CReA** is designed to be a **C**ollaborative Failure-aware **Re**asoning **A**gent for Biomedical AutoML.
 
