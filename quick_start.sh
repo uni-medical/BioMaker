@@ -1,4 +1,3 @@
-meddle data_dir="meddle/example_tasks/retinamnist_224" exp_name="torch-example_task_retina"\
-     goal="Predict the category of each given Fundus Camera image by selecting the most appropriate one from the 5 available classes." \
-     eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set." \
-     agent.step_plan.proposal=20 agent.step_plan.tuning=10 agent.step_plan.hpo=5
+meddle data_dir="organmnist3d" exp_name="test-organmnist3d" \
+     goal="Predict the category of each given 3D Abdominal CT image by selecting the most appropriate one from the 11 available classes." \
+     eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set."

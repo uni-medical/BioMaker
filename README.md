@@ -42,7 +42,18 @@ You could use this command to check whether the creation succeeds.
 ```
 python -m meddle.monai_rag.query_rag_db
 ``` 
-
+## Test with Example Dataset
+You can download the example dataset from [Huggingface](https://huggingface.co/datasets/blueyo0/organmnist3d).
+Download command:
+```
+huggingface-cli download blueyo0/organmnist3d --local-dir organmnist3d
+```
+Then run the `quick_start.sh` to test:
+```
+meddle data_dir="organmnist3d" exp_name="test-organmnist3d" \
+     goal="Predict the category of each given 3D Abdominal CT image by selecting the most appropriate one from the 11 available classes." \
+     eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set."
+```
 
 # 🙏 Acknowledgement
 - We thank all medical workers and dataset owners for making public datasets available to the community.
