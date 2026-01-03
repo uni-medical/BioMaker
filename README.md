@@ -61,9 +61,4 @@ bash quick_start.sh
 # 🙏 Acknowledgement
 - We thank all medical workers and dataset owners for making public datasets available to the community.
 - Thanks to the open-source of the following projects, our code is developed based on their contributions:
-     - [aideml](https://github.com/WecoAI/aideml)
-     - [monai](https://github.com/Project-MONAI)
-     - [AutoGluon](https://github.com/autogluon/autogluon)
-     - [AutoKeras](https://github.com/keras-team/autokeras)
-     - [Auto-SKlearn](https://github.com/automl/auto-sklearn)
-     - [ML-Master](https://github.com/sjtu-sai-agents/ML-Master)
+     [aideml](https://github.com/WecoAI/aideml) [monai](https://github.com/Project-MONAI) [AutoGluon](https://github.com/autogluon/autogluon) [AutoKeras](https://github.com/keras-team/autokeras) [Auto-SKlearn](https://github.com/automl/auto-sklearn) [ML-Master](https://github.com/sjtu-sai-agents/ML-Master)
