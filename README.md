@@ -1,4 +1,8 @@
+<div align="center" id="creatop">
+<img src="https://raw.githubusercontent.com/uni-medical/CREA/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
+
 # CREA
+[![PyPI](https://img.shields.io/pypi/v/crea-med)](https://pypi.org/project/crea-med) [![license](https://img.shields.io/badge/License-MIT-green)](https://github.com/uni-medical/CREA/blob/main/LICENSE) [![Python](https://img.shields.io/badge/Python-3.11-A7D8FF)]() [![PyTorch](https://img.shields.io/badge/PyTorch-2.9-FCD299)]() [![Paper](https://img.shields.io/badge/Paper-to%20be%20released-b31b1b?logo=arxiv&logoColor=red)]()
 
 **CREA** is designed to be a **C**ollaborative Failure-aware **RE**asoning **A**gent for Biomedical AutoML.
 
@@ -53,7 +57,7 @@ Download command:
 ```
 hf download blueyo0/organmnist3d --local-dir dataset/organmnist3d --repo-type dataset
 ```
-Then run the `quick_start.sh` to test:
+Then run the `quick_start.sh` to test (It may take 1-2 hours, and make sure your GPU memory is over 12 GB):
 ```
 bash quick_start.sh
 ```
