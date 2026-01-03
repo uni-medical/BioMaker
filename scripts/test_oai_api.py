@@ -6,13 +6,13 @@ client = OpenAI()
 
 completion = client.chat.completions.create(
     # model="gpt-4o-mini",
-    model="claude-3-5-haiku-20241022",
+    model="gpt-5.2-2025-12-11",
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Write a haiku about recursion in programming."},
     ],
     temperature=0.0,
-    max_tokens=128,
+    max_completion_tokens=128,
 )
 
 print(completion.choices[0].message)

@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 med_dl_tasks
+dataset
 test_monai_mednist
 test_monai_odir
 crea/monai_rag/docs*

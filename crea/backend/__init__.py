@@ -1,7 +1,7 @@
 import logging
 import re
 
-from . import backend_anthropic, backend_openai, backend_openrouter
+from . import backend_openai
 from .utils import FunctionSpec, OutputType, PromptType, compile_prompt_to_md
 
 logger = logging.getLogger("Crea")
@@ -14,8 +14,6 @@ def determine_provider(model: str) -> str:
 
 provider_to_query_func = {
     "openai": backend_openai.query,
-    "anthropic": backend_anthropic.query,
-    "openrouter": backend_openrouter.query,
 }
 
 
@@ -24,7 +22,7 @@ def query(
     user_message: PromptType | None,
     model: str,
     temperature: float | None = None,
-    max_tokens: int | None = None,
+    max_completion_tokens: int | None = None,
     func_spec: FunctionSpec | None = None,
     **model_kwargs,
 ) -> OutputType:
@@ -33,11 +31,11 @@ def query(
     Supports function calling for some backends.
 
     Args:
-        system_message (PromptType | None): Uncompiled system message (will generate a message following the OpenAI/Anthropic format)
-        user_message (PromptType | None): Uncompiled user message (will generate a message following the OpenAI/Anthropic format)
+        system_message (PromptType | None): Uncompiled system message (will generate a message following the OpenAI format)
+        user_message (PromptType | None): Uncompiled user message (will generate a message following the OpenAI format)
         model (str): string identifier for the model to use (e.g. "gpt-4-turbo")
         temperature (float | None, optional): Temperature to sample at. Defaults to the model-specific default.
-        max_tokens (int | None, optional): Maximum number of tokens to generate. Defaults to the model-specific max tokens.
+        max_completion_tokens (int | None, optional): Maximum number of tokens to generate. Defaults to the model-specific max tokens.
         func_spec (FunctionSpec | None, optional): Optional FunctionSpec object defining a function call. If given, the return value will be a dict.
 
     Returns:
@@ -47,7 +45,7 @@ def query(
     model_kwargs = model_kwargs | {
         "model": model,
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_completion_tokens,
     }
 
     # Handle models with beta limitations

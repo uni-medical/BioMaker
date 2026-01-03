@@ -27,5 +27,5 @@ def journal2report(journal: Journal, task_desc: dict, rcfg: StageConfig):
         user_message=context_prompt,
         model=rcfg.model,
         temperature=rcfg.temp,
-        max_tokens=4096,
+        max_completion_tokens=4096,
     )

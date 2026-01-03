@@ -110,14 +110,8 @@ if __name__ == "__main__":
 
     # 示例查询
     test_queries = [
-        # ("MONAI中LoadImage的使用方法", 3),
-        # ("MONAI中Transforms有哪些", 3),
-        # ("MONAI中CacheDataset的使用方法", 3),
         ("The basic knowledge of MONAI Data Pipeline usage", 3),
-        ("The basic knowledge of MONAI Network usage", 3),
-        # (query2doc_search("MONAI中Transforms有哪些"), 3),
-        # ("如何实现3D数据增强", 5),
-        # ("医学影像的IO处理模块", 3)
+        # ("The basic knowledge of MONAI Network usage", 3),
     ]
     for enable_q2d in [False, True]:
         print("setting: enable_query2doc =", enable_q2d)
@@ -130,5 +124,5 @@ if __name__ == "__main__":
             for i, doc in enumerate(results):
                 print(f"[结果 {i+1}] {doc.metadata['source']}")
                 print(len(doc.page_content))
-                print(f"内容摘要: {doc.page_content[:100]}...")
+                print(f"内容摘要: {doc.page_content[:200]}...")
                 print("-" * 50)

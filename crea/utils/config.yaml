@@ -38,7 +38,7 @@ agent:
   # whether to force the agent to use MONAI to train the model
   force_monai_with_prompt: False
   enable_monai_knowledge_base: True
-  enable_query2doc: True
+  enable_query2doc: False
   use_deep_research_knowledge: null
 
   # hyperparameters for the tree search
@@ -49,7 +49,7 @@ agent:
 
   # LLM settings for coding
   code:
-    model: gpt-4o
+    model: gpt-5.2-2025-12-11
     temp: 0.5
 
   # LLM settings for knowledge base embedding
@@ -59,7 +59,7 @@ agent:
 
   # LLM settings for evaluating program output / tracebacks
   feedback:
-    model: gpt-4o-mini
+    model: gpt-4o
     temp: 0.0
 
 # settings for code execution

@@ -37,6 +37,7 @@ export OPENAI_API_KEY="<your key>"
 ```
 ## Setup knowledge base for RAG Tool
 You can create the knowledge base with `create_rag_db.sh`.
+For MONAI-1.4.0, you can also download from [Huggingface](https://huggingface.co/datasets/blueyo0/monai_rag_db).
 
 You could use this command to check whether the creation succeeds.
 ```
@@ -46,13 +47,11 @@ python -m crea.monai_rag.query_rag_db
 You can download the example dataset from [Huggingface](https://huggingface.co/datasets/blueyo0/organmnist3d).
 Download command:
 ```
-huggingface-cli download blueyo0/organmnist3d --local-dir organmnist3d
+hf download blueyo0/organmnist3d --local-dir dataset/organmnist3d --repo-type dataset
 ```
 Then run the `quick_start.sh` to test:
 ```
-crea data_dir="organmnist3d" exp_name="test-organmnist3d" \
-     goal="Predict the category of each given 3D Abdominal CT image by selecting the most appropriate one from the 11 available classes." \
-     eval="Use the accuracy and the area under curve (AUC) between the predicted class and ground-truth class on the test set."
+bash quick_start.sh
 ```
 
 # 🙏 Acknowledgement
