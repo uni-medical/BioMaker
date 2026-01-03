@@ -11,7 +11,7 @@ from ..utils.metric import ZeroMetricValue
 from ..utils.response import wrap_code
 from .base_agent import BaseAgent
 
-logger = logging.getLogger("meddle")
+logger = logging.getLogger("Crea")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
 
 

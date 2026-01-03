@@ -8,7 +8,7 @@ from funcy import notnone, once, select_values
 
 from .utils import FunctionSpec, OutputType, backoff_create, opt_messages_to_list
 
-logger = logging.getLogger("meddle")
+logger = logging.getLogger("Crea")
 
 _client: anthropic.Anthropic = None  # type: ignore
 

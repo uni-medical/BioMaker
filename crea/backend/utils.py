@@ -11,7 +11,7 @@ FunctionCallType = dict
 OutputType = str | FunctionCallType
 
 
-logger = logging.getLogger("meddle")
+logger = logging.getLogger("Crea")
 
 
 @backoff.on_predicate(

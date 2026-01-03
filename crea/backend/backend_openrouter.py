@@ -9,7 +9,7 @@ from funcy import notnone, once, select_values
 
 from .utils import FunctionSpec, OutputType, backoff_create
 
-logger = logging.getLogger("meddle")
+logger = logging.getLogger("Crea")
 
 _client: openai.OpenAI = None  # type: ignore
 

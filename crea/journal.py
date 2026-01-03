@@ -1,5 +1,5 @@
 """
-The journal is the core datastructure in MedDLE that contains:
+The journal is the core datastructure in CREA that contains:
 - the generated code samples
 - information how code samples relate to each other (the tree structure)
 - code execution results

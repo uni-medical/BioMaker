@@ -4,7 +4,7 @@ import re
 from . import backend_anthropic, backend_openai, backend_openrouter
 from .utils import FunctionSpec, OutputType, PromptType, compile_prompt_to_md
 
-logger = logging.getLogger("meddle")
+logger = logging.getLogger("Crea")
 
 
 def determine_provider(model: str) -> str:

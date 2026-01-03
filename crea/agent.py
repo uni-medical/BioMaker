@@ -9,7 +9,7 @@ from .journal import Journal, Node
 from .utils.config import Config
 from .utils.metric import ZeroMetricValue
 
-logger = logging.getLogger("meddle")
+logger = logging.getLogger("crea")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
 
 
@@ -27,7 +27,7 @@ class WorkflowAgent:
         assert self.steps_left >= 0, "steps_left must be >= 0"
 
 
-class MeddleWorkflow(BaseAgent):
+class CreaWorkflow(BaseAgent):
     def __init__(
         self,
         task_desc: str,

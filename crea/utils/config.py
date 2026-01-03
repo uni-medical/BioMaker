@@ -47,7 +47,7 @@ logging.basicConfig(
         RichLogHandler(show_time=True, show_level=True, show_path=False, markup=True)
     ],
 )
-logger = logging.getLogger("meddle")
+logger = logging.getLogger("crea")
 logger.setLevel(logging.WARNING)
 
 """ these dataclasses are just for type hinting, the actual config is in config.yaml """

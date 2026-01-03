@@ -9,7 +9,7 @@ from ..journal import Journal
 
 
 def dumps_json(obj: dataclasses_json.DataClassJsonMixin):
-    """Serialize MedDLE dataclasses (such as Journals) to JSON."""
+    """Serialize CREA dataclasses (such as Journals) to JSON."""
     if isinstance(obj, Journal):
         obj = copy.deepcopy(obj)
         node2parent = {n.id: n.parent.id for n in obj.nodes if n.parent is not None}
@@ -35,7 +35,7 @@ G = TypeVar("G", bound=dataclasses_json.DataClassJsonMixin)
 
 
 def loads_json(s: str, cls: Type[G]) -> G:
-    """Deserialize JSON to MedDLE dataclasses."""
+    """Deserialize JSON to CREA dataclasses."""
     obj_dict = json.loads(s)
     obj = cls.from_dict(obj_dict)
 

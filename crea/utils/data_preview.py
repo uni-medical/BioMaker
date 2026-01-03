@@ -48,7 +48,7 @@ def file_tree(path: Path, depth=0) -> str:
     dirs = [p for p in Path(path).iterdir() if p.is_dir()]
     max_n = 4 if len(files) > 30 else 8
     for p in sorted(files)[:max_n]:
-        if p.name == "MedDLE.md":
+        if p.name == "CREA.md":
             continue
         result.append(f"{' '*depth*4}{p.name} ({get_file_len_size(p)[1]})")
     if len(files) > max_n:
@@ -215,8 +215,8 @@ def generate(base_path, include_file_details=True, simple=False):
         for fn in _walk(base_path):
             file_name = str(fn.relative_to(base_path))
 
-            if fn.name == "MedDLE.md":
-                # 特殊处理 MedDLE.md 文件，读取全部内容
+            if fn.name == "CREA.md":
+                # 特殊处理 CREA.md 文件，读取全部内容
                 with open(fn) as f:
                     content = f.read()
                     out.append(f"Memory of Dataset Details:\n\n```\n{content}\n```")

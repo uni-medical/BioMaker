@@ -1,4 +1,4 @@
-# MedDLE requirements
+# CREA requirements
 funcy==2.0
 humanize==4.8.0
 jsonschema==4.19.2

@@ -8,7 +8,7 @@ from rich.text import Text
 from rich.tree import Tree
 
 from . import backend
-from .agent import MeddleWorkflow
+from .agent import CreaWorkflow
 from .interpreter import Interpreter
 from .journal import Journal, Node
 from .journal2report import journal2report
@@ -28,7 +28,7 @@ def trace(self, message, *args, **kws):
 logging.Logger.trace = trace
 
 
-logger = logging.getLogger("meddle")
+logger = logging.getLogger("Crea")
 logger.setLevel(logging.INFO)  # set default level
 
 
@@ -103,7 +103,7 @@ def run():
         cfg.workspace_dir, **OmegaConf.to_container(cfg.exec)  # type: ignore
     )
 
-    agent = MeddleWorkflow(
+    agent = CreaWorkflow(
         task_desc=task_desc,
         cfg=cfg,
         journal=journal,
@@ -142,14 +142,14 @@ def run():
     timeout_seconds = OmegaConf.select(cfg, "agent.total_time_limit", default=None)
     total_timer = Timer(timeout_seconds=timeout_seconds)
 
-    logger.info(f"Starting MedDLE workflow")
+    logger.info(f"Starting Crea workflow")
     logger.info(f"Step plan:\n{agent.step_plan}")
     total_timer.reset()
     # Continue to the next step only when both the step limit and time limit are not reached
     global_step = 0
     end_with_exception = False
     while global_step < cfg.agent.steps and not total_timer.is_timeout():
-        logger.info(f"MedDLE workflow step: {global_step + 1} / {cfg.agent.steps}")
+        logger.info(f"Crea workflow step: {global_step + 1} / {cfg.agent.steps}")
         try:
             logger.info(Text("Generating code...", style="green"))
             agent.step(exec_callback=exec_callback)

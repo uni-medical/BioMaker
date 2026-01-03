@@ -8,7 +8,7 @@ version = "0.0.3"
 authors = [
     {name = "Haoyu Wang", email = "haoyu.wang.8023@gmail.com"},
 ]
-description = "Agentic Medical Deep Learning Engineer"
+description = "Agentic AutoML for Biomedical Image Analysis"
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = [
@@ -19,19 +19,19 @@ classifiers = [
 dynamic = ["dependencies"]
 
 [project.urls]
-"Homepage" = "https://github.com/uni-medical/MedDLE"
+"Homepage" = "https://github.com/uni-medical/CREA"
 
 [project.scripts]
-meddle = "meddle.run:run"
+crea = "crea.run:run"
 
 [tool.setuptools]
-package-data = {meddle = ["../requirements.txt", "utils/config.yaml", "utils/viz_templates/*"]}
+package-data = {crea = ["../requirements.txt", "utils/config.yaml", "utils/viz_templates/*"]}
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]
-include = ["meddle*"]
+include = ["crea*"]
 exclude = ["logs*", "workspaces*", "exp_summary*"]
 
 [tool.black]

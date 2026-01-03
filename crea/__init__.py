@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from omegaconf import OmegaConf
 from rich.status import Status
 
-from .agent import MeddleWorkflow
+from .agent import CreaWorkflow
 from .interpreter import Interpreter
 from .journal import Journal
 from .utils.config import (
@@ -44,7 +44,7 @@ class Experiment:
             prep_agent_workspace(self.cfg)
 
         self.journal = Journal()
-        self.agent = MeddleWorkflow(
+        self.agent = CreaWorkflow(
             task_desc=self.task_desc,
             cfg=self.cfg,
             journal=self.journal,

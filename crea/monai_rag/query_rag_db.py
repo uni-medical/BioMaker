@@ -7,7 +7,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
-from meddle.backend import query
+from crea.backend import query
 
 PERSIST_DIR = osp.join(osp.dirname(__file__), "monai_rag_db")
 

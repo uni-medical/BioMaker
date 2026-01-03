@@ -20,7 +20,7 @@ from pathlib import Path
 import humanize
 from dataclasses_json import DataClassJsonMixin
 
-logger = logging.getLogger("meddle")
+logger = logging.getLogger("Crea")
 
 
 @dataclass
@@ -52,7 +52,7 @@ def exception_summary(e, working_dir, exec_file_name, format_tb_ipython):
             [
                 line
                 for line in tb_lines
-                if "meddle/" not in line and "importlib" not in line
+                if "crea/" not in line and "importlib" not in line
             ]
         )
         # tb_str = "".join([l for l in tb_lines])
