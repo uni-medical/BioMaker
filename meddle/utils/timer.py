@@ -1,9 +1,10 @@
 import time
 
+
 class Timer:
     def __init__(self, timeout_seconds=None):
         self.timeout_seconds = timeout_seconds
-        self._start_time = time.monotonic() # Use monotonic clock for durations
+        self._start_time = time.monotonic()  # Use monotonic clock for durations
 
     @property
     def elapsed(self) -> float:
@@ -20,7 +21,6 @@ class Timer:
             return False
         return self.elapsed >= self.timeout_seconds + tolerance
 
-            
 
 if __name__ == "__main__":
     timer = Timer(4)

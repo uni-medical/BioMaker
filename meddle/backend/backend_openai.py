@@ -2,12 +2,13 @@
 
 import json
 import logging
+import os
 import time
 
-from .utils import FunctionSpec, OutputType, opt_messages_to_list, backoff_create
-from funcy import notnone, once, select_values
 import openai
-import os
+from funcy import notnone, once, select_values
+
+from .utils import FunctionSpec, OutputType, backoff_create, opt_messages_to_list
 
 logger = logging.getLogger("meddle")
 
@@ -24,9 +25,8 @@ OPENAI_TIMEOUT_EXCEPTIONS = (
 @once
 def _setup_openai_client():
     global _client
-    _client = openai.OpenAI(
-        max_retries=0
-    )
+    _client = openai.OpenAI(max_retries=0)
+
 
 def query(
     system_message: str | None,

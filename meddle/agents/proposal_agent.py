@@ -14,6 +14,7 @@ from .base_agent import BaseAgent
 logger = logging.getLogger("meddle")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
 
+
 class ProposalAgent(BaseAgent):
     def __init__(
         self,
@@ -22,22 +23,26 @@ class ProposalAgent(BaseAgent):
         journal: Journal,
     ):
         super().__init__(task_desc, cfg, journal)
-        self.profile = "You are a medical deep learning grandmaster attending a competition. "
+        self.profile = (
+            "You are a medical deep learning grandmaster attending a competition. "
+        )
         self.knowledge_base = MED_KNOWLEDGE_RAG(model=self.acfg.knowledge_base.model)
 
-    def query_knowledge_base(self, query: str, topk: int=3) -> str: 
+    def query_knowledge_base(self, query: str, topk: int = 3) -> str:
         result = ""
         if self.acfg.enable_monai_knowledge_base:
             logger.trace(f"Querying knowledge base with query: {query}")
-            result = self.knowledge_base.search(query, k=topk, enable_query2doc=self.acfg.enable_query2doc)
+            result = self.knowledge_base.search(
+                query, k=topk, enable_query2doc=self.acfg.enable_query2doc
+            )
             logger.debug(f"Querying knowledge base get result:\n {result[:200]}")
         return result
 
     def _draft(self) -> Node:
         prompt: Any = {
             "Introduction": (
-                self.profile +
-                "In order to win this competition, you need to come up with an excellent and creative plan "
+                self.profile
+                + "In order to win this competition, you need to come up with an excellent and creative plan "
                 "for a solution and then implement this solution in Python. We will now provide a description of the task."
             ),
             "Task description": self.task_desc,
@@ -73,8 +78,8 @@ class ProposalAgent(BaseAgent):
     def _debug(self, parent_node: Node) -> Node:
         prompt: Any = {
             "Introduction": (
-                self.profile + 
-                "Your previous solution had a bug, so based on the information below, you should revise it in order to fix this bug. "
+                self.profile
+                + "Your previous solution had a bug, so based on the information below, you should revise it in order to fix this bug. "
                 "Your response should be an implementation outline in natural language,"
                 " followed by a single markdown code block which implements the bugfix/solution."
             ),
@@ -86,14 +91,18 @@ class ProposalAgent(BaseAgent):
 
         if self.acfg.enable_monai_knowledge_base:
             knowledge_retrieve_context = prompt.copy()
-            knowledge_retrieve_context["Query"] = "What topic should be queried to debug this code?"
+            knowledge_retrieve_context["Query"] = (
+                "What topic should be queried to debug this code?"
+            )
             topic_of_knowledge_for_debug = query(
                 system_message=knowledge_retrieve_context,
                 user_message=None,
                 model=self.acfg.knowledge_base.model,
                 temperature=self.acfg.knowledge_base.temp,
             )
-            prompt["Dependent Knowledge"] = self.query_knowledge_base(topic_of_knowledge_for_debug)
+            prompt["Dependent Knowledge"] = self.query_knowledge_base(
+                topic_of_knowledge_for_debug
+            )
 
         prompt["Instructions"] |= self._prompt_resp_fmt
         prompt["Instructions"] |= {
@@ -101,7 +110,7 @@ class ProposalAgent(BaseAgent):
                 "You should write a brief natural language description (3-5 sentences) of how the issue in the previous implementation can be fixed.",
                 "Don't suggest to do EDA.",
                 "The debugged soultion should **only run 1 training epoch** to help validate the code quickly.",
-                "If the error is due to missing packages (ImportError/ModuleNotFoundError), DO NOT attempt to install. Instead, replace the missing package with an alternative approach using available packages."
+                "If the error is due to missing packages (ImportError/ModuleNotFoundError), DO NOT attempt to install. Instead, replace the missing package with an alternative approach using available packages.",
             ],
         }
         prompt["Instructions"] |= self._prompt_impl_guideline
@@ -131,14 +140,18 @@ class ProposalAgent(BaseAgent):
 
         if self.acfg.enable_monai_knowledge_base:
             knowledge_retrieve_context = prompt.copy()
-            knowledge_retrieve_context["Query"] = "What topic should be queried to improve this code?"
+            knowledge_retrieve_context["Query"] = (
+                "What topic should be queried to improve this code?"
+            )
             topic_of_knowledge_for_debug = query(
                 system_message=knowledge_retrieve_context,
                 user_message=None,
                 model=self.acfg.knowledge_base.model,
                 temperature=self.acfg.knowledge_base.temp,
             )
-            prompt["Dependent Knowledge"] = self.query_knowledge_base(topic_of_knowledge_for_debug)
+            prompt["Dependent Knowledge"] = self.query_knowledge_base(
+                topic_of_knowledge_for_debug
+            )
 
         prompt["Instructions"] |= self._prompt_resp_fmt
         prompt["Instructions"] |= {

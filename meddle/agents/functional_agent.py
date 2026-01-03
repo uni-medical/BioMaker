@@ -2,16 +2,18 @@ import logging
 from typing import Any, Callable, cast
 
 import humanize
+
 from ..backend import FunctionSpec, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
 from ..utils.config import Config
-from ..utils.response import wrap_code
 from ..utils.metric import ZeroMetricValue
+from ..utils.response import wrap_code
 from .base_agent import BaseAgent
 
 logger = logging.getLogger("meddle")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
+
 
 class FunctionalAgent(BaseAgent):
     def __init__(
@@ -22,7 +24,9 @@ class FunctionalAgent(BaseAgent):
         solution_file: str | None = None,
     ):
         super().__init__(task_desc, cfg, journal)
-        self.profile = "You are an expert for optimizing training code for maximum performance. "
+        self.profile = (
+            "You are an expert for optimizing training code for maximum performance. "
+        )
         self.solution_file = solution_file
 
     def search_policy(self) -> Node | None:
@@ -42,7 +46,7 @@ class FunctionalAgent(BaseAgent):
             "Your response should only contain a single code block.",
             f"Be aware of the running time of the code, it should complete within {humanize.naturaldelta(self.cfg.exec.timeout)}.",
             'All the provided input data is stored in "./input" directory.',
-            'When building the Dataset, it should be based on the actual existing data files, rather than relying entirely on the annotation file.',
+            "When building the Dataset, it should be based on the actual existing data files, rather than relying entirely on the annotation file.",
             '**If there is test data provided for this task, please save the test predictions in a `submission.csv` file in the "./working" directory as described in the task description** This is extremely important since this file is used for grading/evaluation. DO NOT FORGET THE submission.csv file!',
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
         ]
@@ -84,8 +88,8 @@ class FunctionalAgent(BaseAgent):
     def _validate_existed_solution_code(self) -> bool:
         code = open(self.solution_file, "r").read()
         solution_node = Node(
-            plan="Try to validate this existed solution code to check whether it is suitable for this task.", 
-            code=code
+            plan="Try to validate this existed solution code to check whether it is suitable for this task.",
+            code=code,
         )
         solution_node.metric = ZeroMetricValue()
         return solution_node
@@ -99,7 +103,9 @@ class FunctionalAgent(BaseAgent):
             if not self.journal.nodes or self.data_preview is None:
                 self.update_data_preview()
             parent_node = self.search_policy()
-            logger.debug(f"Agent is generating code, parent node type: {type(parent_node)}")
+            logger.debug(
+                f"Agent is generating code, parent node type: {type(parent_node)}"
+            )
             solution_node = self._functional_fix(parent_node)
 
         self.parse_exec_result(
@@ -108,4 +114,3 @@ class FunctionalAgent(BaseAgent):
         )
         self.journal.append(solution_node)
         return solution_node
-        

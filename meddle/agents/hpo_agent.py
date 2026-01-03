@@ -15,6 +15,7 @@ from .base_agent import BaseAgent
 logger = logging.getLogger("meddle")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
 
+
 class HPOAgent(BaseAgent):
     def __init__(
         self,
@@ -25,13 +26,13 @@ class HPOAgent(BaseAgent):
         super().__init__(task_desc, cfg, journal)
         self.profile = "You are an expert for optimizing deep learning model training pipelines, especially for medical imaging tasks. "
         self.knowledge_base = knowledge_manager
-    
+
     def update_with_external_journal(self, external_journal: Journal):
         super().update_with_external_journal(external_journal)
         # prune the journal and keep the topk node
         best_node_list = self.journal.get_topk_node_list(only_good=True, topk=3)
         self.journal.nodes = [n for n in best_node_list]
-    
+
     def search_policy(self) -> Node | None:
         # choose from the top-k best-as-known node for further tuning
         node = super().search_policy()
@@ -39,7 +40,9 @@ class HPOAgent(BaseAgent):
             node = self.journal.get_best_node(only_good=True, topk=3)
         return node
 
-    def _optimize_hyperparameters(self, parent_node: Node, exec_callback: ExecCallbackType) -> Node:
+    def _optimize_hyperparameters(
+        self, parent_node: Node, exec_callback: ExecCallbackType
+    ) -> Node:
         prompt: Any = {
             "Introduction": (
                 self.profile + " You are provided with a developed solution below."
@@ -95,4 +98,3 @@ class HPOAgent(BaseAgent):
         )
         self.journal.append(result_node)
         return result_node
-        

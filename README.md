@@ -36,7 +36,7 @@ We recommend using `uv` to manage the environment and dependencies.
    export OPENAI_API_KEY="<your key>"
    ```
 ## Setup knowledge base for RAG Tool
-You can create the knowledge base with `create_monai_knowledge_base.sh` or download from [link](http://ug.link/haoyushare/filemgr/share-download/?id=b8c77eb1346c4ecca4dfb510253d32fe).
+You can create the knowledge base with `create_rag_db.sh`.
 
 You could use this command to check whether the creation succeeds.
 ```

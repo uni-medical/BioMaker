@@ -4,8 +4,8 @@ import logging
 import os
 import time
 
-from funcy import notnone, once, select_values
 import openai
+from funcy import notnone, once, select_values
 
 from .utils import FunctionSpec, OutputType, backoff_create
 

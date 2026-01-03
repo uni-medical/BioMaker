@@ -3,13 +3,13 @@ Contains functions to manually generate a textual preview of some common file ty
 """
 
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import humanize
 import pandas as pd
 from genson import SchemaBuilder
 from pandas.api.types import is_numeric_dtype
-from collections import defaultdict
 from PIL import Image
 
 # these files are treated as code (e.g. markdown wrapped)
@@ -18,6 +18,7 @@ code_files = {".py", ".sh", ".yaml", ".yml", ".md", ".html", ".xml", ".log", ".r
 plaintext_files = {".txt", ".csv", ".json", ".tsv"} | code_files
 # these files are treated as image
 image_files = {".png", ".jpeg", ".jpg", ".tiff"}
+
 
 def get_file_len_size(f: Path) -> tuple[int, str]:
     """
@@ -37,7 +38,7 @@ def get_file_len_size(f: Path) -> tuple[int, str]:
                     img_size_info = f"{width}x{height} pixels"
             except:
                 img_size_info = ""
-        return s, str(humanize.naturalsize(s)) + f", {img_size_info}" 
+        return s, str(humanize.naturalsize(s)) + f", {img_size_info}"
 
 
 def file_tree(path: Path, depth=0) -> str:
@@ -47,7 +48,8 @@ def file_tree(path: Path, depth=0) -> str:
     dirs = [p for p in Path(path).iterdir() if p.is_dir()]
     max_n = 4 if len(files) > 30 else 8
     for p in sorted(files)[:max_n]:
-        if p.name == "MedDLE.md": continue
+        if p.name == "MedDLE.md":
+            continue
         result.append(f"{' '*depth*4}{p.name} ({get_file_len_size(p)[1]})")
     if len(files) > max_n:
         result.append(f"{' '*depth*4}... and {len(files)-max_n} other files")
@@ -196,7 +198,7 @@ def preview_image(image_path, file_name):
             return f"-> {file_name} is an image with size: {width}x{height} pixels"
     except Exception as e:
         return f"-> {file_name} could not be processed as an image: {str(e)}"
-    
+
 
 def generate(base_path, include_file_details=True, simple=False):
     """
@@ -243,28 +245,31 @@ def generate(base_path, include_file_details=True, simple=False):
         # Build image summary
         if image_data or image_errors:
             summary = ["Image Summary:"]
-            
+
             for ext, sizes in image_data.items():
                 count = len(sizes)
-                ext_name = ext.lstrip('.').upper()
-                areas = [w*h for w, h in sizes]
+                ext_name = ext.lstrip(".").upper()
+                areas = [w * h for w, h in sizes]
                 min_size = sizes[areas.index(min(areas))]
                 max_size = sizes[areas.index(max(areas))]
-                
-                size_range = (f"{min_size[0]}x{min_size[1]} - "
-                            f"{max_size[0]}x{max_size[1]}")
+
+                size_range = (
+                    f"{min_size[0]}x{min_size[1]} - " f"{max_size[0]}x{max_size[1]}"
+                )
                 summary.append(f"  • {count} {ext_name}: {size_range}")
-            
+
             if image_errors:
                 summary.append(f"  • {image_errors} files could not be read")
-            
+
             out.append("\n".join(summary))
 
     result = "\n\n".join(out)
 
     if len(result) > 6000 and not simple:
-        return generate(base_path, include_file_details=include_file_details, simple=True)
-    
+        return generate(
+            base_path, include_file_details=include_file_details, simple=True
+        )
+
     return result
 
 

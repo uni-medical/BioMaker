@@ -1,6 +1,7 @@
+import multiprocessing
 import os
 import subprocess
-import multiprocessing
+
 
 class ResourceManager:
     """Simplified Resource Manager for checking system device info."""
@@ -14,6 +15,7 @@ class ResourceManager:
     def get_gpu_count():
         try:
             import torch
+
             if torch.cuda.is_available():
                 return torch.cuda.device_count()
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -27,8 +29,12 @@ class ResourceManager:
     def get_gpu_memory():
         try:
             output = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,nounits,noheader"],
-                encoding="utf-8"
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.total",
+                    "--format=csv,nounits,noheader",
+                ],
+                encoding="utf-8",
             )
             return [int(x) for x in output.strip().split("\n")]
         except Exception:
@@ -43,7 +49,9 @@ class ResourceManager:
         print("=== Device Info Summary ===")
         print(f"CPU Count       : {cpu_info['cpu_count']}")
         print(f"GPU Count       : {gpu_count}")
-        print(f"GPU Memory (MB) : {gpu_memory if gpu_memory else 'Unavailable or No NVIDIA GPU'}")
+        print(
+            f"GPU Memory (MB) : {gpu_memory if gpu_memory else 'Unavailable or No NVIDIA GPU'}"
+        )
         print("============================")
 
     @staticmethod
@@ -53,6 +61,7 @@ class ResourceManager:
         if not gpu_memories:
             return False
         return any(mem >= min_memory_gb * 1024 for mem in gpu_memories)
+
 
 # 示例用法
 if __name__ == "__main__":

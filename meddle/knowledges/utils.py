@@ -1,5 +1,6 @@
-from glob import glob
 import os.path as osp
+from glob import glob
+
 
 class KnowledgeManager:
     def __init__(self):
@@ -12,12 +13,14 @@ class KnowledgeManager:
     def add_knowledge_from_file(self, key, file_path):
         """Add knowledge to the knowledge base from a file."""
         try:
-            if file_path.endswith(('.txt', '.md', '.markdown')):
-                with open(file_path, 'r', encoding='utf-8') as file:
+            if file_path.endswith((".txt", ".md", ".markdown")):
+                with open(file_path, "r", encoding="utf-8") as file:
                     content = file.read()
                 self.knowledge_base[key] = content
             else:
-                raise ValueError("Unsupported file type. Only .txt and .md files are allowed.")
+                raise ValueError(
+                    "Unsupported file type. Only .txt and .md files are allowed."
+                )
         except Exception as e:
             print(f"Error adding knowledge from file: {e}")
 
@@ -30,11 +33,14 @@ class KnowledgeManager:
         if key in self.knowledge_base:
             del self.knowledge_base[key]
 
+
 knowledge_manager = KnowledgeManager()
 knowledge_root_dir = osp.dirname(__file__)
 knowledge_files = glob(osp.join(knowledge_root_dir, "**", "*.md"))
 for fname in knowledge_files:
-    knowledge_manager.add_knowledge_from_file(osp.basename(fname).replace(".md", ""), fname)
+    knowledge_manager.add_knowledge_from_file(
+        osp.basename(fname).replace(".md", ""), fname
+    )
 
 if __name__ == "__main__":
     print(knowledge_manager.get_knowledge("hpo_with_optuna"), end="\n\n\n----\n")

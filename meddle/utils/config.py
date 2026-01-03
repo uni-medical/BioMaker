@@ -26,7 +26,7 @@ class RichLogHandler(RichHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.console = Console(file=sys.stderr, stderr=True)
-    
+
     def emit(self, record):
         # Check if the message is a Rich object
         if isinstance(record.msg, (Tree, Text)):
@@ -37,17 +37,15 @@ class RichLogHandler(RichHandler):
             # Use the default RichHandler behavior for regular messages
             super().emit(record)
 
+
 shutup.mute_warnings()
 logging.basicConfig(
-    level="WARNING", 
-    format="%(message)s", 
-    datefmt="[%X]", 
-    handlers=[RichLogHandler(
-        show_time=True,
-        show_level=True,
-        show_path=False,
-        markup=True
-    )]
+    level="WARNING",
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[
+        RichLogHandler(show_time=True, show_level=True, show_path=False, markup=True)
+    ],
 )
 logger = logging.getLogger("meddle")
 logger.setLevel(logging.WARNING)
@@ -67,24 +65,26 @@ class SearchConfig:
     debug_prob: float
     num_drafts: int
 
+
 @dataclass
 class StepConfig:
     proposal: int
     tuning: int
     hpo: int
 
+
 @dataclass
 class AgentConfig:
     steps: int
     step_plan: StepConfig | None
-    total_time_limit: int # total time limit for all steps (second)
+    total_time_limit: int  # total time limit for all steps (second)
 
     k_fold_validation: int
     search: SearchConfig
-    
+
     expose_prediction: bool
     data_preview: bool
-    
+
     force_monai_with_prompt: bool
     enable_monai_knowledge_base: bool
     enable_query2doc: bool
@@ -187,7 +187,7 @@ def prep_cfg(cfg: Config):
     # update the step plan if no detailed plan is provided
     # if the step <= 10, use all steps for proposal
     # if the step > 10, use 5 step for tuning, others for proposal
-    if (cfg.agent.step_plan is None):
+    if cfg.agent.step_plan is None:
         tuning_step = 5 if (cfg.agent.steps > 10) else 0
         hpo_step = 2 if (cfg.agent.steps > 25) else 0
         proposal_step = cfg.agent.steps - tuning_step - hpo_step
@@ -251,7 +251,7 @@ def prep_agent_workspace(cfg: Config):
         preproc_data(cfg.workspace_dir / "input")
 
 
-def save_run(cfg: Config, journal, solution_tree: Tree=None):
+def save_run(cfg: Config, journal, solution_tree: Tree = None):
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
     # save journal
@@ -269,7 +269,7 @@ def save_run(cfg: Config, journal, solution_tree: Tree=None):
     submission_path = Path(cfg.workspace_dir) / "working/submission.csv"
     if submission_path.is_file():
         shutil.copy2(submission_path, cfg.log_dir / "submission.csv")
-    
+
     # Copy checkpoint file if it exists
     ckpt_path = Path(cfg.workspace_dir) / "working/best_ckpt.pth"
     if ckpt_path.is_file():

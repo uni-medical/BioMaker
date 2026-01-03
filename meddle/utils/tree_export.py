@@ -38,7 +38,9 @@ def normalize_layout(layout: np.ndarray):
 
     # 避免除以0
     nonzero_mask = range_vals != 0
-    layout[:, nonzero_mask] = (layout[:, nonzero_mask] - min_vals[nonzero_mask]) / range_vals[nonzero_mask]
+    layout[:, nonzero_mask] = (
+        layout[:, nonzero_mask] - min_vals[nonzero_mask]
+    ) / range_vals[nonzero_mask]
     layout[:, 1] = 1 - layout[:, 1]
     layout[:, 1] = np.nan_to_num(layout[:, 1], nan=0)
     layout[:, 0] = np.nan_to_num(layout[:, 0], nan=0.5)
@@ -65,11 +67,11 @@ def cfg_to_tree_struct(cfg, jou: Journal):
 
         # 按换行符分割字符串，然后对每一行进行换行处理
         wrapped_lines = []
-        for line in original_string: # 按 \n 分割
-            wrapped_lines.append(textwrap.fill(line, width=80)) # 对每一行进行 fill
+        for line in original_string:  # 按 \n 分割
+            wrapped_lines.append(textwrap.fill(line, width=80))  # 对每一行进行 fill
 
         # 将处理过的行用 \n 重新连接
-        plan_with_metric_list.append('\n'.join(wrapped_lines))
+        plan_with_metric_list.append("\n".join(wrapped_lines))
 
     return dict(
         edges=edges,

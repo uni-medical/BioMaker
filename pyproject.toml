@@ -33,3 +33,10 @@ dependencies = {file = ["requirements.txt"]}
 [tool.setuptools.packages.find]
 include = ["meddle*"]
 exclude = ["logs*", "workspaces*", "exp_summary*"]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+line_length = 88

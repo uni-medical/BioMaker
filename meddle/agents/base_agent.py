@@ -42,6 +42,7 @@ review_func_spec = FunctionSpec(
     description="Submit a review evaluating the output of the training script.",
 )
 
+
 class BaseAgent:
     def __init__(
         self,
@@ -66,7 +67,7 @@ class BaseAgent:
             raise ValueError("external_journal must be an instance of Journal")
         for n in external_journal.nodes:
             self.journal.append(n)
-    
+
     def search_policy(self) -> Node | None:
         """Select a node to work on (or None to draft a new node)."""
         search_cfg = self.acfg.search
@@ -102,7 +103,9 @@ class BaseAgent:
 
     @property
     def _prompt_environment(self):
-        is_medical_code_lib_enabled = self.acfg.force_monai_with_prompt or self.acfg.enable_monai_knowledge_base
+        is_medical_code_lib_enabled = (
+            self.acfg.force_monai_with_prompt or self.acfg.enable_monai_knowledge_base
+        )
         pkgs = [
             "numpy",
             "pandas",
@@ -118,11 +121,11 @@ class BaseAgent:
             "optuna",
         ]
         if is_medical_code_lib_enabled:
-            pkgs += ["monai","lifelines"]
-            
+            pkgs += ["monai", "lifelines"]
+
         random.shuffle(pkgs)
         pkg_str = ", ".join([f"`{p}`" for p in pkgs])
-        
+
         if is_medical_code_lib_enabled:
             env_prompt = {
                 "Installed Packages": f"Your solution can use any relevant deep learning packages such as: {pkg_str}. Feel free to use any other packages too (all packages are already installed!). For neural networks training on medical images, we suggest using MONAI rather than PyTorch/TensorFlow."
@@ -142,7 +145,7 @@ class BaseAgent:
             "Your response should only contain a single code block.",
             f"Be aware of the running time of the code, it should complete within {humanize.naturaldelta(self.cfg.exec.timeout)}.",
             'All the provided input data is stored in "./input" directory.',
-            'When building the Dataset, it should be based on the actual existing data files, rather than relying entirely on the annotation file.',
+            "When building the Dataset, it should be based on the actual existing data files, rather than relying entirely on the annotation file.",
             '**If there is test data provided for this task, please save the test predictions in a `submission.csv` file in the "./working" directory as described in the task description** This is extremely important since this file is used for grading/evaluation. DO NOT FORGET THE submission.csv file!',
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
         ]
@@ -153,7 +156,7 @@ class BaseAgent:
                 "- Use monai.data.ImageDataset for medical imaging data"
                 "- Always wrap with MONAI transforms instead of PyTorch transforms, for example:"
                 "     * Spatial transforms: EnsureChannelFirstd, Resized, RandRotate90d, RandZoomd, RandFlipd"
-                "     * Intensity transforms: ScaleIntensityd, NormalizeIntensityd"    
+                "     * Intensity transforms: ScaleIntensityd, NormalizeIntensityd"
                 "     * Remember to use appropriate spatial_size with Resized when the image sizes are different"
                 "2. **Network Design** (if your task is 3D):"
                 "- Select from monai.networks.nets (DenseNet121/UNet for classification/segmentation)"
@@ -208,15 +211,15 @@ class BaseAgent:
         self.data_preview = data_preview.generate(self.cfg.workspace_dir)
 
     def parse_exec_result(self, node: Node, exec_result: ExecutionResult):
-        ''' core function for feedback for this Agent'''
+        """core function for feedback for this Agent"""
         logger.debug(f"Agent is parsing execution results for node {node.id}")
 
         node.absorb_exec_result(exec_result)
 
         prompt = {
             "Introduction": (
-                self.profile + 
-                "You have written code to solve this task and now need to evaluate the output of the code execution. "
+                self.profile
+                + "You have written code to solve this task and now need to evaluate the output of the code execution. "
                 "You should determine if there were any bugs as well as report the empirical findings."
             ),
             "Task description": self.task_desc,
@@ -254,6 +257,5 @@ class BaseAgent:
             )
 
     def step(self, exec_callback: ExecCallbackType):
-        ''' core logic of the actions of this Agent '''
+        """core logic of the actions of this Agent"""
         raise NotImplementedError
-

@@ -12,21 +12,25 @@ from .agent import MeddleWorkflow
 from .interpreter import Interpreter
 from .journal import Journal, Node
 from .journal2report import journal2report
-from .utils.config import (load_cfg, load_task_desc, prep_agent_workspace,
-                           save_run)
+from .utils.config import load_cfg, load_task_desc, prep_agent_workspace, save_run
 from .utils.timer import Timer
 
 # Add TRACE level
 TRACE_LEVEL_NUM = 5
 logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
+
+
 def trace(self, message, *args, **kws):
     if self.isEnabledFor(TRACE_LEVEL_NUM):
         self._log(TRACE_LEVEL_NUM, message, args, **kws)
+
+
 logging.Logger.trace = trace
 
 
 logger = logging.getLogger("meddle")
-logger.setLevel(logging.INFO) # set default level
+logger.setLevel(logging.INFO)  # set default level
+
 
 def journal_to_rich_tree(journal: Journal):
     best_node = journal.get_best_node()
@@ -72,17 +76,19 @@ def run():
     # 创建文件处理器
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
     log_file = cfg.log_dir / f"{cfg.exp_name}.log"
-    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     file_handler.setLevel(level)
-    
+
     # 创建格式化器
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
     file_handler.setFormatter(formatter)
-    
+
     # 添加文件处理器到logger
     logger.addHandler(file_handler)
     backend.logger.addHandler(file_handler)
-        
+
     logger.info(f'Starting run "{cfg.exp_name}"')
     logger.info(f'Config: "{cfg}"')
 
@@ -91,7 +97,6 @@ def run():
 
     logger.info("Preparing agent workspace (copying and extracting files) ...")
     prep_agent_workspace(cfg)
-
 
     journal = Journal()
     interpreter = Interpreter(
@@ -109,9 +114,11 @@ def run():
     cfg.agent.steps = agent.update_steps_left()
 
     global_step = len(journal)
+
     def cleanup():
         if global_step == 0:
             shutil.rmtree(cfg.workspace_dir)
+
     atexit.register(cleanup)
 
     def exec_callback(*args, **kwargs):
@@ -132,10 +139,10 @@ def run():
                 f.write(report)
             print("Report written to file:", report_file_path)
 
-    timeout_seconds = OmegaConf.select(cfg, 'agent.total_time_limit', default=None)
+    timeout_seconds = OmegaConf.select(cfg, "agent.total_time_limit", default=None)
     total_timer = Timer(timeout_seconds=timeout_seconds)
-    
-    logger.info(f'Starting MedDLE workflow')
+
+    logger.info(f"Starting MedDLE workflow")
     logger.info(f"Step plan:\n{agent.step_plan}")
     total_timer.reset()
     # Continue to the next step only when both the step limit and time limit are not reached

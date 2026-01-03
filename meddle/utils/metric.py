@@ -74,7 +74,8 @@ class WorstMetricValue(MetricValue):
 
     def __str__(self):
         return super().__str__()
-    
+
+
 @dataclass
 class ZeroMetricValue(MetricValue):
     """
