@@ -26,8 +26,12 @@ source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
 3. **Install dependencies**:
 ```bash
 uv pip install -r requirements.txt
-uv pip install -e .
+uv pip install crea-med
 ```
+> for developers:
+> ```bash
+> uv pip install -e .
+> ```
 
 4. **Set up API keys**:
 Set up your private API key for OPENAI-compatible endpoints:
