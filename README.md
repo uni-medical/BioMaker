@@ -34,16 +34,14 @@ We recommend using `uv` to manage the environment and dependencies.
 
 3. **Install dependencies**:
      ```bash
+     git clone https://github.com/uni-medical/CREA
+     cd CREA
      uv pip install -r requirements.txt
-     uv pip install crea-med
+     uv pip install -e .
      ```
-     > for developers:
-     > ```bash
-     > uv pip install -e .
-     > ```
 
 4. **Set up API keys**:
-Set up your private API key for OPENAI-compatible endpoints:
+Set up your private API key for OPENAI-compatible endpoints (e.g. openai official, openrouter):
      ```bash
      export OPENAI_BASE_URL="<your base url>" # (e.g. https://api.openai.com/v1)
      export OPENAI_API_KEY="<your key>"
