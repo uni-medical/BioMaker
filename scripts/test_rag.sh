@@ -1,0 +1,1 @@
+python -m crea.monai_rag.query_rag_db

@@ -4,15 +4,8 @@ __pycache__/
 *$py.class
 med_dl_tasks
 dataset
-test_monai_mednist
-test_monai_odir
 crea/monai_rag/docs*
 crea/monai_rag/*db
-crea/example_tasks/
-crea/example_tasks.zip
-exp_summary
-scripts/*
-AutoMLDev
 
 # C extensions
 *.so

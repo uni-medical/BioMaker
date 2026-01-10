@@ -47,8 +47,8 @@ Set up your private API key for OPENAI-compatible endpoints (e.g. openai officia
      export OPENAI_API_KEY="<your key>"
      ```
 5. **Setup knowledge base for RAG Tool**
-You can create the knowledge base with `create_rag_db.sh`.
-For MONAI-1.4.0, you can also download from [Huggingface](https://huggingface.co/datasets/blueyo0/monai_rag_db).
+You can create the knowledge base with `bash scripts/create_rag_db.sh`.
+For MONAI-1.4.0, you can also download from [Huggingface](https://huggingface.co/datasets/blueyo0/monai_rag_db). (`bash scripts/download_rag_db.sh`)
 
      You could use this command to check whether the creation succeeds.
      ```

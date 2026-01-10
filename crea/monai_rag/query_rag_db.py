@@ -91,6 +91,10 @@ class MED_KNOWLEDGE_RAG:
             final_documents = self._rerank_documents(query, all_documents, k)
         else:
             final_documents = documents
+        if len(final_documents) == 0:
+            raise ValueError(
+                "No documents found, please check whether the RAG database exists."
+            )
         if convert_to_str:
             return (
                 "\n".join(
@@ -113,16 +117,12 @@ if __name__ == "__main__":
         ("The basic knowledge of MONAI Data Pipeline usage", 3),
         # ("The basic knowledge of MONAI Network usage", 3),
     ]
-    for enable_q2d in [False, True]:
-        print("setting: enable_query2doc =", enable_q2d)
-        for q, k in test_queries:
-            print(f"\n=== 测试查询: {q} ===")
-            results = rag.search(
-                q, k=k, enable_query2doc=enable_q2d, convert_to_str=False
-            )
-            # print(results)
-            for i, doc in enumerate(results):
-                print(f"[结果 {i+1}] {doc.metadata['source']}")
-                print(len(doc.page_content))
-                print(f"内容摘要: {doc.page_content[:200]}...")
-                print("-" * 50)
+    for q, k in test_queries:
+        print(f"\n=== 测试查询: {q} ===")
+        results = rag.search(q, k=k, enable_query2doc=False, convert_to_str=False)
+        # print(results)
+        for i, doc in enumerate(results):
+            print(f"[结果 {i+1}] {doc.metadata['source']}")
+            print(len(doc.page_content))
+            print(f"内容摘要: {doc.page_content[:200]}...")
+            print("-" * 50)

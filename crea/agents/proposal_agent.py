@@ -32,9 +32,12 @@ class ProposalAgent(BaseAgent):
         result = ""
         if self.acfg.enable_monai_knowledge_base:
             logger.trace(f"Querying knowledge base with query: {query}")
-            result = self.knowledge_base.search(
-                query, k=topk, enable_query2doc=self.acfg.enable_query2doc
-            )
+            try:
+                result = self.knowledge_base.search(
+                    query, k=topk, enable_query2doc=self.acfg.enable_query2doc
+                )
+            except Exception as e:
+                logger.warning(f"Failed to query knowledge base with error: {e}.")
             logger.debug(f"Querying knowledge base get result:\n {result[:200]}")
         return result
 
