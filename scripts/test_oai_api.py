@@ -6,7 +6,7 @@ client = OpenAI()
 
 completion = client.chat.completions.create(
     # model="gpt-4o-mini",
-    model="gpt-5.2-2025-12-11",
+    model="openai/gpt-4.1",
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Write a haiku about recursion in programming."},
