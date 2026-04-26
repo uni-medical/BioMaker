@@ -1,92 +1,40 @@
-# CREA requirements
+# BioMaker runtime
+backoff
+black
+coolname>=2.2.0
+dataclasses_json>=0.6.4
 funcy==2.0
+genson>=1.2.0
 humanize==4.8.0
 jsonschema==4.19.2
+omegaconf>=2.3.0
 openai>=1.69.0
-anthropic>=0.20.0
-pytest==7.4.3
+python-dotenv
 requests==2.31.0
 rich==13.7.0
-dataclasses_json>=0.6.4
-omegaconf>=2.3.0
-loguru==0.7.2
 shutup>=0.2.0
-coolname>=2.2.0
-igraph>=0.11.3
-genson>=1.2.0
-black
-pre-commit
 
-# agent requirements (packages that the agent might need)
+# Data inspection and lightweight documentation indexing
+beautifulsoup4
+huggingface_hub
+openpyxl
+pandas
+Pillow
+
+# Common packages available to generated solutions
 lightgbm
 matplotlib
-seaborn
-gensim
+numpy
 scikit-learn
-opencv-python
 scipy
-biopython
-imbalanced-learn
-h5py
-numba
-arrow
-markovify
-imgaug
-scikit-optimize
-plotly
-hyperopt
-bayesian-optimization
-imagecodecs
-hmmlearn
-bayespy==0.5.1
-sklearn-pandas
-tensorpack
-sentencepiece
-librosa
-ipykernel
-ipython
-nbformat
-kornia
-Pillow
-pyparsing
-pytz
-PyYAML
-fastai
-gym
-optuna
-transformers
-datasets==2.1.0
-torchmetrics
-pytorch-lightning
-sympy
 timm
-torchinfo
-pdf2image
-PyPDF
-pyocr
-pyarrow
-xlrd
-backoff
-streamlit==1.40.2
-python-dotenv
-openpyxl
+torch
+torchvision
+xgboost
 
-langchain
-langchain-openai
-langchain-community
-beautifulsoup4
-chromadb
-SimpleITK
-nibabel
-
-html2text
-tiktoken
-autogluon
-
-# MONAI requirements
-onnxruntime==1.22.1
-monai[all]==1.4.0
-
-# additional medical task requirements
-pydicom
+# Biomedical imaging packages
 lifelines
+monai==1.4.0
+nibabel
+pydicom
+SimpleITK

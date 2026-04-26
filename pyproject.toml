@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "crea-med"
+name = "biomaker"
 version = "0.0.3"
 authors = [
     {name = "Haoyu Wang", email = "haoyu.wang.8023@gmail.com"},
@@ -19,19 +19,19 @@ classifiers = [
 dynamic = ["dependencies"]
 
 [project.urls]
-"Homepage" = "https://github.com/uni-medical/CREA"
+"Homepage" = "https://github.com/Ziyan-Huang/BioMaker"
 
 [project.scripts]
-crea = "crea.run:run"
+biomaker = "biomaker.run:run"
 
 [tool.setuptools]
-package-data = {crea = ["../requirements.txt", "utils/config.yaml", "utils/viz_templates/*"]}
+package-data = {biomaker = ["utils/config.yaml", "utils/viz_templates/*"]}
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]
-include = ["crea*"]
+include = ["biomaker*"]
 exclude = ["logs*", "workspaces*", "exp_summary*"]
 
 [tool.black]

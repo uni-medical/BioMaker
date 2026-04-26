@@ -1,12 +1,13 @@
 import os
 
+from dotenv import load_dotenv
 from openai import OpenAI
 
+load_dotenv()
 client = OpenAI()
 
 completion = client.chat.completions.create(
-    # model="gpt-4o-mini",
-    model="openai/gpt-4.1",
+    model=os.getenv("OPENAI_MODEL", "gpt-4o"),
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Write a haiku about recursion in programming."},

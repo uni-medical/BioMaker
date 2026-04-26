@@ -1,1 +1,0 @@
-- Use Rayleigh/Gamma-distributed speckle noise augmentation during training to improve ultrasound-specific robustness.

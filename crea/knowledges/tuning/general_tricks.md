@@ -1,5 +1,0 @@
-- Use a pretrained model (e.g., from `timm`) if none is applied.
-- Add early stopping to avoid relying only on the final checkpoint.
-- Use greedy-soup to average top checkpoints for better generalization.
-- Use AdamW/Adam for most models; use SGD with Nesterov momentum for CNNs and small models.
-- Use CosineAnnealingLR or OneCycleLR for smooth convergence; use ReduceLROnPlateau if training is unstable.

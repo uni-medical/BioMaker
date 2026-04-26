@@ -1,9 +1,0 @@
-- Pretrain models using self-supervised learning (e.g., masked image modeling) on large unlabeled medical datasets.
-- Freeze a large self-supervised foundation model and train a lightweight task-specific head (adapter) for efficiency.
-- Use classical U-Net or variants for most semantic segmentation tasks.
-- Use 3D network backbones (e.g., 3D U-Net) for MRI and volumetric medical imaging to capture spatial coherence.
-- Build multi-task models to share representations across tasks (e.g., segmentation + reconstruction).
-- Enable MC Dropout during inference to estimate uncertainty and flag uncertain predictions.
-- Use Diffusion Models or GANs to generate synthetic augmentation data for low-resource tasks.
-- Apply unrolled optimization networks for reconstruction (alternate learned regularization and data consistency).
-- Add data consistency loss when reconstructing images to constrain outputs to real k-space measurements.
