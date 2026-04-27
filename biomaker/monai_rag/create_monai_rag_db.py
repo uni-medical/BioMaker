@@ -95,9 +95,20 @@ def parse_installed_monai_docs() -> list[dict]:
             if not doc:
                 continue
             title = f"{module.__name__}.{name}"
+            details = [title]
+            try:
+                details.append(f"Signature: {name}{inspect.signature(obj)}")
+            except (TypeError, ValueError):
+                pass
+            details.append(doc)
+            try:
+                source = inspect.getsource(obj)
+                details.append(f"Source excerpt:\n{_clean_text(source)[:6000]}")
+            except (OSError, TypeError):
+                pass
             docs.append(
                 {
-                    "page_content": _clean_text(f"{title}\n\n{doc}"),
+                    "page_content": _clean_text("\n\n".join(details)),
                     "metadata": {
                         "source": "installed-monai",
                         "version": getattr(__import__("monai"), "__version__", ""),

@@ -74,19 +74,3 @@ class WorstMetricValue(MetricValue):
 
     def __str__(self):
         return super().__str__()
-
-
-@dataclass
-class ZeroMetricValue(MetricValue):
-    """
-    Represents an invalid metric value, e.g. when the agent creates a buggy solution.
-    Always compares worse than any valid metric value.
-    """
-
-    value: float = 0.0
-
-    def __repr__(self):
-        return super().__repr__()
-
-    def __str__(self):
-        return super().__str__()

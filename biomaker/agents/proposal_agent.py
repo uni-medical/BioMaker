@@ -1,9 +1,11 @@
+import json
 import logging
+import re
 from typing import Any, Callable
 
 import humanize
 
-from ..backend import query
+from ..backend import FunctionSpec, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
 from ..utils.config import Config
@@ -40,8 +42,91 @@ DEBUG_CODE_CHARS = 10000
 REFERENCE_CODE_CHARS = 5000
 IMPROVE_CODE_CHARS = 12000
 MEMORY_CHARS = 4500
-BRANCH_FACTS_CHARS = 2200
+BRANCH_FACTS_CHARS = 10000
+TOOL_OBSERVATION_TOTAL_CHARS = 12000
+TOOL_OBSERVATION_ENTRY_CHARS = 1600
+LOW_SIGNAL_API_SYMBOLS = {
+    "accuracy",
+    "auc",
+    "batch",
+    "check",
+    "class",
+    "code",
+    "compose",
+    "configuration",
+    "data",
+    "dataloader",
+    "dataset",
+    "dermdataset",
+    "false",
+    "file",
+    "filenotfounderror",
+    "image",
+    "label",
+    "memory",
+    "metric",
+    "none",
+    "path",
+    "prediction",
+    "preparation",
+    "result",
+    "runtimeerror",
+    "score",
+    "target",
+    "traceback",
+    "true",
+    "typeerror",
+    "valueerror",
+}
+ERROR_EVIDENCE_TERMS = {
+    "attributeerror",
+    "exception",
+    "importerror",
+    "modulenotfounderror",
+    "runtimeerror",
+    "signature",
+    "traceback",
+    "typeerror",
+    "unexpected keyword",
+    "valueerror",
+}
 
+tool_request_func_spec = FunctionSpec(
+    name="submit_tool_requests",
+    json_schema={
+        "type": "object",
+        "properties": {
+            "requests": {
+                "type": "array",
+                "description": "Optional information requests before final code generation. Return [] when the prompt already contains enough information.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {
+                            "type": "string",
+                            "enum": ["inspect_api", "search_docs", "web_search"],
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Brief reason this information is needed.",
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Search query for search_docs or web_search.",
+                        },
+                        "code": {
+                            "type": "string",
+                            "description": "Short read-only Python snippet for inspect_api.",
+                        },
+                    },
+                    "required": ["tool", "reason"],
+                },
+            }
+        },
+        "required": ["requests"],
+    },
+    description="Request optional tool observations before writing the final candidate code.",
+)
 
 class ProposalAgent(BaseAgent):
     def __init__(
@@ -55,14 +140,88 @@ class ProposalAgent(BaseAgent):
             "You are a medical deep learning grandmaster attending a competition. "
         )
         self.knowledge_base = None
-        self.external_knowledge_cache: dict[tuple[str, bool], str] = {}
 
     def _is_monai_query(self, query: str) -> bool:
         normalized = query.lower().replace(".", "").replace("_", "")
         return any(hint in normalized for hint in MONAI_QUERY_HINTS)
 
-    def _uses_monai_context(self, *texts: str | None) -> bool:
-        return any(self._is_monai_query(text or "") for text in texts)
+    def _extract_api_symbols(self, text: str, limit: int = 12) -> list[str]:
+        """Extract high-signal API/error identifiers for retrieval query construction."""
+        patterns = [
+            r"\b(?:monai|torch|torchvision|numpy|pandas|sklearn)(?:\.[A-Za-z_][A-Za-z0-9_]*)+",
+            r"\b__[A-Za-z0-9_]+__\b",
+            r"\b[A-Za-z_][A-Za-z0-9_]*\.py\b",
+            r"\b[A-Z][A-Za-z0-9_]*[a-z][A-Za-z0-9_]*\b",
+        ]
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for pattern in patterns:
+            for match in re.findall(pattern, text):
+                normalized = re.sub(r"[^a-z0-9]+", "", match.lower())
+                if (
+                    len(normalized) < 4
+                    or normalized in LOW_SIGNAL_API_SYMBOLS
+                    or normalized in seen
+                ):
+                    continue
+                seen.add(normalized)
+                symbols.append(match)
+                if len(symbols) >= limit:
+                    return symbols
+        return symbols
+
+    def _has_exact_api_reference(self, query: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:monai|torch|torchvision|numpy|pandas|sklearn)(?:\.[A-Za-z_][A-Za-z0-9_]*)+",
+                query,
+            )
+            or re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\.py\b", query)
+            or re.search(r"\b__[A-Za-z0-9_]+__\b", query)
+        )
+
+    def _is_monai_evidence_query(self, query: str) -> bool:
+        lowered = query.lower()
+        if not self._is_monai_query(query):
+            return False
+        if any(term in lowered for term in ERROR_EVIDENCE_TERMS):
+            return True
+        if self._has_exact_api_reference(query):
+            return True
+        return False
+
+    def _is_local_contract_query(self, query: str) -> bool:
+        lowered = query.lower()
+        return "evaluator" in lowered or "score_val" in lowered or "prediction_spec" in lowered
+
+    def _augment_doc_query(self, query: str, prompt: dict[str, Any] | None) -> str:
+        if prompt is None:
+            return query
+        context_parts = []
+        for key in [
+            "Previous (buggy) implementation",
+            "Previous solution",
+            "Best known solution",
+        ]:
+            if key in prompt:
+                context_parts.append(str(prompt[key]))
+        if "Execution output" in prompt:
+            relevant_lines = []
+            for line in str(prompt["Execution output"]).splitlines():
+                lowered = line.lower()
+                if (
+                    "monai" in lowered
+                    or "metatensor" in lowered
+                    or "runtimeerror" in lowered
+                    or "typeerror" in lowered
+                ):
+                    relevant_lines.append(line)
+            context_parts.append("\n".join(relevant_lines))
+        symbols = self._extract_api_symbols("\n".join(context_parts))
+        missing = [symbol for symbol in symbols if symbol.lower() not in query.lower()]
+        if not missing:
+            return query
+        return f"{query}\nRelevant exact identifiers from current context: {' '.join(missing)}"
 
     def _wrap_code_context(self, code: str, max_chars: int) -> str:
         return wrap_code(
@@ -111,56 +270,277 @@ class ProposalAgent(BaseAgent):
         logger.debug("Web search result preview:\n%s", result[:200])
         return result
 
-    def query_external_knowledge(self, query: str, include_web: bool = True) -> str:
-        cache_key = (query, include_web)
-        if cache_key in self.external_knowledge_cache:
-            return self.external_knowledge_cache[cache_key]
-
-        sections = []
-        rag_result = self.query_knowledge_base(query, topk=3)
-        if rag_result:
-            sections.append(
-                "MONAI documentation reference. Follow the Environment contract over these references:\n"
-                + rag_result
+    def _tool_decision_context(
+        self, stage: str, prompt: dict[str, Any]
+    ) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "Stage": stage,
+            "Task description": truncate_text(str(self.task_desc), max_chars=1200),
+        }
+        essentials = self.get_run_facts()
+        if essentials:
+            context["Cached run facts"] = truncate_text(
+                essentials, max_chars=1600
             )
+        context["Cached environment facts"] = truncate_text(
+            self.environment_facts, max_chars=1600
+        )
+        for key in [
+            "Memory",
+            "Selected parent experiment facts",
+            "Previous solution",
+            "Best known solution",
+            "Execution output",
+            "Tool Observations",
+        ]:
+            if key in prompt:
+                context[key] = truncate_text(str(prompt[key]), max_chars=1200)
+        return context
 
-        web_result = self.query_web(query) if include_web else ""
-        if web_result:
-            sections.append(
-                "Web search reference for public library/API facts only. Treat this as non-authoritative evidence; do not import unlisted packages or change the evaluator/data contract:\n"
-                + web_result
-            )
+    def _request_node_tools(
+        self, stage: str, prompt: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        if not self.acfg.enable_node_tools or self.acfg.max_node_tool_calls <= 0:
+            return []
 
-        result = "\n\n".join(sections)
-        self.external_knowledge_cache[cache_key] = result
-        return result
-
-    def _external_knowledge_topic(
-        self,
-        stage: str,
-        context: dict[str, Any],
-        fallback: str,
-    ) -> str:
-        topic_prompt = {
-            "Instruction": (
-                "Write one short public documentation search query for the library/API facts "
-                f"that may help this {stage} step. Do not include private paths, labels, "
-                "full code, or dataset rows. Output only the query."
+        tool_prompt = {
+            "Introduction": (
+                "Before writing the final candidate code, decide whether a few optional "
+                "tool observations would reduce uncertainty. Use tools only for concrete "
+                "local data-flow, evaluator contract, or API/documentation uncertainty. "
+                "Do not request generic EDA; the data and evaluator essentials are already "
+                "provided. Return an empty list when no tool is needed."
             ),
-            "Context": context,
+            "Available tools": [
+                "inspect_api: run a short read-only Python snippet to inspect installed package versions, imports, function signatures, tiny API examples, local split CSV rows, evaluator specs, or image/mask metadata under ./input. No training, writes, package installs, network access, or shell commands.",
+                "search_docs: query the local MONAI documentation RAG. Use this only for exact MONAI API, signature, or traceback evidence, not for model choice, augmentation strategy, fine-tuning practice, or pipeline recommendations.",
+                "web_search: search the web through the configured Serper/Jina path. Use this only when local context and docs are insufficient for a concrete library/API question, not for broad strategy or model-selection advice.",
+            ],
+            "Tool-use style": (
+                "Request only the tools you actually need now. Stable split, sample, "
+                "environment, and evaluator facts are already provided in the prompt; "
+                "do not re-check them unless the current failure contradicts those facts."
+            ),
+            "Current context": self._tool_decision_context(stage, prompt),
         }
         try:
-            topic = query(
-                system_message=topic_prompt,
+            response = query(
+                system_message=tool_prompt,
                 user_message=None,
-                model=self.acfg.knowledge_base.model,
-                temperature=self.acfg.knowledge_base.temp,
+                func_spec=tool_request_func_spec,
+                model=self.acfg.code.model,
+                temperature=0.0,
             )
-            topic = str(topic).strip()
         except Exception as exc:
-            logger.warning("Failed to generate external knowledge topic: %s", exc)
-            topic = ""
-        return topic or fallback
+            logger.warning("Node tool request failed: %s", exc)
+            return []
+        if not isinstance(response, dict):
+            return []
+        requests = response.get("requests", [])
+        if not isinstance(requests, list):
+            return []
+        return [request for request in requests if isinstance(request, dict)]
+
+    def _execute_node_tool(
+        self, request: dict[str, Any], prompt: dict[str, Any] | None = None
+    ) -> str:
+        tool = str(request.get("tool", "")).strip()
+        if tool == "inspect_api":
+            code = str(request.get("code") or "").strip()
+            if not code:
+                return "ToolError: inspect_api requires a short Python snippet in `code`."
+            from ..tools import python_probe
+
+            return python_probe(code, cwd=self.cfg.workspace_dir)
+
+        query_text = str(request.get("query") or "").strip()
+        if not query_text:
+            return f"ToolError: {tool} requires a concrete `query`."
+        if tool == "search_docs":
+            if self._is_local_contract_query(query_text):
+                return (
+                    "ToolSkipped: evaluator and prediction-contract questions are "
+                    "local workspace facts; use the provided evaluator contract or "
+                    "inspect_api, not MONAI documentation RAG."
+                )
+            if not self._is_monai_evidence_query(query_text):
+                return (
+                    "ToolSkipped: MONAI documentation RAG is reserved for concrete "
+                    "MONAI API, signature, or traceback evidence. Use exact names such as "
+                    "`monai.transforms.RandRotate` when a MONAI documentation lookup is needed."
+                )
+            query_text = self._augment_doc_query(query_text, prompt)
+            result = self.query_knowledge_base(query_text, topk=3)
+            return result or "No local documentation result was returned."
+        if tool == "web_search":
+            if self._is_local_contract_query(query_text):
+                return (
+                    "ToolSkipped: evaluator and prediction-contract questions are "
+                    "local workspace facts; use the provided evaluator contract or "
+                    "inspect_api, not web search."
+                )
+            result = self.query_web(query_text)
+            return result or "No web result was returned or web search is disabled."
+        return f"ToolError: unknown tool `{tool}`."
+
+    def _write_tool_trace(self, record: dict[str, Any]) -> None:
+        trace_path = self.cfg.log_dir / "tool_traces.jsonl"
+        try:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with trace_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:
+            logger.debug("Failed to write tool trace: %s", exc)
+
+    def _tool_signal_score(self, record: dict[str, Any]) -> float:
+        result = str(record.get("result", ""))
+        lowered = result.lower()
+        score = 0.0
+        if record.get("tool") == "inspect_api":
+            score += 3.0
+        if "exit_code=0" in lowered:
+            score += 1.0
+        if "signature" in lowered or "inspect.signature" in str(
+            record.get("code", "")
+        ):
+            score += 3.0
+        if "__version__" in str(record.get("code", "")) or "version" in lowered:
+            score += 1.0
+        if "traceback" in lowered or "error" in lowered or "exception" in lowered:
+            score += 2.0
+        if "url:" in lowered or "http://" in lowered or "https://" in lowered:
+            score += 1.5
+        if "no local documentation result" in lowered or "no web result" in lowered:
+            score -= 1.0
+        return score
+
+    def _format_tool_record(self, record: dict[str, Any]) -> str:
+        code = str(record.get("code") or "")
+        query_text = str(record.get("query") or "")
+        parts = [
+            f"## Tool request {record.get('call_index')}",
+            f"tool: {record.get('tool')}",
+            f"reason: {truncate_text(str(record.get('reason', '')), max_chars=300)}",
+        ]
+        if query_text:
+            parts.append(f"query: {truncate_text(query_text, max_chars=300)}")
+        if code:
+            parts.extend(
+                [
+                    "code:",
+                    wrap_code(
+                        truncate_text(
+                            code,
+                            max_chars=900,
+                            marker="probe code trimmed",
+                        ),
+                        lang="python",
+                    ),
+                ]
+            )
+        parts.extend(
+            [
+                "observation:",
+                truncate_text(
+                    str(record.get("result", "")),
+                    max_chars=TOOL_OBSERVATION_ENTRY_CHARS,
+                    marker="tool observation trimmed",
+                ),
+            ]
+        )
+        return "\n".join(parts)
+
+    def _compact_tool_observations(self, records: list[dict[str, Any]]) -> str:
+        if not records:
+            return ""
+
+        formatted = [(record, self._format_tool_record(record)) for record in records]
+        all_text = "\n\n".join(text for _, text in formatted)
+        if len(all_text) <= TOOL_OBSERVATION_TOTAL_CHARS:
+            return all_text
+
+        ranked_records = sorted(
+            records,
+            key=lambda record: (
+                self._tool_signal_score(record),
+                int(record.get("call_index", 0)),
+            ),
+            reverse=True,
+        )
+        selected: list[dict[str, Any]] = []
+        used = 0
+        for record in ranked_records:
+            text = self._format_tool_record(record)
+            if used + len(text) + 2 > TOOL_OBSERVATION_TOTAL_CHARS:
+                continue
+            selected.append(record)
+            used += len(text) + 2
+        selected.sort(key=lambda record: int(record.get("call_index", 0)))
+        omitted = len(records) - len(selected)
+        header = (
+            f"Tool observations are compacted by signal; full raw results are saved in "
+            f"`{self.cfg.log_dir / 'tool_traces.jsonl'}`."
+        )
+        if omitted > 0:
+            header += f" Omitted {omitted} lower-signal observation(s) from prompt."
+        return header + "\n\n" + "\n\n".join(
+            self._format_tool_record(record) for record in selected
+        )
+
+    def attach_node_tool_observations(self, stage: str, prompt: dict[str, Any]) -> None:
+        records: list[dict[str, Any]] = []
+        seen_requests: set[tuple[str, str, str]] = set()
+        call_count = 0
+        max_calls = max(1, int(self.acfg.max_node_tool_calls))
+        requests = self._request_node_tools(stage, prompt)
+        for request in requests:
+            tool_name = str(request.get("tool", ""))
+            request_key = (
+                tool_name,
+                (
+                    ""
+                    if tool_name == "inspect_api"
+                    else str(request.get("query", "")).strip()
+                ),
+                str(request.get("code", "")).strip(),
+            )
+            if request_key in seen_requests:
+                continue
+            seen_requests.add(request_key)
+            if call_count >= max_calls:
+                records.append(
+                    {
+                        "stage": stage,
+                        "call_index": call_count + 1,
+                        "tool": "budget",
+                        "reason": "Configured safety budget reached.",
+                        "query": "",
+                        "code": "",
+                        "result": "NodeToolBudget: stopped tool use after the configured safety budget.",
+                    }
+                )
+                break
+            call_count += 1
+            result = self._execute_node_tool(request, prompt=prompt)
+            record = {
+                "stage": stage,
+                "call_index": call_count,
+                "tool": request.get("tool"),
+                "reason": request.get("reason", ""),
+                "query": (
+                    self._augment_doc_query(str(request.get("query", "")), prompt)
+                    if request.get("tool") == "search_docs"
+                    else request.get("query", "")
+                ),
+                "code": request.get("code", ""),
+                "result": result,
+            }
+            records.append(record)
+            self._write_tool_trace(record)
+
+        if records:
+            logger.debug("Attached %d node tool observation(s)", call_count)
+            prompt["Tool Observations"] = self._compact_tool_observations(records)
 
     def _draft(self) -> Node:
         prompt: Any = {
@@ -183,7 +563,7 @@ class ProposalAgent(BaseAgent):
                 "Use the frozen evaluator as the source of truth for validation scoring.",
                 "Don't suggest to do EDA.",
                 "The data is already prepared and available in the `./input` directory. There is no need to unzip any files.",
-                "Check the data preview of `./input` directory carefully, and make sure the correct Dataset and DataLoader is created.",
+                "Check the data preview of `./input` directory carefully, and make sure the data loading and batching logic matches the actual files.",
                 "Keep the first solution cheap; one epoch is enough to validate the workflow.",
                 "If the dataset is large, use a small representative training subset for the first draft so the full workflow finishes quickly.",
             ],
@@ -193,23 +573,14 @@ class ProposalAgent(BaseAgent):
 
         self.attach_data_overview(prompt, max_chars=DRAFT_DATA_OVERVIEW_CHARS)
 
-        if self.acfg.force_monai_with_prompt:
-            dependent_knowledge = self.query_external_knowledge(
-                "MONAI official documentation ImageDataset transforms DenseNet 2D classification",
-                include_web=True,
-            )
-            if dependent_knowledge:
-                prompt["Dependent Knowledge"] = dependent_knowledge
-
+        self.attach_node_tool_observations("draft", prompt)
         plan, code = self.plan_and_code_query(prompt)
         return Node(plan=plan, code=code)
 
     def _debug(self, parent_node: Node) -> Node:
-        reference_node = (
-            parent_node.parent
-            if parent_node.parent is not None and parent_node.parent.is_buggy is False
-            else self.journal.get_best_node(only_good=True, topk=1)
-        )
+        reference_node = self.journal.get_nearest_successful_ancestor(parent_node)
+        if reference_node is None:
+            reference_node = self.journal.get_best_node(only_good=True, topk=1)
         prompt: Any = {
             "Introduction": (
                 self.profile
@@ -222,6 +593,7 @@ class ProposalAgent(BaseAgent):
                 parent_node.code, max_chars=DEBUG_CODE_CHARS
             ),
             "Execution output": wrap_code(parent_node.term_out, lang=""),
+            "Debug memory": self.journal.generate_debug_summary(parent_node),
             "Instructions": {},
         }
         if reference_node is not None:
@@ -244,37 +616,13 @@ class ProposalAgent(BaseAgent):
                 ),
             }
 
-        if self.acfg.enable_monai_knowledge_base or self.acfg.enable_web_search:
-            topic_of_knowledge_for_debug = self._external_knowledge_topic(
-                stage="debug",
-                context={
-                    "Task": truncate_text(str(self.task_desc), max_chars=700),
-                    "Buggy plan": truncate_text(str(parent_node.plan), max_chars=500),
-                    "Error type": parent_node.exc_type,
-                    "Execution output excerpt": truncate_text(
-                        parent_node.term_out, max_chars=1400
-                    ),
-                },
-                fallback=(
-                    f"{parent_node.exc_type or 'Python error'} "
-                    f"{truncate_text(parent_node.term_out, max_chars=300)}"
-                ),
-            )
-            dependent_knowledge = self.query_external_knowledge(
-                str(topic_of_knowledge_for_debug),
-                include_web=True,
-            )
-            if dependent_knowledge:
-                prompt["Dependent Knowledge"] = dependent_knowledge
-
         prompt["Instructions"] |= self._prompt_resp_fmt
         prompt["Instructions"] |= {
             "Bugfix improvement sketch guideline": [
                 "You should write a brief natural language description (3-5 sentences) of how the issue in the previous implementation can be fixed.",
                 "Preserve the proposed method as much as possible; this is a code/debug step, not a new modeling strategy step.",
                 "Don't suggest to do EDA.",
-                "Keep the debugged solution cheap; fix the bug without increasing the training budget.",
-                "If the previous solution was too slow, use a smaller training subset, smaller images, smaller model, or larger batch size to validate the workflow first.",
+                "Use the execution output and resource facts to fix the observed bug; change training budget only if it is necessary for the fix and state that in the sketch.",
                 "If the execution output contains DependencyPolicyError, remove the unavailable import or package-manager call and replace it with Python standard library or allowed packages.",
                 "If the error is due to missing packages (ImportError/ModuleNotFoundError), DO NOT attempt to install. Instead, replace the missing package with an alternative approach using available packages.",
             ],
@@ -288,6 +636,7 @@ class ProposalAgent(BaseAgent):
             essentials_first=True,
         )
 
+        self.attach_node_tool_observations("debug", prompt)
         plan, code = self.plan_and_code_query(prompt)
         return Node(plan=plan, code=code, parent=parent_node)
 
@@ -297,7 +646,6 @@ class ProposalAgent(BaseAgent):
             "Introduction": (
                 self.profile + "You are provided with a previously developed "
                 "solution below and should improve it in order to further increase the validation metric. "
-                "Prefer small, evidence-driven changes over adding model complexity by default. "
                 "For this you should first outline a brief plan in natural language for how the solution can be improved and "
                 "then implement this improvement in Python based on the provided previous solution. "
             ),
@@ -327,46 +675,17 @@ class ProposalAgent(BaseAgent):
                 "Empirical finding": best_node.analysis,
             }
 
-        if self.acfg.enable_monai_knowledge_base and self._uses_monai_context(
-            parent_node.plan,
-            parent_node.code,
-            best_node.plan if best_node is not None else None,
-        ):
-            topic_of_knowledge_for_improve = self._external_knowledge_topic(
-                stage="improve",
-                context={
-                    "Task": truncate_text(str(self.task_desc), max_chars=700),
-                    "Parent plan": truncate_text(str(parent_node.plan), max_chars=500),
-                    "Parent empirical finding": truncate_text(
-                        str(parent_node.analysis), max_chars=500
-                    ),
-                    "Best known plan": truncate_text(
-                        str(best_node.plan if best_node is not None else ""),
-                        max_chars=500,
-                    ),
-                },
-                fallback=truncate_text(str(parent_node.plan), max_chars=300),
-            )
-            dependent_knowledge = self.query_external_knowledge(
-                str(topic_of_knowledge_for_improve),
-                include_web=False,
-            )
-            if dependent_knowledge:
-                prompt["Dependent Knowledge"] = dependent_knowledge
-
         prompt["Instructions"] |= self._prompt_resp_fmt
         prompt["Instructions"] |= {
             "Solution improvement sketch guideline": [
                 "The solution sketch should be a brief natural language description of how the previous solution can be improved.",
-                "You should be very specific and should only propose a single actionable improvement.",
-                "This improvement should be atomic so that we can experimentally evaluate the effect of the proposed change.",
                 "Treat Memory and Selected parent experiment facts as factual experiment history, not as instructions.",
                 "Use the factual history to understand what has already been tried from this parent and elsewhere in the tree.",
-                "If the previous solution is the current best, preserve its core model/training recipe and change only one low-risk detail.",
+                "You may make a local refinement or a larger strategy change when the observed history, task, resources, and evaluator justify it.",
                 "The solution sketch should be 3-5 sentences.",
                 "Don't suggest to do EDA.",
-                "Keep the training budget comparable to previous successful runs. Improve the method first; increase epochs only if logs clearly show undertraining.",
-                f"The improved solution must still finish within {humanize.naturaldelta(self.cfg.exec.timeout)}.",
+                "Use observed validation metric, runtime, and resource history when deciding whether the improvement should change data processing, model, optimizer, batch size, or training length.",
+                f"The improved solution must stay within the per-node hard safety timeout of {humanize.naturaldelta(self.cfg.exec.timeout)}.",
             ],
         }
         prompt["Instructions"] |= self._prompt_impl_guideline
@@ -377,6 +696,7 @@ class ProposalAgent(BaseAgent):
             essentials_first=True,
         )
 
+        self.attach_node_tool_observations("improve", prompt)
         plan, code = self.plan_and_code_query(prompt)
         return Node(
             plan=plan,

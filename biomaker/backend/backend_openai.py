@@ -2,8 +2,10 @@
 
 import json
 import logging
+import re
 import time
 
+import jsonschema
 import openai
 from funcy import notnone, once, select_values
 
@@ -20,6 +22,37 @@ OPENAI_TIMEOUT_EXCEPTIONS = (
     openai.APITimeoutError,
     openai.InternalServerError,
 )
+
+
+def _supports_openai_tool_choice(model_name: str) -> bool:
+    return not model_name.startswith("deepseek")
+
+
+def _append_json_fallback_instruction(
+    system_message: str | None, func_spec: FunctionSpec
+) -> str:
+    instruction = (
+        "\n\nYou must return exactly one raw JSON object and no markdown. "
+        f"The JSON object must satisfy this schema for `{func_spec.name}`:\n"
+        + json.dumps(func_spec.json_schema, ensure_ascii=False, indent=2)
+    )
+    return (system_message or "") + instruction
+
+
+def _parse_json_object(text: str, func_spec: FunctionSpec) -> dict:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        if start < 0:
+            raise
+        data, _ = json.JSONDecoder().raw_decode(stripped[start:])
+    jsonschema.validate(data, func_spec.json_schema)
+    return data
 
 
 @once
@@ -46,11 +79,16 @@ def query(
 
     messages = opt_messages_to_list(system_message, user_message)
 
-    if func_spec is not None:
-        # Only check function call support for feedback/search operations
-        if func_spec.name == "submit_review":
-            filtered_kwargs["tools"] = [func_spec.as_openai_tool_dict]
-            filtered_kwargs["tool_choice"] = func_spec.openai_tool_choice_dict
+    use_tool_call = func_spec is not None and _supports_openai_tool_choice(model_name)
+    if func_spec is not None and not use_tool_call:
+        messages = opt_messages_to_list(
+            _append_json_fallback_instruction(system_message, func_spec),
+            user_message,
+        )
+
+    if func_spec is not None and use_tool_call:
+        filtered_kwargs["tools"] = [func_spec.as_openai_tool_dict]
+        filtered_kwargs["tool_choice"] = func_spec.openai_tool_choice_dict
 
     t0 = time.time()
     completion = backoff_create(
@@ -63,8 +101,10 @@ def query(
 
     choice = completion.choices[0]
 
-    if func_spec is None or "tools" not in filtered_kwargs:
+    if func_spec is None:
         output = choice.message.content
+    elif not use_tool_call:
+        output = _parse_json_object(choice.message.content or "", func_spec)
     else:
         tool_calls = getattr(choice.message, "tool_calls", None)
 

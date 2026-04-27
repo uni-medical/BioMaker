@@ -13,7 +13,6 @@ from ..utils.config import Config
 from ..utils.evaluator_setup import parse_external_validation
 from ..utils.environment import environment_manifest_text
 from ..utils.metric import MetricValue, WorstMetricValue
-from ..utils.package_cards import package_cards_text
 from ..utils.response import (
     extract_code,
     extract_text_up_to_code,
@@ -23,6 +22,7 @@ from ..utils.response import (
 
 logger = logging.getLogger("biomaker")
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
+FEEDBACK_CODE_CHARS = 6000
 
 review_func_spec = FunctionSpec(
     name="submit_review",
@@ -35,7 +35,7 @@ review_func_spec = FunctionSpec(
             },
             "summary": {
                 "type": "string",
-                "description": "if there is a bug, propose a fix. Otherwise, write a short summary (2-3 sentences) describing the empirical findings.",
+                "description": "If there is a bug, write one concise factual sentence naming where execution failed and the direct cause; do not propose a fix. Otherwise, write 2-3 concise sentences describing the metric, runtime/resource facts when relevant, and the empirical finding.",
             },
             "metric": {
                 "type": ["number", "null"],
@@ -65,6 +65,10 @@ class BaseAgent:
         self.acfg = cfg.agent
         self.journal = journal
         self.data_preview: str | None = None
+        self.run_facts: str | None = None
+        self.environment_facts = environment_manifest_text(
+            include_medical=self.cfg.exec.include_medical_packages
+        )
         self.profile = "You are a helpful assistance. "
 
     def has_empty_journal(self) -> bool:
@@ -139,17 +143,7 @@ class BaseAgent:
 
     @property
     def _prompt_environment(self):
-        is_medical_code_lib_enabled = (
-            self.acfg.force_monai_with_prompt or self.cfg.exec.include_medical_packages
-        )
-        return {
-            "Environment contract": environment_manifest_text(
-                include_medical=is_medical_code_lib_enabled
-            ),
-            "Package usage cards": package_cards_text(
-                include_medical=is_medical_code_lib_enabled
-            ),
-        }
+        return {"Environment contract": self.environment_facts}
 
     @property
     def _prompt_impl_guideline(self):
@@ -158,27 +152,17 @@ class BaseAgent:
             "The code should be a single-file python program that is self-contained and can be executed as-is.",
             "No parts of the code should be skipped. Do not terminate before finishing the script.",
             "Your response should contain a brief plan followed by exactly one Python code block.",
+            "If you use PyTorch, the code must run on CPU, CUDA, and Apple MPS by selecting the available device dynamically; do not hard-code CUDA or MPS-only execution.",
             "Do not import unlisted third-party packages, and do not install packages.",
             "You may use pretrained model weights from installed libraries when useful, including downloading those weights at runtime. Do not install packages or modify the uv environment.",
-            "Keep training budgets comparable while exploring. Do not use more epochs as the default improvement; increase epochs only if logs clearly show undertraining.",
-            f"Be aware of the running time of the code, it should complete within {humanize.naturaldelta(self.cfg.exec.timeout)}.",
+            "Use observed validation metric, runtime, and resource history when deciding training budget; if you change the budget, make it an explicit part of the proposed experiment.",
+            f"The per-node execution timeout is a hard safety limit of {humanize.naturaldelta(self.cfg.exec.timeout)}, not a target budget. Choose the experiment scale from the task, data, observed validation metric, runtime, and resource history.",
             'All the provided input data is stored in "./input" directory.',
-            "When building the Dataset, it should be based on the actual existing data files, rather than relying entirely on the annotation file.",
+            "When building data loading code, base it on the actual existing data files rather than relying entirely on the annotation file.",
             "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` for validation predictions and `./working/submission.csv`.",
             "BioMaker computes the final node score after your script exits by calling `evaluator.score_val()` with no arguments. You may call `evaluator.score_val()` or `evaluator.validate_submission()` yourself only after writing the required files.",
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
         ]
-        if self.acfg.force_monai_with_prompt:
-            impl_guideline.append(
-                "Prefer MONAI only where it directly simplifies the medical imaging implementation. "
-                "For simple image classification with `monai.data.ImageDataset`, use array transforms such as "
-                "`EnsureChannelFirst`, `Resize`, `ScaleIntensity`, and `ToTensor`. "
-                "Use dictionary transforms such as `LoadImaged`, `EnsureChannelFirstd`, `Resized`, "
-                "`RandFlipd`, or `RandRotate90d` only when the dataset items are dictionaries. "
-                "For networks, select small appropriate models from `monai.networks.nets` when useful "
-                "(for example DenseNet for classification or UNet for segmentation), and keep the evaluator "
-                "artifact contract unchanged."
-            )
         if self.acfg.expose_prediction:
             impl_guideline.append(
                 "The implementation should include a predict() function, "
@@ -227,6 +211,13 @@ class BaseAgent:
 
     def update_data_preview(self):
         self.data_preview = data_preview.generate(self.cfg.workspace_dir)
+        self.run_facts = data_preview.biomaker_essentials(self.cfg.workspace_dir)
+
+    def get_run_facts(self) -> str:
+        """Return deterministic task facts that should be stable for the whole run."""
+        if self.run_facts is None:
+            self.run_facts = data_preview.biomaker_essentials(self.cfg.workspace_dir)
+        return self.run_facts
 
     def attach_data_overview(
         self,
@@ -237,7 +228,7 @@ class BaseAgent:
         if self.acfg.data_preview and self.data_preview:
             overview = self.data_preview
             if essentials_first and max_chars is not None:
-                essentials = data_preview.biomaker_essentials(self.cfg.workspace_dir)
+                essentials = self.get_run_facts()
                 if essentials:
                     remaining = max_chars - len(essentials) - 80
                     if remaining > 300:
@@ -274,10 +265,24 @@ class BaseAgent:
                 self.profile
                 + "You have written code to solve this task and now need to evaluate the output of the code execution. "
                 "You should determine if there were any bugs and summarize the empirical findings. "
-                "If a line beginning with BioMakerExternalValidation is present, it is the authoritative validation score."
+                "If a line beginning with BioMakerExternalValidation is present, it is the authoritative validation score. "
+                "For failed runs, the summary should be a factual failure note only, not repair advice."
             ),
             "Task description": self.task_desc,
-            "Implementation": wrap_code(node.code),
+            "Execution facts": {
+                "exception_type": node.exc_type,
+                "exception_info": node.exc_info,
+                "execution_time_seconds": node.exec_time,
+                "resource_usage": node.resource_usage,
+                "authoritative_external_metric": external_metric,
+            },
+            "Implementation excerpt": wrap_code(
+                truncate_text(
+                    node.code,
+                    max_chars=FEEDBACK_CODE_CHARS,
+                    marker="feedback code excerpt trimmed",
+                )
+            ),
             "Execution output": wrap_code(node.term_out, lang=""),
         }
 

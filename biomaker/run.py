@@ -2,6 +2,7 @@ import atexit
 import json
 import logging
 import shutil
+import time
 
 from omegaconf import OmegaConf
 from rich.text import Text
@@ -137,7 +138,7 @@ def run():
         "Strictly follow `evaluator.prediction_spec()` for validation predictions and test submission. "
         "BioMaker computes the final node score after your script exits via no-argument `evaluator.score_val()`. "
         "Key columns in prediction artifacts must exactly match the split CSV values. "
-        "If a DataLoader returns key values as tensors, convert them to ordinary Python scalars with `.item()` or read the key column directly from the dataframe; never write values such as `tensor(1)`. "
+        "If a framework returns key values as tensors or arrays, convert them to ordinary Python scalars or read the key column directly from the source table; never write serialized framework objects such as `tensor(1)`. "
         "Classification probability columns must be complete softmax probabilities for every class and each row must sum to 1; do not fill missing rows with zeros. "
         f"Prediction spec: {prepared_evaluator.prediction_spec}"
     )
@@ -163,6 +164,7 @@ def run():
 
     def exec_callback(*args, **kwargs):
         logger.info(Text("Executing code...", style="magenta"))
+        node_start_time = time.monotonic()
         clean_candidate_outputs(cfg.workspace_dir)
         res = interpreter.run(*args, **kwargs)
         if res.exc_type is None:
@@ -192,6 +194,7 @@ def run():
                     "\nEvaluatorValidationError: "
                     + (evaluator_result.error or "external evaluator failed")
                 )
+        res.exec_time = time.monotonic() - node_start_time
         logger.info(Text("Execution done.", style="magenta"))
         return res
 

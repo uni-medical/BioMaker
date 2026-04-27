@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import humanize
+import numpy as np
 import pandas as pd
 from genson import SchemaBuilder
 from pandas.api.types import is_numeric_dtype
@@ -40,6 +41,71 @@ def _load_json_file(path: Path):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _image_observation(path_value: object) -> dict | None:
+    if not isinstance(path_value, str) or not path_value.strip():
+        return None
+    path = Path(path_value)
+    if not path.is_file():
+        return {"path": path_value, "exists": False}
+    try:
+        with Image.open(path) as img:
+            arr = np.asarray(img)
+            info = {
+                "path": path_value,
+                "exists": True,
+                "pil_mode": img.mode,
+                "pil_size": list(img.size),
+                "array_shape": list(arr.shape),
+                "array_dtype": str(arr.dtype),
+            }
+            if arr.size:
+                info["min"] = int(np.min(arr))
+                info["max"] = int(np.max(arr))
+                unique = np.unique(arr)
+                info["unique_count"] = int(len(unique))
+                if len(unique) <= 12:
+                    info["unique_values"] = [int(v) for v in unique.tolist()]
+                else:
+                    info["unique_sample"] = [int(v) for v in unique[:12].tolist()]
+            return info
+    except Exception as exc:
+        return {"path": path_value, "exists": True, "error": str(exc)}
+
+
+def _segmentation_sample_facts(split_dir: Path) -> str:
+    train_path = split_dir / "agent_train.csv"
+    if not train_path.is_file():
+        return ""
+    try:
+        train_df = pd.read_csv(train_path)
+    except Exception:
+        return ""
+    if train_df.empty or "mask_path" not in train_df.columns:
+        return ""
+
+    image_column = next(
+        (column for column in ["image_path", "path", "file_path"] if column in train_df.columns),
+        None,
+    )
+    if image_column is None:
+        return ""
+
+    row = train_df.iloc[0]
+    facts = {
+        "source": "./input/biomaker_splits/agent_train.csv first row",
+        "image_column": image_column,
+        "mask_column": "mask_path",
+        "image": _image_observation(row[image_column]),
+        "mask": _image_observation(row["mask_path"]),
+    }
+    return (
+        "Observed segmentation sample facts:\n"
+        + "```json\n"
+        + _compact_json(facts, max_chars=1800)
+        + "\n```"
+    )
 
 
 def _csv_schema_line(path: Path, base_path: Path) -> str | None:
@@ -114,6 +180,10 @@ def biomaker_essentials(base_path: Path) -> str:
     if target_lines:
         lines.append("Visible target summary:")
         lines.extend(target_lines)
+
+    segmentation_facts = _segmentation_sample_facts(split_dir)
+    if segmentation_facts:
+        lines.append(segmentation_facts)
 
     spec_path = base_path / "evaluator_prediction_spec.json"
     spec = _load_json_file(spec_path)

@@ -18,7 +18,6 @@ import pandas as pd
 from .. import backend
 from . import data_preview
 from .environment import environment_manifest_text, validate_code_environment
-from .package_cards import package_cards_text
 from .response import extract_code
 
 logger = logging.getLogger("biomaker")
@@ -91,6 +90,63 @@ def _task_payload(task_desc: Any) -> str:
     return json.dumps(task_desc, indent=2, ensure_ascii=False, default=str)
 
 
+def _artifact_contract_facts(workspace_dir: Path) -> dict[str, Any]:
+    split_dir = workspace_dir / "input" / "biomaker_splits"
+    val_path = split_dir / "agent_val.csv"
+    test_path = split_dir / "agent_test.csv"
+    if not val_path.is_file() or not test_path.is_file():
+        return {}
+
+    try:
+        val_df = pd.read_csv(val_path, nrows=3)
+        test_df = pd.read_csv(test_path, nrows=3)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    val_columns = list(val_df.columns)
+    test_columns = list(test_df.columns)
+    test_set = set(test_columns)
+    label_tokens = {
+        "annotation",
+        "class",
+        "diagnosis",
+        "finding",
+        "grade",
+        "ground_truth",
+        "gt",
+        "instance",
+        "label",
+        "mask",
+        "target",
+        "y",
+    }
+    ground_truth_only = []
+    for column in val_columns:
+        normalized = column.lower()
+        if column not in test_set or any(token in normalized for token in label_tokens):
+            if column not in test_set or column not in {"image_path", "path", "file_path"}:
+                ground_truth_only.append(column)
+
+    common_columns = [column for column in val_columns if column in test_set]
+    likely_key_columns = [
+        column
+        for column in common_columns
+        if not any(token in column.lower() for token in ["path", "image", "mask"])
+    ]
+
+    return {
+        "agent_val_columns": val_columns,
+        "agent_test_columns": test_columns,
+        "ground_truth_only_columns": ground_truth_only,
+        "likely_key_columns": likely_key_columns,
+        "note": (
+            "Candidate artifacts may use key columns and new prediction columns only. "
+            "Columns listed as ground_truth_only_columns must be loaded from agent_val.csv "
+            "inside score_val(), not required from candidate validation/test artifacts."
+        ),
+    }
+
+
 def _evaluator_prompt(task_desc: Any, workspace_dir: Path) -> dict[str, Any]:
     return {
         "Introduction": (
@@ -101,8 +157,8 @@ def _evaluator_prompt(task_desc: Any, workspace_dir: Path) -> dict[str, Any]:
         ),
         "Task description": _task_payload(task_desc),
         "Data overview": data_preview.generate(workspace_dir),
+        "Observed artifact contract facts": _artifact_contract_facts(workspace_dir),
         "Environment contract": environment_manifest_text(include_medical=True),
-        "Package usage cards": package_cards_text(include_medical=True),
         "Evaluator requirements": [
             "Write exactly one Python file.",
             "Use only Python standard library and allowed installed packages.",
@@ -114,6 +170,8 @@ def _evaluator_prompt(task_desc: Any, workspace_dir: Path) -> dict[str, Any]:
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
             "The candidate validation artifact must follow the same public prediction contract as the test submission: key_columns plus prediction_columns only. Do not require candidates to output validation ground-truth columns such as label, class, target, or true_class. score_val() must load validation labels from ./input/biomaker_splits/agent_val.csv and align them to the validation artifact by key columns.",
             "When reading candidate artifacts, validate the required columns and then restrict the dataframe to key_columns plus prediction_columns before merging with ground truth. Extra candidate columns such as class, label, target, or true_class must not collide with ground-truth columns or change scoring.",
+            "For tabular score_val(), use this safe merge pattern: copy the ground-truth label column to a private column named `__y_true`, build `truth_view = agent_val[key_columns + ['__y_true']]`, build `pred_view = predictions[key_columns + prediction_columns]`, convert every key column in both views to string before merging, merge those restricted views only, and read labels from `merged['__y_true']`. Never read `merged['class']`, `merged['label']`, `merged['target']`, or candidate-supplied label-like columns after merge.",
+            "For tabular validate_submission(), apply the same key-column string normalization and restrict submission data to key_columns plus prediction_columns before checking duplicates, missing keys, or shapes.",
             "For probability outputs, include class_labels when prediction_columns do not directly encode class names; for single-column binary probability outputs, include positive_class.",
             "The submission contract must preserve enough information for the requested user-only test metrics. For classification with AUC, require probabilities rather than only hard labels.",
             "Define score_val() with no required arguments. It must read the candidate validation artifact from ./working, validate the contract, and return a dict containing numeric key 'metric' and boolean key 'maximize'. Add useful extra metric keys when appropriate.",
@@ -122,8 +180,8 @@ def _evaluator_prompt(task_desc: Any, workspace_dir: Path) -> dict[str, Any]:
             "For probability outputs, validate with numeric tolerance and return a clear error when rows are not valid probabilities.",
             "If a primary metric is mathematically undefined on the current validation split, return a deterministic fallback metric with an explanatory field instead of crashing.",
             "Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real agent_val and agent_test split CSVs, exactly follow prediction_spec(), call score_val() and validate_submission(), assert the returned metric is numeric, then print EVALUATOR_OK.",
-            "Keep the evaluator simple and deterministic. Prefer standard metrics from sklearn when applicable and small direct numpy/PIL implementations for image masks.",
-            "For segmentation masks, support mask files referenced from CSV. Binary Dice should treat nonzero pixels as foreground. AJI/instance metrics should use integer connected/instance labels if the task asks for them.",
+            "Keep the evaluator simple and deterministic. Use standard metrics from sklearn when directly applicable and small direct numpy/PIL implementations for image masks.",
+            "For segmentation masks, support mask files referenced from CSV. The prediction spec should make this explicit with prediction_type='mask_file_path' or file_reference_columns for the mask path column. Binary Dice should treat nonzero pixels as foreground. AJI/instance metrics should use integer connected/instance labels if the task asks for them.",
         ],
         "Output format": (
             "Return a brief note followed by exactly one markdown Python code block. "
@@ -302,6 +360,9 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         "prediction_columns": prediction_columns,
         "primary_metric": primary_metric,
     }
+    metric_lower = primary_metric.lower()
+    if any(token in metric_lower for token in ["aji", "dice", "mask", "segmentation"]):
+        normalized.setdefault("prediction_type", "mask_file_path")
     for optional_key in [
         "metrics",
         "constraints",

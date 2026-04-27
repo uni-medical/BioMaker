@@ -67,7 +67,6 @@ The default run is intentionally simple:
 
 ```text
 prepare workspace and data
--> optional validation for proposed_solution_file
 -> ProposalAgent loop
    -> draft a solution when no good candidate exists
    -> debug failed candidates

@@ -64,7 +64,7 @@ logger.setLevel(logging.WARNING)
 
 @dataclass
 class StageConfig:
-    model: str
+    model: str | None
     temp: float
 
 
@@ -88,11 +88,13 @@ class AgentConfig:
     expose_prediction: bool
     data_preview: bool
 
-    force_monai_with_prompt: bool
     enable_monai_knowledge_base: bool
     enable_query2doc: bool
     enable_web_search: bool
     web_search_topk: int
+    enable_node_tools: bool
+    max_node_tool_rounds: int
+    max_node_tool_calls: int
 
     code: StageConfig
     feedback: StageConfig
@@ -111,7 +113,6 @@ class ExecConfig:
 @dataclass
 class Config(Hashable):
     data_dir: Path
-    proposed_solution_file: Path | None
     desc_file: Path | None
 
     goal: str | None
@@ -211,6 +212,22 @@ def prep_cfg(cfg: Config):
 
     cfg.log_dir = (top_log_dir / cfg.exp_name).resolve()
     cfg.workspace_dir = (top_workspace_dir / cfg.exp_name).resolve()
+
+    main_model = (
+        os.getenv("BIOMAKER_MAIN_MODEL")
+        or os.getenv("OPENAI_MODEL")
+        or "deepseek-v4-pro"
+    )
+    helper_model = (
+        os.getenv("BIOMAKER_HELPER_MODEL")
+        or os.getenv("OPENAI_HELPER_MODEL")
+        or "deepseek-v4-flash"
+    )
+
+    cfg.agent.code.model = cfg.agent.code.model or main_model
+    cfg.agent.feedback.model = cfg.agent.feedback.model or main_model
+    cfg.agent.knowledge_base.model = cfg.agent.knowledge_base.model or helper_model
+    cfg.report.model = cfg.report.model or helper_model
 
     # if `model_for_all_agents` is set
     # override all model settings with the same model

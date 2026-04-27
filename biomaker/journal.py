@@ -40,6 +40,7 @@ class Node(DataClassJsonMixin):
     # ---- execution info ----
     _term_out: list[str] = field(default=None, kw_only=True)  # type: ignore
     exec_time: float = field(default=None, kw_only=True)  # type: ignore
+    resource_usage: dict | None = field(default=None, kw_only=True)
     exc_type: str | None = field(default=None, kw_only=True)
     exc_info: dict | None = field(default=None, kw_only=True)
     exc_stack: list[tuple] | None = field(default=None, kw_only=True)
@@ -77,6 +78,7 @@ class Node(DataClassJsonMixin):
         """Absorb the result of executing the code from this node."""
         self._term_out = exec_result.term_out
         self.exec_time = exec_result.exec_time
+        self.resource_usage = exec_result.resource_usage
         self.exc_type = exec_result.exc_type
         self.exc_info = exec_result.exc_info
         self.exc_stack = exec_result.exc_stack
@@ -210,18 +212,19 @@ class Journal(DataClassJsonMixin):
         top_nodes = sorted(nodes, key=lambda n: n.metric, reverse=True)[:topk]
         return random.choice(top_nodes) if top_nodes else None
 
-    def _memory_nodes(self, topk: int) -> list[Node]:
-        good_nodes = sorted(self.good_nodes, key=lambda n: n.metric, reverse=True)
-        strong_nodes = [n for n in good_nodes if n.outcome != "regressed_parent"]
-        leaf_strong_nodes = [n for n in strong_nodes if n.is_leaf]
+    def get_nearest_successful_ancestor(self, node: Node) -> Node | None:
+        """Return the closest runnable ancestor for local debug reference."""
+        current = node.parent
+        while current is not None:
+            if current.is_buggy is False:
+                return current
+            current = current.parent
+        return None
 
-        selected: list[Node] = []
-        for candidate in [*good_nodes[:1], *leaf_strong_nodes, *strong_nodes]:
-            if candidate not in selected:
-                selected.append(candidate)
-            if len(selected) >= topk:
-                break
-        return selected
+    def _reference_nodes(self, topk: int) -> list[Node]:
+        """Return deterministic high-scoring successful nodes for factual memory."""
+        good_nodes = sorted(self.good_nodes, key=lambda n: n.metric, reverse=True)
+        return good_nodes[:topk]
 
     def _avoid_summary(self, max_items: int = 4) -> str:
         failures = []
@@ -301,6 +304,28 @@ class Journal(DataClassJsonMixin):
             max_chars=max_chars,
         )
 
+    def generate_debug_summary(
+        self,
+        buggy_node: Node,
+        max_chars: int = 2500,
+    ) -> str:
+        """Summarize factual context useful for fixing the current buggy node."""
+        parts = ["Current buggy node\n" + _format_memory_node(buggy_node)]
+        reference_node = self.get_nearest_successful_ancestor(buggy_node)
+        if reference_node is not None:
+            parts.append(
+                "Nearest successful ancestor\n" + _format_memory_node(reference_node)
+            )
+
+        avoid_summary = self._avoid_summary(max_items=3)
+        if avoid_summary:
+            parts.append(avoid_summary)
+
+        return truncate_text(
+            "\n-------------------------------\n".join(parts),
+            max_chars=max_chars,
+        )
+
     def generate_summary(
         self,
         include_code: bool = False,
@@ -322,10 +347,10 @@ class Journal(DataClassJsonMixin):
             if avoid_summary:
                 summary.append(avoid_summary)
 
-        candidates = [n for n in self._memory_nodes(topk=topk) if n != best_node]
+        candidates = [n for n in self._reference_nodes(topk=topk) if n != best_node]
         if candidates:
             summary.append(
-                "Strong candidate branches\n"
+                "Other high-scoring successful nodes\n"
                 + "\n\n".join(_format_memory_node(n) for n in candidates)
             )
 
@@ -359,12 +384,39 @@ def _format_delta(delta: float | None) -> str:
     return f"{delta:+.4f}"
 
 
+def _format_runtime(seconds: float | None) -> str:
+    if seconds is None:
+        return "n/a"
+    if seconds < 1:
+        return f"{seconds:.2f}s"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rem = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes}m {rem:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def _format_resource_usage(resource_usage: dict | None) -> str:
+    if not resource_usage:
+        return "n/a"
+    peak_rss = resource_usage.get("peak_rss_mb")
+    if not isinstance(peak_rss, (int, float)):
+        return "n/a"
+    if peak_rss >= 1024:
+        return f"peak_rss {peak_rss / 1024:.2f}GB"
+    return f"peak_rss {peak_rss:.0f}MB"
+
+
 def _format_node_header(n: Node) -> str:
     metric = n.metric.value if n.metric is not None else None
     metric_text = "n/a" if metric is None else f"{float(metric):.4f}"
     return (
         f"Node {n.id[:8]} | status: {n.node_status} | "
-        f"metric: {metric_text} | outcome: {n.outcome or 'unknown'}"
+        f"metric: {metric_text} | runtime: {_format_runtime(n.exec_time)} | "
+        f"resources: {_format_resource_usage(n.resource_usage)} | "
+        f"outcome: {n.outcome or 'unknown'}"
     )
 
 

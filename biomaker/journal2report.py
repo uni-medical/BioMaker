@@ -15,11 +15,13 @@ def journal2report(journal: Journal, task_desc: dict, rcfg: StageConfig):
     )
     system_prompt_dict = {
         "Role": "You are a research assistant that always uses concise language.",
-        "Goal": "The goal is to write a technical report summarising the empirical findings and technical decisions.",
+        "Goal": "The goal is to write a factual technical report summarising the empirical findings and technical decisions.",
         "Input": "You are given a raw research journal with list of design attempts and their outcomes, and a task description.",
         "Output": [
             "Your output should be a single markdown document.",
-            "Your report should have the following sections: Introduction, Preprocessing, Modellind Methods, Results Discussion, Future Work",
+            "Base every claim on the supplied journal. Do not invent unobserved metrics, methods, or recommendations.",
+            "Prefer concise experiment-log style over broad literature-style advice.",
+            "Your report should have the following sections: Introduction, Preprocessing, Modeling Methods, Results Discussion, Limitations",
             "You can include subsections if needed.",
         ],
     }

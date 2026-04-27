@@ -2,7 +2,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .agents import BaseAgent, FunctionalAgent, ProposalAgent
+from .agents import BaseAgent, ProposalAgent
 from .interpreter import ExecutionResult
 from .journal import Journal
 from .utils.config import Config
@@ -41,19 +41,7 @@ class BioMakerWorkflow:
         self.proposal_agent = ProposalAgent(
             task_desc=task_desc, cfg=cfg, journal=Journal()
         )
-        self.func_agent = FunctionalAgent(
-            task_desc=task_desc,
-            cfg=cfg,
-            journal=Journal(),
-            solution_file=self.cfg.proposed_solution_file,
-        )
-
         self.workflow = [
-            WorkflowAgent(
-                name="func_val",
-                steps_left=1 if (self.cfg.proposed_solution_file is not None) else 0,
-                agent=self.func_agent,
-            ),
             WorkflowAgent(
                 name="proposal",
                 steps_left=cfg.agent.steps,

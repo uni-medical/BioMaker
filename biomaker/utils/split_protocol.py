@@ -190,16 +190,17 @@ def _copy_private_truth(
     for value in test_df[test_mask_column].dropna():
         mask_rel = Path(str(value).removeprefix("./"))
         if mask_rel.is_absolute():
-            mask_path = mask_rel
+            matches = [mask_rel] if mask_rel.is_file() else []
             private_mask = private_dir / mask_rel.name
-        elif mask_rel.parts and mask_rel.parts[0] == "input":
-            mask_path = input_dir.parent / mask_rel
-            private_mask = private_dir / Path(*mask_rel.parts[1:])
         else:
-            mask_path = test_source.parent / mask_rel
-            if not mask_path.is_file():
-                mask_path = input_dir / mask_rel
-            private_mask = private_dir / mask_rel
+            matches = _observe_existing_paths(str(value), input_dir, test_source.parent)
+            if mask_rel.parts and mask_rel.parts[0] == "input":
+                private_mask = private_dir / Path(*mask_rel.parts[1:])
+            else:
+                private_mask = private_dir / mask_rel
+        if len(matches) != 1:
+            continue
+        mask_path = matches[0]
         if not mask_path.is_file():
             continue
         private_mask.parent.mkdir(parents=True, exist_ok=True)
@@ -263,17 +264,92 @@ def _remove_private_workspace_dir(input_dir: Path) -> None:
         shutil.rmtree(private_dir)
 
 
-def _as_workspace_absolute(value: Any, input_dir: Path, base_dir: Path | None) -> Any:
+def _path_suffix_matches(path: Path, suffix: Path) -> bool:
+    suffix_parts = suffix.parts
+    if not suffix_parts or len(suffix_parts) > len(path.parts):
+        return False
+    return path.parts[-len(suffix_parts) :] == suffix_parts
+
+
+def _observe_existing_paths(value: str, input_dir: Path, base_dir: Path | None) -> list[Path]:
+    normalized = Path(value.removeprefix("./"))
+    if normalized.parts and normalized.parts[0] == "input":
+        direct_bases = [input_dir.parent]
+    else:
+        direct_bases = [input_dir]
+        if base_dir is not None and base_dir != input_dir:
+            direct_bases.append(base_dir)
+
+    matches: dict[str, Path] = {}
+    for base in direct_bases:
+        candidate = base / normalized
+        if candidate.exists():
+            matches[str(candidate.resolve())] = candidate
+
+    if matches or not normalized.parts:
+        return list(matches.values())
+
+    name = normalized.name
+    for candidate in input_dir.rglob(name):
+        if "biomaker_splits" in candidate.parts or not candidate.exists():
+            continue
+        try:
+            relative = candidate.relative_to(input_dir)
+        except ValueError:
+            continue
+        if _path_suffix_matches(relative, normalized):
+            matches[str(candidate.resolve())] = candidate
+    return list(matches.values())
+
+
+def _record_path_warning(
+    warnings: list[str] | None,
+    seen: set[str] | None,
+    message: str,
+) -> None:
+    if warnings is None or seen is None or message in seen:
+        return
+    seen.add(message)
+    warnings.append(message)
+
+
+def _as_workspace_absolute(
+    value: Any,
+    input_dir: Path,
+    base_dir: Path | None,
+    column: str | None = None,
+    warnings: list[str] | None = None,
+    seen_warnings: set[str] | None = None,
+) -> Any:
     if not isinstance(value, str) or not value.strip():
         return value
     path = Path(value)
     if path.is_absolute():
+        if not path.exists():
+            _record_path_warning(
+                warnings,
+                seen_warnings,
+                f"Path value in `{column or 'unknown'}` does not exist: `{value}`.",
+            )
         return value
-    normalized = value.removeprefix("./")
-    if normalized.startswith("input/"):
-        return str(input_dir.parent / normalized)
-    anchor = base_dir or input_dir
-    return str(anchor / normalized)
+
+    matches = _observe_existing_paths(value, input_dir, base_dir)
+    if len(matches) == 1:
+        return str(matches[0])
+    if len(matches) > 1:
+        _record_path_warning(
+            warnings,
+            seen_warnings,
+            f"Path value in `{column or 'unknown'}` is ambiguous and was left unchanged: `{value}`.",
+        )
+        return value
+
+    _record_path_warning(
+        warnings,
+        seen_warnings,
+        f"Path value in `{column or 'unknown'}` could not be grounded to an existing file and was left unchanged: `{value}`.",
+    )
+    return value
 
 
 def _normalize_agent_paths(
@@ -282,12 +358,21 @@ def _normalize_agent_paths(
     path_column: str | None,
     mask_column: str | None,
     base_dir: Path | None = None,
+    warnings: list[str] | None = None,
 ) -> pd.DataFrame:
     df = df.copy()
+    seen_warnings: set[str] = set()
     for column in {path_column, mask_column}:
         if column and column in df.columns:
             df[column] = df[column].map(
-                lambda value: _as_workspace_absolute(value, input_dir, base_dir)
+                lambda value: _as_workspace_absolute(
+                    value,
+                    input_dir,
+                    base_dir,
+                    column=column,
+                    warnings=warnings,
+                    seen_warnings=seen_warnings,
+                )
             )
     return df
 
@@ -419,6 +504,7 @@ def prepare_split_protocol(
             train_summary.get("path_column"),
             train_summary.get("mask_column"),
             train_base_dir,
+            warnings,
         )
         val_df = _normalize_agent_paths(
             val_df,
@@ -426,6 +512,7 @@ def prepare_split_protocol(
             train_summary.get("path_column"),
             train_summary.get("mask_column"),
             val_base_dir,
+            warnings,
         )
         _write_csv(train_df, agent_train)
         _write_csv(val_df, agent_val)
@@ -447,6 +534,7 @@ def prepare_split_protocol(
                 test_summary.get("path_column"),
                 None,
                 test_source.parent,
+                warnings,
             )
             _write_csv(
                 agent_test_df,

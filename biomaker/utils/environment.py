@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import importlib.metadata
 import importlib.util
+import os
+import platform
 import re
 import sys
 from dataclasses import dataclass
@@ -86,13 +88,38 @@ def _torch_accelerator_info() -> str:
         return f"PyTorch accelerator: unavailable because torch is not importable. {policy}"
 
     if torch.cuda.is_available():
+        devices = []
+        for idx in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(idx)
+            total_gb = props.total_memory / (1024**3)
+            devices.append(f"{idx}: {props.name}, {total_gb:.1f} GB")
         return (
-            f"PyTorch accelerator: CUDA is available with {torch.cuda.device_count()} device(s). "
+            "PyTorch accelerator: CUDA is available with "
+            f"{torch.cuda.device_count()} device(s) ({'; '.join(devices)}). "
             f"{policy}"
         )
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return f"PyTorch accelerator: Apple MPS is available on this machine. {policy}"
+        return (
+            "PyTorch accelerator: Apple MPS is available on this machine. "
+            "Apple MPS uses unified system memory; see Host resources for the memory pool shared by the OS, Python, data loading, and model tensors. "
+            f"{policy}"
+        )
     return f"PyTorch accelerator: no GPU backend detected on this machine. {policy}"
+
+
+def _system_resource_info() -> str:
+    parts = [
+        f"machine={platform.machine() or 'unknown'}",
+        f"cpu_cores={os.cpu_count() or 'unknown'}",
+    ]
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        total_gb = pages * page_size / (1024**3)
+        parts.append(f"system_memory={total_gb:.1f} GB")
+    except (AttributeError, ValueError, OSError):
+        parts.append("system_memory=unknown")
+    return "Host resources: " + ", ".join(parts) + "."
 
 
 def environment_manifest_text(include_medical: bool = True) -> str:
@@ -104,9 +131,11 @@ def environment_manifest_text(include_medical: bool = True) -> str:
     return "\n".join(
         [
             f"Python: {sys.version.split()[0]}",
+            _system_resource_info(),
             _torch_accelerator_info(),
             "Allowed third-party packages:",
             *packages,
+            "This list describes what is available in the environment; it is not a recommendation to use any specific package.",
             "",
             "Allowed local generated modules:",
             "- `evaluator`: frozen BioMaker evaluator generated before solution search. Candidate code may import it for validation monitoring and artifact-format guidance when it exists.",
@@ -115,8 +144,9 @@ def environment_manifest_text(include_medical: bool = True) -> str:
             "- Use only the allowed third-party packages above and the Python standard library.",
             "- Do not import unlisted third-party packages.",
             "- Do not install packages or call package managers from generated code.",
-            "- Downloading pretrained model weights is allowed when it uses installed libraries such as torchvision, timm, torch.hub, or MONAI. Do not download or install new Python packages.",
+            "- Downloading pretrained model weights is allowed when it is done through an installed library and does not install or modify Python packages.",
             "- If a useful package is unavailable, implement the smallest replacement with allowed packages.",
+            "- PyTorch code must be portable across CUDA, Apple MPS, and CPU. Select the device dynamically and never hard-code a single accelerator.",
             f"- Common unavailable examples to avoid: {blocked}.",
         ]
     )
@@ -202,6 +232,22 @@ def _uses_external_weight_download(tree: ast.AST) -> bool:
     return False
 
 
+def _portable_device_violation(tree: ast.AST) -> tuple[str, int] | None:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            if func.attr == "cuda":
+                return (
+                    "Use dynamic device selection and `.to(device)` instead of `.cuda()`, so the code also runs on MPS and CPU.",
+                    getattr(node, "lineno", 0),
+                )
+
+    return None
+
+
 def validate_code_environment(
     code: str, include_medical: bool = True
 ) -> PreflightResult:
@@ -225,6 +271,20 @@ def validate_code_environment(
             error_type="SyntaxError",
             message=f"SyntaxError: {e.msg} at line {e.lineno}, column {e.offset}.",
             exc_info={"msg": e.msg, "lineno": str(e.lineno), "offset": str(e.offset)},
+        )
+
+    portable_device_error = _portable_device_violation(tree)
+    if portable_device_error is not None:
+        message, lineno = portable_device_error
+        return PreflightResult(
+            ok=False,
+            error_type="DevicePortabilityError",
+            message=(
+                f"DevicePortabilityError at line {lineno}: {message} "
+                "Use a dynamic fallback such as CUDA if available, else MPS if available, else CPU, "
+                "and move model/tensors through the selected `device`."
+            ),
+            exc_info={"lineno": str(lineno), "reason": message},
         )
 
     allowed_imports = allowed_import_names(include_medical)
