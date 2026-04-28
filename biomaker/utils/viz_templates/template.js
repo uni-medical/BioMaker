@@ -1,29 +1,94 @@
 const bgCol = "#F2F0E7";
-const accentCol = "#fd4578";
+const accentCol = "#2F6FED";
+const bestCol = "#D6A11E";
 const okCol = "#2F7D59";
 const bugCol = "#B4493D";
 const rootCol = "#50565F";
+const edgeCol = "#9B9486";
 
 hljs.initHighlightingOnLoad();
 
 const updateTargetDims = () => {
-  // width is max-width of `.contentContainer` - its padding
-  // return [min(windowWidth, 900 - 80), 700]
-  return [windowWidth * (1 / 2), windowHeight];
+  return [windowWidth * 0.58, windowHeight];
 };
 
-const setCodeAndPlan = (code, plan) => {
-  const codeElm = document.getElementById("code");
-  if (codeElm) {
-    // codeElm.innerText = code;
-    codeElm.innerHTML = hljs.highlight(code, { language: "python" }).value;
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+
+const compact = (value, fallback = "n/a") => {
+  const text = String(value ?? "").trim();
+  return text.length ? text : fallback;
+};
+
+const metricLine = (label, value) => `
+  <div class="metric">
+    <span>${escapeHtml(label)}</span>
+    <strong>${escapeHtml(compact(value))}</strong>
+  </div>`;
+
+const setNodeDetails = (treeInd) => {
+  const summary = (treeStructData.summaries || [])[treeInd] || {};
+  const selectedLabel = document.getElementById("selected-label");
+  if (selectedLabel) selectedLabel.textContent = summary.title || "Search start";
+
+  const summaryElm = document.getElementById("node-summary");
+  if (summaryElm) {
+    summaryElm.innerHTML = `
+      <div class="metrics-grid">
+        ${metricLine("stage", summary.stage)}
+        ${metricLine("metric", summary.metric)}
+        ${metricLine("runtime", summary.runtime)}
+        ${metricLine("memory", summary.memory)}
+        ${metricLine("cpu", summary.cpu)}
+        ${metricLine("outcome", summary.outcome)}
+      </div>
+      ${summary.parent ? `<p><b>parent</b>: ${escapeHtml(summary.parent)}</p>` : ""}
+      ${summary.is_best ? '<p class="best-pill">best node</p>' : ""}
+      ${summary.selected ? `<h3>Selection</h3><p>${escapeHtml(summary.selected)}</p>` : ""}
+      ${summary.plan ? `<h3>Plan</h3><p>${escapeHtml(summary.plan)}</p>` : ""}
+      ${summary.analysis ? `<h3>Analysis</h3><p>${escapeHtml(summary.analysis)}</p>` : ""}
+      ${summary.artifact ? `<h3>Artifact</h3><pre>${escapeHtml(summary.artifact)}</pre>` : ""}
+      ${summary.error ? `<h3>Error</h3><pre>${escapeHtml(summary.error)}</pre>` : ""}
+    `;
   }
 
-  const planElm = document.getElementById("plan");
-  if (planElm) {
-    // planElm.innerText = plan.trim();
-    planElm.innerHTML = hljs.highlight(plan, { language: "plaintext" }).value;
+  const codeElm = document.getElementById("code");
+  if (codeElm) {
+    const code = treeStructData.code[treeInd] || "";
+    codeElm.innerHTML = code
+      ? hljs.highlight(code, { language: "python" }).value
+      : "";
   }
+
+  const outputElm = document.getElementById("output");
+  if (outputElm) {
+    const termOut = treeStructData.term_out[treeInd] || "";
+    outputElm.textContent = termOut || "";
+  }
+
+  const artifactElm = document.getElementById("artifact-json");
+  if (artifactElm) {
+    const report = summary.artifact || "";
+    artifactElm.textContent = report || "";
+  }
+};
+
+const setRunSummary = () => {
+  const elm = document.getElementById("run-summary");
+  if (!elm) return;
+  const s = treeStructData.run_summary || {};
+  elm.innerHTML = `
+    <span>${escapeHtml(s.exp_name || "BioMaker run")}</span>
+    <b>best ${escapeHtml(compact(s.best_metric))}</b>
+    <span>valid ${escapeHtml(s.valid ?? 0)}</span>
+    <span>bug ${escapeHtml(s.bug ?? 0)}</span>
+    <span>timeout ${escapeHtml(s.timeout ?? 0)}</span>
+    <span>steps ${escapeHtml(s.steps ?? 0)}</span>
+  `;
 };
 
 const preferredNode = (visibleNodes) => {
@@ -32,7 +97,10 @@ const preferredNode = (visibleNodes) => {
     const bestNode = visibleNodes.find((node) => node.treeInd === bestInd);
     if (bestNode) return bestNode;
   }
-  return visibleNodes[0];
+  return visibleNodes.find((node) => {
+    const status = (treeStructData.statuses || [])[node.treeInd] || "unknown";
+    return status !== "virtual";
+  }) || visibleNodes[0];
 };
 
 windowResized = () => {
@@ -69,6 +137,7 @@ let lastScrollPos = 0;
 
 setup = () => {
   canvas = createCanvas(...updateTargetDims());
+  setRunSummary();
 };
 
 class Node {
@@ -137,17 +206,16 @@ class Node {
 
     const mouseXlocalCoords = (mouseX - width / 2) / scaleFactor;
     const mouseYlocalCoords = (mouseY - height / 2) / scaleFactor;
+    const status = (treeStructData.statuses || [])[this.treeInd] || "unknown";
     const isMouseOver =
+      status !== "virtual" &&
       dist(mouseXlocalCoords, mouseYlocalCoords, this.x, this.y) <
       this.renderSize / 1.5;
     if (isMouseOver) cursor(HAND);
     if (isMouseOver && mouseIsPressed) {
       nodes.forEach((n) => (n.selected = false));
       this.selected = true;
-      setCodeAndPlan(
-        treeStructData.code[this.treeInd],
-        treeStructData.plan[this.treeInd],
-      );
+      setNodeDetails(this.treeInd);
       manualSelection = true;
     }
 
@@ -168,7 +236,6 @@ class Node {
       }
     }
 
-    const status = (treeStructData.statuses || [])[this.treeInd] || "unknown";
     fill(this.color);
     if (status === "virtual") {
       fill(rootCol);
@@ -177,13 +244,14 @@ class Node {
     } else {
       fill(okCol);
     }
-    if (this.selected) {
-      fill(accentCol);
-    }
-
+    const isBest = (treeStructData.is_best || [])[this.treeInd];
     noStroke();
     if (status === "virtual") {
-      circle(this.x, this.y, this.renderSize);
+      noFill();
+      stroke(rootCol);
+      strokeWeight(2);
+      circle(this.x, this.y, Math.max(8, this.renderSize * 0.42));
+      noStroke();
     } else {
       square(
         this.x - this.renderSize / 2,
@@ -193,15 +261,35 @@ class Node {
       );
     }
 
+    if (isBest || this.selected) {
+      noFill();
+      stroke(this.selected ? accentCol : bestCol);
+      strokeWeight(this.selected ? 4 : 3);
+      if (status !== "virtual") {
+        square(
+          this.x - this.renderSize / 2 - 4,
+          this.y - this.renderSize / 2 - 4,
+          this.renderSize + 8,
+          9,
+        );
+      }
+      noStroke();
+    }
+
     noStroke();
     textAlign(CENTER, CENTER);
-    textSize(status === "virtual" ? this.renderSize / 3 : this.renderSize / 2.2);
+    const label = (treeStructData.display_labels || [])[this.treeInd] || "";
+    textSize(status === "virtual" ? this.renderSize / 3 : this.renderSize / 3.2);
     fill(255);
-    text(status === "virtual" ? "ROOT" : "{ }", this.x, this.y - 1);
-    if ((treeStructData.is_best || [])[this.treeInd]) {
-      textSize(this.renderSize / 2);
-      fill(accentCol);
-      text("*", this.x + this.renderSize * 0.45, this.y - this.renderSize * 0.45);
+    if (status === "virtual") {
+      return;
+    } else {
+      text(label, this.x, this.y - 1);
+    }
+    if (isBest) {
+      textSize(this.renderSize / 2.2);
+      fill(bestCol);
+      text("*", this.x + this.renderSize * 0.55, this.y - this.renderSize * 0.5);
     }
 
     const dotAnimThreshold = 0.85;
@@ -306,8 +394,8 @@ class Edge {
     strokeWeight(this.weight);
     noFill();
     const status = (treeStructData.statuses || [])[this.nodeB.treeInd] || "unknown";
-    const edgeColor = status === "bug" ? bugCol : status === "virtual" ? rootCol : accentCol;
-    stroke(lerpColor(color(bgCol), color(edgeColor), 0.85));
+    const edgeColor = status === "bug" ? bugCol : status === "virtual" ? rootCol : edgeCol;
+    stroke(lerpColor(color(bgCol), color(edgeColor), 0.75));
     bezier(
       this.nodeT.xB,
       this.nodeT.yB,
@@ -337,8 +425,8 @@ draw = () => {
   globalTime += globalAnimSpeed * initAnimationSpeedFactor * deltaTime;
 
   if (nodes.length == 0) {
-    const spacingHeight = height * 1.25;
-    const spacingWidth = Math.max(width * 1.25, treeStructData.layout.length * 42);
+    const spacingHeight = height * 1.18;
+    const spacingWidth = Math.max(width * 1.10, treeStructData.layout.length * 44);
     treeStructData.layout.forEach((lay, index) => {
       new Node(
         spacingWidth * lay[0] - spacingWidth / 2,
@@ -354,11 +442,9 @@ draw = () => {
       if (n.isRootNode) n.startAnimation();
     });
     if (nodes.length > 0) {
-      nodes[0].selected = true;
-      setCodeAndPlan(
-        treeStructData.code[0],
-        treeStructData.plan[0],
-      )
+      const initialNode = preferredNode(nodes);
+      initialNode.selected = true;
+      setNodeDetails(initialNode.treeInd);
     }
   }
 
@@ -369,10 +455,7 @@ draw = () => {
     const selectedNode = preferredNode(staticNodes);
     if (!manualSelection) {
       if (!selectedNode.selected) {
-        setCodeAndPlan(
-          treeStructData.code[selectedNode.treeInd],
-          treeStructData.plan[selectedNode.treeInd],
-        );
+        setNodeDetails(selectedNode.treeInd);
       }
       staticNodes.forEach((node) => {
         node.selected = node === selectedNode;

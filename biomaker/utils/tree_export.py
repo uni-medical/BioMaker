@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..journal import Journal
+from .response import truncate_text
 
 
 @dataclass
@@ -102,31 +103,139 @@ def _node_metric(node) -> str:
     return str(node.metric.value_npsafe)
 
 
+def _node_metric_short(node) -> str:
+    if node is None or node.metric is None or node.metric.value is None:
+        return ""
+    try:
+        return f"{float(node.metric.value):.3f}"
+    except Exception:
+        return str(node.metric.value_npsafe)
+
+
 def _node_label(node) -> str:
     if node is None:
-        return "ROOT"
+        return ""
     prefix = "bug" if node.is_buggy else node.node_status
     metric = _node_metric(node)
     step = "na" if node.step is None else str(node.step)
     return f"{step}: {prefix} {metric}"
 
 
+def _node_display_label(node) -> str:
+    if node is None:
+        return ""
+    step = "?" if node.step is None else str(node.step)
+    if node.is_buggy:
+        reason = "timeout" if node.exc_type == "TimeoutError" else "bug"
+        return f"{step}\n{reason}"
+    metric = _node_metric_short(node)
+    return f"{step}\n{metric}" if metric else step
+
+
+def _format_seconds(value) -> str:
+    if value is None:
+        return ""
+    try:
+        return f"{float(value):.1f}s"
+    except Exception:
+        return str(value)
+
+
+def _format_mb(value) -> str:
+    if value is None:
+        return ""
+    try:
+        return f"{float(value):.0f} MB"
+    except Exception:
+        return str(value)
+
+
+def _artifact_summary(report: dict | None) -> str:
+    if not isinstance(report, dict):
+        return ""
+    parts = []
+    available = report.get("available")
+    if available is not None:
+        parts.append(f"available: {available}")
+    alignment = report.get("alignment")
+    if isinstance(alignment, dict):
+        method = alignment.get("method")
+        matched = alignment.get("matched_rows")
+        if method or matched is not None:
+            parts.append(f"alignment: {method or 'n/a'} ({matched or 0} rows)")
+    predictions = report.get("prediction_column_summaries")
+    if isinstance(predictions, dict):
+        for key, value in list(predictions.items())[:3]:
+            if isinstance(value, dict):
+                parts.append(
+                    f"{key}: nulls={value.get('null_count', 'n/a')}, "
+                    f"unique={value.get('sample_unique_count', 'n/a')}"
+                )
+    warnings = report.get("warnings")
+    if warnings:
+        parts.append("warnings: " + truncate_text(str(warnings), max_chars=160))
+    return "\n".join(parts)
+
+
+def _node_summary(node, best_node) -> dict:
+    if node is None:
+        return {
+            "title": "Search start",
+            "stage": "virtual",
+            "status": "virtual",
+            "metric": "",
+            "runtime": "",
+            "memory": "",
+            "cpu": "",
+            "outcome": "",
+            "parent": "",
+            "selected": "",
+            "plan": "Draft nodes are direct children of this start point.",
+            "analysis": "",
+            "artifact": "",
+            "error": "",
+        }
+
+    resources = node.resource_usage or {}
+    metric = _node_metric(node)
+    status = "bug" if node.is_buggy else node.node_status
+    return {
+        "title": _node_label(node),
+        "stage": node.node_status,
+        "status": status,
+        "metric": "" if metric == "n/a" else metric,
+        "runtime": _format_seconds(node.exec_time),
+        "memory": _format_mb(resources.get("peak_rss_mb")),
+        "cpu": (
+            ""
+            if resources.get("avg_cpu_percent") is None
+            else f"{float(resources.get('avg_cpu_percent')):.1f}%"
+        ),
+        "outcome": node.outcome or "",
+        "parent": node.parent.id[:8] if node.parent is not None else "",
+        "selected": truncate_text(str(node.selection_reason or ""), max_chars=220),
+        "plan": truncate_text(str(node.plan or ""), max_chars=900),
+        "analysis": truncate_text(str(node.analysis or ""), max_chars=900),
+        "artifact": _artifact_summary(node.artifact_report),
+        "error": truncate_text(str(node.exc_info or node.exc_type or ""), max_chars=600),
+        "is_best": bool(node == best_node),
+    }
+
+
 def _node_plan_text(node) -> str:
     if node is None:
         return (
-            "Virtual root\n"
-            "This node represents the start of the search. Draft nodes are direct "
-            "children of this virtual parent."
+            "Search start\n"
+            "Draft nodes are direct children of this start point."
         )
     original_lines = [
         f"node:{node.id[:8]}",
         f"stage:{node.node_status}",
         f"metric:{_node_metric(node)}",
         f"outcome:{node.outcome}",
-        f"selected:{node.selection_reason}",
-        f"plan:{node.plan}",
-        f"analysis:{node.analysis}",
-        f"term_out:{node.term_out}",
+        f"selected:{truncate_text(str(node.selection_reason or ''), max_chars=220)}",
+        f"plan:{truncate_text(str(node.plan or ''), max_chars=900)}",
+        f"analysis:{truncate_text(str(node.analysis or ''), max_chars=900)}",
     ]
     return "\n".join(textwrap.fill(str(line), width=88) for line in original_lines)
 
@@ -135,6 +244,9 @@ def cfg_to_tree_struct(cfg, jou: Journal):
     visual_nodes, edges = _build_visual_tree(jou)
     layout = generate_layout(visual_nodes)
     best_node = jou.get_best_node(only_good=True, topk=1)
+    good_nodes = [node for node in jou.nodes if node.is_buggy is False]
+    bug_nodes = [node for node in jou.nodes if node.is_buggy is True]
+    timeout_nodes = [node for node in bug_nodes if node.exc_type == "TimeoutError"]
 
     return dict(
         edges=edges,
@@ -145,7 +257,9 @@ def cfg_to_tree_struct(cfg, jou: Journal):
             for v in visual_nodes
         ],
         term_out=[
-            "" if v.source_node is None else v.source_node.term_out
+            ""
+            if v.source_node is None
+            else truncate_text(v.source_node.term_out, max_chars=12000)
             for v in visual_nodes
         ],
         analysis=[
@@ -155,6 +269,8 @@ def cfg_to_tree_struct(cfg, jou: Journal):
         exp_name=cfg.exp_name,
         metrics=[0 for _ in visual_nodes],
         labels=[_node_label(v.source_node) for v in visual_nodes],
+        display_labels=[_node_display_label(v.source_node) for v in visual_nodes],
+        summaries=[_node_summary(v.source_node, best_node) for v in visual_nodes],
         statuses=[
             (
                 "virtual"
@@ -169,6 +285,14 @@ def cfg_to_tree_struct(cfg, jou: Journal):
             bool(v.source_node is not None and v.source_node == best_node)
             for v in visual_nodes
         ],
+        run_summary={
+            "exp_name": cfg.exp_name,
+            "steps": len(jou.nodes),
+            "valid": len(good_nodes),
+            "bug": len(bug_nodes),
+            "timeout": len(timeout_nodes),
+            "best_metric": _node_metric_short(best_node),
+        },
     )
 
 

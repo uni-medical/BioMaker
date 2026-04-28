@@ -28,34 +28,154 @@
         margin: 0;
         padding: 0;
         box-sizing: border-box;
-        overflow: scroll;
       }
       body {
         background-color: #f2f0e7;
+        color: #f2f0e7;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        overflow: hidden;
       }
       canvas {
         float: left;
         height: 100vh;
-        width: 40vw;
+        width: 58vw;
       }
-      #text-container {
+      #side-panel {
         float: right;
         height: 100vh;
-        width: 50vw;
+        width: 42vw;
         background-color: #282c34;
+        overflow: auto;
+        padding: 18px 20px 28px;
       }
-      #plan {
-        /* border-left: 2px solid #282c34; */
-        background-color: #282c34;
+      #run-summary {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 12px;
+        align-items: center;
+        border-bottom: 1px solid #3a404b;
+        color: #c7ccd8;
+        font-size: 13px;
+        padding-bottom: 12px;
+        margin-bottom: 14px;
+      }
+      #run-summary b {
+        color: #f0d36c;
+      }
+      #selected-label {
+        color: #ffffff;
+        font-size: 20px;
+        font-weight: 650;
+        line-height: 1.25;
+        margin-bottom: 12px;
+      }
+      .metrics-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 14px;
+      }
+      .metric {
+        border: 1px solid #3a404b;
+        border-radius: 6px;
+        padding: 8px;
+        min-width: 0;
+      }
+      .metric span {
+        display: block;
+        color: #9da6b8;
+        font-size: 11px;
+        margin-bottom: 4px;
+      }
+      .metric strong {
+        color: #f6f7fb;
+        font-size: 13px;
+        overflow-wrap: anywhere;
+      }
+      h3 {
+        color: #d5d9e3;
+        font-size: 13px;
+        margin: 14px 0 6px;
+      }
+      p,
+      pre {
         color: #f2f0e7;
-        min-height: 5rem;
-        padding: 1em 0 1em 1em;
+        font-family: inherit;
+        font-size: 13px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      pre {
+        background-color: #20242c;
+        border: 1px solid #3a404b;
+        border-radius: 6px;
+        padding: 10px;
+        overflow: auto;
+      }
+      details {
+        border-top: 1px solid #3a404b;
+        margin-top: 14px;
+        padding-top: 12px;
+      }
+      summary {
+        cursor: pointer;
+        color: #d5d9e3;
+        font-size: 13px;
+        font-weight: 650;
+        margin-bottom: 10px;
+      }
+      code {
+        font-size: 12px;
+        line-height: 1.45;
+        white-space: pre;
+      }
+      .best-pill {
+        display: inline-block;
+        color: #201b09;
+        background: #d6a11e;
+        border-radius: 999px;
+        padding: 3px 8px;
+        font-size: 12px;
+        font-weight: 650;
+      }
+      @media (max-width: 900px) {
+        canvas,
+        #side-panel {
+          float: none;
+          width: 100vw;
+        }
+        canvas {
+          height: 48vh;
+        }
+        #side-panel {
+          height: 52vh;
+        }
+        .metrics-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
       }
     </style>
   </head>
   <body>
-    <pre
-      id="text-container"
-    ><div id="plan"></div><hr><code id="code" class="language-python"></code></pre>
+    <aside id="side-panel">
+      <div id="run-summary"></div>
+      <div id="selected-label">Search start</div>
+      <section id="node-summary"></section>
+      <details>
+        <summary>Code</summary>
+        <pre><code id="code" class="language-python"></code></pre>
+      </details>
+      <details>
+        <summary>Execution Output</summary>
+        <pre id="output"></pre>
+      </details>
+      <details>
+        <summary>Artifact Details</summary>
+        <pre id="artifact-json"></pre>
+      </details>
+    </aside>
   </body>
 </html>
