@@ -24,6 +24,7 @@ ERROR_KEYWORDS = (
 STATUS_PREFIXES = (
     "BioMakerExternalValidation:",
     "EVALUATOR_RESULT_JSON=",
+    "EVALUATOR_ARTIFACT_REPORT_JSON=",
     "Execution time:",
     "Process exited with return code",
     "TimeoutError:",

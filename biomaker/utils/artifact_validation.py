@@ -22,9 +22,53 @@ def _resolve_artifact_path(workspace_dir: Path, value: str) -> Path:
         return path
 
     normalized = Path(str(path).removeprefix("./"))
-    if normalized.parts and normalized.parts[0] == "working":
-        return workspace_dir / normalized
+    candidates = [
+        workspace_dir / normalized,
+        workspace_dir / "working" / normalized,
+        workspace_dir / "input" / normalized,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     return workspace_dir / "working" / normalized
+
+
+def _canonical_working_ref(workspace_dir: Path, value: str) -> str:
+    artifact_path = _resolve_artifact_path(workspace_dir, value)
+    try:
+        artifact_path.relative_to(workspace_dir / "working")
+    except ValueError:
+        return value
+    return str(artifact_path.resolve())
+
+
+def _normalize_csv_path_refs(workspace_dir: Path, csv_path: Path) -> list[str]:
+    if not csv_path.is_file():
+        return []
+
+    df = pd.read_csv(csv_path)
+    path_columns = [
+        column for column in df.columns if "path" in column.lower() or "file" in column.lower()
+    ]
+    if not path_columns:
+        return []
+
+    changed = False
+    for column in path_columns:
+        new_values = []
+        for value in df[column].tolist():
+            if not isinstance(value, str) or not value.strip():
+                new_values.append(value)
+                continue
+            normalized = _canonical_working_ref(workspace_dir, value)
+            changed = changed or normalized != value
+            new_values.append(normalized)
+        df[column] = new_values
+
+    if not changed:
+        return []
+    df.to_csv(csv_path, index=False)
+    return [f"ArtifactNormalization: normalized working file references in {csv_path.name}"]
 
 
 def _submission_expected_rows(input_dir: Path) -> int | None:
@@ -59,8 +103,11 @@ def normalize_working_outputs(workspace_dir: Path | str, task_desc: str) -> list
     input_dir = workspace_dir / "input"
     working_dir = workspace_dir / "working"
     submission_path = working_dir / "submission.csv"
+    messages: list[str] = []
+    for csv_path in sorted(working_dir.glob("*.csv")):
+        messages.extend(_normalize_csv_path_refs(workspace_dir, csv_path))
     if not submission_path.is_file():
-        return []
+        return messages
 
     submission = pd.read_csv(submission_path)
     path_columns = [
@@ -75,7 +122,6 @@ def normalize_working_outputs(workspace_dir: Path | str, task_desc: str) -> list
     task_desc_lower = task_desc.lower()
     instance_expected = "instance" in task_desc_lower or "aji" in task_desc_lower
     binary_required = "binary" in task_desc_lower and not instance_expected
-    messages: list[str] = []
 
     with open(submission_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)

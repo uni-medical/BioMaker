@@ -14,17 +14,20 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from PIL import Image
+import numpy as np
 
 from .. import backend
 from . import data_preview
 from .environment import environment_manifest_text, validate_code_environment
-from .response import extract_code
+from .response import extract_code, truncate_text
 
 logger = logging.getLogger("biomaker")
 
 EXTERNAL_VALIDATION_PREFIX = "BioMakerExternalValidation:"
 _RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
 _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
+_ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 
 
 class EvaluatorSetupError(RuntimeError):
@@ -47,10 +50,12 @@ class EvaluatorRunResult:
     error: str | None = None
 
     def log_line(self) -> str:
+        details = dict(self.details)
+        details.pop("artifact_report", None)
         payload = {
             "metric": self.metric,
             "maximize": self.maximize,
-            "details": self.details,
+            "details": details,
         }
         return EXTERNAL_VALIDATION_PREFIX + " " + json.dumps(payload, sort_keys=True)
 
@@ -79,6 +84,20 @@ def parse_external_validation(term_out: list[str] | str) -> tuple[float, bool] |
             if isinstance(metric, bool) or metric is None:
                 return None
             return float(metric), maximize
+        except Exception:
+            return None
+    return None
+
+
+def parse_artifact_report(term_out: list[str] | str) -> dict[str, Any] | None:
+    text = "\n".join(term_out) if isinstance(term_out, list) else term_out
+    for line in reversed(text.splitlines()):
+        if not line.startswith(_ARTIFACT_REPORT_PREFIX):
+            continue
+        payload = line[len(_ARTIFACT_REPORT_PREFIX) :].strip()
+        try:
+            data = json.loads(payload)
+            return data if isinstance(data, dict) else None
         except Exception:
             return None
     return None
@@ -124,7 +143,11 @@ def _artifact_contract_facts(workspace_dir: Path) -> dict[str, Any]:
     for column in val_columns:
         normalized = column.lower()
         if column not in test_set or any(token in normalized for token in label_tokens):
-            if column not in test_set or column not in {"image_path", "path", "file_path"}:
+            if column not in test_set or column not in {
+                "image_path",
+                "path",
+                "file_path",
+            }:
                 ground_truth_only.append(column)
 
     common_columns = [column for column in val_columns if column in test_set]
@@ -477,6 +500,310 @@ def _run_public_artifact_contract_test(
         )
 
 
+def _resolve_candidate_path(
+    workspace_dir: Path, raw_value: Any, base_dir: Path | None = None
+) -> Path:
+    path = Path(str(raw_value).strip())
+    if path.is_absolute():
+        return path
+    normalized = Path(str(path).removeprefix("./"))
+    candidates = []
+    if base_dir is not None:
+        candidates.append(base_dir / normalized)
+    candidates.extend(
+        [
+            workspace_dir / normalized,
+            workspace_dir / "working" / normalized,
+            workspace_dir / "input" / normalized,
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else workspace_dir / normalized
+
+
+def _safe_scalar(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return str(value)
+
+
+def _summarize_series(series: pd.Series) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "dtype": str(series.dtype),
+        "null_count": int(series.isna().sum()),
+    }
+    non_null = series.dropna()
+    if non_null.empty:
+        summary["sample_values"] = []
+        return summary
+    if pd.api.types.is_numeric_dtype(non_null):
+        values = pd.to_numeric(non_null, errors="coerce").dropna()
+        if not values.empty:
+            summary.update(
+                {
+                    "min": float(values.min()),
+                    "max": float(values.max()),
+                    "mean": float(values.mean()),
+                    "std": float(values.std()) if len(values) > 1 else 0.0,
+                }
+            )
+    summary["sample_values"] = [
+        _safe_scalar(value) for value in non_null.head(3).tolist()
+    ]
+    return summary
+
+
+def _summarize_array_file(path: Path) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.is_file(),
+    }
+    if not path.is_file():
+        return summary | {"error": "file not found"}
+    summary["size_bytes"] = path.stat().st_size
+    try:
+        with Image.open(path) as image:
+            arr = np.asarray(image)
+            unique_preview = np.unique(
+                arr[: min(arr.shape[0], 256), : min(arr.shape[1], 256)]
+            )
+            result: dict[str, Any] = {
+                "kind": "image_array",
+                "mode": image.mode,
+                "size": list(image.size),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "min": _safe_scalar(arr.min()) if arr.size else None,
+                "max": _safe_scalar(arr.max()) if arr.size else None,
+                "sample_unique_count": int(len(unique_preview)),
+                "sample_unique_values": [
+                    _safe_scalar(v) for v in unique_preview[:8].tolist()
+                ],
+            }
+            if arr.size:
+                result["nonzero_fraction"] = float(np.count_nonzero(arr) / arr.size)
+                if arr.ndim <= 2:
+                    values, counts = np.unique(arr, return_counts=True)
+                    if len(values):
+                        idx = int(np.argmax(counts))
+                        result["most_common_value"] = _safe_scalar(values[idx])
+                        result["most_common_fraction"] = float(counts[idx] / arr.size)
+            summary.update(result)
+            return summary
+    except Exception as image_exc:
+        summary["image_read_error"] = str(image_exc)
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        summary.update(
+            {
+                "kind": "text_file",
+                "preview": truncate_text(text, max_chars=300),
+            }
+        )
+    except Exception as exc:
+        summary["error"] = str(exc)
+    return summary
+
+
+def _align_truth_rows(
+    pred_df: pd.DataFrame,
+    truth_df: pd.DataFrame,
+    key_columns: list[str],
+) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    if not key_columns:
+        n = min(len(pred_df), len(truth_df))
+        return truth_df.iloc[:n].reset_index(drop=True), {
+            "method": "row_order",
+            "truth_rows_used": n,
+        }
+    missing = [
+        column
+        for column in key_columns
+        if column not in pred_df.columns or column not in truth_df.columns
+    ]
+    if missing:
+        return None, {"method": "key_columns", "missing_key_columns": missing}
+    pred_keys = pred_df[key_columns].astype(str)
+    truth_keys = truth_df[key_columns].astype(str)
+    truth_lookup = truth_df.copy()
+    for column in key_columns:
+        truth_lookup[column] = truth_lookup[column].astype(str)
+    merged = pred_keys.merge(
+        truth_lookup.reset_index().rename(columns={"index": "__truth_index"}),
+        on=key_columns,
+        how="left",
+    )
+    missing_truth = int(merged["__truth_index"].isna().sum())
+    if missing_truth:
+        return None, {
+            "method": "key_columns",
+            "matched_rows": int(len(merged) - missing_truth),
+            "missing_truth_rows": missing_truth,
+        }
+    indices = merged["__truth_index"].astype(int).tolist()
+    return truth_df.iloc[indices].reset_index(drop=True), {
+        "method": "key_columns",
+        "matched_rows": len(indices),
+    }
+
+
+def inspect_candidate_artifacts(
+    workspace_dir: Path | str,
+    max_samples: int = 3,
+) -> dict[str, Any]:
+    """Best-effort deterministic summary of artifacts consumed by the evaluator."""
+    workspace_dir = Path(workspace_dir)
+    report: dict[str, Any] = {
+        "available": True,
+        "warnings": [],
+    }
+    try:
+        spec_path = workspace_dir / "evaluator_prediction_spec.json"
+        if not spec_path.is_file():
+            return {
+                "available": False,
+                "error": "evaluator_prediction_spec.json missing",
+            }
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        if not isinstance(spec, dict):
+            return {"available": False, "error": "prediction spec is not a JSON object"}
+        report["prediction_spec"] = {
+            key: spec.get(key)
+            for key in [
+                "validation_artifact",
+                "key_columns",
+                "prediction_columns",
+                "primary_metric",
+                "prediction_type",
+            ]
+            if key in spec
+        }
+
+        validation_artifact = spec.get("validation_artifact")
+        if not isinstance(validation_artifact, str) or not validation_artifact:
+            return report | {
+                "available": False,
+                "error": "validation_artifact missing from prediction spec",
+            }
+        artifact_path = _resolve_candidate_path(workspace_dir, validation_artifact)
+        report["validation_artifact"] = {
+            "path": str(artifact_path),
+            "exists": artifact_path.is_file(),
+        }
+        if not artifact_path.is_file():
+            report["warnings"].append("validation artifact file is missing")
+            return report
+
+        pred_df = pd.read_csv(artifact_path)
+        report["validation_artifact"].update(
+            {
+                "rows": int(len(pred_df)),
+                "columns": list(pred_df.columns),
+            }
+        )
+        key_columns = _list_of_strings(spec.get("key_columns"))
+        prediction_columns = _list_of_strings(spec.get("prediction_columns"))
+        missing_prediction_columns = [
+            column for column in prediction_columns if column not in pred_df.columns
+        ]
+        if missing_prediction_columns:
+            report["warnings"].append(
+                "missing prediction columns: " + ", ".join(missing_prediction_columns)
+            )
+
+        truth_path = workspace_dir / "input" / "biomaker_splits" / "agent_val.csv"
+        truth_df = pd.read_csv(truth_path) if truth_path.is_file() else pd.DataFrame()
+        report["target_artifact"] = {
+            "path": str(truth_path),
+            "exists": truth_path.is_file(),
+            "rows": int(len(truth_df)) if truth_path.is_file() else None,
+            "columns": list(truth_df.columns) if truth_path.is_file() else [],
+        }
+        aligned_truth, alignment = (
+            _align_truth_rows(pred_df, truth_df, key_columns)
+            if truth_path.is_file()
+            else (None, {"error": "agent_val.csv missing"})
+        )
+        report["alignment"] = alignment
+
+        column_summaries = {}
+        for column in prediction_columns:
+            if column in pred_df.columns:
+                column_summaries[column] = _summarize_series(pred_df[column])
+        report["prediction_column_summaries"] = column_summaries
+
+        target_columns = [
+            column
+            for column in truth_df.columns
+            if column not in set(key_columns) and column not in set(pred_df.columns)
+        ]
+        target_path_columns = [
+            column
+            for column in target_columns
+            if "path" in column.lower() or "file" in column.lower()
+        ]
+        report["target_columns_not_in_prediction"] = target_columns[:12]
+
+        sample_reports = []
+        n_samples = min(max_samples, len(pred_df))
+        for idx in range(n_samples):
+            pred_row = pred_df.iloc[idx]
+            sample: dict[str, Any] = {
+                "row_index": idx,
+                "keys": {
+                    column: _safe_scalar(pred_row[column])
+                    for column in key_columns
+                    if column in pred_df.columns
+                },
+                "predictions": {},
+            }
+            for column in prediction_columns:
+                if column not in pred_df.columns:
+                    continue
+                value = pred_row[column]
+                if "path" in column.lower() or "file" in column.lower():
+                    sample["predictions"][column] = _summarize_array_file(
+                        _resolve_candidate_path(
+                            workspace_dir, value, base_dir=artifact_path.parent
+                        )
+                    )
+                else:
+                    sample["predictions"][column] = {"value": _safe_scalar(value)}
+
+            if aligned_truth is not None and idx < len(aligned_truth):
+                truth_row = aligned_truth.iloc[idx]
+                target_summary: dict[str, Any] = {}
+                for column in target_path_columns[:3]:
+                    value = truth_row[column]
+                    target_summary[column] = _summarize_array_file(
+                        _resolve_candidate_path(
+                            workspace_dir, value, base_dir=truth_path.parent
+                        )
+                    )
+                for column in target_columns:
+                    if column in target_summary or column in target_path_columns:
+                        continue
+                    target_summary[column] = {"value": _safe_scalar(truth_row[column])}
+                    if len(target_summary) >= 6:
+                        break
+                sample["targets"] = target_summary
+            sample_reports.append(sample)
+        report["sample_reports"] = sample_reports
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+    return report
+
+
 def prepare_evaluator(
     workspace_dir: Path | str,
     log_dir: Path | str,
@@ -606,6 +933,15 @@ def score_candidate_with_evaluator(
             continue
         try:
             payload = json.loads(line[len(_RESULT_PREFIX) :])
+            payload["artifact_report"] = inspect_candidate_artifacts(workspace_dir)
+            output_with_report = (
+                output
+                + "\n"
+                + _ARTIFACT_REPORT_PREFIX
+                + json.dumps(
+                    payload["artifact_report"], ensure_ascii=False, default=str
+                )
+            )
             score = payload.get("score") or {}
             metric = score.get("metric")
             if isinstance(metric, bool) or metric is None:
@@ -619,7 +955,7 @@ def score_candidate_with_evaluator(
                 metric=metric,
                 maximize=maximize,
                 details=payload,
-                output=output,
+                output=output_with_report,
             )
         except Exception as exc:
             return EvaluatorRunResult(

@@ -1,6 +1,7 @@
 import logging
 import numbers
 import random
+import json
 from typing import Callable, cast
 
 import humanize
@@ -10,7 +11,7 @@ from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
 from ..utils import data_preview
 from ..utils.config import Config
-from ..utils.evaluator_setup import parse_external_validation
+from ..utils.evaluator_setup import parse_artifact_report, parse_external_validation
 from ..utils.environment import environment_manifest_text
 from ..utils.metric import MetricValue, WorstMetricValue
 from ..utils.response import (
@@ -259,6 +260,8 @@ class BaseAgent:
 
         node.absorb_exec_result(exec_result)
         external_metric = parse_external_validation(node.term_out)
+        artifact_report = parse_artifact_report(exec_result.term_out)
+        node.artifact_report = artifact_report
 
         prompt = {
             "Introduction": (
@@ -275,6 +278,20 @@ class BaseAgent:
                 "execution_time_seconds": node.exec_time,
                 "resource_usage": node.resource_usage,
                 "authoritative_external_metric": external_metric,
+                "artifact_report": (
+                    truncate_text(
+                        json.dumps(
+                            artifact_report,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ),
+                        max_chars=6000,
+                        marker="artifact report trimmed",
+                    )
+                    if artifact_report is not None
+                    else None
+                ),
             },
             "Implementation excerpt": wrap_code(
                 truncate_text(

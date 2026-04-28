@@ -7,6 +7,7 @@ The journal is the core datastructure in BioMaker that contains:
 ...
 """
 
+import json
 import random
 import time
 import uuid
@@ -41,6 +42,7 @@ class Node(DataClassJsonMixin):
     _term_out: list[str] = field(default=None, kw_only=True)  # type: ignore
     exec_time: float = field(default=None, kw_only=True)  # type: ignore
     resource_usage: dict | None = field(default=None, kw_only=True)
+    artifact_report: dict | None = field(default=None, kw_only=True)
     exc_type: str | None = field(default=None, kw_only=True)
     exc_info: dict | None = field(default=None, kw_only=True)
     exc_stack: list[tuple] | None = field(default=None, kw_only=True)
@@ -409,6 +411,23 @@ def _format_resource_usage(resource_usage: dict | None) -> str:
     return f"peak_rss {peak_rss:.0f}MB"
 
 
+def json_dumps_compact(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _format_artifact_report(report: dict) -> str:
+    compact = {
+        "warnings": report.get("warnings"),
+        "alignment": report.get("alignment"),
+        "validation_artifact": report.get("validation_artifact"),
+        "target_artifact": report.get("target_artifact"),
+    }
+    samples = report.get("sample_reports")
+    if isinstance(samples, list) and samples:
+        compact["sample_0"] = samples[0]
+    return json_dumps_compact(compact)
+
+
 def _format_node_header(n: Node) -> str:
     metric = n.metric.value if n.metric is not None else None
     metric_text = "n/a" if metric is None else f"{float(metric):.4f}"
@@ -421,12 +440,18 @@ def _format_node_header(n: Node) -> str:
 
 
 def _format_memory_node(n: Node) -> str:
+    artifact_text = ""
+    if n.artifact_report:
+        artifact_text = "\nArtifact facts: " + truncate_text(
+            _format_artifact_report(n.artifact_report), max_chars=520
+        )
     return (
         f"{_format_node_header(n)}\n"
         f"delta_vs_parent: {_format_delta(n.delta_vs_parent)} | "
         f"delta_vs_best_before: {_format_delta(n.delta_vs_best)}\n"
         f"Core idea: {truncate_text(str(n.plan), max_chars=320)}\n"
         f"Empirical finding: {truncate_text(str(n.analysis), max_chars=260)}"
+        f"{artifact_text}"
     )
 
 
@@ -442,4 +467,8 @@ def _format_child_experiment(n: Node) -> str:
         line += f"\n  Finding: {truncate_text(str(n.analysis), max_chars=180)}"
     elif n.exc_info:
         line += f"\n  Error info: {truncate_text(str(n.exc_info), max_chars=180)}"
+    if n.artifact_report:
+        line += "\n  Artifact facts: " + truncate_text(
+            _format_artifact_report(n.artifact_report), max_chars=320
+        )
     return line
