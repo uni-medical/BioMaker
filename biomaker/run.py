@@ -18,12 +18,14 @@ from .utils.artifact_validation import (
     validate_working_outputs,
 )
 from .utils.config import load_cfg, load_task_desc, prep_agent_workspace, save_run
+from .utils.events import append_event
 from .utils.evaluator_setup import (
     clean_candidate_outputs,
     prepare_evaluator,
     score_candidate_with_evaluator,
 )
 from .utils.private_evaluation import evaluate_private_outputs
+from .utils.run_manifest import write_run_manifest
 from .utils.split_protocol import prepare_split_protocol
 from .utils.timer import Timer
 
@@ -61,7 +63,11 @@ def journal_to_rich_tree(journal: Journal):
             s += " (new)"
 
         subtree = tree.add(s)
-        for child in node.children:
+        children = sorted(
+            node.children,
+            key=lambda child: child.step if child.step is not None else 10**9,
+        )
+        for child in children:
             append_rec(child, subtree)
 
     tree = Tree("[bold blue]Solution tree")
@@ -103,14 +109,31 @@ def run():
 
     logger.info(f'Starting run "{cfg.exp_name}"')
     logger.info(f'Config: "{cfg}"')
+    append_event(
+        cfg.log_dir,
+        "run_started",
+        exp_name=cfg.exp_name,
+        data_dir=cfg.data_dir,
+        workspace_dir=cfg.workspace_dir,
+        steps=cfg.agent.steps,
+        per_node_timeout_seconds=cfg.exec.timeout,
+        total_time_limit_seconds=cfg.agent.total_time_limit,
+    )
 
     task_desc = load_task_desc(cfg)
 
     logger.info("Preparing agent workspace (copying and extracting files) ...")
     prep_agent_workspace(cfg)
+    append_event(cfg.log_dir, "workspace_prepared", workspace_dir=cfg.workspace_dir)
     private_dir = cfg.log_dir / "private_truth"
     split_protocol = prepare_split_protocol(
         cfg.workspace_dir / "input", private_dir=private_dir
+    )
+    append_event(
+        cfg.log_dir,
+        "split_protocol_prepared",
+        private_dir=private_dir,
+        prompt_chars=len(split_protocol.prompt_text),
     )
     logger.info("Split protocol:\n%s", split_protocol.prompt_text)
     interpreter = Interpreter(
@@ -133,6 +156,11 @@ def run():
         temperature=0.0,
         timeout=min(180, cfg.exec.timeout),
     )
+    append_event(
+        cfg.log_dir,
+        "evaluator_prepared",
+        prediction_spec_chars=len(prepared_evaluator.prediction_spec),
+    )
     task_desc["Evaluation protocol"] = (
         "A frozen evaluator has been generated and smoke-tested at `./evaluator.py`. "
         "Strictly follow `evaluator.prediction_spec()` for validation predictions and test submission. "
@@ -142,6 +170,17 @@ def run():
         "Classification probability columns must be complete softmax probabilities for every class and each row must sum to 1; do not fill missing rows with zeros. "
         f"Prediction spec: {prepared_evaluator.prediction_spec}"
     )
+    try:
+        prediction_spec = json.loads(prepared_evaluator.prediction_spec)
+    except Exception:
+        prediction_spec = {"raw": prepared_evaluator.prediction_spec}
+    manifest_path = write_run_manifest(
+        cfg,
+        task_desc,
+        split_protocol_text=split_protocol.prompt_text,
+        prediction_spec=prediction_spec,
+    )
+    append_event(cfg.log_dir, "run_manifest_written", path=manifest_path)
 
     journal = Journal()
 
@@ -165,6 +204,11 @@ def run():
     def exec_callback(*args, **kwargs):
         logger.info(Text("Executing code...", style="magenta"))
         node_start_time = time.monotonic()
+        append_event(
+            cfg.log_dir,
+            "execution_started",
+            code_chars=len(str(args[0])) if args else None,
+        )
         clean_candidate_outputs(cfg.workspace_dir)
         res = interpreter.run(*args, **kwargs)
         if res.exc_type is None:
@@ -195,6 +239,13 @@ def run():
                     + (evaluator_result.error or "external evaluator failed")
                 )
         res.exec_time = time.monotonic() - node_start_time
+        append_event(
+            cfg.log_dir,
+            "execution_finished",
+            exec_time=res.exec_time,
+            exc_type=res.exc_type,
+            resource_usage=res.resource_usage,
+        )
         logger.info(Text("Execution done.", style="magenta"))
         return res
 
@@ -255,9 +306,17 @@ def run():
 
         tree = journal_to_rich_tree(journal)
         save_run(cfg, journal, tree)
+        append_event(
+            cfg.log_dir,
+            "step_saved",
+            step=global_step,
+            node_id=solution_node.id if solution_node is not None else None,
+            best_node_id=best_node.id if best_node is not None else None,
+        )
         logger.info(tree)
         global_step += 1
     interpreter.cleanup_session()
+    append_event(cfg.log_dir, "run_finished", completed_steps=global_step)
     agent_loop_exit_handler(end_with_exception=end_with_exception)
 
 

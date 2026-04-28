@@ -20,6 +20,7 @@ import numpy as np
 from .. import backend
 from . import data_preview
 from .environment import environment_manifest_text, validate_code_environment
+from .events import append_event
 from .response import extract_code, truncate_text
 
 logger = logging.getLogger("biomaker")
@@ -193,7 +194,7 @@ def _evaluator_prompt(task_desc: Any, workspace_dir: Path) -> dict[str, Any]:
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
             "The candidate validation artifact must follow the same public prediction contract as the test submission: key_columns plus prediction_columns only. Do not require candidates to output validation ground-truth columns such as label, class, target, or true_class. score_val() must load validation labels from ./input/biomaker_splits/agent_val.csv and align them to the validation artifact by key columns.",
             "When reading candidate artifacts, validate the required columns and then restrict the dataframe to key_columns plus prediction_columns before merging with ground truth. Extra candidate columns such as class, label, target, or true_class must not collide with ground-truth columns or change scoring.",
-            "For tabular score_val(), use this safe merge pattern: copy the ground-truth label column to a private column named `__y_true`, build `truth_view = agent_val[key_columns + ['__y_true']]`, build `pred_view = predictions[key_columns + prediction_columns]`, convert every key column in both views to string before merging, merge those restricted views only, and read labels from `merged['__y_true']`. Never read `merged['class']`, `merged['label']`, `merged['target']`, or candidate-supplied label-like columns after merge.",
+            "For tabular score_val(), use this safe merge pattern: copy the ground-truth label column to a private column named `y_true_private`, build `truth_view = agent_val[key_columns + ['y_true_private']]`, build `pred_view = predictions[key_columns + prediction_columns]`, convert every key column in both views to string before merging, merge those restricted views only, and read labels with dataframe/series indexing such as `merged['y_true_private']` or `row['y_true_private']`. Never rely on tuple attribute access for helper columns, and never read `merged['class']`, `merged['label']`, `merged['target']`, or candidate-supplied label-like columns after merge.",
             "For tabular validate_submission(), apply the same key-column string normalization and restrict submission data to key_columns plus prediction_columns before checking duplicates, missing keys, or shapes.",
             "For probability outputs, include class_labels when prediction_columns do not directly encode class names; for single-column binary probability outputs, include positive_class.",
             "The submission contract must preserve enough information for the requested user-only test metrics. For classification with AUC, require probabilities rather than only hard labels.",
@@ -821,6 +822,7 @@ def prepare_evaluator(
     errors: list[str] = []
 
     for attempt in range(1, attempts + 1):
+        append_event(log_dir, "evaluator_attempt_started", attempt=attempt)
         completion = backend.query(
             system_message=prompt
             | {
@@ -834,15 +836,33 @@ def prepare_evaluator(
         code = extract_code(str(completion))
         if not code:
             errors.append("No Python code block was returned.")
+            append_event(
+                log_dir,
+                "evaluator_attempt_failed",
+                attempt=attempt,
+                reason=errors[-1],
+            )
             continue
 
         preflight = validate_code_environment(code, include_medical=True)
         if not preflight.ok:
             errors.append(preflight.message)
+            append_event(
+                log_dir,
+                "evaluator_attempt_failed",
+                attempt=attempt,
+                reason=preflight.message,
+            )
             continue
         if _uses_eval_or_exec(code):
             errors.append(
                 "Evaluator uses eval() or exec(). Use json.loads or ast.literal_eval instead."
+            )
+            append_event(
+                log_dir,
+                "evaluator_attempt_failed",
+                attempt=attempt,
+                reason=errors[-1],
             )
             continue
 
@@ -860,6 +880,12 @@ def prepare_evaluator(
             )
         except Exception as exc:
             errors.append(str(exc))
+            append_event(
+                log_dir,
+                "evaluator_attempt_failed",
+                attempt=attempt,
+                reason=truncate_text(str(exc), max_chars=1200),
+            )
             continue
 
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -872,6 +898,7 @@ def prepare_evaluator(
         )
         clean_candidate_outputs(workspace_dir)
         logger.info("Evaluator prepared at %s", evaluator_path)
+        append_event(log_dir, "evaluator_attempt_succeeded", attempt=attempt)
         return PreparedEvaluator(path=evaluator_path, prediction_spec=prediction_spec)
 
     try:

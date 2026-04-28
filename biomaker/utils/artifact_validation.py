@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from PIL import Image
@@ -48,7 +50,9 @@ def _normalize_csv_path_refs(workspace_dir: Path, csv_path: Path) -> list[str]:
 
     df = pd.read_csv(csv_path)
     path_columns = [
-        column for column in df.columns if "path" in column.lower() or "file" in column.lower()
+        column
+        for column in df.columns
+        if "path" in column.lower() or "file" in column.lower()
     ]
     if not path_columns:
         return []
@@ -69,6 +73,32 @@ def _normalize_csv_path_refs(workspace_dir: Path, csv_path: Path) -> list[str]:
         return []
     df.to_csv(csv_path, index=False)
     return [f"ArtifactNormalization: normalized working file references in {csv_path.name}"]
+
+
+def _load_prediction_spec(workspace_dir: Path) -> dict[str, Any]:
+    spec_path = workspace_dir / "evaluator_prediction_spec.json"
+    if not spec_path.is_file():
+        return {}
+    try:
+        data = json.loads(spec_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _path_from_spec(workspace_dir: Path, value: Any, fallback: Path) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        return fallback
+    path = Path(value.strip())
+    if path.is_absolute():
+        return path
+    return workspace_dir / str(path).removeprefix("./")
+
+
+def _list_of_strings(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if isinstance(item, str) and item]
+    return []
 
 
 def _submission_expected_rows(input_dir: Path) -> int | None:
@@ -100,63 +130,10 @@ def _patient_image_size_map(input_dir: Path) -> dict[str, tuple[int, int]]:
 def normalize_working_outputs(workspace_dir: Path | str, task_desc: str) -> list[str]:
     """Apply deterministic, task-format-only fixes to generated artifacts."""
     workspace_dir = Path(workspace_dir)
-    input_dir = workspace_dir / "input"
     working_dir = workspace_dir / "working"
-    submission_path = working_dir / "submission.csv"
     messages: list[str] = []
     for csv_path in sorted(working_dir.glob("*.csv")):
         messages.extend(_normalize_csv_path_refs(workspace_dir, csv_path))
-    if not submission_path.is_file():
-        return messages
-
-    submission = pd.read_csv(submission_path)
-    path_columns = [
-        column
-        for column in submission.columns
-        if "path" in column.lower() or "file" in column.lower()
-    ]
-    if not path_columns:
-        return []
-
-    patient_sizes = _patient_image_size_map(input_dir)
-    task_desc_lower = task_desc.lower()
-    instance_expected = "instance" in task_desc_lower or "aji" in task_desc_lower
-    binary_required = "binary" in task_desc_lower and not instance_expected
-
-    with open(submission_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            patient = row.get("patient")
-            if not patient or patient not in patient_sizes:
-                continue
-
-            for column in path_columns:
-                value = row.get(column) or ""
-                if "mask" not in column.lower() and "mask" not in value.lower():
-                    continue
-
-                artifact_path = _resolve_artifact_path(workspace_dir, value)
-                if not artifact_path.is_file():
-                    continue
-
-                target_size = patient_sizes[patient]
-                with Image.open(artifact_path) as image:
-                    mask = image.copy() if instance_expected else image.convert("L")
-                    changed = False
-                    if mask.size != target_size:
-                        mask = mask.resize(target_size, Image.Resampling.NEAREST)
-                        changed = True
-                    if binary_required:
-                        mask = mask.point(lambda pixel: 255 if pixel > 0 else 0)
-                        changed = True
-
-                    if changed:
-                        artifact_path.parent.mkdir(parents=True, exist_ok=True)
-                        mask.save(artifact_path)
-                        messages.append(
-                            f"ArtifactNormalization: normalized {value} to size {target_size}"
-                        )
-
     return messages
 
 
@@ -165,17 +142,27 @@ def validate_working_outputs(
 ) -> ArtifactValidationResult:
     """Check common generated artifacts before the agent accepts a run."""
     workspace_dir = Path(workspace_dir)
-    input_dir = workspace_dir / "input"
     working_dir = workspace_dir / "working"
-    submission_path = working_dir / "submission.csv"
+    input_dir = workspace_dir / "input"
+    spec = _load_prediction_spec(workspace_dir)
+    submission_path = _path_from_spec(
+        workspace_dir,
+        spec.get("test_submission"),
+        working_dir / "submission.csv",
+    )
     messages: list[str] = []
 
-    expected_rows = _submission_expected_rows(input_dir)
+    test_split = workspace_dir / "input" / "biomaker_splits" / "agent_test.csv"
+    expected_rows = (
+        len(pd.read_csv(test_split))
+        if test_split.is_file()
+        else _submission_expected_rows(input_dir)
+    )
     if expected_rows is not None and not submission_path.is_file():
         return ArtifactValidationResult(
             ok=False,
             messages=[
-                "ArtifactValidationError: expected ./working/submission.csv because test data is present, but it was not created."
+                "ArtifactValidationError: expected test submission because test data is present, but it was not created."
             ],
         )
 
@@ -185,29 +172,39 @@ def validate_working_outputs(
     submission = pd.read_csv(submission_path)
     if expected_rows is not None and len(submission) != expected_rows:
         messages.append(
-            "ArtifactValidationError: submission.csv row count "
+            f"ArtifactValidationError: {submission_path.name} row count "
             f"({len(submission)}) does not match test data row count ({expected_rows})."
         )
 
+    required_columns = [
+        * _list_of_strings(spec.get("key_columns")),
+        * _list_of_strings(spec.get("prediction_columns")),
+    ]
+    missing_columns = [column for column in required_columns if column not in submission]
+    if missing_columns:
+        messages.append(
+            "ArtifactValidationError: submission is missing required evaluator "
+            "contract columns: " + ", ".join(missing_columns)
+        )
+
+    prediction_columns = set(_list_of_strings(spec.get("prediction_columns")))
+    declared_file_columns = set(_list_of_strings(spec.get("file_reference_columns")))
     path_columns = [
         column
         for column in submission.columns
-        if "path" in column.lower() or "file" in column.lower()
+        if column in declared_file_columns
+        or (column in prediction_columns and ("path" in column.lower() or "file" in column.lower()))
+        or (not prediction_columns and ("path" in column.lower() or "file" in column.lower()))
     ]
     if not path_columns:
         return ArtifactValidationResult(ok=not messages, messages=messages)
 
-    patient_sizes = _patient_image_size_map(input_dir)
-    task_desc_lower = task_desc.lower()
-    instance_expected = "instance" in task_desc_lower or "aji" in task_desc_lower
-    binary_required = "binary" in task_desc_lower and not instance_expected
     missing_paths = []
     invalid_masks = []
 
     with open(submission_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            patient = row.get("patient")
             for column in path_columns:
                 value = row.get(column) or ""
                 if not value.strip():
@@ -224,21 +221,7 @@ def validate_working_outputs(
 
                 try:
                     with Image.open(artifact_path) as mask:
-                        if (
-                            patient
-                            and patient in patient_sizes
-                            and mask.size != patient_sizes[patient]
-                        ):
-                            invalid_masks.append(
-                                f"{value}: mask size {mask.size} does not match image size {patient_sizes[patient]}"
-                            )
-                        if binary_required:
-                            values = set(mask.convert("L").getdata())
-                            if not values.issubset({0, 255}):
-                                preview = sorted(values)[:10]
-                                invalid_masks.append(
-                                    f"{value}: binary mask contains values outside 0/255, e.g. {preview}"
-                                )
+                        mask.verify()
                 except Exception as exc:
                     invalid_masks.append(f"{value}: mask file is not readable: {exc}")
 

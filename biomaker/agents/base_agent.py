@@ -11,6 +11,7 @@ from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
 from ..utils import data_preview
 from ..utils.config import Config
+from ..utils.events import append_event
 from ..utils.evaluator_setup import parse_artifact_report, parse_external_validation
 from ..utils.environment import environment_manifest_text
 from ..utils.metric import MetricValue, WorstMetricValue
@@ -67,6 +68,7 @@ class BaseAgent:
         self.journal = journal
         self.data_preview: str | None = None
         self.run_facts: str | None = None
+        self._last_selection_reason: str | None = None
         self.environment_facts = environment_manifest_text(
             include_medical=self.cfg.exec.include_medical_packages
         )
@@ -88,59 +90,104 @@ class BaseAgent:
         debuggable_nodes = [
             n
             for n in self.journal.buggy_nodes
-            if (n.is_leaf and n.debug_depth < search_cfg.max_debug_depth)
+            if (
+                n.is_leaf
+                and n.debug_depth < search_cfg.max_debug_depth
+                and len(n.children) < search_cfg.num_bugs
+            )
         ]
         good_nodes = self.journal.good_nodes
 
-        if not good_nodes:
-            if debuggable_nodes:
-                logger.debug("[search policy] debugging shallow buggy leaf")
-                return random.choice(debuggable_nodes)
-
-            if len(self.journal.draft_nodes) < search_cfg.num_drafts:
-                logger.debug("[search policy] drafting new node (no good nodes)")
-                return None
-
-            logger.debug(
-                "[search policy] drafting new node (no good or debuggable nodes)"
-            )
-            return None
-
-        if random.random() < search_cfg.draft_prob_after_success:
-            logger.debug("[search policy] drafting new node for diversity")
-            return None
-
-        if debuggable_nodes and random.random() < search_cfg.debug_prob:
-            logger.debug("[search policy] debugging buggy leaf")
-            return random.choice(debuggable_nodes)
-
-        clean_frontier_nodes = [
-            n for n in good_nodes if n.is_leaf and n.outcome != "regressed_parent"
+        eligible_success_nodes = [
+            n
+            for n in good_nodes
+            if len(n.children) < search_cfg.max_children_per_node
+            and n.outcome != "regressed_parent"
         ]
-        strong_nodes = [n for n in good_nodes if n.outcome != "regressed_parent"]
+        if not eligible_success_nodes:
+            eligible_success_nodes = [
+                n
+                for n in good_nodes
+                if len(n.children) < search_cfg.max_children_per_node
+            ]
+
+        clean_frontier_nodes = [n for n in eligible_success_nodes if n.is_leaf]
+        strong_nodes = list(eligible_success_nodes)
         leaf_nodes = [n for n in good_nodes if n.is_leaf]
         best_node = self.journal.get_best_node(only_good=True, topk=1)
         candidate_nodes = []
         for candidate in [
-            best_node,
+            (
+                best_node
+                if best_node is not None
+                and best_node in eligible_success_nodes
+                else None
+            ),
             *clean_frontier_nodes,
             *strong_nodes,
             *leaf_nodes,
-            *good_nodes,
         ]:
-            if candidate is not None and candidate not in candidate_nodes:
+            if (
+                candidate is not None
+                and candidate in eligible_success_nodes
+                and candidate not in candidate_nodes
+            ):
                 candidate_nodes.append(candidate)
         top_nodes = sorted(candidate_nodes, key=lambda n: n.metric, reverse=True)[
             : search_cfg.topk_improve
         ]
-        # Bias toward the current best, but keep other strong branches alive.
-        weights = [1.0 / (rank + 1) for rank in range(len(top_nodes))]
-        node = random.choices(top_nodes, weights=weights, k=1)[0]
+
+        choices: list[Node | None] = []
+        weights: list[float] = []
+        for rank, node in enumerate(top_nodes):
+            choices.append(node)
+            weights.append(1.0 / (rank + 1))
+
+        root_draft_available = (
+            len(self.journal.draft_nodes) < search_cfg.max_children_per_node
+        )
+        if root_draft_available:
+            choices.append(None)
+            weights.append(0.5)
+
+        for node in debuggable_nodes:
+            choices.append(node)
+            weights.append(0.5)
+
+        if not choices:
+            logger.debug("[search policy] no expandable candidates")
+            self._last_selection_reason = (
+                "no expandable successful, buggy, or root node remains"
+            )
+            return None
+
+        selected = random.choices(choices, weights=weights, k=1)[0]
+        if selected is None:
+            logger.debug("[search policy] expanding virtual root into a draft")
+            self._last_selection_reason = (
+                "weighted exploration selected virtual root draft "
+                f"({len(self.journal.draft_nodes) + 1}/"
+                f"{search_cfg.max_children_per_node})"
+            )
+            return None
+
+        if selected.is_buggy:
+            logger.debug("[search policy] debugging selected buggy node")
+            self._last_selection_reason = (
+                "weighted exploration selected a buggy leaf for debug "
+                f"(depth {selected.debug_depth + 1}/{search_cfg.max_debug_depth})"
+            )
+            return selected
+
         logger.debug(
-            "[search policy] improving one of the top-%d frontier good nodes",
+            "[search policy] improving one of the top-%d available good nodes",
             len(top_nodes),
         )
-        return node
+        self._last_selection_reason = (
+            f"weighted exploration selected rank {top_nodes.index(selected) + 1} "
+            f"of {len(top_nodes)} available successful candidates"
+        )
+        return selected
 
     @property
     def _prompt_environment(self):
@@ -209,6 +256,10 @@ class BaseAgent:
             print("Plan + code extraction failed, retrying...")
         print("Final plan + code extraction attempt failed, giving up...")
         return "", completion_text  # type: ignore
+
+    def wrap_execution_output(self, node: Node) -> str:
+        """Return the execution output in the form shown to debug prompts."""
+        return wrap_code(node.term_out, lang="")
 
     def update_data_preview(self):
         self.data_preview = data_preview.generate(self.cfg.workspace_dir)
@@ -339,6 +390,25 @@ class BaseAgent:
             )
         best_node_before = self.journal.get_best_node(only_good=True, topk=1)
         node.record_experiment_context(best_node_before=best_node_before)
+        append_event(
+            self.cfg.log_dir,
+            "node_evaluated",
+            node_id=node.id,
+            parent_id=node.parent.id if node.parent is not None else None,
+            stage=node.node_status,
+            is_buggy=node.is_buggy,
+            metric=None if node.metric is None else node.metric.value,
+            maximize=None if node.metric is None else node.metric.maximize,
+            outcome=node.outcome,
+            exec_time=node.exec_time,
+            resource_usage=node.resource_usage,
+            exc_type=node.exc_type,
+            artifact_available=(
+                node.artifact_report.get("available")
+                if isinstance(node.artifact_report, dict)
+                else None
+            ),
+        )
 
     def step(self, exec_callback: ExecCallbackType):
         """core logic of the actions of this Agent"""

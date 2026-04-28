@@ -24,6 +24,7 @@ from rich.tree import Tree
 
 from . import copytree, preproc_data, serialize
 from .env import load_local_env
+from .response import truncate_text
 
 try:
     csv.field_size_limit(sys.maxsize)
@@ -71,9 +72,8 @@ class StageConfig:
 @dataclass
 class SearchConfig:
     max_debug_depth: int
-    debug_prob: float
-    draft_prob_after_success: float
-    num_drafts: int
+    max_children_per_node: int
+    num_bugs: int
     topk_improve: int
 
 
@@ -353,11 +353,230 @@ def _copy_submission_artifacts(
                 shutil.copy2(src, dst)
 
 
+def _node_artifact_path(log_dir: Path, node) -> Path:
+    step = "na" if node.step is None else f"{int(node.step):03d}"
+    return log_dir / "node_artifacts" / f"{step}_{node.id[:8]}"
+
+
+def _copy_csv_referenced_files(
+    csv_path: Path,
+    workspace_dir: Path,
+    dst_dir: Path,
+    file_columns: set[str] | None = None,
+) -> None:
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if file_columns is None:
+                path_columns = [
+                    name
+                    for name in (reader.fieldnames or [])
+                    if "path" in name.lower() or "file" in name.lower()
+                ]
+            else:
+                path_columns = [
+                    name for name in (reader.fieldnames or []) if name in file_columns
+                ]
+            for row in reader:
+                for column in path_columns:
+                    value = (row.get(column) or "").strip()
+                    if not value:
+                        continue
+                    raw_path = Path(value)
+                    if raw_path.is_absolute():
+                        src = raw_path
+                    else:
+                        normalized = Path(str(raw_path).removeprefix("./"))
+                        candidates = [
+                            workspace_dir / normalized,
+                            workspace_dir / "working" / normalized,
+                            workspace_dir / "input" / normalized,
+                        ]
+                        src = next((p for p in candidates if p.is_file()), candidates[0])
+                    if not src.is_file():
+                        continue
+                    try:
+                        rel = src.relative_to(workspace_dir / "working")
+                    except ValueError:
+                        rel = Path("external_files") / src.name
+                    dst = dst_dir / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+    except Exception as exc:
+        logger.debug("Failed to copy CSV-referenced files from %s: %s", csv_path, exc)
+
+
+def _copy_node_artifacts(cfg: Config, node) -> None:
+    """Persist the candidate-owned artifacts for one node before ./working changes."""
+    if node is None:
+        return
+    working_dir = Path(cfg.workspace_dir) / "working"
+    if not working_dir.is_dir():
+        return
+
+    dst_dir = _node_artifact_path(cfg.log_dir, node)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    (dst_dir / "runfile.py").write_text(node.code or "", encoding="utf-8")
+
+    metadata = {
+        "node_id": node.id,
+        "step": node.step,
+        "parent_id": node.parent.id if node.parent is not None else None,
+        "status": node.node_status,
+        "selection_reason": node.selection_reason,
+        "metric": (
+            None
+            if node.metric is None
+            else {
+                "value": node.metric.value,
+                "maximize": node.metric.maximize,
+            }
+        ),
+        "outcome": node.outcome,
+        "exec_time": node.exec_time,
+        "resource_usage": node.resource_usage,
+        "exc_type": node.exc_type,
+        "exc_info": node.exc_info,
+        "plan": node.plan,
+        "analysis": node.analysis,
+    }
+    (dst_dir / "node_metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    if node.artifact_report:
+        (dst_dir / "artifact_report.json").write_text(
+            json.dumps(node.artifact_report, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+
+    spec_path = Path(cfg.workspace_dir) / "evaluator_prediction_spec.json"
+    if spec_path.is_file():
+        shutil.copy2(spec_path, dst_dir / "evaluator_prediction_spec.json")
+        try:
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        except Exception:
+            spec = {}
+    else:
+        spec = {}
+
+    prediction_columns = {
+        str(column)
+        for column in spec.get("prediction_columns", [])
+        if isinstance(column, str)
+    }
+    file_reference_columns = {
+        str(column)
+        for column in spec.get("file_reference_columns", [])
+        if isinstance(column, str)
+    }
+    prediction_file_columns = {
+        column
+        for column in prediction_columns | file_reference_columns
+        if "path" in column.lower() or "file" in column.lower()
+    }
+    if not prediction_file_columns and not prediction_columns:
+        prediction_file_columns = set()
+
+    for csv_path in sorted(working_dir.glob("*.csv")):
+        dst = dst_dir / csv_path.name
+        shutil.copy2(csv_path, dst)
+        _copy_csv_referenced_files(
+            csv_path,
+            Path(cfg.workspace_dir),
+            dst_dir,
+            file_columns=prediction_file_columns or None,
+        )
+
+
+def _artifact_alignment_value(report: dict | None, key: str):
+    if not isinstance(report, dict):
+        return None
+    alignment = report.get("alignment")
+    if isinstance(alignment, dict):
+        return alignment.get(key)
+    return None
+
+
+def _write_results_table(log_dir: Path, journal) -> None:
+    path = log_dir / "results.tsv"
+    fieldnames = [
+        "step",
+        "node_id",
+        "parent_id",
+        "status",
+        "metric",
+        "maximize",
+        "outcome",
+        "delta_vs_parent",
+        "delta_vs_best",
+        "runtime_s",
+        "peak_rss_mb",
+        "avg_cpu_percent",
+        "artifact_available",
+        "alignment_method",
+        "matched_rows",
+        "exc_type",
+        "error",
+        "selection_reason",
+        "plan",
+        "analysis",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for node in journal.nodes:
+            metric = node.metric.value if node.metric is not None else None
+            resources = node.resource_usage or {}
+            report = node.artifact_report
+            writer.writerow(
+                {
+                    "step": node.step,
+                    "node_id": node.id[:8],
+                    "parent_id": node.parent.id[:8] if node.parent else "",
+                    "status": node.node_status,
+                    "metric": "" if metric is None else metric,
+                    "maximize": (
+                        "" if node.metric is None else bool(node.metric.maximize)
+                    ),
+                    "outcome": node.outcome or "",
+                    "delta_vs_parent": (
+                        "" if node.delta_vs_parent is None else node.delta_vs_parent
+                    ),
+                    "delta_vs_best": (
+                        "" if node.delta_vs_best is None else node.delta_vs_best
+                    ),
+                    "runtime_s": "" if node.exec_time is None else node.exec_time,
+                    "peak_rss_mb": resources.get("peak_rss_mb", ""),
+                    "avg_cpu_percent": resources.get("avg_cpu_percent", ""),
+                    "artifact_available": (
+                        "" if not isinstance(report, dict) else report.get("available")
+                    ),
+                    "alignment_method": _artifact_alignment_value(report, "method")
+                    or "",
+                    "matched_rows": _artifact_alignment_value(report, "matched_rows")
+                    or "",
+                    "exc_type": node.exc_type or "",
+                    "error": truncate_text(
+                        str(node.exc_info or ""), max_chars=300
+                    ),
+                    "selection_reason": truncate_text(
+                        str(node.selection_reason or ""), max_chars=240
+                    ),
+                    "plan": truncate_text(str(node.plan or ""), max_chars=500),
+                    "analysis": truncate_text(
+                        str(node.analysis or ""), max_chars=500
+                    ),
+                }
+            )
+
+
 def save_run(cfg: Config, journal, solution_tree: Tree = None):
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
     # save journal
     serialize.dump_json(journal, cfg.log_dir / "journal.json")
+    _write_results_table(cfg.log_dir, journal)
     # save config
     OmegaConf.save(config=cfg, f=cfg.log_dir / "config.yaml")
     split_dir = Path(cfg.workspace_dir) / "input" / "biomaker_splits"
@@ -381,6 +600,9 @@ def save_run(cfg: Config, journal, solution_tree: Tree = None):
             f.write(best_node.code)
 
     latest_node = journal.nodes[-1] if journal.nodes else None
+    if latest_node is not None:
+        _copy_node_artifacts(cfg, latest_node)
+
     if latest_node is not None and latest_node is best_node:
         # Copy artifacts only when the latest candidate is the best runnable node.
         # This keeps best_solution.py, submission.csv, masks, and private_latest aligned.

@@ -7,6 +7,8 @@ Supports:
 """
 
 import logging
+import os
+import signal
 import sys
 import subprocess
 import time
@@ -50,11 +52,37 @@ def _infer_exception_type(output: str, returncode: int) -> str:
     return "RuntimeError"
 
 
-def _sample_process_usage(pid: int) -> dict | None:
-    """Sample process RSS and CPU percent with platform tools, without extra deps."""
+def _descendant_pids(pid: int) -> list[int]:
+    """Return child process ids recursively using platform tools."""
     try:
         completed = subprocess.run(
-            ["ps", "-o", "rss=,%cpu=", "-p", str(pid)],
+            ["pgrep", "-P", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=0.2,
+        )
+    except Exception:
+        return []
+    if completed.returncode != 0:
+        return []
+    children = []
+    for line in completed.stdout.splitlines():
+        try:
+            child = int(line.strip())
+        except ValueError:
+            continue
+        children.append(child)
+        children.extend(_descendant_pids(child))
+    return children
+
+
+def _sample_process_usage(pid: int) -> dict | None:
+    """Sample process-tree RSS and CPU percent with platform tools, without extra deps."""
+    pids = [pid, *_descendant_pids(pid)]
+    pid_args = ",".join(str(p) for p in pids)
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "rss=,%cpu=", "-p", pid_args],
             capture_output=True,
             text=True,
             timeout=0.2,
@@ -63,16 +91,24 @@ def _sample_process_usage(pid: int) -> dict | None:
         return None
     if completed.returncode != 0:
         return None
-    line = completed.stdout.strip()
-    if not line:
-        return None
-    parts = line.split()
-    if len(parts) < 2:
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
         return None
     try:
+        rss_mb = 0.0
+        cpu_percent = 0.0
+        sampled_processes = 0
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            rss_mb += int(parts[0]) / 1024.0
+            cpu_percent += float(parts[1])
+            sampled_processes += 1
         return {
-            "rss_mb": int(parts[0]) / 1024.0,
-            "cpu_percent": float(parts[1]),
+            "rss_mb": rss_mb,
+            "cpu_percent": cpu_percent,
+            "process_count": sampled_processes,
         }
     except ValueError:
         return None
@@ -89,7 +125,12 @@ def _summarize_usage(samples: list[dict]) -> dict | None:
     if cpu_values:
         summary["avg_cpu_percent"] = sum(cpu_values) / len(cpu_values)
         summary["peak_cpu_percent"] = max(cpu_values)
-    summary["scope"] = "generated_script_process"
+    process_counts = [
+        int(s["process_count"]) for s in samples if "process_count" in s
+    ]
+    if process_counts:
+        summary["peak_process_count"] = max(process_counts)
+    summary["scope"] = "generated_script_process_tree"
     return summary
 
 
@@ -103,6 +144,9 @@ def _format_usage_line(resource_usage: dict | None) -> str | None:
     avg_cpu = resource_usage.get("avg_cpu_percent")
     if isinstance(avg_cpu, (int, float)):
         parts.append(f"avg_cpu={avg_cpu:.1f}%")
+    peak_processes = resource_usage.get("peak_process_count")
+    if isinstance(peak_processes, (int, float)) and peak_processes > 1:
+        parts.append(f"peak_processes={int(peak_processes)}")
     if not parts:
         return None
     return "Resource usage: " + ", ".join(parts) + "."
@@ -181,6 +225,7 @@ class Interpreter:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
             stdout = ""
             stderr = ""
@@ -194,7 +239,10 @@ class Interpreter:
                 remaining = self.timeout - elapsed
                 if remaining <= 0:
                     timed_out = True
-                    process.kill()
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except Exception:
+                        process.kill()
                     stdout, stderr = process.communicate()
                     break
 

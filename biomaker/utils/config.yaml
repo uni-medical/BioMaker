@@ -43,10 +43,9 @@ agent:
 
   # hyperparameters for the tree search
   search:
-    num_drafts: 3
-    debug_prob: 0.35
-    max_debug_depth: 3
-    draft_prob_after_success: 0.30
+    max_children_per_node: 5
+    num_bugs: 1
+    max_debug_depth: 2
     topk_improve: 3
 
   # LLM settings for coding. Null means read BIOMAKER_MAIN_MODEL / OPENAI_MODEL from .env.

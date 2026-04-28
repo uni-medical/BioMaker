@@ -1,5 +1,8 @@
 const bgCol = "#F2F0E7";
 const accentCol = "#fd4578";
+const okCol = "#2F7D59";
+const bugCol = "#B4493D";
+const rootCol = "#50565F";
 
 hljs.initHighlightingOnLoad();
 
@@ -23,8 +26,20 @@ const setCodeAndPlan = (code, plan) => {
   }
 };
 
+const preferredNode = (visibleNodes) => {
+  const bestInd = (treeStructData.is_best || []).findIndex(Boolean);
+  if (bestInd >= 0) {
+    const bestNode = visibleNodes.find((node) => node.treeInd === bestInd);
+    if (bestNode) return bestNode;
+  }
+  return visibleNodes[0];
+};
+
 windowResized = () => {
   resizeCanvas(...updateTargetDims());
+  nodes = [];
+  edges = [];
+  manualSelection = false;
   awaitingPostResizeOps = true;
 };
 
@@ -79,8 +94,10 @@ class Node {
   bgCol;
 
   constructor(x, y, relSize, treeInd) {
-    const minSize = 35;
-    const maxSize = 60;
+    const nodeCount = Math.max(treeStructData.layout.length, 1);
+    const crowdScale = Math.max(0.55, Math.min(1.0, 18 / nodeCount));
+    const minSize = 24 * crowdScale;
+    const maxSize = 38 * crowdScale;
 
     const maxColor = 10;
     const minColor = 125;
@@ -151,28 +168,41 @@ class Node {
       }
     }
 
+    const status = (treeStructData.statuses || [])[this.treeInd] || "unknown";
     fill(this.color);
+    if (status === "virtual") {
+      fill(rootCol);
+    } else if (status === "bug") {
+      fill(bugCol);
+    } else {
+      fill(okCol);
+    }
     if (this.selected) {
       fill(accentCol);
     }
 
     noStroke();
-    square(
-      this.x - this.renderSize / 2,
-      this.y - this.renderSize / 2,
-      this.renderSize,
-      10,
-    );
+    if (status === "virtual") {
+      circle(this.x, this.y, this.renderSize);
+    } else {
+      square(
+        this.x - this.renderSize / 2,
+        this.y - this.renderSize / 2,
+        this.renderSize,
+        8,
+      );
+    }
 
     noStroke();
     textAlign(CENTER, CENTER);
-    textSize(this.renderSize / 2);
+    textSize(status === "virtual" ? this.renderSize / 3 : this.renderSize / 2.2);
     fill(255);
-    // fill(lerpColor(color(accentCol), color(255), this.animationProgress))
-    text("{ }", this.x, this.y - 1);
-    // DEBUG PRINT:
-    // text(round(this.relSize, 2), this.x, this.y - 1)
-    // text(this.treeInd, this.x, this.y + 15)
+    text(status === "virtual" ? "ROOT" : "{ }", this.x, this.y - 1);
+    if ((treeStructData.is_best || [])[this.treeInd]) {
+      textSize(this.renderSize / 2);
+      fill(accentCol);
+      text("*", this.x + this.renderSize * 0.45, this.y - this.renderSize * 0.45);
+    }
 
     const dotAnimThreshold = 0.85;
     if (this.isStarred && this.animationProgress >= dotAnimThreshold) {
@@ -275,9 +305,9 @@ class Edge {
 
     strokeWeight(this.weight);
     noFill();
-    stroke(
-      lerpColor(color(bgCol), color(accentCol), this.nodeB.relSize * 1 + 0.7),
-    );
+    const status = (treeStructData.statuses || [])[this.nodeB.treeInd] || "unknown";
+    const edgeColor = status === "bug" ? bugCol : status === "virtual" ? rootCol : accentCol;
+    stroke(lerpColor(color(bgCol), color(edgeColor), 0.85));
     bezier(
       this.nodeT.xB,
       this.nodeT.yB,
@@ -307,8 +337,8 @@ draw = () => {
   globalTime += globalAnimSpeed * initAnimationSpeedFactor * deltaTime;
 
   if (nodes.length == 0) {
-    const spacingHeight = height * 1.3;
-    const spacingWidth = width * 1.3;
+    const spacingHeight = height * 1.25;
+    const spacingWidth = Math.max(width * 1.25, treeStructData.layout.length * 42);
     treeStructData.layout.forEach((lay, index) => {
       new Node(
         spacingWidth * lay[0] - spacingWidth / 2,
@@ -323,29 +353,29 @@ draw = () => {
     nodes.forEach((n) => {
       if (n.isRootNode) n.startAnimation();
     });
-    nodes[0].selected = true;
-    setCodeAndPlan(
-      treeStructData.code[0],
-      treeStructData.plan[0],
-    )
+    if (nodes.length > 0) {
+      nodes[0].selected = true;
+      setCodeAndPlan(
+        treeStructData.code[0],
+        treeStructData.plan[0],
+      )
+    }
   }
 
   const staticNodes = nodes.filter(
     (n) => n.isStatic || n.animationProgress >= 0.7,
   );
   if (staticNodes.length > 0) {
-    const largestNode = staticNodes.reduce((prev, current) =>
-      prev.relSize > current.relSize ? prev : current,
-    );
+    const selectedNode = preferredNode(staticNodes);
     if (!manualSelection) {
-      if (!largestNode.selected) {
+      if (!selectedNode.selected) {
         setCodeAndPlan(
-          treeStructData.code[largestNode.treeInd],
-          treeStructData.plan[largestNode.treeInd],
+          treeStructData.code[selectedNode.treeInd],
+          treeStructData.plan[selectedNode.treeInd],
         );
       }
       staticNodes.forEach((node) => {
-        node.selected = node === largestNode;
+        node.selected = node === selectedNode;
       });
     }
   }

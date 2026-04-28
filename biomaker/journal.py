@@ -37,6 +37,7 @@ class Node(DataClassJsonMixin):
     ctime: float = field(default_factory=lambda: time.time(), kw_only=True)
     parent: Optional["Node"] = field(default=None, kw_only=True)
     children: set["Node"] = field(default_factory=set, kw_only=True)
+    selection_reason: str | None = field(default=None, kw_only=True)
 
     # ---- execution info ----
     _term_out: list[str] = field(default=None, kw_only=True)  # type: ignore
@@ -445,12 +446,19 @@ def _format_memory_node(n: Node) -> str:
         artifact_text = "\nArtifact facts: " + truncate_text(
             _format_artifact_report(n.artifact_report), max_chars=520
         )
+    selection_text = ""
+    if n.selection_reason:
+        selection_text = (
+            "\nSelected because: "
+            + truncate_text(str(n.selection_reason), max_chars=180)
+        )
     return (
         f"{_format_node_header(n)}\n"
         f"delta_vs_parent: {_format_delta(n.delta_vs_parent)} | "
         f"delta_vs_best_before: {_format_delta(n.delta_vs_best)}\n"
         f"Core idea: {truncate_text(str(n.plan), max_chars=320)}\n"
         f"Empirical finding: {truncate_text(str(n.analysis), max_chars=260)}"
+        f"{selection_text}"
         f"{artifact_text}"
     )
 
