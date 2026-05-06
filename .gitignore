@@ -170,6 +170,7 @@ cython_debug/
 
 workspaces
 logs
+logs_taishiji/
 
 .DS_STORE
 .trunk
