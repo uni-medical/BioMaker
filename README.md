@@ -1,13 +1,3 @@
-<div align="center" id="biomakertop">
-<img src="./assets/BioMaker_logo.png" alt="logo" width="400" margin="10px"></img>
-<br/>
-<a href="https://pypi.org/project/biomaker"><img src="https://img.shields.io/pypi/v/biomaker" alt="PyPI"></a>
-<a href="https://github.com/Ziyan-Huang/BioMaker/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="license"></a>
-<img src="https://img.shields.io/badge/Python-3.11-A7D8FF" alt="Python">
-<img src="https://img.shields.io/badge/PyTorch-2.x-FCD299" alt="PyTorch">
-<img src="https://img.shields.io/badge/Paper-to%20be%20released-b31b1b?logo=arxiv&logoColor=red" alt="Paper">
-</div>
-
 # Introduction
 **BioMaker** is an agentic development system for biomedical image analysis.
 
