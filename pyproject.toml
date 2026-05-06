@@ -19,7 +19,7 @@ classifiers = [
 dynamic = ["dependencies"]
 
 [project.urls]
-"Homepage" = "https://github.com/Ziyan-Huang/BioMaker"
+"Homepage" = "https://github.com/uni-medical/CREA"
 
 [project.scripts]
 biomaker = "biomaker.run:run"
