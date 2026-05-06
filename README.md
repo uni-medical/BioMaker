@@ -64,8 +64,6 @@ prepare workspace and data
 -> save journal, tree, best solution, and optional final report
 ```
 
-There is no AutoGluon, Optuna, or separate HPO stage in the default workflow. Increase `agent.steps` for longer searches, or lower it for quick local runs.
-
 The proposal loop is a lightweight solution tree search. BioMaker drafts a conservative baseline, debugs failed leaf nodes until a runnable solution exists, then mostly improves top-performing nodes. It can still create extra draft roots later to preserve diversity.
 
 Generated code runs under a strict dependency policy. BioMaker tells the model which installed packages are allowed, blocks package installation, and performs a preflight import check before execution. If code imports an unavailable package such as `cv2` or `albumentations`, the run fails fast with a policy error so the next debug step can replace it with an allowed package.
