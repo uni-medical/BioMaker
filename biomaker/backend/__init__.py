@@ -39,8 +39,9 @@ def query(
     temperature: float | None = None,
     max_completion_tokens: int | None = None,
     func_spec: FunctionSpec | None = None,
+    return_metadata: bool = False,
     **model_kwargs,
-) -> OutputType:
+) -> OutputType | tuple[OutputType, dict]:
     """
     General LLM query for various backends with a single system and user message.
     Supports function calling for some backends.
@@ -107,5 +108,34 @@ def query(
         func_spec=func_spec,
         **model_kwargs,
     )
+
+    if return_metadata:
+        metadata = {
+            "request_time_seconds": req_time,
+            "prompt_tokens": in_tok_count,
+            "completion_tokens": out_tok_count,
+            "provider": provider,
+            "model": model,
+            "model_info": info,
+            "compiled_system_chars": len(compiled_system or ""),
+            "compiled_user_chars": len(compiled_user or ""),
+            "sent_messages": [
+                message
+                for message in [
+                    (
+                        {"role": "system", "content": compiled_system}
+                        if compiled_system
+                        else None
+                    ),
+                    (
+                        {"role": "user", "content": compiled_user}
+                        if compiled_user
+                        else None
+                    ),
+                ]
+                if message is not None
+            ],
+        }
+        return output, metadata  # type: ignore[return-value]
 
     return output

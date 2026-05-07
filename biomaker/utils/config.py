@@ -392,7 +392,9 @@ def _copy_csv_referenced_files(
                             workspace_dir / "working" / normalized,
                             workspace_dir / "input" / normalized,
                         ]
-                        src = next((p for p in candidates if p.is_file()), candidates[0])
+                        src = next(
+                            (p for p in candidates if p.is_file()), candidates[0]
+                        )
                     if not src.is_file():
                         continue
                     try:
@@ -439,6 +441,9 @@ def _copy_node_artifacts(cfg: Config, node) -> None:
         "exc_info": node.exc_info,
         "plan": node.plan,
         "analysis": node.analysis,
+        "prompt_stats": node.prompt_stats,
+        "prompt_messages": node.prompt_messages,
+        "prompt": node.prompt,
     }
     (dst_dir / "node_metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False, default=str),
@@ -557,16 +562,12 @@ def _write_results_table(log_dir: Path, journal) -> None:
                     "matched_rows": _artifact_alignment_value(report, "matched_rows")
                     or "",
                     "exc_type": node.exc_type or "",
-                    "error": truncate_text(
-                        str(node.exc_info or ""), max_chars=300
-                    ),
+                    "error": truncate_text(str(node.exc_info or ""), max_chars=300),
                     "selection_reason": truncate_text(
                         str(node.selection_reason or ""), max_chars=240
                     ),
                     "plan": truncate_text(str(node.plan or ""), max_chars=500),
-                    "analysis": truncate_text(
-                        str(node.analysis or ""), max_chars=500
-                    ),
+                    "analysis": truncate_text(str(node.analysis or ""), max_chars=500),
                 }
             )
 

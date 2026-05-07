@@ -2,11 +2,11 @@ import logging
 import numbers
 import random
 import json
-from typing import Callable, cast
+from typing import Any, Callable, cast
 
 import humanize
 
-from ..backend import FunctionSpec, query
+from ..backend import FunctionSpec, compile_prompt_to_md, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
 from ..utils import data_preview
@@ -52,6 +52,14 @@ review_func_spec = FunctionSpec(
     },
     description="Submit a review evaluating the output of the training script.",
 )
+
+
+def _estimated_tokens(text: str) -> int:
+    return max(1, round(len(text) / 4)) if text else 0
+
+
+def _json_safe(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
 class BaseAgent:
@@ -119,8 +127,7 @@ class BaseAgent:
         for candidate in [
             (
                 best_node
-                if best_node is not None
-                and best_node in eligible_success_nodes
+                if best_node is not None and best_node in eligible_success_nodes
                 else None
             ),
             *clean_frontier_nodes,
@@ -235,27 +242,73 @@ class BaseAgent:
             )
         }
 
-    def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str]:
-        """Generate a natural language plan + code in the same LLM call and split them apart."""
-        completion_text = None
-        for _ in range(retries):
-            completion_text = query(
-                system_message=prompt,
-                user_message=None,
-                model=self.acfg.code.model,
-                temperature=self.acfg.code.temp,
+    def _prompt_capture(self, prompt: dict, metadata: dict | None) -> dict[str, Any]:
+        sections = []
+        for key, value in prompt.items():
+            section_text = compile_prompt_to_md(value)
+            sections.append(
+                {
+                    "name": str(key),
+                    "chars": len(section_text),
+                    "estimated_tokens": _estimated_tokens(section_text),
+                }
             )
 
+        metadata = metadata or {}
+        sent_messages = metadata.get("sent_messages") or []
+        sent_chars = sum(
+            len(str(message.get("content") or "")) for message in sent_messages
+        )
+        return {
+            "prompt": _json_safe(prompt),
+            "messages": _json_safe(sent_messages),
+            "stats": {
+                "model": metadata.get("model", self.acfg.code.model),
+                "provider": metadata.get("provider"),
+                "request_time_seconds": metadata.get("request_time_seconds"),
+                "input_tokens": metadata.get("prompt_tokens"),
+                "output_tokens": metadata.get("completion_tokens"),
+                "estimated_input_tokens": _estimated_tokens(
+                    "\n".join(
+                        str(message.get("content") or "") for message in sent_messages
+                    )
+                ),
+                "sent_chars": sent_chars,
+                "compiled_system_chars": metadata.get("compiled_system_chars"),
+                "compiled_user_chars": metadata.get("compiled_user_chars"),
+                "sections": sections,
+                "model_info": metadata.get("model_info"),
+            },
+        }
+
+    def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str, dict[str, Any]]:
+        """Generate a natural language plan + code in the same LLM call and split them apart."""
+        completion_text = None
+        prompt_capture: dict[str, Any] = self._prompt_capture(prompt, None)
+        for _ in range(retries):
+            completion_text, metadata = cast(
+                tuple[str, dict[str, Any]],
+                query(
+                    system_message=prompt,
+                    user_message=None,
+                    model=self.acfg.code.model,
+                    temperature=self.acfg.code.temp,
+                    return_metadata=True,
+                ),
+            )
+            prompt_capture = self._prompt_capture(prompt, metadata)
+
+            completion_text = cast(str, completion_text)
             code = extract_code(completion_text)
             nl_text = extract_text_up_to_code(completion_text)
 
             if code and nl_text:
                 # merge all code blocks into a single string
-                return nl_text, code
+                return nl_text, code, prompt_capture
 
             print("Plan + code extraction failed, retrying...")
         print("Final plan + code extraction attempt failed, giving up...")
-        return "", completion_text  # type: ignore
+        return "", completion_text, prompt_capture  # type: ignore
 
     def wrap_execution_output(self, node: Node) -> str:
         """Return the execution output in the form shown to debug prompts."""

@@ -127,6 +127,26 @@
         font-weight: 650;
         margin-bottom: 10px;
       }
+      .prompt-metrics {
+        margin-top: 2px;
+      }
+      .prompt-section {
+        border-top: 0;
+        margin-top: 8px;
+        padding-top: 0;
+      }
+      .prompt-section summary {
+        align-items: baseline;
+        display: flex;
+        gap: 8px;
+        justify-content: space-between;
+      }
+      .prompt-section summary span,
+      .muted {
+        color: #9da6b8;
+        font-size: 12px;
+        font-weight: 500;
+      }
       code {
         font-size: 12px;
         line-height: 1.45;
@@ -164,6 +184,10 @@
       <div id="run-summary"></div>
       <div id="selected-label">Search start</div>
       <section id="node-summary"></section>
+      <details>
+        <summary>Input Prompt</summary>
+        <div id="input-prompt"></div>
+      </details>
       <details>
         <summary>Code</summary>
         <pre><code id="code" class="language-python"></code></pre>

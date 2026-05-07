@@ -5,6 +5,7 @@ import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..backend import compile_prompt_to_md
 from ..journal import Journal
 from .response import truncate_text
 
@@ -149,6 +150,46 @@ def _format_mb(value) -> str:
         return str(value)
 
 
+def _estimated_tokens(text: str) -> int:
+    return max(1, round(len(text) / 4)) if text else 0
+
+
+def _node_prompt(node) -> dict:
+    if node is None:
+        return {"available": False}
+
+    prompt = node.prompt
+    messages = node.prompt_messages or []
+    stats = node.prompt_stats or {}
+    sections = []
+    if isinstance(prompt, dict):
+        section_stats = {
+            str(item.get("name")): item
+            for item in stats.get("sections", [])
+            if isinstance(item, dict)
+        }
+        for key, value in prompt.items():
+            text = compile_prompt_to_md(value)
+            saved_stats = section_stats.get(str(key), {})
+            sections.append(
+                {
+                    "name": str(key),
+                    "chars": saved_stats.get("chars", len(text)),
+                    "estimated_tokens": saved_stats.get(
+                        "estimated_tokens", _estimated_tokens(text)
+                    ),
+                    "text": text,
+                }
+            )
+
+    return {
+        "available": bool(prompt or messages),
+        "stats": stats,
+        "sections": sections,
+        "messages": messages,
+    }
+
+
 def _artifact_summary(report: dict | None) -> str:
     if not isinstance(report, dict):
         return ""
@@ -216,17 +257,16 @@ def _node_summary(node, best_node) -> dict:
         "plan": truncate_text(str(node.plan or ""), max_chars=900),
         "analysis": truncate_text(str(node.analysis or ""), max_chars=900),
         "artifact": _artifact_summary(node.artifact_report),
-        "error": truncate_text(str(node.exc_info or node.exc_type or ""), max_chars=600),
+        "error": truncate_text(
+            str(node.exc_info or node.exc_type or ""), max_chars=600
+        ),
         "is_best": bool(node == best_node),
     }
 
 
 def _node_plan_text(node) -> str:
     if node is None:
-        return (
-            "Search start\n"
-            "Draft nodes are direct children of this start point."
-        )
+        return "Search start\n" "Draft nodes are direct children of this start point."
     original_lines = [
         f"node:{node.id[:8]}",
         f"stage:{node.node_status}",
@@ -255,9 +295,11 @@ def cfg_to_tree_struct(cfg, jou: Journal):
             for v in visual_nodes
         ],
         term_out=[
-            ""
-            if v.source_node is None
-            else truncate_text(v.source_node.term_out, max_chars=12000)
+            (
+                ""
+                if v.source_node is None
+                else truncate_text(v.source_node.term_out, max_chars=12000)
+            )
             for v in visual_nodes
         ],
         analysis=[
@@ -269,13 +311,12 @@ def cfg_to_tree_struct(cfg, jou: Journal):
         labels=[_node_label(v.source_node) for v in visual_nodes],
         display_labels=[_node_display_label(v.source_node) for v in visual_nodes],
         summaries=[_node_summary(v.source_node, best_node) for v in visual_nodes],
+        prompts=[_node_prompt(v.source_node) for v in visual_nodes],
         statuses=[
             (
                 "virtual"
                 if v.source_node is None
-                else "bug"
-                if v.source_node.is_buggy
-                else v.source_node.node_status
+                else "bug" if v.source_node.is_buggy else v.source_node.node_status
             )
             for v in visual_nodes
         ],

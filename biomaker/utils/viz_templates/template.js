@@ -30,6 +30,86 @@ const metricLine = (label, value) => `
     <strong>${escapeHtml(compact(value))}</strong>
   </div>`;
 
+const formatNumber = (value) => {
+  if (value === null || value === undefined || value === "") return "n/a";
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toLocaleString() : String(value);
+};
+
+const promptTokenText = (stats) => {
+  const exact = stats?.input_tokens;
+  const estimated = stats?.estimated_input_tokens;
+  if (exact !== null && exact !== undefined) return `${formatNumber(exact)} tokens`;
+  if (estimated !== null && estimated !== undefined) {
+    return `~${formatNumber(estimated)} tokens`;
+  }
+  return "n/a";
+};
+
+const renderPromptSections = (sections) => {
+  if (!Array.isArray(sections) || sections.length === 0) {
+    return '<p class="muted">No prompt sections were saved for this node.</p>';
+  }
+  return sections
+    .map((section) => {
+      const tokens = section.estimated_tokens ?? "";
+      const chars = section.chars ?? "";
+      return `
+        <details class="prompt-section">
+          <summary>
+            ${escapeHtml(section.name || "section")}
+            <span>${formatNumber(tokens)} est. tokens · ${formatNumber(chars)} chars</span>
+          </summary>
+          <pre>${escapeHtml(section.text || "")}</pre>
+        </details>
+      `;
+    })
+    .join("");
+};
+
+const renderPromptMessages = (messages) => {
+  if (!Array.isArray(messages) || messages.length === 0) return "";
+  return `
+    <details class="prompt-section">
+      <summary>Actual sent messages <span>${messages.length} message(s)</span></summary>
+      ${messages
+        .map(
+          (message) => `
+            <h3>${escapeHtml(message.role || "message")}</h3>
+            <pre>${escapeHtml(message.content || "")}</pre>
+          `,
+        )
+        .join("")}
+    </details>
+  `;
+};
+
+const renderPromptDetails = (treeInd) => {
+  const prompt = (treeStructData.prompts || [])[treeInd] || {};
+  if (!prompt.available) {
+    return '<p class="muted">No full input prompt was recorded for this node.</p>';
+  }
+  const stats = prompt.stats || {};
+  const requestTime =
+    stats.request_time_seconds === null || stats.request_time_seconds === undefined
+      ? ""
+      : `${Number(stats.request_time_seconds).toFixed(2)}s`;
+  return `
+    <div class="metrics-grid prompt-metrics">
+      ${metricLine("input tokens", promptTokenText(stats))}
+      ${metricLine("output tokens", formatNumber(stats.output_tokens))}
+      ${metricLine("sent chars", formatNumber(stats.sent_chars))}
+      ${metricLine("model", stats.model)}
+      ${metricLine("request", requestTime)}
+      ${metricLine("sections", Array.isArray(prompt.sections) ? prompt.sections.length : 0)}
+    </div>
+    <h3>Prompt Components</h3>
+    ${renderPromptSections(prompt.sections)}
+    <h3>Compiled Input</h3>
+    ${renderPromptMessages(prompt.messages)}
+  `;
+};
+
 const setNodeDetails = (treeInd) => {
   const summary = (treeStructData.summaries || [])[treeInd] || {};
   const selectedLabel = document.getElementById("selected-label");
@@ -74,6 +154,11 @@ const setNodeDetails = (treeInd) => {
   if (artifactElm) {
     const report = summary.artifact || "";
     artifactElm.textContent = report || "";
+  }
+
+  const promptElm = document.getElementById("input-prompt");
+  if (promptElm) {
+    promptElm.innerHTML = renderPromptDetails(treeInd);
   }
 };
 

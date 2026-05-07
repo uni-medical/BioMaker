@@ -12,7 +12,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from dataclasses_json import DataClassJsonMixin
 
@@ -30,6 +30,9 @@ class Node(DataClassJsonMixin):
     plan: str = field(default=None, kw_only=True)  # type: ignore
     agent_name: str = field(default=None, kw_only=True)  # type: ignore
     tag: str = field(default=None, kw_only=True)  # type: ignore
+    prompt: dict[str, Any] | None = field(default=None, kw_only=True)
+    prompt_messages: list[dict[str, str]] | None = field(default=None, kw_only=True)
+    prompt_stats: dict[str, Any] | None = field(default=None, kw_only=True)
 
     # ---- general attrs ----
     step: int = field(default=None, kw_only=True)  # type: ignore
@@ -448,9 +451,8 @@ def _format_memory_node(n: Node) -> str:
         )
     selection_text = ""
     if n.selection_reason:
-        selection_text = (
-            "\nSelected because: "
-            + truncate_text(str(n.selection_reason), max_chars=180)
+        selection_text = "\nSelected because: " + truncate_text(
+            str(n.selection_reason), max_chars=180
         )
     return (
         f"{_format_node_header(n)}\n"

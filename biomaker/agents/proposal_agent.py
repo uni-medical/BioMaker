@@ -120,6 +120,7 @@ tool_request_func_spec = FunctionSpec(
     description="Request optional tool observations before writing the final candidate code.",
 )
 
+
 class ProposalAgent(BaseAgent):
     def __init__(
         self,
@@ -185,7 +186,11 @@ class ProposalAgent(BaseAgent):
 
     def _is_local_contract_query(self, query: str) -> bool:
         lowered = query.lower()
-        return "evaluator" in lowered or "score_val" in lowered or "prediction_spec" in lowered
+        return (
+            "evaluator" in lowered
+            or "score_val" in lowered
+            or "prediction_spec" in lowered
+        )
 
     def _augment_doc_query(self, query: str, prompt: dict[str, Any] | None) -> str:
         if prompt is None:
@@ -272,9 +277,7 @@ class ProposalAgent(BaseAgent):
         }
         essentials = self.get_run_facts()
         if essentials:
-            context["Cached run facts"] = truncate_text(
-                essentials, max_chars=1600
-            )
+            context["Cached run facts"] = truncate_text(essentials, max_chars=1600)
         context["Cached environment facts"] = truncate_text(
             self.environment_facts, max_chars=1600
         )
@@ -341,7 +344,9 @@ class ProposalAgent(BaseAgent):
         if tool == "inspect_api":
             code = str(request.get("code") or "").strip()
             if not code:
-                return "ToolError: inspect_api requires a short Python snippet in `code`."
+                return (
+                    "ToolError: inspect_api requires a short Python snippet in `code`."
+                )
             from ..tools import python_probe
 
             return python_probe(code, cwd=self.cfg.workspace_dir)
@@ -405,9 +410,7 @@ class ProposalAgent(BaseAgent):
             score += 3.0
         if "exit_code=0" in lowered:
             score += 1.0
-        if "signature" in lowered or "inspect.signature" in str(
-            record.get("code", "")
-        ):
+        if "signature" in lowered or "inspect.signature" in str(record.get("code", "")):
             score += 3.0
         if "__version__" in str(record.get("code", "")) or "version" in lowered:
             score += 1.0
@@ -488,8 +491,10 @@ class ProposalAgent(BaseAgent):
         )
         if omitted > 0:
             header += f" Omitted {omitted} lower-signal observation(s) from prompt."
-        return header + "\n\n" + "\n\n".join(
-            self._format_tool_record(record) for record in selected
+        return (
+            header
+            + "\n\n"
+            + "\n\n".join(self._format_tool_record(record) for record in selected)
         )
 
     def attach_node_tool_observations(self, stage: str, prompt: dict[str, Any]) -> None:
@@ -556,8 +561,14 @@ class ProposalAgent(BaseAgent):
             stage="draft",
             shape=prompt_shape(prompt),
         )
-        plan, code = self.plan_and_code_query(prompt)
-        return Node(plan=plan, code=code)
+        plan, code, prompt_capture = self.plan_and_code_query(prompt)
+        return Node(
+            plan=plan,
+            code=code,
+            prompt=prompt_capture["prompt"],
+            prompt_messages=prompt_capture["messages"],
+            prompt_stats=prompt_capture["stats"],
+        )
 
     def _debug(self, parent_node: Node) -> Node:
         prompt = self.context_builder.build_debug(parent_node)
@@ -569,8 +580,15 @@ class ProposalAgent(BaseAgent):
             parent_id=parent_node.id,
             shape=prompt_shape(prompt),
         )
-        plan, code = self.plan_and_code_query(prompt)
-        return Node(plan=plan, code=code, parent=parent_node)
+        plan, code, prompt_capture = self.plan_and_code_query(prompt)
+        return Node(
+            plan=plan,
+            code=code,
+            parent=parent_node,
+            prompt=prompt_capture["prompt"],
+            prompt_messages=prompt_capture["messages"],
+            prompt_stats=prompt_capture["stats"],
+        )
 
     def _improve(self, parent_node: Node) -> Node:
         prompt = self.context_builder.build_improve(parent_node)
@@ -582,11 +600,14 @@ class ProposalAgent(BaseAgent):
             parent_id=parent_node.id,
             shape=prompt_shape(prompt),
         )
-        plan, code = self.plan_and_code_query(prompt)
+        plan, code, prompt_capture = self.plan_and_code_query(prompt)
         return Node(
             plan=plan,
             code=code,
             parent=parent_node,
+            prompt=prompt_capture["prompt"],
+            prompt_messages=prompt_capture["messages"],
+            prompt_stats=prompt_capture["stats"],
         )
 
     def step(self, exec_callback: ExecCallbackType):
