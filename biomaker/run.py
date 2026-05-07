@@ -76,6 +76,49 @@ def journal_to_rich_tree(journal: Journal):
     return tree
 
 
+def _metric_payload(node: Node) -> dict:
+    metric = node.metric
+    if metric is None:
+        return {"value": None, "maximize": None}
+    return {
+        "value": metric.value_npsafe,
+        "maximize": metric.maximize,
+    }
+
+
+def _append_private_metrics_entry(cfg, entry: dict) -> None:
+    path = cfg.log_dir / "private_metrics.json"
+    note = "Private metrics are for user inspection only and are not passed to the agent."
+    payload = {
+        "version": 1,
+        "visible_to_agent": False,
+        "note": note,
+        "latest": None,
+        "history": [],
+    }
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                payload.update(
+                    {
+                        "version": existing.get("version", payload["version"]),
+                        "visible_to_agent": False,
+                        "note": existing.get("note", note),
+                        "latest": existing.get("latest"),
+                        "history": existing.get("history", []),
+                    }
+                )
+        except json.JSONDecodeError:
+            logger.warning("Existing private metrics history is invalid JSON; rewriting.")
+
+    if not isinstance(payload["history"], list):
+        payload["history"] = []
+    payload["history"].append(entry)
+    payload["latest"] = entry
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def run():
     cfg = load_cfg()
     log_level = cfg.log_level.upper()
@@ -285,23 +328,45 @@ def run():
             journal.pop()
             break
         best_node = journal.get_best_node(only_good=True)
-        if solution_node is not None and solution_node is best_node:
+        if solution_node is not None:
+            private_metrics = None
+            private_error = None
             try:
                 private_metrics = evaluate_private_outputs(
                     cfg.workspace_dir, private_dir
                 )
             except Exception as exc:
                 logger.warning("Private evaluation failed: %s", exc)
-                private_metrics = None
-            if private_metrics:
-                private_path = (
-                    cfg.log_dir / f"private_metrics_step_{solution_node.step}.json"
-                )
-                private_path.write_text(
-                    json.dumps(private_metrics, indent=2), encoding="utf-8"
-                )
-                (cfg.log_dir / "private_metrics_latest.json").write_text(
-                    json.dumps(private_metrics, indent=2), encoding="utf-8"
+                private_error = str(exc)
+
+            if (
+                private_metrics
+                or private_error
+                or (private_dir / "private_split_plan.json").is_file()
+            ):
+                _append_private_metrics_entry(
+                    cfg,
+                    {
+                        "workflow_step": global_step,
+                        "node_step": solution_node.step,
+                        "node_id": solution_node.id,
+                        "parent_id": (
+                            solution_node.parent.id
+                            if solution_node.parent is not None
+                            else None
+                        ),
+                        "stage": solution_node.node_status,
+                        "is_buggy": bool(solution_node.is_buggy),
+                        "outcome": solution_node.outcome,
+                        "metric": _metric_payload(solution_node),
+                        "is_current_best": solution_node is best_node,
+                        "created_at": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                        ),
+                        "private_metrics_available": private_metrics is not None,
+                        "private_metrics": private_metrics,
+                        "private_error": private_error,
+                    },
                 )
 
         tree = journal_to_rich_tree(journal)

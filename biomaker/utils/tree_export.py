@@ -126,8 +126,7 @@ def _node_display_label(node) -> str:
         return ""
     step = "?" if node.step is None else str(node.step)
     if node.is_buggy:
-        reason = "timeout" if node.exc_type == "TimeoutError" else "bug"
-        return f"{step}\n{reason}"
+        return f"{step}\nbug"
     metric = _node_metric_short(node)
     return f"{step}\n{metric}" if metric else step
 
@@ -246,7 +245,6 @@ def cfg_to_tree_struct(cfg, jou: Journal):
     best_node = jou.get_best_node(only_good=True, topk=1)
     good_nodes = [node for node in jou.nodes if node.is_buggy is False]
     bug_nodes = [node for node in jou.nodes if node.is_buggy is True]
-    timeout_nodes = [node for node in bug_nodes if node.exc_type == "TimeoutError"]
 
     return dict(
         edges=edges,
@@ -290,7 +288,6 @@ def cfg_to_tree_struct(cfg, jou: Journal):
             "steps": len(jou.nodes),
             "valid": len(good_nodes),
             "bug": len(bug_nodes),
-            "timeout": len(timeout_nodes),
             "best_metric": _node_metric_short(best_node),
         },
     )

@@ -86,7 +86,6 @@ const setRunSummary = () => {
     <b>best ${escapeHtml(compact(s.best_metric))}</b>
     <span>valid ${escapeHtml(s.valid ?? 0)}</span>
     <span>bug ${escapeHtml(s.bug ?? 0)}</span>
-    <span>timeout ${escapeHtml(s.timeout ?? 0)}</span>
     <span>steps ${escapeHtml(s.steps ?? 0)}</span>
   `;
 };
@@ -116,7 +115,7 @@ const animEase = (t) => 1 - (1 - Math.min(t, 1.0)) ** 5;
 // ---- global constants ----
 
 const globalAnimSpeed = 1.1;
-const scaleFactor = 0.57;
+const scaleFactor = 1.0;
 
 // ---- global vars ----
 
@@ -164,7 +163,7 @@ class Node {
 
   constructor(x, y, relSize, treeInd) {
     const nodeCount = Math.max(treeStructData.layout.length, 1);
-    const crowdScale = Math.max(0.55, Math.min(1.0, 18 / nodeCount));
+    const crowdScale = Math.max(0.6, Math.min(1.0, 22 / nodeCount));
     const minSize = 24 * crowdScale;
     const maxSize = 38 * crowdScale;
 
@@ -281,9 +280,7 @@ class Node {
     const label = (treeStructData.display_labels || [])[this.treeInd] || "";
     textSize(status === "virtual" ? this.renderSize / 3 : this.renderSize / 3.2);
     fill(255);
-    if (status === "virtual") {
-      return;
-    } else {
+    if (status !== "virtual") {
       text(label, this.x, this.y - 1);
     }
     if (isBest) {
@@ -425,12 +422,12 @@ draw = () => {
   globalTime += globalAnimSpeed * initAnimationSpeedFactor * deltaTime;
 
   if (nodes.length == 0) {
-    const spacingHeight = height * 1.18;
-    const spacingWidth = Math.max(width * 1.10, treeStructData.layout.length * 44);
+    const spacingHeight = height * 0.84;
+    const spacingWidth = width * 0.92;
     treeStructData.layout.forEach((lay, index) => {
       new Node(
-        spacingWidth * lay[0] - spacingWidth / 2,
-        20 + spacingHeight * lay[1] - spacingHeight / 2,
+        spacingWidth * (lay[0] - 0.5),
+        spacingHeight * (lay[1] - 0.5),
         1 - treeStructData.metrics[index],
         index,
       );
