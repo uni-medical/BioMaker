@@ -9,7 +9,7 @@ from ..journal import Journal, Node
 from ..utils.config import Config
 from ..utils.events import append_event
 from ..utils.response import truncate_text, wrap_code
-from .base_agent import BaseAgent
+from .base_agent import BaseAgent, RoundTask
 from .context_builder import ContextBuilder, prompt_shape
 
 logger = logging.getLogger("biomaker")
@@ -134,6 +134,56 @@ class ProposalAgent(BaseAgent):
         )
         self.knowledge_base = None
         self.context_builder = ContextBuilder(self)
+        self._pending_round_nodes: list[Node] = []
+
+    def set_pending_round_nodes(self, nodes: list[Node]) -> None:
+        """Expose generated-but-unevaluated same-round proposals to later prompts."""
+        self._pending_round_nodes = list(nodes)
+
+    def clear_pending_round_nodes(self) -> None:
+        self._pending_round_nodes = []
+
+    def format_pending_round_context(self, selected_parent: Node | None) -> str:
+        rows = []
+        for idx, node in enumerate(self._pending_round_nodes, start=1):
+            same_parent = node.parent is selected_parent
+            same_virtual_root = node.parent is None and selected_parent is None
+            if not (same_parent or same_virtual_root):
+                continue
+            rows.append(
+                "\n".join(
+                    [
+                        f"Pending proposal {idx}",
+                        f"id: {node.id[:8]}",
+                        f"stage: {node.node_status}",
+                        (
+                            "parent_id: "
+                            + (
+                                node.parent.id[:8]
+                                if node.parent is not None
+                                else "root"
+                            )
+                        ),
+                        "status: same-round proposal; execution result, metric, and feedback are intentionally hidden from this prompt",
+                        "plan: "
+                        + truncate_text(
+                            " ".join(str(node.plan or "").split()),
+                            max_chars=700,
+                        ),
+                        "code excerpt:",
+                        truncate_text(str(node.code or ""), max_chars=5000),
+                    ]
+                )
+            )
+        if not rows:
+            return ""
+        return (
+            "These in-flight proposals were generated earlier but have not been "
+            "made part of this prompt's empirical history. They are not empirical evidence; any execution result, "
+            "metric, or feedback from them is intentionally hidden from this prompt. "
+            "Use them only to avoid generating the same proposal again.\n\n"
+            + "\n\n".join(rows)
+        )
 
     def _is_monai_query(self, query: str) -> bool:
         normalized = query.lower().replace(".", "").replace("_", "")
@@ -610,12 +660,17 @@ class ProposalAgent(BaseAgent):
             prompt_stats=prompt_capture["stats"],
         )
 
-    def step(self, exec_callback: ExecCallbackType):
+    def generate_node(self, task: RoundTask) -> Node:
+        """Generate plan/code for one selected tree task without executing it."""
         if not self.journal.nodes or self.data_preview is None:
             self.update_data_preview()
 
-        parent_node = self.search_policy()
-        logger.debug(f"Agent is generating code, parent node type: {type(parent_node)}")
+        parent_node = task.parent
+        selection_reason = task.selection_reason
+        self._last_selection_reason = selection_reason
+        logger.debug(
+            "Agent is generating code, parent node type: %s", type(parent_node)
+        )
         append_event(
             self.cfg.log_dir,
             "node_selected",
@@ -625,7 +680,7 @@ class ProposalAgent(BaseAgent):
                 else "debug" if parent_node.is_buggy else "improve"
             ),
             parent_id=None if parent_node is None else parent_node.id,
-            selection_reason=self._last_selection_reason,
+            selection_reason=selection_reason,
         )
 
         if parent_node is None:
@@ -634,11 +689,16 @@ class ProposalAgent(BaseAgent):
             result_node = self._debug(parent_node)
         else:
             result_node = self._improve(parent_node)
-        result_node.selection_reason = self._last_selection_reason
+        result_node.selection_reason = selection_reason
+        return result_node
+
+    def step(self, exec_callback: ExecCallbackType):
+        task = self.select_round_tasks()[0]
+        result_node = self.generate_node(task)
 
         self.parse_exec_result(
             node=result_node,
-            exec_result=exec_callback(result_node.code, True),
+            exec_result=exec_callback(result_node.code, True, node=result_node),
         )
         self.journal.append(result_node)
         return result_node

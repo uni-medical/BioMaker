@@ -54,13 +54,40 @@ const renderPromptSections = (sections) => {
     .map((section) => {
       const tokens = section.estimated_tokens ?? "";
       const chars = section.chars ?? "";
+      const sectionText = section.text || "";
+      const body =
+        section.name === "Detail records"
+          ? renderDetailRecords(sectionText)
+          : `<pre>${escapeHtml(sectionText)}</pre>`;
       return `
         <details class="prompt-section">
           <summary>
             ${escapeHtml(section.name || "section")}
             <span>${formatNumber(tokens)} est. tokens · ${formatNumber(chars)} chars</span>
           </summary>
-          <pre>${escapeHtml(section.text || "")}</pre>
+          ${body}
+        </details>
+      `;
+    })
+    .join("");
+};
+
+const renderDetailRecords = (text) => {
+  const records = String(text || "")
+    .split(/\n\n---\n\n/g)
+    .map((record) => record.trim())
+    .filter(Boolean);
+  if (records.length === 0) return '<p class="muted">No detail records.</p>';
+  return records
+    .map((record, index) => {
+      const firstLine = record.split("\n").find((line) => line.trim()) || "";
+      return `
+        <details class="prompt-section detail-record">
+          <summary>
+            ${escapeHtml(firstLine || `Detail record ${index + 1}`)}
+            <span>${formatNumber(Math.round(record.length / 4))} est. tokens · ${formatNumber(record.length)} chars</span>
+          </summary>
+          <pre>${escapeHtml(record)}</pre>
         </details>
       `;
     })
@@ -152,8 +179,10 @@ const setNodeDetails = (treeInd) => {
 
   const artifactElm = document.getElementById("artifact-json");
   if (artifactElm) {
-    const report = summary.artifact || "";
-    artifactElm.textContent = report || "";
+    const report = (treeStructData.artifact_reports || [])[treeInd];
+    artifactElm.textContent = report
+      ? JSON.stringify(report, null, 2)
+      : summary.artifact || "";
   }
 
   const promptElm = document.getElementById("input-prompt");

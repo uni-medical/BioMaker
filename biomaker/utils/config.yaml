@@ -11,10 +11,10 @@ log_dir: logs
 workspace_dir: workspaces
 
 # whether to unzip any archives in the data directory
-preprocess_data: True
+preprocess_data: False
 # whether to copy the data to the workspace directory (otherwise it will be symlinked)
-# copying is recommended to prevent the agent from accidentally modifying the original data
-copy_data: True
+# by default BioMaker creates a shallow symlinked input workspace so large datasets are not copied
+copy_data: False
 
 exp_name: null # a random experiment name will be generated if not provided
 
@@ -67,6 +67,15 @@ agent:
 exec:
   # Hard safety timeout for one generated node in seconds. This is a longest tolerated runtime, not a target budget.
   timeout: 600
+  # Number of generated nodes that may execute concurrently. Use 1 for shared GPU-heavy runs.
+  # Even with 1 worker, BioMaker overlaps node execution with generation of later same-round nodes.
+  parallel_workers: 2
+  # Maximum generated-but-not-yet-running nodes to keep queued for known useful non-draft tasks.
+  # A value near topk_improve + num_bugs keeps the LLM ahead without generating too far past feedback.
+  max_generated_backlog: 3
+  # Drafts are riskier to pre-generate because early evaluator/data-loading failures are often shared.
+  # Keep this lower so bootstrap drafts can react to the first failures instead of making five similar bugs.
+  max_draft_generated_backlog: 2
   agent_file_name: runfile.py
   format_tb_ipython: False
   enforce_environment: True

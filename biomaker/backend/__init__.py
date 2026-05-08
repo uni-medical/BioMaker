@@ -5,7 +5,6 @@ from . import backend_openai
 from .utils import FunctionSpec, OutputType, PromptType, compile_prompt_to_md
 
 logger = logging.getLogger("biomaker")
-PROMPT_WARNING_CHARS = 45000
 
 
 def determine_provider(model: str) -> str:
@@ -94,12 +93,6 @@ def query(
         _prompt_section_sizes(system_message),
         _prompt_section_sizes(user_message),
     )
-    if len(compiled_system or "") + len(compiled_user or "") > PROMPT_WARNING_CHARS:
-        logger.warning(
-            "Prompt context is large (%d chars). Consider reducing data overview, memory, retrieved knowledge, or code context.",
-            len(compiled_system or "") + len(compiled_user or ""),
-        )
-
     provider = determine_provider(model)
     query_func = provider_to_query_func[provider]
     output, req_time, in_tok_count, out_tok_count, info = query_func(

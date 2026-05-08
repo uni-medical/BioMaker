@@ -34,21 +34,20 @@ def _build_visual_tree(journal: Journal) -> tuple[list[VisualNode], list[list[in
         visual_nodes.append(VisualNode(source_node=node))
 
     edges: list[list[int]] = []
-    root_children = sorted(
-        journal.draft_nodes,
+    ordered_nodes = sorted(
+        list(journal),
         key=lambda node: node.step if node.step is not None else 10**9,
     )
-    for node in root_children:
+    for node in ordered_nodes:
         child_index = index_by_node[node]
-        visual_nodes[0].children.append(child_index)
-        edges.append([0, child_index])
-
-    for node in journal:
-        parent_index = index_by_node[node]
-        for child in _sorted_children(node):
-            child_index = index_by_node[child]
-            visual_nodes[parent_index].children.append(child_index)
-            edges.append([parent_index, child_index])
+        if node.parent is None:
+            parent_index = 0
+        elif node.parent in index_by_node:
+            parent_index = index_by_node[node.parent]
+        else:
+            parent_index = 0
+        visual_nodes[parent_index].children.append(child_index)
+        edges.append([parent_index, child_index])
     return visual_nodes, edges
 
 
@@ -116,6 +115,13 @@ def _node_metric_short(node) -> str:
 def _node_label(node) -> str:
     if node is None:
         return ""
+    if node.step is None:
+        if node.tag == "completed":
+            if node.is_buggy:
+                return "?: bug"
+            metric = _node_metric(node)
+            return f"?: completed {metric}" if metric != "n/a" else "?: completed"
+        return f"?: {_transient_status(node)}"
     prefix = "bug" if node.is_buggy else node.node_status
     metric = _node_metric(node)
     step = "na" if node.step is None else str(node.step)
@@ -126,6 +132,13 @@ def _node_display_label(node) -> str:
     if node is None:
         return ""
     step = "?" if node.step is None else str(node.step)
+    if node.step is None:
+        if node.tag == "completed":
+            if node.is_buggy:
+                return f"{step}\nbug"
+            metric = _node_metric_short(node)
+            return f"{step}\n{metric}" if metric else f"{step}\ncompleted"
+        return f"{step}\n{_transient_status(node)}"
     if node.is_buggy:
         return f"{step}\nbug"
     metric = _node_metric_short(node)
@@ -152,6 +165,18 @@ def _format_mb(value) -> str:
 
 def _estimated_tokens(text: str) -> int:
     return max(1, round(len(text) / 4)) if text else 0
+
+
+def _transient_status(node) -> str:
+    if node is None:
+        return "virtual"
+    if node.step is None:
+        if node.tag == "completed" and node.is_buggy:
+            return "bug"
+        return str(node.tag or "pending")
+    if node.is_buggy:
+        return "bug"
+    return node.node_status
 
 
 def _node_prompt(node) -> dict:
@@ -238,7 +263,7 @@ def _node_summary(node, best_node) -> dict:
 
     resources = node.resource_usage or {}
     metric = _node_metric(node)
-    status = "bug" if node.is_buggy else node.node_status
+    status = _transient_status(node)
     return {
         "title": _node_label(node),
         "stage": node.node_status,
@@ -251,7 +276,7 @@ def _node_summary(node, best_node) -> dict:
             if resources.get("avg_cpu_percent") is None
             else f"{float(resources.get('avg_cpu_percent')):.1f}%"
         ),
-        "outcome": node.outcome or "",
+        "outcome": node.outcome or ("not yet appended" if node.step is None else ""),
         "parent": node.parent.id[:8] if node.parent is not None else "",
         "selected": truncate_text(str(node.selection_reason or ""), max_chars=220),
         "plan": truncate_text(str(node.plan or ""), max_chars=900),
@@ -279,12 +304,24 @@ def _node_plan_text(node) -> str:
     return "\n".join(textwrap.fill(str(line), width=88) for line in original_lines)
 
 
-def cfg_to_tree_struct(cfg, jou: Journal):
+def _node_term_out(node) -> str:
+    if node is None or getattr(node, "_term_out", None) is None:
+        return ""
+    return truncate_text(node.term_out, max_chars=12000)
+
+
+def cfg_to_tree_struct(cfg, jou: Journal, live: bool = False):
     visual_nodes, edges = _build_visual_tree(jou)
     layout = generate_layout(visual_nodes)
-    best_node = jou.get_best_node(only_good=True, topk=1)
-    good_nodes = [node for node in jou.nodes if node.is_buggy is False]
-    bug_nodes = [node for node in jou.nodes if node.is_buggy is True]
+    committed_nodes = [node for node in jou.nodes if node.step is not None]
+    good_nodes = [node for node in committed_nodes if node.is_buggy is False]
+    bug_nodes = [node for node in committed_nodes if node.is_buggy is True]
+    scored_good_nodes = [node for node in good_nodes if node.metric is not None]
+    best_node = (
+        sorted(scored_good_nodes, key=lambda node: node.metric, reverse=True)[0]
+        if scored_good_nodes
+        else None
+    )
 
     return dict(
         edges=edges,
@@ -295,15 +332,15 @@ def cfg_to_tree_struct(cfg, jou: Journal):
             for v in visual_nodes
         ],
         term_out=[
-            (
-                ""
-                if v.source_node is None
-                else truncate_text(v.source_node.term_out, max_chars=12000)
-            )
+            _node_term_out(v.source_node)
             for v in visual_nodes
         ],
         analysis=[
             "" if v.source_node is None else v.source_node.analysis
+            for v in visual_nodes
+        ],
+        artifact_reports=[
+            None if v.source_node is None else v.source_node.artifact_report
             for v in visual_nodes
         ],
         exp_name=cfg.exp_name,
@@ -313,23 +350,24 @@ def cfg_to_tree_struct(cfg, jou: Journal):
         summaries=[_node_summary(v.source_node, best_node) for v in visual_nodes],
         prompts=[_node_prompt(v.source_node) for v in visual_nodes],
         statuses=[
-            (
-                "virtual"
-                if v.source_node is None
-                else "bug" if v.source_node.is_buggy else v.source_node.node_status
-            )
+            _transient_status(v.source_node)
             for v in visual_nodes
         ],
         is_best=[
-            bool(v.source_node is not None and v.source_node == best_node)
+            bool(
+                v.source_node is not None
+                and v.source_node.step is not None
+                and v.source_node == best_node
+            )
             for v in visual_nodes
         ],
         run_summary={
             "exp_name": cfg.exp_name,
-            "steps": len(jou.nodes),
+            "steps": len(committed_nodes),
             "valid": len(good_nodes),
             "bug": len(bug_nodes),
             "best_metric": _node_metric_short(best_node),
+            "live": live,
         },
     )
 
@@ -348,8 +386,8 @@ def generate_html(tree_graph_str: str):
         return html
 
 
-def generate(cfg, jou: Journal, out_path: Path):
-    tree_graph_str = json.dumps(cfg_to_tree_struct(cfg, jou))
+def generate(cfg, jou: Journal, out_path: Path, live: bool = False):
+    tree_graph_str = json.dumps(cfg_to_tree_struct(cfg, jou, live=live))
     html = generate_html(tree_graph_str)
     with open(out_path, "w") as f:
         f.write(html)

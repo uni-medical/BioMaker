@@ -104,6 +104,9 @@ class AgentConfig:
 @dataclass
 class ExecConfig:
     timeout: int
+    parallel_workers: int
+    max_generated_backlog: int
+    max_draft_generated_backlog: int
     agent_file_name: str
     format_tb_ipython: bool
     enforce_environment: bool
@@ -318,6 +321,47 @@ def prep_agent_workspace(cfg: Config):
         preproc_data(cfg.workspace_dir / "input")
 
 
+def _replace_path_with_symlink(link_path: Path, target: Path) -> None:
+    if link_path.exists() or link_path.is_symlink():
+        if link_path.is_dir() and not link_path.is_symlink():
+            shutil.rmtree(link_path)
+        else:
+            link_path.unlink()
+    link_path.symlink_to(target)
+
+
+def prepare_node_workspace(cfg: Config, node) -> Path:
+    """Create an isolated execution workspace for one node.
+
+    The node workspace has its own `working/` and `runfile.py`, while `input/`
+    and evaluator files are symlinked to the run workspace so large datasets are
+    not copied.
+    """
+    node_dir = cfg.workspace_dir / "node_workspaces" / node.id[:8]
+    node_dir.mkdir(parents=True, exist_ok=True)
+    (node_dir / "working").mkdir(parents=True, exist_ok=True)
+
+    _replace_path_with_symlink(node_dir / "input", cfg.workspace_dir / "input")
+    for filename in ["evaluator.py", "evaluator_prediction_spec.json"]:
+        src = cfg.workspace_dir / filename
+        if src.exists():
+            _replace_path_with_symlink(node_dir / filename, src)
+
+    node.execution_workspace = str(node_dir)
+    return node_dir
+
+
+def sync_node_working_to_run_workspace(cfg: Config, node_workspace: Path) -> None:
+    """Mirror one node's working outputs to the run-level working directory."""
+    src = node_workspace / "working"
+    dst = cfg.workspace_dir / "working"
+    if not src.is_dir():
+        return
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst, symlinks=True)
+
+
 def _copy_submission_artifacts(
     submission_path: Path, workspace_dir: Path, log_dir: Path
 ):
@@ -412,7 +456,8 @@ def _copy_node_artifacts(cfg: Config, node) -> None:
     """Persist the candidate-owned artifacts for one node before ./working changes."""
     if node is None:
         return
-    working_dir = Path(cfg.workspace_dir) / "working"
+    source_workspace = Path(node.execution_workspace or cfg.workspace_dir)
+    working_dir = source_workspace / "working"
     if not working_dir.is_dir():
         return
 
@@ -488,7 +533,7 @@ def _copy_node_artifacts(cfg: Config, node) -> None:
         shutil.copy2(csv_path, dst)
         _copy_csv_referenced_files(
             csv_path,
-            Path(cfg.workspace_dir),
+            source_workspace,
             dst_dir,
             file_columns=prediction_file_columns or None,
         )

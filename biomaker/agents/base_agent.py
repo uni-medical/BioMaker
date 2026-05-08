@@ -1,7 +1,7 @@
 import logging
 import numbers
-import random
 import json
+from dataclasses import dataclass
 from typing import Any, Callable, cast
 
 import humanize
@@ -23,8 +23,14 @@ from ..utils.response import (
 )
 
 logger = logging.getLogger("biomaker")
-ExecCallbackType = Callable[[str, bool], ExecutionResult]
+ExecCallbackType = Callable[..., ExecutionResult]
 FEEDBACK_CODE_CHARS = 6000
+
+
+@dataclass(frozen=True)
+class RoundTask:
+    parent: Node | None
+    selection_reason: str
 
 review_func_spec = FunctionSpec(
     name="submit_review",
@@ -92,109 +98,104 @@ class BaseAgent:
         for n in external_journal.nodes:
             self.journal.append(n)
 
-    def search_policy(self) -> Node | None:
-        """Select a node to work on (or None to draft a new node)."""
+    def select_round_tasks(self) -> list[RoundTask]:
+        """Select the next batch of tree-search tasks from the current journal.
+
+        This freezes the empirical search frontier for one scheduler round. Code
+        generation may happen serially afterward, but the selected parent set is
+        based only on completed nodes already present in the journal.
+        """
         search_cfg = self.acfg.search
+        if len(self.journal.draft_nodes) < search_cfg.max_children_per_node:
+            current = len(self.journal.draft_nodes)
+            return [
+                RoundTask(
+                    parent=None,
+                    selection_reason=(
+                        "bootstrap selected virtual root draft "
+                        f"({current + idx + 1}/{search_cfg.max_children_per_node})"
+                    ),
+                )
+                for idx in range(search_cfg.max_children_per_node - current)
+            ]
+
+        tasks: list[RoundTask] = []
+        improve_candidates = [
+            n
+            for n in self.journal.good_nodes
+            if (
+                n.metric is not None
+                and len(n.children) < search_cfg.max_children_per_node
+            )
+        ]
+        if improve_candidates:
+            ranked_candidates = sorted(
+                improve_candidates,
+                key=lambda n: (
+                    n.metric,
+                    -(n.step if n.step is not None else 10**9),
+                ),
+                reverse=True,
+            )
+            top_candidates = ranked_candidates[: search_cfg.topk_improve]
+            for selected in top_candidates:
+                rank = ranked_candidates.index(selected)
+                tasks.append(
+                    RoundTask(
+                        parent=selected,
+                        selection_reason=(
+                            "round global frontier selected node "
+                            f"{selected.id[:8]} rank {rank + 1} "
+                            f"within top {len(top_candidates)} successful expandable nodes"
+                        ),
+                    )
+                )
+
         debuggable_nodes = [
             n
             for n in self.journal.buggy_nodes
             if (
-                n.is_leaf
-                and n.debug_depth < search_cfg.max_debug_depth
+                n.debug_depth < search_cfg.max_debug_depth
                 and len(n.children) < search_cfg.num_bugs
             )
         ]
-        good_nodes = self.journal.good_nodes
+        for selected_bug in sorted(
+            debuggable_nodes,
+            key=lambda n: n.step if n.step is not None else 10**9,
+        ):
+            tasks.append(
+                RoundTask(
+                    parent=selected_bug,
+                    selection_reason=(
+                        "round frontier debug selected buggy node "
+                        f"(depth {selected_bug.debug_depth + 1}/"
+                        f"{search_cfg.max_debug_depth})"
+                    ),
+                )
+            )
 
-        eligible_success_nodes = [
-            n
-            for n in good_nodes
-            if len(n.children) < search_cfg.max_children_per_node
-            and n.outcome != "regressed_parent"
-        ]
-        if not eligible_success_nodes:
-            eligible_success_nodes = [
-                n
-                for n in good_nodes
-                if len(n.children) < search_cfg.max_children_per_node
+        if not tasks:
+            return [
+                RoundTask(
+                    parent=None,
+                    selection_reason=(
+                        "no successful expandable node remains after bootstrap drafts"
+                    ),
+                )
             ]
 
-        clean_frontier_nodes = [n for n in eligible_success_nodes if n.is_leaf]
-        strong_nodes = list(eligible_success_nodes)
-        leaf_nodes = [n for n in good_nodes if n.is_leaf]
-        best_node = self.journal.get_best_node(only_good=True, topk=1)
-        candidate_nodes = []
-        for candidate in [
-            (
-                best_node
-                if best_node is not None and best_node in eligible_success_nodes
-                else None
-            ),
-            *clean_frontier_nodes,
-            *strong_nodes,
-            *leaf_nodes,
-        ]:
-            if (
-                candidate is not None
-                and candidate in eligible_success_nodes
-                and candidate not in candidate_nodes
-            ):
-                candidate_nodes.append(candidate)
-        top_nodes = sorted(candidate_nodes, key=lambda n: n.metric, reverse=True)[
-            : search_cfg.topk_improve
-        ]
+        return tasks
 
-        choices: list[Node | None] = []
-        weights: list[float] = []
-        for rank, node in enumerate(top_nodes):
-            choices.append(node)
-            weights.append(1.0 / (rank + 1))
-
-        root_draft_available = (
-            len(self.journal.draft_nodes) < search_cfg.max_children_per_node
-        )
-        if root_draft_available:
-            choices.append(None)
-            weights.append(0.5)
-
-        for node in debuggable_nodes:
-            choices.append(node)
-            weights.append(0.5)
-
-        if not choices:
-            logger.debug("[search policy] no expandable candidates")
-            self._last_selection_reason = (
-                "no expandable successful, buggy, or root node remains"
-            )
+    def search_policy(self) -> Node | None:
+        """Select a node to work on (or None to draft a new node)."""
+        tasks = self.select_round_tasks()
+        if not tasks:
+            self._last_selection_reason = "no search task selected"
             return None
 
-        selected = random.choices(choices, weights=weights, k=1)[0]
-        if selected is None:
-            logger.debug("[search policy] expanding virtual root into a draft")
-            self._last_selection_reason = (
-                "weighted exploration selected virtual root draft "
-                f"({len(self.journal.draft_nodes) + 1}/"
-                f"{search_cfg.max_children_per_node})"
-            )
-            return None
-
-        if selected.is_buggy:
-            logger.debug("[search policy] debugging selected buggy node")
-            self._last_selection_reason = (
-                "weighted exploration selected a buggy leaf for debug "
-                f"(depth {selected.debug_depth + 1}/{search_cfg.max_debug_depth})"
-            )
-            return selected
-
-        logger.debug(
-            "[search policy] improving one of the top-%d available good nodes",
-            len(top_nodes),
-        )
-        self._last_selection_reason = (
-            f"weighted exploration selected rank {top_nodes.index(selected) + 1} "
-            f"of {len(top_nodes)} available successful candidates"
-        )
-        return selected
+        selected_task = tasks[0]
+        self._last_selection_reason = selected_task.selection_reason
+        return selected_task.parent
 
     @property
     def _prompt_environment(self):
@@ -214,8 +215,8 @@ class BaseAgent:
             f"The per-node execution timeout is a hard safety limit of {humanize.naturaldelta(self.cfg.exec.timeout)}, not a target budget. Choose the experiment scale from the task, data, observed validation metric, runtime, and resource history.",
             'All the provided input data is stored in "./input" directory.',
             "When building data loading code, base it on the actual existing data files rather than relying entirely on the annotation file.",
-            "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` for validation predictions and `./working/submission.csv`.",
-            "BioMaker computes the final node score after your script exits by calling `evaluator.score_val()` with no arguments. You may call `evaluator.score_val()` or `evaluator.validate_submission()` yourself only after writing the required files.",
+            "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` for score-validation predictions and `./working/submission.csv`.",
+            "BioMaker computes the final node score after your script exits using hidden score labels that are not available to generated code. You may call `evaluator.validate_submission()` yourself after writing the required files, but do not call `evaluator.score_val()` inside generated code because the hidden score labels are only supplied to BioMaker's external scoring process.",
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
         ]
         if self.acfg.expose_prediction:
@@ -358,7 +359,12 @@ class BaseAgent:
                 else overview
             )
 
-    def parse_exec_result(self, node: Node, exec_result: ExecutionResult):
+    def parse_exec_result(
+        self,
+        node: Node,
+        exec_result: ExecutionResult,
+        best_node_before: Node | None = None,
+    ):
         """core function for feedback for this Agent"""
         logger.debug(f"Agent is parsing execution results for node {node.id}")
 
@@ -441,7 +447,8 @@ class BaseAgent:
             node.metric = MetricValue(
                 response["metric"], maximize=not response["lower_is_better"]
             )
-        best_node_before = self.journal.get_best_node(only_good=True, topk=1)
+        if best_node_before is None:
+            best_node_before = self.journal.get_best_node(only_good=True, topk=1)
         node.record_experiment_context(best_node_before=best_node_before)
         append_event(
             self.cfg.log_dir,

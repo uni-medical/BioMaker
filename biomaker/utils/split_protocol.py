@@ -38,6 +38,8 @@ PRIVATE_TEST_COLUMN_TOKENS = [
     "grade",
     "finding",
 ]
+SCORE_VAL_PUBLIC_FILENAME = "score_val.csv"
+SCORE_VAL_TRUTH_FILENAME = "score_val_truth.csv"
 
 
 @dataclass(frozen=True)
@@ -172,6 +174,12 @@ def _sanitize_test_table(
     return df[keep_columns].copy()
 
 
+def _sanitize_score_table(
+    df: pd.DataFrame, label_column: str | None, mask_column: str | None
+) -> pd.DataFrame:
+    return _sanitize_test_table(df, label_column, mask_column)
+
+
 def _copy_private_truth(
     input_dir: Path,
     private_dir: Path,
@@ -262,6 +270,9 @@ def _remove_private_workspace_dir(input_dir: Path) -> None:
     private_dir = input_dir.parent / "private"
     if private_dir.is_dir():
         shutil.rmtree(private_dir)
+    score_dir = input_dir.parent / "_score_truth"
+    if score_dir.is_dir():
+        shutil.rmtree(score_dir)
 
 
 def _path_suffix_matches(path: Path, suffix: Path) -> bool:
@@ -393,17 +404,17 @@ def _render_prompt(split_plan: dict[str, Any]) -> str:
     ]
     agent_visible = split_plan.get("agent_visible", {})
     train_path = agent_visible.get("train")
-    val_path = agent_visible.get("val")
-    if train_path and val_path:
+    score_path = agent_visible.get("score_val")
+    if train_path and score_path:
         lines.extend(
             [
-                f"- Train only with `./input/{train_path}`.",
-                f"- Compute the agent-visible validation metric only on `./input/{val_path}`.",
+                f"- Use `./input/{train_path}` as the only labeled agent-visible training table. Candidate code may create its own internal holdout, OOF, CV, calibration, or stacking scheme from this training table.",
+                f"- Generate `./working/validation_predictions.csv` for every row in `./input/{score_path}`. This score split intentionally has no labels in the agent workspace; BioMaker scores it after your script exits.",
             ]
         )
     else:
         lines.append(
-            "- No deterministic train/validation CSV split was inferred. Inspect the input folder and create any needed development split from training-eligible data only."
+            "- No deterministic train/score CSV split was inferred. Inspect the input folder and create any needed development split from training-eligible data only."
         )
     test_path = agent_visible.get("test")
     if test_path:
@@ -474,30 +485,48 @@ def prepare_split_protocol(
         group_column = train_summary.get("group_column")
 
         if train_source and val_source:
-            strategy = "official_train_val"
-            train_df = _read_table(train_source)
-            val_df = _read_table(val_source)
+            strategy = "official_val_as_hidden_score"
+            val_summary = _table_summary(val_source, input_dir)
+            train_source_df = _read_table(train_source)
+            train_df = train_source_df.copy()
+            score_val_df = _read_table(val_source)
             train_base_dir = train_source.parent
-            val_base_dir = val_source.parent
+            score_base_dir = val_source.parent
+            score_path_column = val_summary.get("path_column") or train_summary.get(
+                "path_column"
+            )
+            score_mask_column = val_summary.get("mask_column") or train_summary.get(
+                "mask_column"
+            )
+            score_label_column = val_summary.get("label_column") or label_column
             split_diagnostics: dict[str, Any] = {}
         else:
-            strategy = "split_from_train"
+            strategy = "hidden_score_split_from_train"
             source_df = _read_table(source_for_split)
-            train_base_dir = source_for_split.parent
-            val_base_dir = source_for_split.parent
-            train_df, val_df, split_diagnostics = _split_dataframe(
+            train_df, score_val_df, score_diagnostics = _split_dataframe(
                 source_df,
                 label_column=label_column,
                 group_column=group_column,
+                val_fraction=0.2,
+                seed=42,
             )
+            train_base_dir = source_for_split.parent
+            score_base_dir = source_for_split.parent
+            score_path_column = train_summary.get("path_column")
+            score_mask_column = train_summary.get("mask_column")
+            score_label_column = label_column
+            split_diagnostics = {
+                "score_val": score_diagnostics,
+            }
             warnings.append(
-                "No official validation split found; created an agent-visible validation split from training data."
+                "No official validation split found; created a hidden score split from training data. The remaining rows are the labeled agent-visible training table."
             )
 
         agent_train = split_dir / "agent_train.csv"
-        agent_val = split_dir / "agent_val.csv"
+        public_score_val = split_dir / SCORE_VAL_PUBLIC_FILENAME
+        hidden_score_val = private_dir / SCORE_VAL_TRUTH_FILENAME
         train_rel = _relative(agent_train, input_dir)
-        val_rel = _relative(agent_val, input_dir)
+        score_rel = _relative(public_score_val, input_dir)
         train_df = _normalize_agent_paths(
             train_df,
             input_dir,
@@ -506,18 +535,27 @@ def prepare_split_protocol(
             train_base_dir,
             warnings,
         )
-        val_df = _normalize_agent_paths(
-            val_df,
+        score_val_df = _normalize_agent_paths(
+            score_val_df,
             input_dir,
-            train_summary.get("path_column"),
-            train_summary.get("mask_column"),
-            val_base_dir,
+            score_path_column,
+            score_mask_column,
+            score_base_dir,
             warnings,
         )
+        public_score_val_df = _sanitize_score_table(
+            score_val_df,
+            score_label_column,
+            score_mask_column,
+        )
         _write_csv(train_df, agent_train)
-        _write_csv(val_df, agent_val)
+        _write_csv(public_score_val_df, public_score_val)
+        _write_csv(score_val_df, hidden_score_val)
 
-        agent_visible: dict[str, str] = {"train": train_rel, "val": val_rel}
+        agent_visible: dict[str, str] = {
+            "train": train_rel,
+            "score_val": score_rel,
+        }
 
         if test_source:
             test_summary = _table_summary(test_source, input_dir)
@@ -580,10 +618,26 @@ def prepare_split_protocol(
                 "mask": mask_column,
                 "group": group_column,
             },
-            "metric_split": "agent_val",
+            "score_validation": {
+                "public": score_rel,
+                "labels_visible_to_agent": False,
+            },
+            "metric_split": "score_val",
             "private_evaluation": private_evaluation,
             "diagnostics": split_diagnostics,
             "warnings": warnings,
+        }
+        private_plan["score_validation"] = {
+            "source": (
+                str(val_source.relative_to(input_dir))
+                if val_source
+                else str(source_for_split.relative_to(input_dir))
+            ),
+            "truth_file": SCORE_VAL_TRUTH_FILENAME,
+            "visible_to_agent": False,
+            "label_column": label_column,
+            "mask_column": mask_column,
+            "id_column": train_summary.get("id_column"),
         }
 
     dataset_report = inspect_dataset(input_dir)
@@ -595,6 +649,10 @@ def prepare_split_protocol(
     )
     if private_plan["private_evaluation"]:
         private_dir.mkdir(parents=True, exist_ok=True)
+        (private_dir / "private_split_plan.json").write_text(
+            json.dumps(private_plan, indent=2), encoding="utf-8"
+        )
+    if (private_dir / SCORE_VAL_TRUTH_FILENAME).is_file():
         (private_dir / "private_split_plan.json").write_text(
             json.dumps(private_plan, indent=2), encoding="utf-8"
         )

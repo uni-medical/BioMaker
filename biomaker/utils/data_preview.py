@@ -26,6 +26,7 @@ excluded_dirs = {
     "private",
     "private_truth",
     "_private_truth",
+    "_score_truth",
     "working",
 }
 excluded_files = {"evaluator_prediction_spec.json"}
@@ -164,7 +165,12 @@ def biomaker_essentials(base_path: Path) -> str:
         lines.append(protocol)
 
     split_lines = []
-    for filename in ["agent_train.csv", "agent_val.csv", "agent_test.csv"]:
+    for filename in [
+        "agent_train.csv",
+        "score_val.csv",
+        "agent_val.csv",
+        "agent_test.csv",
+    ]:
         line = _csv_schema_line(split_dir / filename, base_path)
         if line:
             split_lines.append(line)

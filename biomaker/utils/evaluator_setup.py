@@ -6,6 +6,7 @@ import ast
 import json
 import logging
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,7 @@ EXTERNAL_VALIDATION_PREFIX = "BioMakerExternalValidation:"
 _RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
 _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
+_SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
 
 
 class EvaluatorSetupError(RuntimeError):
@@ -110,9 +112,18 @@ def _task_payload(task_desc: Any) -> str:
     return json.dumps(task_desc, indent=2, ensure_ascii=False, default=str)
 
 
-def _artifact_contract_facts(workspace_dir: Path) -> dict[str, Any]:
+def _artifact_contract_facts(
+    workspace_dir: Path, score_truth_path: Path | None = None
+) -> dict[str, Any]:
     split_dir = workspace_dir / "input" / "biomaker_splits"
-    val_path = split_dir / "agent_val.csv"
+    val_path = split_dir / "score_val.csv"
+    legacy_val_path = split_dir / "agent_val.csv"
+    if not val_path.is_file():
+        val_path = legacy_val_path
+    dev_path = split_dir / "agent_dev.csv"
+    score_truth_path = score_truth_path or (
+        workspace_dir / "_score_truth" / "score_val.csv"
+    )
     test_path = split_dir / "agent_test.csv"
     if not val_path.is_file() or not test_path.is_file():
         return {}
@@ -120,6 +131,12 @@ def _artifact_contract_facts(workspace_dir: Path) -> dict[str, Any]:
     try:
         val_df = pd.read_csv(val_path, nrows=3)
         test_df = pd.read_csv(test_path, nrows=3)
+        dev_df = pd.read_csv(dev_path, nrows=3) if dev_path.is_file() else None
+        score_truth_df = (
+            pd.read_csv(score_truth_path, nrows=3)
+            if score_truth_path.is_file()
+            else None
+        )
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -159,19 +176,26 @@ def _artifact_contract_facts(workspace_dir: Path) -> dict[str, Any]:
     ]
 
     return {
-        "agent_val_columns": val_columns,
+        "score_val_public_columns": val_columns,
+        "agent_dev_columns": list(dev_df.columns) if dev_df is not None else None,
+        "hidden_score_truth_columns": (
+            list(score_truth_df.columns) if score_truth_df is not None else None
+        ),
         "agent_test_columns": test_columns,
         "ground_truth_only_columns": ground_truth_only,
         "likely_key_columns": likely_key_columns,
         "note": (
-            "Candidate artifacts may use key columns and new prediction columns only. "
-            "Columns listed as ground_truth_only_columns must be loaded from agent_val.csv "
-            "inside score_val(), not required from candidate validation/test artifacts."
+            "Candidate validation artifacts are predictions for score_val.csv and may use "
+            "key columns plus new prediction columns only. Hidden score labels are not "
+            "present in score_val.csv; score_val() must load them from the path in "
+            f"environment variable {_SCORE_ENV_VAR}."
         ),
     }
 
 
-def _evaluator_prompt(task_desc: Any, workspace_dir: Path) -> dict[str, Any]:
+def _evaluator_prompt(
+    task_desc: Any, workspace_dir: Path, score_truth_path: Path | None = None
+) -> dict[str, Any]:
     return {
         "Introduction": (
             "You are writing the frozen evaluator for a machine learning task. "
@@ -181,29 +205,32 @@ def _evaluator_prompt(task_desc: Any, workspace_dir: Path) -> dict[str, Any]:
         ),
         "Task description": _task_payload(task_desc),
         "Data overview": data_preview.generate(workspace_dir),
-        "Observed artifact contract facts": _artifact_contract_facts(workspace_dir),
+        "Observed artifact contract facts": _artifact_contract_facts(
+            workspace_dir, score_truth_path
+        ),
         "Environment contract": environment_manifest_text(include_medical=True),
         "Evaluator requirements": [
             "Write exactly one Python file.",
             "Use only Python standard library and allowed installed packages.",
             "Do not train a model. Do not install packages. Do not use network access.",
             "Do not use Python eval() or exec(). Parse serialized values with json.loads or ast.literal_eval.",
-            "Use files under ./input/biomaker_splits as the source of truth for train/validation/test split.",
+            "Use files under ./input/biomaker_splits as the source of truth for public train/development/score/test split.",
             "Define prediction_spec() returning a concise JSON-serializable dict with these top-level keys: validation_artifact, test_submission, key_columns, prediction_columns, primary_metric. key_columns may be [] only when row order is the contract.",
             "test_submission must be exactly './working/submission.csv'.",
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
-            "The candidate validation artifact must follow the same public prediction contract as the test submission: key_columns plus prediction_columns only. Do not require candidates to output validation ground-truth columns such as label, class, target, or true_class. score_val() must load validation labels from ./input/biomaker_splits/agent_val.csv and align them to the validation artifact by key columns.",
+            "The candidate validation artifact must contain predictions for rows in ./input/biomaker_splits/score_val.csv when that file exists, otherwise ./input/biomaker_splits/agent_val.csv for backward compatibility.",
+            "The candidate validation artifact must follow the same public prediction contract as the test submission: key_columns plus prediction_columns only. Do not require candidates to output validation ground-truth columns such as label, class, target, or true_class. score_val() must load hidden score labels from os.environ['BIOMAKER_SCORE_VAL_PATH'] and align them to the validation artifact by key columns.",
             "When reading candidate artifacts, validate the required columns and then restrict the dataframe to key_columns plus prediction_columns before merging with ground truth. Extra candidate columns such as class, label, target, or true_class must not collide with ground-truth columns or change scoring.",
-            "For tabular score_val(), use this safe merge pattern: copy the ground-truth label column to a private column named `y_true_private`, build `truth_view = agent_val[key_columns + ['y_true_private']]`, build `pred_view = predictions[key_columns + prediction_columns]`, convert every key column in both views to string before merging, merge those restricted views only, and read labels with dataframe/series indexing such as `merged['y_true_private']` or `row['y_true_private']`. Never rely on tuple attribute access for helper columns, and never read `merged['class']`, `merged['label']`, `merged['target']`, or candidate-supplied label-like columns after merge.",
+            "For tabular score_val(), use this safe merge pattern: copy the hidden ground-truth label column to a private column named `y_true_private`, build `truth_view = score_truth[key_columns + ['y_true_private']]`, build `pred_view = predictions[key_columns + prediction_columns]`, convert every key column in both views to string before merging, merge those restricted views only, and read labels with dataframe/series indexing such as `merged['y_true_private']` or `row['y_true_private']`. Never rely on tuple attribute access for helper columns, and never read `merged['class']`, `merged['label']`, `merged['target']`, or candidate-supplied label-like columns after merge.",
             "For tabular validate_submission(), apply the same key-column string normalization and restrict submission data to key_columns plus prediction_columns before checking duplicates, missing keys, or shapes.",
             "For probability outputs, include class_labels when prediction_columns do not directly encode class names; for single-column binary probability outputs, include positive_class.",
             "The submission contract must preserve enough information for the requested user-only test metrics. For classification with AUC, require probabilities rather than only hard labels.",
-            "Define score_val() with no required arguments. It must read the candidate validation artifact from ./working, validate the contract, and return a dict containing numeric key 'metric' and boolean key 'maximize'. Add useful extra metric keys when appropriate.",
+            f"Define score_val() with no required arguments. It must read hidden score truth from os.environ['{_SCORE_ENV_VAR}'], read the candidate validation artifact from ./working, validate the contract, and return a dict containing numeric key 'metric' and boolean key 'maximize'. Add useful extra metric keys when appropriate.",
             "Define validate_submission() with no required arguments. It must validate ./working/submission.csv and any referenced files against the same contract, returning a dict or raising a clear exception.",
             "For tabular prediction artifacts, align rows by the declared key columns after normalizing keys to strings; reject missing keys, duplicate keys, extra keys, bad shapes, and invalid numeric values.",
             "For probability outputs, validate with numeric tolerance and return a clear error when rows are not valid probabilities.",
             "If a primary metric is mathematically undefined on the current validation split, return a deterministic fallback metric with an explanatory field instead of crashing.",
-            "Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real agent_val and agent_test split CSVs, exactly follow prediction_spec(), call score_val() and validate_submission(), assert the returned metric is numeric, then print EVALUATOR_OK.",
+            f"Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real public score_val and agent_test split CSVs, exactly follow prediction_spec(), call score_val() with os.environ['{_SCORE_ENV_VAR}'] available, call validate_submission(), assert the returned metric is numeric, then print EVALUATOR_OK.",
             "Keep the evaluator simple and deterministic. Use standard metrics from sklearn when directly applicable and small direct numpy/PIL implementations for image masks.",
             "For segmentation masks, support mask files referenced from CSV. The prediction spec should make this explicit with prediction_type='mask_file_path' or file_reference_columns for the mask path column. Binary Dice should treat nonzero pixels as foreground. AJI/instance metrics should use integer connected/instance labels if the task asks for them.",
         ],
@@ -215,14 +242,22 @@ def _evaluator_prompt(task_desc: Any, workspace_dir: Path) -> dict[str, Any]:
 
 
 def _run_python(
-    workspace_dir: Path, code: str, timeout: int = 120
+    workspace_dir: Path,
+    code: str,
+    timeout: int = 120,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    run_env = None
+    if env is not None:
+        run_env = os.environ.copy()
+        run_env.update(env)
     return subprocess.run(
         [sys.executable, "-c", code],
         cwd=workspace_dir,
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=run_env,
     )
 
 
@@ -235,7 +270,26 @@ def _uses_eval_or_exec(code: str) -> bool:
     return False
 
 
-def _run_self_test(workspace_dir: Path, timeout: int) -> str:
+def _score_truth_env(
+    workspace_dir: Path, score_truth_path: Path | str | None = None
+) -> dict[str, str]:
+    truth_path = Path(score_truth_path) if score_truth_path is not None else None
+    if truth_path is None:
+        truth_path = workspace_dir / "_score_truth" / "score_val.csv"
+    if not truth_path.is_file():
+        input_path = workspace_dir / "input"
+        try:
+            truth_path = input_path.resolve().parent / "_score_truth" / "score_val.csv"
+        except Exception:
+            pass
+    return {_SCORE_ENV_VAR: str(truth_path)}
+
+
+def _run_self_test(
+    workspace_dir: Path,
+    timeout: int,
+    score_truth_path: Path | str | None = None,
+) -> str:
     code = (
         "import evaluator\n"
         "assert hasattr(evaluator, 'prediction_spec')\n"
@@ -244,7 +298,12 @@ def _run_self_test(workspace_dir: Path, timeout: int) -> str:
         "assert hasattr(evaluator, 'self_test')\n"
         "evaluator.self_test()\n"
     )
-    completed = _run_python(workspace_dir, code, timeout=timeout)
+    completed = _run_python(
+        workspace_dir,
+        code,
+        timeout=timeout,
+        env=_score_truth_env(workspace_dir, score_truth_path),
+    )
     output = (completed.stdout or "") + (completed.stderr or "")
     if completed.returncode != 0 or "EVALUATOR_OK" not in output:
         raise EvaluatorSetupError("Evaluator self-test failed.\n" + output[-4000:])
@@ -450,6 +509,7 @@ def _run_public_artifact_contract_test(
     workspace_dir: Path,
     prediction_spec: str,
     timeout: int,
+    score_truth_path: Path | str | None = None,
 ) -> None:
     """Reject evaluators whose score_val requires hidden columns in predictions."""
     try:
@@ -466,8 +526,11 @@ def _run_public_artifact_contract_test(
         class_labels = None
 
     clean_candidate_outputs(workspace_dir)
+    score_split = workspace_dir / "input" / "biomaker_splits" / "score_val.csv"
+    if not score_split.is_file():
+        score_split = workspace_dir / "input" / "biomaker_splits" / "agent_val.csv"
     _write_dummy_tabular_artifact(
-        workspace_dir / "input" / "biomaker_splits" / "agent_val.csv",
+        score_split,
         workspace_dir / str(spec["validation_artifact"]).removeprefix("./"),
         key_columns,
         prediction_columns,
@@ -489,14 +552,19 @@ def _run_public_artifact_contract_test(
         "assert isinstance(score.get('metric'), (int, float)), score\n"
         "evaluator.validate_submission()\n"
     )
-    completed = _run_python(workspace_dir, code, timeout=timeout)
+    completed = _run_python(
+        workspace_dir,
+        code,
+        timeout=timeout,
+        env=_score_truth_env(workspace_dir, score_truth_path),
+    )
     output = (completed.stdout or "") + (completed.stderr or "")
     if completed.returncode != 0:
         raise EvaluatorSetupError(
             "Evaluator public artifact contract test failed. "
             "score_val() must accept validation predictions containing only "
             "key_columns plus prediction_columns from prediction_spec(); it should "
-            "load validation labels from ./input/biomaker_splits/agent_val.csv.\n"
+            f"load hidden score labels from ${_SCORE_ENV_VAR}.\n"
             + output[-4000:]
         )
 
@@ -722,7 +790,9 @@ def inspect_candidate_artifacts(
                 "missing prediction columns: " + ", ".join(missing_prediction_columns)
             )
 
-        truth_path = workspace_dir / "input" / "biomaker_splits" / "agent_val.csv"
+        truth_path = workspace_dir / "input" / "biomaker_splits" / "score_val.csv"
+        if not truth_path.is_file():
+            truth_path = workspace_dir / "input" / "biomaker_splits" / "agent_val.csv"
         truth_df = pd.read_csv(truth_path) if truth_path.is_file() else pd.DataFrame()
         report["target_artifact"] = {
             "path": str(truth_path),
@@ -733,7 +803,7 @@ def inspect_candidate_artifacts(
         aligned_truth, alignment = (
             _align_truth_rows(pred_df, truth_df, key_columns)
             if truth_path.is_file()
-            else (None, {"error": "agent_val.csv missing"})
+            else (None, {"error": "score_val.csv missing"})
         )
         report["alignment"] = alignment
 
@@ -818,7 +888,8 @@ def prepare_evaluator(
     workspace_dir = Path(workspace_dir)
     log_dir = Path(log_dir)
     evaluator_path = workspace_dir / "evaluator.py"
-    prompt = _evaluator_prompt(task_desc, workspace_dir)
+    score_truth_path = log_dir / "private_truth" / "score_val_truth.csv"
+    prompt = _evaluator_prompt(task_desc, workspace_dir, score_truth_path)
     errors: list[str] = []
 
     for attempt in range(1, attempts + 1):
@@ -869,7 +940,11 @@ def prepare_evaluator(
         clean_candidate_outputs(workspace_dir)
         evaluator_path.write_text(code, encoding="utf-8")
         try:
-            _run_self_test(workspace_dir, timeout=timeout)
+            _run_self_test(
+                workspace_dir,
+                timeout=timeout,
+                score_truth_path=score_truth_path,
+            )
             prediction_spec = _normalize_prediction_spec_json(
                 _load_prediction_spec(workspace_dir)
             )
@@ -877,6 +952,7 @@ def prepare_evaluator(
                 workspace_dir,
                 prediction_spec,
                 timeout=timeout,
+                score_truth_path=score_truth_path,
             )
         except Exception as exc:
             errors.append(str(exc))
@@ -918,7 +994,9 @@ def prepare_evaluator(
 
 
 def score_candidate_with_evaluator(
-    workspace_dir: Path | str, timeout: int = 120
+    workspace_dir: Path | str,
+    timeout: int = 120,
+    score_truth_path: Path | str | None = None,
 ) -> EvaluatorRunResult:
     """Run the frozen evaluator against the current ./working artifacts."""
     workspace_dir = Path(workspace_dir)
@@ -932,7 +1010,12 @@ def score_candidate_with_evaluator(
         f"print('{_RESULT_PREFIX}' + json.dumps(payload, ensure_ascii=False, default=str))\n"
     )
     try:
-        completed = _run_python(workspace_dir, code, timeout=timeout)
+        completed = _run_python(
+            workspace_dir,
+            code,
+            timeout=timeout,
+            env=_score_truth_env(workspace_dir, score_truth_path),
+        )
     except subprocess.TimeoutExpired as exc:
         output = (exc.stdout or "") + (exc.stderr or "")
         return EvaluatorRunResult(
