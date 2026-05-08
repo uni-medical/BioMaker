@@ -1,4 +1,5 @@
 import atexit
+import csv
 import json
 import logging
 import math
@@ -41,6 +42,7 @@ from .utils.evaluator_setup import (
     prepare_evaluator,
     score_candidate_with_evaluator,
 )
+from .utils.input_cache import prepare_input_cache
 from .utils.metric import MetricValue, WorstMetricValue
 from .utils.private_evaluation import evaluate_private_outputs
 from .utils.run_manifest import write_run_manifest
@@ -155,6 +157,109 @@ def _metric_payload(node: Node) -> dict:
         "value": metric.value_npsafe,
         "maximize": metric.maximize,
     }
+
+
+def _count_csv_rows(path: Path | None) -> int | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            return sum(1 for _row in reader)
+    except Exception:
+        return None
+
+
+def _input_relative_path(workspace_dir: Path, rel_path: str | None) -> Path | None:
+    if not rel_path:
+        return None
+    path = Path(str(rel_path))
+    if path.is_absolute():
+        return path
+    return workspace_dir / "input" / path
+
+
+def _compact_task_description(task_desc, max_chars: int = 900) -> str:
+    if isinstance(task_desc, dict):
+        parts = []
+        for key, value in task_desc.items():
+            text = str(value).strip()
+            if not text:
+                continue
+            parts.append(f"{key}: {text}")
+        raw = "\n".join(parts)
+    else:
+        raw = str(task_desc or "").strip()
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        return text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def _run_overview_text(task_desc, split_protocol, workspace_dir: Path, private_dir: Path) -> tuple[str, dict]:
+    plan = split_protocol.split_plan
+    agent_visible = plan.get("agent_visible", {})
+    train_rel = agent_visible.get("train")
+    score_rel = agent_visible.get("score_val")
+    test_rel = agent_visible.get("test")
+
+    train_rows = _count_csv_rows(_input_relative_path(workspace_dir, train_rel))
+    score_rows = _count_csv_rows(_input_relative_path(workspace_dir, score_rel))
+    test_rows = _count_csv_rows(_input_relative_path(workspace_dir, test_rel))
+
+    private_sources = []
+    private_test_rows = None
+    for private_eval in plan.get("private_evaluation", []):
+        if not isinstance(private_eval, dict):
+            continue
+        source = private_eval.get("source")
+        if not source:
+            continue
+        private_sources.append(str(source))
+        private_rows = _count_csv_rows(private_dir / str(source))
+        if private_rows is not None:
+            private_test_rows = private_rows
+            break
+    if private_test_rows is None:
+        private_test_rows = test_rows
+
+    overview = {
+        "train_rows": train_rows,
+        "node_selection_val_rows": score_rows,
+        "agent_test_rows": test_rows,
+        "private_test_rows": private_test_rows,
+        "train_path": train_rel,
+        "node_selection_val_path": score_rel,
+        "agent_test_path": test_rel,
+        "private_sources": private_sources,
+    }
+
+    lines = ["Run overview:"]
+    task_summary = _compact_task_description(task_desc)
+    if task_summary:
+        lines.append("Task description:")
+        lines.extend(f"  {line}" for line in task_summary.splitlines())
+    lines.append("Data split:")
+    if train_rel:
+        lines.append(
+            f"- Training rows visible to generated code: {train_rows if train_rows is not None else 'unknown'} (`./input/{train_rel}`)."
+        )
+    if score_rel:
+        lines.append(
+            f"- Node-selection validation rows, not for generated-code training: {score_rows if score_rows is not None else 'unknown'} (`./input/{score_rel}`; labels hidden from generated code)."
+        )
+    if test_rel:
+        lines.append(
+            f"- Test input rows visible only for prediction: {test_rows if test_rows is not None else 'unknown'} (`./input/{test_rel}`)."
+        )
+    if private_sources:
+        source_text = ", ".join(f"`{source}`" for source in private_sources)
+        lines.append(
+            f"- Completely hidden/private test labels for user-only evaluation: {private_test_rows if private_test_rows is not None else 'unknown'} rows ({source_text})."
+        )
+    return "\n".join(lines), overview
 
 
 def _append_private_metrics_entry(cfg, entry: dict) -> None:
@@ -369,7 +474,47 @@ def run():
         private_dir=private_dir,
         prompt_chars=len(split_protocol.prompt_text),
     )
+    overview_text, overview_payload = _run_overview_text(
+        task_desc,
+        split_protocol,
+        workspace_dir=cfg.workspace_dir,
+        private_dir=private_dir,
+    )
+    logger.info("%s", overview_text)
+    append_event(cfg.log_dir, "run_overview", **overview_payload)
     logger.info("Split protocol:\n%s", split_protocol.prompt_text)
+
+    input_cache_prompt = None
+    if cfg.input_cache.enabled:
+        logger.info("Preparing deterministic input cache ...")
+        input_cache_result = prepare_input_cache(
+            cfg.workspace_dir / "input",
+            split_protocol.split_plan,
+            shared_root=(
+                cfg.resource_dir / "input_cache" if cfg.input_cache.reuse else None
+            ),
+            decode_arrays=cfg.input_cache.decode_arrays,
+        )
+        input_cache_prompt = input_cache_result.prompt_text
+        logger.info(
+            "Input cache prepared at %s (%d files, %d decoded arrays, %d errors, reused=%s)",
+            input_cache_result.path,
+            input_cache_result.files_total,
+            input_cache_result.arrays_decoded,
+            input_cache_result.errors,
+            input_cache_result.reused,
+        )
+        append_event(
+            cfg.log_dir,
+            "input_cache_prepared",
+            path=str(input_cache_result.path),
+            fingerprint=input_cache_result.fingerprint,
+            files_total=input_cache_result.files_total,
+            arrays_decoded=input_cache_result.arrays_decoded,
+            errors=input_cache_result.errors,
+            reused=input_cache_result.reused,
+        )
+
     interpreter = Interpreter(
         cfg.workspace_dir,
         **_interpreter_kwargs(cfg),
@@ -381,6 +526,8 @@ def run():
             "Task description": task_desc,
             "Data split protocol": split_protocol.prompt_text,
         }
+    if input_cache_prompt:
+        task_desc["Input cache protocol"] = input_cache_prompt
 
     logger.info("Preparing frozen evaluator ...")
     prepared_evaluator = prepare_evaluator(
@@ -390,6 +537,9 @@ def run():
         model=cfg.agent.feedback.model,
         temperature=0.0,
         timeout=min(180, cfg.exec.timeout),
+        cache_root=(
+            cfg.resource_dir / "evaluators" if cfg.evaluator_cache.enabled else None
+        ),
     )
     append_event(
         cfg.log_dir,
@@ -403,7 +553,7 @@ def run():
         "Generated code may call `evaluator.validate_submission()` after writing outputs, but should not call `evaluator.score_val()` because hidden score labels are only supplied to BioMaker's external scoring process. "
         "Key columns in prediction artifacts must exactly match the split CSV values. "
         "If a framework returns key values as tensors or arrays, convert them to ordinary Python scalars or read the key column directly from the source table; never write serialized framework objects such as `tensor(1)`. "
-        "Classification probability columns must be complete softmax probabilities for every class and each row must sum to 1; do not fill missing rows with zeros. "
+        "For classification probability artifacts, follow `prediction_spec()` exactly: write only the requested probability columns, use valid numeric probabilities, make mutually exclusive class probabilities sum to 1 only when all class probabilities are requested, and do not fill missing rows with zeros. "
         f"Prediction spec: {prepared_evaluator.prediction_spec}"
     )
     try:
@@ -1043,7 +1193,11 @@ def run():
         if block and futures and not done:
             wait(futures, return_when=FIRST_COMPLETED)
         handle_finished_generations(executor, block=False)
-        handle_finished_futures(block=False, executor=executor)
+        handle_finished_futures(
+            block=False,
+            executor=executor,
+            append_round_index=append_round_index,
+        )
         submit_ready_nodes(executor)
 
     def wait_for_scheduler_capacity(
@@ -1191,7 +1345,9 @@ def run():
         refresh_live_tree(log_tree=False)
 
     def handle_finished_futures(
-        block: bool = False, executor: ThreadPoolExecutor | None = None
+        block: bool = False,
+        executor: ThreadPoolExecutor | None = None,
+        append_round_index: int | None = None,
     ) -> None:
         futures = list(future_to_round_node)
         if not futures:
@@ -1210,7 +1366,12 @@ def run():
         if executor is not None:
             submit_ready_nodes(executor)
         for round_node in finished_round_nodes:
-            parse_round_node_if_ready(round_node)
+            can_append_result = (
+                append_round_index is None
+                or round_node.round_index <= append_round_index
+            )
+            if can_append_result:
+                parse_round_node_if_ready(round_node)
             if round_node.node.id not in parsed_node_ids:
                 refresh_live_tree(log_tree=False)
 
@@ -1396,7 +1557,9 @@ def run():
                         if not submitted:
                             break
                     handle_scheduler_events(
-                        executor, append_round_index=round_index, block=True
+                        executor,
+                        append_round_index=round_index,
+                        block=not round_ready_to_commit(round_index),
                     )
 
                 append_event(

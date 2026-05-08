@@ -11,6 +11,13 @@ from typing import Any
 import pandas as pd
 
 ID_CANDIDATES = ["patient", "patient_id", "case", "case_id", "study", "Id", "id"]
+METADATA_TABLE_CANDIDATES = [
+    "metadata.csv",
+    "labels.csv",
+    "label.csv",
+    "annotations.csv",
+    "annotation.csv",
+]
 LABEL_CANDIDATES = [
     "label",
     "class",
@@ -22,7 +29,15 @@ LABEL_CANDIDATES = [
     "y",
     "mask_path",
 ]
-PATH_CANDIDATES = ["path", "image_path", "filename", "file_path"]
+PATH_CANDIDATES = [
+    "path",
+    "image_path",
+    "data_path",
+    "volume_path",
+    "filename",
+    "file_path",
+    "filepath",
+]
 MASK_CANDIDATES = ["mask_path", "mask", "label_path"]
 GROUP_CANDIDATES = ["patient", "patient_id", "case", "case_id", "study"]
 PRIVATE_TEST_COLUMN_TOKENS = [
@@ -126,7 +141,12 @@ def _split_dataframe(
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     diagnostics: dict[str, Any] = {"seed": seed, "val_fraction": val_fraction}
 
-    if group_column and group_column in df.columns and df[group_column].nunique() > 1:
+    if (
+        group_column
+        and group_column in df.columns
+        and df[group_column].nunique() > 1
+        and df[group_column].nunique() < len(df)
+    ):
         groups = pd.Series(df[group_column].dropna().unique()).sample(
             frac=1.0, random_state=seed
         )
@@ -196,7 +216,7 @@ def _copy_private_truth(
         return
 
     for value in test_df[test_mask_column].dropna():
-        mask_rel = Path(str(value).removeprefix("./"))
+        mask_rel = _path_value_to_relative_path(str(value))
         if mask_rel.is_absolute():
             matches = [mask_rel] if mask_rel.is_file() else []
             private_mask = private_dir / mask_rel.name
@@ -282,8 +302,15 @@ def _path_suffix_matches(path: Path, suffix: Path) -> bool:
     return path.parts[-len(suffix_parts) :] == suffix_parts
 
 
+def _path_value_to_relative_path(value: str) -> Path:
+    text = value.strip().removeprefix("./")
+    if "\\" in text and not Path(text).is_absolute():
+        text = text.replace("\\", "/")
+    return Path(text)
+
+
 def _observe_existing_paths(value: str, input_dir: Path, base_dir: Path | None) -> list[Path]:
-    normalized = Path(value.removeprefix("./"))
+    normalized = _path_value_to_relative_path(value)
     if normalized.parts and normalized.parts[0] == "input":
         direct_bases = [input_dir.parent]
     else:
@@ -409,7 +436,7 @@ def _render_prompt(split_plan: dict[str, Any]) -> str:
         lines.extend(
             [
                 f"- Use `./input/{train_path}` as the only labeled agent-visible training table. Candidate code may create its own internal holdout, OOF, CV, calibration, or stacking scheme from this training table.",
-                f"- Generate `./working/validation_predictions.csv` for every row in `./input/{score_path}`. This score split intentionally has no labels in the agent workspace; BioMaker scores it after your script exits.",
+                f"- Generate `./working/validation_predictions.csv` for every row in `./input/{score_path}`. This score split is used by BioMaker to score and select nodes; it intentionally has no labels in the agent workspace and must not be used for training, calibration, model selection, debugging, or metric reporting by generated code.",
             ]
         )
     else:
@@ -433,7 +460,7 @@ def _render_prompt(split_plan: dict[str, Any]) -> str:
         lines.append(f"- Warning: {warning}")
     if split_plan.get("columns", {}).get("mask"):
         lines.append(
-            "- Mask labels are present. If the task asks for AJI or instance segmentation, optimize AJI on the validation split and save instance masks; Binary Dice should treat every nonzero pixel as foreground."
+            "- A mask column is present in labeled agent-visible rows. Treat masks as task-provided labels or auxiliary training information only when useful; follow the task description and frozen evaluator for the required metric and prediction artifact format."
         )
     return "\n".join(lines)
 
@@ -465,7 +492,7 @@ def prepare_split_protocol(
         input_dir, "val.csv", "validation.csv", "val/metadata.csv"
     )
     test_source = _candidate_table(input_dir, "test.csv", "test/metadata.csv")
-    metadata_source = _candidate_table(input_dir, "metadata.csv")
+    metadata_source = _candidate_table(input_dir, *METADATA_TABLE_CANDIDATES)
 
     source_for_split = train_source or metadata_source
     if source_for_split is None:

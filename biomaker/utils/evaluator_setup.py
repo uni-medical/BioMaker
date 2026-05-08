@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import math
@@ -31,6 +32,7 @@ _RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
 _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 _SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
+_EVALUATOR_CACHE_VERSION = 1
 
 
 class EvaluatorSetupError(RuntimeError):
@@ -875,6 +877,96 @@ def inspect_candidate_artifacts(
     return report
 
 
+def _stable_evaluator_cache_key(prompt: dict[str, Any], model: str) -> str:
+    payload = {
+        "cache_version": _EVALUATOR_CACHE_VERSION,
+        "model": model,
+        "prompt": prompt,
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
+
+
+def _try_reuse_cached_evaluator(
+    cache_entry: Path,
+    workspace_dir: Path,
+    log_dir: Path,
+    timeout: int,
+    score_truth_path: Path,
+) -> PreparedEvaluator | None:
+    cached_evaluator = cache_entry / "evaluator.py"
+    cached_spec = cache_entry / "evaluator_prediction_spec.json"
+    if not cached_evaluator.is_file() or not cached_spec.is_file():
+        return None
+
+    evaluator_path = workspace_dir / "evaluator.py"
+    prediction_spec_path = workspace_dir / "evaluator_prediction_spec.json"
+    try:
+        shutil.copy2(cached_evaluator, evaluator_path)
+        prediction_spec = cached_spec.read_text(encoding="utf-8")
+        prediction_spec_path.write_text(prediction_spec, encoding="utf-8")
+        _run_self_test(
+            workspace_dir,
+            timeout=timeout,
+            score_truth_path=score_truth_path,
+        )
+        _run_public_artifact_contract_test(
+            workspace_dir,
+            prediction_spec,
+            timeout=timeout,
+            score_truth_path=score_truth_path,
+        )
+    except Exception as exc:
+        append_event(
+            log_dir,
+            "evaluator_cache_reuse_failed",
+            cache_entry=str(cache_entry),
+            reason=truncate_text(str(exc), max_chars=1200),
+        )
+        clean_candidate_outputs(workspace_dir)
+        return None
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(evaluator_path, log_dir / "evaluator.py")
+    (log_dir / "evaluator_prediction_spec.json").write_text(
+        prediction_spec, encoding="utf-8"
+    )
+    clean_candidate_outputs(workspace_dir)
+    append_event(log_dir, "evaluator_cache_reused", cache_entry=str(cache_entry))
+    logger.info("Reused cached evaluator from %s", cache_entry)
+    return PreparedEvaluator(path=evaluator_path, prediction_spec=prediction_spec)
+
+
+def _store_cached_evaluator(
+    cache_entry: Path, evaluator_path: Path, prediction_spec: str
+) -> None:
+    if (cache_entry / "evaluator.py").is_file() and (
+        cache_entry / "evaluator_prediction_spec.json"
+    ).is_file():
+        return
+    cache_entry.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = cache_entry.parent / f".tmp-{cache_entry.name}-{os.getpid()}"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(evaluator_path, tmp_dir / "evaluator.py")
+    (tmp_dir / "evaluator_prediction_spec.json").write_text(
+        prediction_spec, encoding="utf-8"
+    )
+    (tmp_dir / "manifest.json").write_text(
+        json.dumps(
+            {"cache_version": _EVALUATOR_CACHE_VERSION},
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    try:
+        tmp_dir.rename(cache_entry)
+    except FileExistsError:
+        shutil.rmtree(tmp_dir)
+
+
 def prepare_evaluator(
     workspace_dir: Path | str,
     log_dir: Path | str,
@@ -883,6 +975,7 @@ def prepare_evaluator(
     temperature: float = 0.0,
     attempts: int = 5,
     timeout: int = 120,
+    cache_root: Path | str | None = None,
 ) -> PreparedEvaluator:
     """Generate, smoke-test, and freeze evaluator.py in the workspace."""
     workspace_dir = Path(workspace_dir)
@@ -890,6 +983,19 @@ def prepare_evaluator(
     evaluator_path = workspace_dir / "evaluator.py"
     score_truth_path = log_dir / "private_truth" / "score_val_truth.csv"
     prompt = _evaluator_prompt(task_desc, workspace_dir, score_truth_path)
+    cache_entry = None
+    if cache_root is not None:
+        cache_key = _stable_evaluator_cache_key(prompt, model=model)
+        cache_entry = Path(cache_root) / cache_key
+        reused = _try_reuse_cached_evaluator(
+            cache_entry,
+            workspace_dir=workspace_dir,
+            log_dir=log_dir,
+            timeout=timeout,
+            score_truth_path=score_truth_path,
+        )
+        if reused is not None:
+            return reused
     errors: list[str] = []
 
     for attempt in range(1, attempts + 1):
@@ -972,6 +1078,8 @@ def prepare_evaluator(
         (log_dir / "evaluator_prediction_spec.json").write_text(
             prediction_spec, encoding="utf-8"
         )
+        if cache_entry is not None:
+            _store_cached_evaluator(cache_entry, evaluator_path, prediction_spec)
         clean_candidate_outputs(workspace_dir)
         logger.info("Evaluator prepared at %s", evaluator_path)
         append_event(log_dir, "evaluator_attempt_succeeded", attempt=attempt)

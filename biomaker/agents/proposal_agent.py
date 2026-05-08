@@ -130,7 +130,7 @@ class ProposalAgent(BaseAgent):
     ):
         super().__init__(task_desc, cfg, journal)
         self.profile = (
-            "You are a medical deep learning grandmaster attending a competition. "
+            "You are a pragmatic biomedical machine learning engineer. "
         )
         self.knowledge_base = None
         self.context_builder = ContextBuilder(self)
@@ -143,47 +143,15 @@ class ProposalAgent(BaseAgent):
     def clear_pending_round_nodes(self) -> None:
         self._pending_round_nodes = []
 
-    def format_pending_round_context(self, selected_parent: Node | None) -> str:
-        rows = []
-        for idx, node in enumerate(self._pending_round_nodes, start=1):
+    def pending_round_nodes_for(self, selected_parent: Node | None) -> list[Node]:
+        """Return same-round generated siblings that have not executed yet."""
+        nodes = []
+        for node in self._pending_round_nodes:
             same_parent = node.parent is selected_parent
             same_virtual_root = node.parent is None and selected_parent is None
-            if not (same_parent or same_virtual_root):
-                continue
-            rows.append(
-                "\n".join(
-                    [
-                        f"Pending proposal {idx}",
-                        f"id: {node.id[:8]}",
-                        f"stage: {node.node_status}",
-                        (
-                            "parent_id: "
-                            + (
-                                node.parent.id[:8]
-                                if node.parent is not None
-                                else "root"
-                            )
-                        ),
-                        "status: same-round proposal; execution result, metric, and feedback are intentionally hidden from this prompt",
-                        "plan: "
-                        + truncate_text(
-                            " ".join(str(node.plan or "").split()),
-                            max_chars=700,
-                        ),
-                        "code excerpt:",
-                        truncate_text(str(node.code or ""), max_chars=5000),
-                    ]
-                )
-            )
-        if not rows:
-            return ""
-        return (
-            "These in-flight proposals were generated earlier but have not been "
-            "made part of this prompt's empirical history. They are not empirical evidence; any execution result, "
-            "metric, or feedback from them is intentionally hidden from this prompt. "
-            "Use them only to avoid generating the same proposal again.\n\n"
-            + "\n\n".join(rows)
-        )
+            if same_parent or same_virtual_root:
+                nodes.append(node)
+        return nodes
 
     def _is_monai_query(self, query: str) -> bool:
         normalized = query.lower().replace(".", "").replace("_", "")
@@ -323,7 +291,7 @@ class ProposalAgent(BaseAgent):
     ) -> dict[str, Any]:
         context: dict[str, Any] = {
             "Stage": stage,
-            "Task description": truncate_text(str(self.task_desc), max_chars=1200),
+            "Task Description": truncate_text(str(self.task_desc), max_chars=1200),
         }
         essentials = self.get_run_facts()
         if essentials:

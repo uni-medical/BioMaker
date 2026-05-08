@@ -138,6 +138,21 @@
       .detail-record {
         margin-left: 10px;
       }
+      .detail-record-body {
+        border-left: 2px solid #3a404b;
+        margin: 8px 0 0 14px;
+        padding-left: 12px;
+      }
+      .detail-record-body .prompt-section {
+        background-color: #252a33;
+        border: 1px solid #343b46;
+        border-radius: 6px;
+        margin-top: 8px;
+        padding: 8px;
+      }
+      .detail-record-body .prompt-section summary {
+        margin-bottom: 8px;
+      }
       .prompt-section summary {
         align-items: baseline;
         display: flex;
@@ -192,16 +207,16 @@
         <div id="input-prompt"></div>
       </details>
       <details>
+        <summary>Plan</summary>
+        <pre id="plan"></pre>
+      </details>
+      <details>
         <summary>Code</summary>
         <pre><code id="code" class="language-python"></code></pre>
       </details>
       <details>
         <summary>Execution Output</summary>
         <pre id="output"></pre>
-      </details>
-      <details>
-        <summary>Artifact Details</summary>
-        <pre id="artifact-json"></pre>
       </details>
     </aside>
   </body>

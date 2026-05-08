@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ..backend import compile_prompt_to_md
 from ..journal import Journal
-from .response import truncate_text
+from .response import format_human_execution_output, truncate_text
 
 
 @dataclass
@@ -211,7 +211,7 @@ def _node_prompt(node) -> dict:
         "available": bool(prompt or messages),
         "stats": stats,
         "sections": sections,
-        "messages": messages,
+        "messages": [],
     }
 
 
@@ -246,18 +246,17 @@ def _node_summary(node, best_node) -> dict:
     if node is None:
         return {
             "title": "Search start",
+            "node_id": "",
+            "step": "",
             "stage": "virtual",
             "status": "virtual",
             "metric": "",
             "runtime": "",
             "memory": "",
+            "gpu_memory": "",
             "cpu": "",
             "outcome": "",
-            "parent": "",
-            "selected": "",
             "plan": "Draft nodes are direct children of this start point.",
-            "analysis": "",
-            "artifact": "",
             "error": "",
         }
 
@@ -266,22 +265,21 @@ def _node_summary(node, best_node) -> dict:
     status = _transient_status(node)
     return {
         "title": _node_label(node),
+        "node_id": node.id[:8],
+        "step": "" if node.step is None else str(node.step),
         "stage": node.node_status,
         "status": status,
         "metric": "" if metric == "n/a" else metric,
         "runtime": _format_seconds(node.exec_time),
         "memory": _format_mb(resources.get("peak_rss_mb")),
+        "gpu_memory": _format_mb(resources.get("peak_gpu_memory_mb")),
         "cpu": (
             ""
             if resources.get("avg_cpu_percent") is None
             else f"{float(resources.get('avg_cpu_percent')):.1f}%"
         ),
         "outcome": node.outcome or ("not yet appended" if node.step is None else ""),
-        "parent": node.parent.id[:8] if node.parent is not None else "",
-        "selected": truncate_text(str(node.selection_reason or ""), max_chars=220),
         "plan": truncate_text(str(node.plan or ""), max_chars=900),
-        "analysis": truncate_text(str(node.analysis or ""), max_chars=900),
-        "artifact": _artifact_summary(node.artifact_report),
         "error": truncate_text(
             str(node.exc_info or node.exc_type or ""), max_chars=600
         ),
@@ -299,7 +297,6 @@ def _node_plan_text(node) -> str:
         f"outcome:{node.outcome}",
         f"selected:{truncate_text(str(node.selection_reason or ''), max_chars=220)}",
         f"plan:{truncate_text(str(node.plan or ''), max_chars=900)}",
-        f"analysis:{truncate_text(str(node.analysis or ''), max_chars=900)}",
     ]
     return "\n".join(textwrap.fill(str(line), width=88) for line in original_lines)
 
@@ -307,7 +304,7 @@ def _node_plan_text(node) -> str:
 def _node_term_out(node) -> str:
     if node is None or getattr(node, "_term_out", None) is None:
         return ""
-    return truncate_text(node.term_out, max_chars=12000)
+    return format_human_execution_output("".join(node._term_out), max_chars=12000)
 
 
 def cfg_to_tree_struct(cfg, jou: Journal, live: bool = False):
@@ -333,10 +330,6 @@ def cfg_to_tree_struct(cfg, jou: Journal, live: bool = False):
         ],
         term_out=[
             _node_term_out(v.source_node)
-            for v in visual_nodes
-        ],
-        analysis=[
-            "" if v.source_node is None else v.source_node.analysis
             for v in visual_nodes
         ],
         artifact_reports=[

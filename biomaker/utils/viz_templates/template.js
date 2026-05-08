@@ -36,6 +36,19 @@ const formatNumber = (value) => {
   return Number.isFinite(num) ? num.toLocaleString() : String(value);
 };
 
+const formatSeconds = (value) => {
+  if (value === null || value === undefined || value === "") return "n/a";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  return `${num.toFixed(num >= 10 ? 0 : 1)}s`;
+};
+
+const formatMetric = (value) => {
+  if (value === null || value === undefined || value === "") return "n/a";
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(4) : String(value);
+};
+
 const promptTokenText = (stats) => {
   const exact = stats?.input_tokens;
   const estimated = stats?.estimated_input_tokens;
@@ -56,7 +69,7 @@ const renderPromptSections = (sections) => {
       const chars = section.chars ?? "";
       const sectionText = section.text || "";
       const body =
-        section.name === "Detail records"
+        section.name === "Detail records" || section.name === "Tree Records"
           ? renderDetailRecords(sectionText)
           : `<pre>${escapeHtml(sectionText)}</pre>`;
       return `
@@ -78,37 +91,162 @@ const renderDetailRecords = (text) => {
     .map((record) => record.trim())
     .filter(Boolean);
   if (records.length === 0) return '<p class="muted">No detail records.</p>';
+
+  const roles = detailRecordRoles(records);
   return records
     .map((record, index) => {
-      const firstLine = record.split("\n").find((line) => line.trim()) || "";
+      const summary = detailRecordSummary(record, index, roles[index]);
       return `
         <details class="prompt-section detail-record">
           <summary>
-            ${escapeHtml(firstLine || `Detail record ${index + 1}`)}
+            ${escapeHtml(summary)}
             <span>${formatNumber(Math.round(record.length / 4))} est. tokens · ${formatNumber(record.length)} chars</span>
           </summary>
-          <pre>${escapeHtml(record)}</pre>
+          ${renderDetailRecordBody(record)}
         </details>
       `;
     })
     .join("");
 };
 
-const renderPromptMessages = (messages) => {
-  if (!Array.isArray(messages) || messages.length === 0) return "";
+const isNodeDetailRecord = (record) =>
+  /^Node\s+[0-9a-fA-F]+\s+full record/.test(String(record || ""));
+
+const lineageRole = (distanceFromParent) => {
+  if (distanceFromParent === 0) return "parent";
+  if (distanceFromParent === 1) return "grandparent";
+  if (distanceFromParent === 2) return "grandgrandparent";
+  return `ancestor-${distanceFromParent + 1}`;
+};
+
+const detailRecordRoles = (records) => {
+  const roles = Array(records.length).fill("");
+  const lineageStart = records.findIndex((record) =>
+    String(record || "").startsWith("Parent Lineage"),
+  );
+  const siblingStart = records.findIndex((record) =>
+    String(record || "").startsWith("Existing Children") ||
+      String(record || "").startsWith("Existing Root Drafts") ||
+      String(record || "").startsWith("Siblings of the Buggy Parent"),
+  );
+
+  if (lineageStart >= 0) {
+    const lineageEnd = siblingStart >= 0 ? siblingStart : records.length;
+    const lineageNodeIndices = [];
+    for (let i = lineageStart + 1; i < lineageEnd; i += 1) {
+      if (isNodeDetailRecord(records[i])) lineageNodeIndices.push(i);
+    }
+    lineageNodeIndices.forEach((recordIndex, position) => {
+      const distanceFromParent = lineageNodeIndices.length - position - 1;
+      roles[recordIndex] = lineageRole(distanceFromParent);
+    });
+  }
+
+  if (siblingStart >= 0) {
+    for (let i = siblingStart + 1; i < records.length; i += 1) {
+      if (isNodeDetailRecord(records[i])) roles[i] = "sibling";
+    }
+  }
+  return roles;
+};
+
+const renderDetailRecordBody = (record) => {
+  const parsed = parseNodeDetailRecord(record);
+  if (!parsed) return `<pre>${escapeHtml(record)}</pre>`;
   return `
-    <details class="prompt-section">
-      <summary>Actual sent messages <span>${messages.length} message(s)</span></summary>
-      ${messages
-        .map(
-          (message) => `
-            <h3>${escapeHtml(message.role || "message")}</h3>
-            <pre>${escapeHtml(message.content || "")}</pre>
-          `,
-        )
-        .join("")}
-    </details>
+    <div class="detail-record-body">
+      <details class="prompt-section" open>
+        <summary>Metadata</summary>
+        <pre>${escapeHtml(parsed.metadata)}</pre>
+      </details>
+      ${
+        parsed.artifact
+          ? `<details class="prompt-section">
+              <summary>Output Check</summary>
+              <pre>${escapeHtml(parsed.artifact)}</pre>
+            </details>`
+          : ""
+      }
+      <details class="prompt-section">
+        <summary>Plan</summary>
+        <pre>${escapeHtml(parsed.plan)}</pre>
+      </details>
+      <details class="prompt-section">
+        <summary>Code</summary>
+        <pre><code class="language-python">${escapeHtml(parsed.code)}</code></pre>
+      </details>
+      ${
+        parsed.output
+          ? `<details class="prompt-section">
+              <summary>Execution Output</summary>
+              <pre>${escapeHtml(parsed.output)}</pre>
+            </details>`
+          : ""
+      }
+    </div>
   `;
+};
+
+const parseNodeDetailRecord = (record) => {
+  const text = String(record || "");
+  if (!/^Node\s+[0-9a-fA-F]+\s+full record/.test(text)) return null;
+  const outputCheckMarker = "\n\nOutput Check:\n";
+  const planMarker = "\n\nPlan:\n";
+  const outputCheckStart = text.indexOf(outputCheckMarker);
+  const planStart = text.indexOf(planMarker);
+  if (planStart < 0) return null;
+
+  const hasOutputCheck = outputCheckStart >= 0 && outputCheckStart < planStart;
+  const metadata = text.slice(0, hasOutputCheck ? outputCheckStart : planStart).trim();
+  const artifact = hasOutputCheck
+    ? text.slice(outputCheckStart + outputCheckMarker.length, planStart).trim()
+    : "";
+  const rest = text.slice(planStart + planMarker.length);
+  const codeMarker = "\n\nCode:\n```python\n";
+  const codeStart = rest.indexOf(codeMarker);
+  if (codeStart < 0) return null;
+
+  const plan = rest.slice(0, codeStart).trim();
+  const afterCodeMarker = rest.slice(codeStart + codeMarker.length);
+  const outputMarker = "\n```\n\nExecution Output:\n```\n";
+  const outputStart = afterCodeMarker.indexOf(outputMarker);
+  if (outputStart < 0) {
+    const codeOnly = afterCodeMarker.replace(/\n```[\s\n]*$/, "").trim();
+    return { metadata, artifact, plan, code: codeOnly, output: "" };
+  }
+
+  const code = afterCodeMarker.slice(0, outputStart).trim();
+  const afterOutputMarker = afterCodeMarker.slice(outputStart + outputMarker.length);
+  const findingMarker = "\n```\n\nEmpirical finding:\n";
+  const findingStart = afterOutputMarker.indexOf(findingMarker);
+  const rawOutput =
+    findingStart >= 0
+      ? afterOutputMarker.slice(0, findingStart)
+      : afterOutputMarker;
+  const output = rawOutput.replace(/\n```[\s\n]*$/, "").trim();
+  return { metadata, artifact, plan, code, output };
+};
+
+const detailRecordSummary = (record, index, role = "") => {
+  const lines = String(record || "").split("\n");
+  const firstLine = lines.find((line) => line.trim()) || `Detail record ${index + 1}`;
+  const nodeMatch = firstLine.match(/^Node\s+([0-9a-fA-F]+)\s+full record/);
+  if (!nodeMatch) return firstLine;
+
+  const fields = {};
+  for (const line of lines) {
+    const match = line.match(/^([a-zA-Z_]+):\s*(.*)$/);
+    if (match) fields[match[1]] = match[2];
+  }
+  const nodeId = fields.node_id || nodeMatch[1];
+  const step = fields.step && fields.step !== "None" ? fields.step : "pending";
+  const parts = [`Node ${nodeId}`, `Step ${step}`];
+  if (role) parts.push(role);
+  const valMetric = fields.val_metric || fields.metric;
+  if (valMetric && valMetric !== "n/a") {
+    parts.push(`val metric ${formatMetric(valMetric)}`);
+  }
+  return parts.join(" · ");
 };
 
 const renderPromptDetails = (treeInd) => {
@@ -116,49 +254,37 @@ const renderPromptDetails = (treeInd) => {
   if (!prompt.available) {
     return '<p class="muted">No full input prompt was recorded for this node.</p>';
   }
-  const stats = prompt.stats || {};
-  const requestTime =
-    stats.request_time_seconds === null || stats.request_time_seconds === undefined
-      ? ""
-      : `${Number(stats.request_time_seconds).toFixed(2)}s`;
-  return `
-    <div class="metrics-grid prompt-metrics">
-      ${metricLine("input tokens", promptTokenText(stats))}
-      ${metricLine("output tokens", formatNumber(stats.output_tokens))}
-      ${metricLine("sent chars", formatNumber(stats.sent_chars))}
-      ${metricLine("model", stats.model)}
-      ${metricLine("request", requestTime)}
-      ${metricLine("sections", Array.isArray(prompt.sections) ? prompt.sections.length : 0)}
-    </div>
-    <h3>Prompt Components</h3>
-    ${renderPromptSections(prompt.sections)}
-    <h3>Compiled Input</h3>
-    ${renderPromptMessages(prompt.messages)}
-  `;
+  return renderPromptSections(prompt.sections);
 };
 
 const setNodeDetails = (treeInd) => {
   const summary = (treeStructData.summaries || [])[treeInd] || {};
   const selectedLabel = document.getElementById("selected-label");
-  if (selectedLabel) selectedLabel.textContent = summary.title || "Search start";
+  if (selectedLabel) {
+    const step = summary.step || "";
+    const nodeId = summary.node_id || "";
+    selectedLabel.textContent = nodeId
+      ? `${step ? `${step}: ` : ""}${nodeId}`
+      : "Search start";
+  }
 
   const summaryElm = document.getElementById("node-summary");
   if (summaryElm) {
+    const prompt = (treeStructData.prompts || [])[treeInd] || {};
+    const stats = prompt.stats || {};
     summaryElm.innerHTML = `
       <div class="metrics-grid">
-        ${metricLine("stage", summary.stage)}
-        ${metricLine("metric", summary.metric)}
-        ${metricLine("runtime", summary.runtime)}
-        ${metricLine("memory", summary.memory)}
-        ${metricLine("cpu", summary.cpu)}
-        ${metricLine("outcome", summary.outcome)}
+        ${metricLine("val metric", formatMetric(summary.metric))}
+        ${metricLine("llm time", formatSeconds(stats.request_time_seconds))}
+        ${metricLine("execution time", summary.runtime)}
+        ${metricLine("cpu usage", summary.cpu)}
+        ${metricLine("system memory", summary.memory)}
+        ${metricLine("gpu memory", summary.gpu_memory)}
+        ${metricLine("model", stats.model)}
+        ${metricLine("input tokens", promptTokenText(stats))}
+        ${metricLine("output tokens", formatNumber(stats.output_tokens))}
       </div>
-      ${summary.parent ? `<p><b>parent</b>: ${escapeHtml(summary.parent)}</p>` : ""}
       ${summary.is_best ? '<p class="best-pill">best node</p>' : ""}
-      ${summary.selected ? `<h3>Selection</h3><p>${escapeHtml(summary.selected)}</p>` : ""}
-      ${summary.plan ? `<h3>Plan</h3><p>${escapeHtml(summary.plan)}</p>` : ""}
-      ${summary.analysis ? `<h3>Analysis</h3><p>${escapeHtml(summary.analysis)}</p>` : ""}
-      ${summary.artifact ? `<h3>Artifact</h3><pre>${escapeHtml(summary.artifact)}</pre>` : ""}
       ${summary.error ? `<h3>Error</h3><pre>${escapeHtml(summary.error)}</pre>` : ""}
     `;
   }
@@ -177,17 +303,14 @@ const setNodeDetails = (treeInd) => {
     outputElm.textContent = termOut || "";
   }
 
-  const artifactElm = document.getElementById("artifact-json");
-  if (artifactElm) {
-    const report = (treeStructData.artifact_reports || [])[treeInd];
-    artifactElm.textContent = report
-      ? JSON.stringify(report, null, 2)
-      : summary.artifact || "";
-  }
-
   const promptElm = document.getElementById("input-prompt");
   if (promptElm) {
     promptElm.innerHTML = renderPromptDetails(treeInd);
+  }
+
+  const planElm = document.getElementById("plan");
+  if (planElm) {
+    planElm.textContent = summary.plan || "";
   }
 };
 

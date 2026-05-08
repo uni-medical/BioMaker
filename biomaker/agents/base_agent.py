@@ -1,12 +1,11 @@
 import logging
-import numbers
 import json
 from dataclasses import dataclass
 from typing import Any, Callable, cast
 
 import humanize
 
-from ..backend import FunctionSpec, compile_prompt_to_md, query
+from ..backend import compile_prompt_to_md, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
 from ..utils import data_preview
@@ -24,40 +23,11 @@ from ..utils.response import (
 
 logger = logging.getLogger("biomaker")
 ExecCallbackType = Callable[..., ExecutionResult]
-FEEDBACK_CODE_CHARS = 6000
-
 
 @dataclass(frozen=True)
 class RoundTask:
     parent: Node | None
     selection_reason: str
-
-review_func_spec = FunctionSpec(
-    name="submit_review",
-    json_schema={
-        "type": "object",
-        "properties": {
-            "is_bug": {
-                "type": "boolean",
-                "description": "true if the output log shows that the execution failed or has some bug, otherwise false.",
-            },
-            "summary": {
-                "type": "string",
-                "description": "If there is a bug, write one concise factual sentence naming where execution failed and the direct cause; do not propose a fix. Otherwise, write 2-3 concise sentences describing the metric, runtime/resource facts when relevant, and the empirical finding.",
-            },
-            "metric": {
-                "type": ["number", "null"],
-                "description": "If BioMakerExternalValidation is present, report that validation metric. If the code failed, leave it null.",
-            },
-            "lower_is_better": {
-                "type": "boolean",
-                "description": "true if the authoritative metric should be minimized, false if it should be maximized.",
-            },
-        },
-        "required": ["is_bug", "summary", "metric", "lower_is_better"],
-    },
-    description="Submit a review evaluating the output of the training script.",
-)
 
 
 def _estimated_tokens(text: str) -> int:
@@ -86,7 +56,7 @@ class BaseAgent:
         self.environment_facts = environment_manifest_text(
             include_medical=self.cfg.exec.include_medical_packages
         )
-        self.profile = "You are a helpful assistance. "
+        self.profile = "You are a factual biomedical machine learning assistant. "
 
     def has_empty_journal(self) -> bool:
         """Check if the journal is empty."""
@@ -316,7 +286,7 @@ class BaseAgent:
         return wrap_code(node.term_out, lang="")
 
     def update_data_preview(self):
-        self.data_preview = data_preview.generate(self.cfg.workspace_dir)
+        self.data_preview = data_preview.generate(self.cfg.workspace_dir, max_chars=None)
         self.run_facts = data_preview.biomaker_essentials(self.cfg.workspace_dir)
 
     def get_run_facts(self) -> str:
@@ -338,11 +308,12 @@ class BaseAgent:
                 if essentials:
                     remaining = max_chars - len(essentials) - 80
                     if remaining > 300:
+                        excerpt_source = self.data_preview.replace(essentials, "", 1).strip()
                         overview = (
                             essentials
                             + "\n\nAdditional dataset preview excerpt:\n"
                             + truncate_text(
-                                self.data_preview,
+                                excerpt_source,
                                 max_chars=remaining,
                                 marker="data overview excerpt trimmed",
                             )
@@ -365,88 +336,22 @@ class BaseAgent:
         exec_result: ExecutionResult,
         best_node_before: Node | None = None,
     ):
-        """core function for feedback for this Agent"""
+        """Parse factual execution results and evaluator output for a node."""
         logger.debug(f"Agent is parsing execution results for node {node.id}")
 
         node.absorb_exec_result(exec_result)
-        external_metric = parse_external_validation(node.term_out)
+        external_metric = parse_external_validation(exec_result.term_out)
         artifact_report = parse_artifact_report(exec_result.term_out)
         node.artifact_report = artifact_report
 
-        prompt = {
-            "Introduction": (
-                self.profile
-                + "You have written code to solve this task and now need to evaluate the output of the code execution. "
-                "You should determine if there were any bugs and summarize the empirical findings. "
-                "If a line beginning with BioMakerExternalValidation is present, it is the authoritative validation score. "
-                "For failed runs, the summary should be a factual failure note only, not repair advice."
-            ),
-            "Task description": self.task_desc,
-            "Execution facts": {
-                "exception_type": node.exc_type,
-                "exception_info": node.exc_info,
-                "execution_time_seconds": node.exec_time,
-                "resource_usage": node.resource_usage,
-                "authoritative_external_metric": external_metric,
-                "artifact_report": (
-                    truncate_text(
-                        json.dumps(
-                            artifact_report,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            default=str,
-                        ),
-                        max_chars=6000,
-                        marker="artifact report trimmed",
-                    )
-                    if artifact_report is not None
-                    else None
-                ),
-            },
-            "Implementation excerpt": wrap_code(
-                truncate_text(
-                    node.code,
-                    max_chars=FEEDBACK_CODE_CHARS,
-                    marker="feedback code excerpt trimmed",
-                )
-            ),
-            "Execution output": wrap_code(node.term_out, lang=""),
-        }
-
-        response = query(
-            system_message=prompt,
-            user_message=None,
-            func_spec=review_func_spec,
-            model=self.acfg.feedback.model,
-            temperature=self.acfg.feedback.temp,
-        )
-        if not isinstance(response, dict):
-            raise TypeError(
-                f"Expected review response to be a dict, got {type(response)}"
-            )
-        response = cast(dict, response)
-
-        metric = response["metric"]
-        if isinstance(metric, bool) or not isinstance(metric, numbers.Real):
-            response["metric"] = None
-        if external_metric is not None:
-            response["metric"], maximize = external_metric
-            response["lower_is_better"] = not maximize
-            response["is_bug"] = False
-
-        node.analysis = response["summary"]
-        node.is_buggy = (
-            response["is_bug"]
-            or node.exc_type is not None
-            or response["metric"] is None
-        )
+        node.analysis = ""
+        node.is_buggy = node.exc_type is not None or external_metric is None
 
         if node.is_buggy:
             node.metric = WorstMetricValue()
         else:
-            node.metric = MetricValue(
-                response["metric"], maximize=not response["lower_is_better"]
-            )
+            metric, maximize = external_metric
+            node.metric = MetricValue(metric, maximize=maximize)
         if best_node_before is None:
             best_node_before = self.journal.get_best_node(only_good=True, topk=1)
         node.record_experiment_context(best_node_before=best_node_before)

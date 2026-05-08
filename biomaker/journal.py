@@ -18,7 +18,11 @@ from dataclasses_json import DataClassJsonMixin
 
 from .interpreter import ExecutionResult
 from .utils.metric import MetricValue
-from .utils.response import trim_execution_output, truncate_text
+from .utils.response import (
+    format_prompt_execution_output,
+    trim_execution_output,
+    truncate_text,
+)
 
 
 @dataclass(eq=False)
@@ -238,11 +242,19 @@ class Journal(DataClassJsonMixin):
         if not self.nodes:
             return "No previous nodes."
 
-        header = (
-            "step | id | parent | stage | status | metric | "
-            "delta_parent | delta_best | runtime | idea"
+        legend = (
+            "Column legend: step=completed node order; id=short node id; "
+            "parent=short parent id or root; stage=draft/debug/improve; "
+            "status=execution outcome; val_metric=primary validation metric; "
+            "delta_parent=change versus parent where positive means better; "
+            "delta_best=change versus best node before this attempt where positive means better; "
+            "runtime=execution time."
         )
-        rows = [header]
+        header = (
+            "step | id | parent | stage | status | val_metric | "
+            "delta_parent | delta_best | runtime"
+        )
+        rows = [legend, header]
         for n in self.nodes:
             rows.append(
                 " | ".join(
@@ -256,7 +268,6 @@ class Journal(DataClassJsonMixin):
                         _format_delta(n.delta_vs_parent),
                         _format_delta(n.delta_vs_best),
                         _format_runtime(n.exec_time),
-                        _one_line(str(n.plan or n.analysis or ""), max_chars=90),
                     ]
                 )
             )
@@ -309,6 +320,10 @@ class Journal(DataClassJsonMixin):
 
         if selected_parent is not None:
             add(selected_parent, "selected parent; direct parent of the new node")
+            add_many(
+                _ancestor_chain(selected_parent),
+                "recursive parent ancestor of the new node, nearest first",
+            )
             if stage == "debug":
                 if selected_parent.parent is None:
                     sibling_nodes = [
@@ -322,18 +337,16 @@ class Journal(DataClassJsonMixin):
                     ]
                 add_many(
                     sorted(sibling_nodes, key=_node_sort_step),
-                    "sibling of the selected buggy parent; alternative attempt from the same parent",
+                    "sibling of the selected buggy parent; alternative attempt from the selected parent's parent",
                 )
+                return selected
 
-        if selected_parent is not None:
-            add_many(
-                _ancestor_chain(selected_parent),
-                "ancestor of the selected parent, nearest first",
-            )
-            add_many(
-                sorted(selected_parent.children, key=_node_sort_step),
-                "existing sibling of the new node; already generated from the same selected parent",
-            )
+            if stage == "improve":
+                add_many(
+                    sorted(selected_parent.children, key=_node_sort_step),
+                    "existing sibling of the new node; already generated from the same selected parent",
+                )
+                return selected
 
         return selected
 
@@ -351,6 +364,62 @@ class Journal(DataClassJsonMixin):
         return "\n\n" + ("\n\n---\n\n").join(
             _format_detail_record(node, reason) for node, reason in selected
         )
+
+    def generate_tree_records(
+        self,
+        stage: Literal["draft", "debug", "improve"],
+        selected_parent: Node | None = None,
+        pending_same_round_nodes: list[Node] | None = None,
+    ) -> str:
+        """Return the single prompt section that describes tree context.
+
+        The top overview stays compact. Full node records are only emitted in
+        the ordered lineage and sibling sections so the selected parent is not
+        repeated as a full record in multiple places.
+        """
+        parts = [
+            "Overall tree\n"
+            + _format_current_target(stage, selected_parent)
+            + "\n\n"
+            + self.generate_tree_index(),
+        ]
+
+        lineage = _lineage_from_root(selected_parent) if selected_parent else []
+        if lineage:
+            parts.append(_tree_record_lineage_intro(stage, selected_parent))
+            parts.extend(
+                _format_detail_record(
+                    node,
+                    (
+                        "root-to-parent lineage; selected parent"
+                        if node is selected_parent
+                        else "root-to-parent lineage ancestor"
+                    ),
+                )
+                for node in lineage
+            )
+        else:
+            parts.append(_tree_record_lineage_intro(stage, selected_parent))
+
+        sibling_nodes = [
+            node
+            for node in _tree_record_siblings(stage, selected_parent, self.draft_nodes)
+            if node in self.nodes
+        ]
+        if pending_same_round_nodes:
+            sibling_nodes.extend(
+                node for node in pending_same_round_nodes if node not in sibling_nodes
+            )
+        if sibling_nodes:
+            parts.append(_tree_record_sibling_intro(stage, selected_parent))
+            parts.extend(
+                _format_detail_record(node, _tree_record_sibling_reason(stage))
+                for node in sorted(sibling_nodes, key=_node_sort_step)
+            )
+        else:
+            parts.append(_tree_record_sibling_intro(stage, selected_parent) + "\nNone.")
+
+        return "\n\n---\n\n".join(parts)
 
     def _avoid_summary(self, max_items: int = 4) -> str:
         failures = []
@@ -527,12 +596,24 @@ def _format_runtime(seconds: float | None) -> str:
 def _format_resource_usage(resource_usage: dict | None) -> str:
     if not resource_usage:
         return "n/a"
+    parts = []
     peak_rss = resource_usage.get("peak_rss_mb")
-    if not isinstance(peak_rss, (int, float)):
+    if isinstance(peak_rss, (int, float)):
+        if peak_rss >= 1024:
+            parts.append(f"peak_rss {peak_rss / 1024:.2f}GB")
+        else:
+            parts.append(f"peak_rss {peak_rss:.0f}MB")
+    peak_gpu = resource_usage.get("peak_gpu_memory_mb")
+    if isinstance(peak_gpu, (int, float)):
+        backend = resource_usage.get("gpu_backend")
+        label = f"peak_{backend}" if backend else "peak_gpu"
+        if peak_gpu >= 1024:
+            parts.append(f"{label} {peak_gpu / 1024:.2f}GB")
+        else:
+            parts.append(f"{label} {peak_gpu:.0f}MB")
+    if not parts:
         return "n/a"
-    if peak_rss >= 1024:
-        return f"peak_rss {peak_rss / 1024:.2f}GB"
-    return f"peak_rss {peak_rss:.0f}MB"
+    return ", ".join(parts)
 
 
 def _node_sort_step(n: Node) -> int:
@@ -565,6 +646,12 @@ def _ancestor_chain(node: Node) -> list[Node]:
     return ancestors
 
 
+def _lineage_from_root(node: Node | None) -> list[Node]:
+    if node is None:
+        return []
+    return list(reversed(_ancestor_chain(node))) + [node]
+
+
 def _is_local_to_selected_parent(node: Node, selected_parent: Node) -> bool:
     if node == selected_parent:
         return True
@@ -575,6 +662,131 @@ def _is_local_to_selected_parent(node: Node, selected_parent: Node) -> bool:
     if selected_parent.parent is None:
         return node.parent is None
     return node.parent == selected_parent.parent
+
+
+def _tree_record_siblings(
+    stage: Literal["draft", "debug", "improve"],
+    selected_parent: Node | None,
+    draft_nodes,
+) -> list[Node]:
+    if stage == "draft":
+        return sorted(list(draft_nodes), key=_node_sort_step)
+    if selected_parent is None:
+        return []
+    if stage == "debug":
+        if selected_parent.parent is None:
+            return [
+                node for node in sorted(list(draft_nodes), key=_node_sort_step)
+                if node is not selected_parent
+            ]
+        return [
+            node
+            for node in sorted(selected_parent.parent.children, key=_node_sort_step)
+            if node is not selected_parent
+        ]
+    if stage == "improve":
+        return sorted(selected_parent.children, key=_node_sort_step)
+    return []
+
+
+def _tree_record_sibling_title(stage: Literal["draft", "debug", "improve"]) -> str:
+    if stage == "debug":
+        return "Siblings of the Buggy Parent"
+    if stage == "improve":
+        return "Existing Children of the Selected Parent"
+    return "Existing Root Drafts"
+
+
+def _tree_record_lineage_intro(
+    stage: Literal["draft", "debug", "improve"], selected_parent: Node | None
+) -> str:
+    title = "Parent Lineage"
+    if selected_parent is None:
+        return (
+            f"{title}\n"
+            "None. This is a new root draft, so there is no parent lineage to inherit."
+        )
+    if stage == "debug":
+        instruction = (
+            "This is the chain of implementations that led to the buggy parent. "
+            "Keep that method's useful parts and fix the concrete failure."
+        )
+    else:
+        instruction = (
+            "This is the chain of implementations from the root to the selected "
+            "parent. Build on the selected parent while keeping the useful context "
+            "from its ancestors."
+        )
+    return f"{title}\n{instruction}"
+
+
+def _tree_record_sibling_intro(
+    stage: Literal["draft", "debug", "improve"], selected_parent: Node | None
+) -> str:
+    title = _tree_record_sibling_title(stage)
+    if stage == "debug":
+        if selected_parent is None:
+            instruction = (
+                "There is no selected parent, so no buggy-parent sibling context is available."
+            )
+        else:
+            instruction = (
+                "These records are siblings of the buggy parent: they were generated "
+                "from the same parent as the node being debugged. Use them as nearby "
+                "evidence, but the new debug node should fix the selected buggy parent "
+                "rather than become a different sibling strategy."
+            )
+    elif stage == "improve":
+        instruction = (
+            "These are previous children of the same selected parent. Compare their "
+            "plans, code, and results, then make this new child try a distinct "
+            "improvement rather than repeating one of them."
+        )
+    else:
+        instruction = (
+            "These are previous root drafts. Use them as alternative starting points "
+            "and make the new draft meaningfully distinct."
+        )
+    return f"{title}\n{instruction}"
+
+
+def _tree_record_sibling_reason(stage: Literal["draft", "debug", "improve"]) -> str:
+    if stage == "debug":
+        return (
+            "sibling of the selected parent; use as context while fixing the "
+            "selected parent"
+        )
+    if stage == "improve":
+        return (
+            "existing child of the selected parent; sibling of the new improve "
+            "node"
+        )
+    return "existing root draft; sibling of the new draft node"
+
+
+def _format_current_target(
+    stage: Literal["draft", "debug", "improve"], selected_parent: Node | None
+) -> str:
+    if selected_parent is None:
+        return (
+            "Current target: generate a new root draft with no parent. Treat any "
+            "existing root drafts as sibling alternatives, not as parents."
+        )
+    if stage == "debug":
+        relation = (
+            "Current target: generate a debug child of the selected buggy parent "
+            "node. Preserve the selected parent's intended method and fix the "
+            "observed failure."
+        )
+    else:
+        relation = (
+            "Current target: generate a child of the selected parent node. Base the "
+            "new implementation on that parent and try to improve it."
+        )
+    return (
+        f"{relation}\n"
+        f"Selected parent node: {selected_parent.id} ({selected_parent.id[:8]})."
+    )
 
 
 def _top_successful_nodes(nodes) -> list[Node]:
@@ -645,6 +857,110 @@ def _format_artifact_report(report: dict) -> str:
     return json_dumps_compact(compact)
 
 
+def _format_artifact_facts(
+    report: dict | None, include_raw_report: bool = False
+) -> str:
+    if not isinstance(report, dict):
+        return "artifact_status: n/a"
+
+    status = _artifact_status(report)
+    warnings = report.get("warnings")
+
+    if not include_raw_report and not warnings and report.get("available") is not False:
+        lines = ["validation output: valid"]
+        alignment = report.get("alignment")
+        if isinstance(alignment, dict):
+            method = alignment.get("method", "n/a")
+            matched = alignment.get("matched_rows", "n/a")
+            lines.append(f"alignment: {method}, matched_rows={matched}")
+        else:
+            lines.append(f"alignment: {status}")
+        lines.append("warnings: none")
+        return "\n".join(lines)
+
+    lines = [
+        "Local evaluator artifact check; format/alignment facts only, no hidden labels.",
+        f"artifact_status: {status}",
+    ]
+
+    alignment = report.get("alignment")
+    if isinstance(alignment, dict):
+        method = alignment.get("method", "n/a")
+        matched = alignment.get("matched_rows", "n/a")
+        lines.append(f"alignment: method={method}, matched_rows={matched}")
+
+    validation = report.get("validation_artifact")
+    if isinstance(validation, dict):
+        columns = validation.get("columns")
+        column_count = len(columns) if isinstance(columns, list) else "n/a"
+        lines.append(
+            "validation_artifact: "
+            f"exists={validation.get('exists')}, "
+            f"rows={validation.get('rows')}, "
+            f"columns={column_count}"
+        )
+
+    target = report.get("target_artifact")
+    if isinstance(target, dict):
+        lines.append(
+            "target_artifact: "
+            f"exists={target.get('exists')}, rows={target.get('rows')}"
+        )
+
+    spec = report.get("prediction_spec")
+    if isinstance(spec, dict):
+        pred_cols = spec.get("prediction_columns")
+        pred_col_count = len(pred_cols) if isinstance(pred_cols, list) else "n/a"
+        lines.append(
+            "prediction_spec: "
+            f"type={spec.get('prediction_type')}, "
+            f"primary_metric={spec.get('primary_metric')}, "
+            f"prediction_columns={pred_col_count}"
+        )
+
+    summaries = report.get("prediction_column_summaries")
+    if isinstance(summaries, dict) and summaries:
+        nulls = 0
+        mins = []
+        maxes = []
+        dtypes = set()
+        for summary in summaries.values():
+            if not isinstance(summary, dict):
+                continue
+            null_count = summary.get("null_count")
+            if isinstance(null_count, (int, float)):
+                nulls += int(null_count)
+            min_value = summary.get("min")
+            max_value = summary.get("max")
+            if isinstance(min_value, (int, float)):
+                mins.append(float(min_value))
+            if isinstance(max_value, (int, float)):
+                maxes.append(float(max_value))
+            dtype = summary.get("dtype")
+            if dtype:
+                dtypes.add(str(dtype))
+        range_text = (
+            f", global_min={min(mins):.4g}, global_max={max(maxes):.4g}"
+            if mins and maxes
+            else ""
+        )
+        dtype_text = ",".join(sorted(dtypes)) if dtypes else "n/a"
+        lines.append(
+            "prediction_columns: "
+            f"dtypes={dtype_text}, nulls={nulls}{range_text}"
+        )
+
+    if warnings:
+        lines.append("warnings: " + truncate_text(str(warnings), max_chars=500))
+    else:
+        lines.append("warnings: none")
+
+    if include_raw_report:
+        lines.append("raw_artifact_report: " + json_dumps_compact(report))
+
+    return "\n".join(lines)
+
+
 def _format_node_header(n: Node) -> str:
     metric = n.metric.value if n.metric is not None else None
     metric_text = "n/a" if metric is None else f"{float(metric):.4f}"
@@ -660,19 +976,24 @@ def _format_memory_node(n: Node) -> str:
     artifact_text = ""
     if n.artifact_report:
         artifact_text = "\nArtifact facts: " + truncate_text(
-            _format_artifact_report(n.artifact_report), max_chars=520
+            _format_artifact_facts(n.artifact_report), max_chars=520
         )
     selection_text = ""
     if n.selection_reason:
         selection_text = "\nSelected because: " + truncate_text(
             str(n.selection_reason), max_chars=180
         )
+    finding_text = (
+        f"\nEmpirical finding: {truncate_text(str(n.analysis), max_chars=260)}"
+        if n.analysis
+        else ""
+    )
     return (
         f"{_format_node_header(n)}\n"
         f"delta_vs_parent: {_format_delta(n.delta_vs_parent)} | "
         f"delta_vs_best_before: {_format_delta(n.delta_vs_best)}\n"
-        f"Core idea: {truncate_text(str(n.plan), max_chars=320)}\n"
-        f"Empirical finding: {truncate_text(str(n.analysis), max_chars=260)}"
+        f"Core idea: {truncate_text(str(n.plan), max_chars=320)}"
+        f"{finding_text}"
         f"{selection_text}"
         f"{artifact_text}"
     )
@@ -698,10 +1019,21 @@ def _format_child_experiment(n: Node) -> str:
 
 
 def _format_detail_record(n: Node, reason: str) -> str:
-    artifact_report = (
-        json_dumps_compact(n.artifact_report)
-        if n.artifact_report is not None
-        else "n/a"
+    not_executed = n.step is None or n._term_out is None
+    include_output_check = bool(
+        n.is_buggy
+        or (
+            isinstance(n.artifact_report, dict)
+            and (
+                n.artifact_report.get("available") is False
+                or bool(n.artifact_report.get("warnings"))
+            )
+        )
+    )
+    artifact_facts = (
+        _format_artifact_facts(n.artifact_report, include_raw_report=True)
+        if include_output_check
+        else ""
     )
     resource_usage = (
         json_dumps_compact(n.resource_usage) if n.resource_usage is not None else "n/a"
@@ -711,28 +1043,47 @@ def _format_detail_record(n: Node, reason: str) -> str:
         "exc_info": n.exc_info,
         "exc_stack": n.exc_stack,
     }
+    result_text = (
+        "not_executed_yet"
+        if not_executed
+        else ("bug" if n.is_buggy is True else "success")
+    )
+    metric_text = "unknown_not_executed" if not_executed else _metric_text(n)
+    exec_time = "unknown_not_executed" if not_executed else _format_runtime(n.exec_time)
+    parent_id = n.parent.id[:8] if n.parent is not None else "root"
+    children_ids = [child.id[:8] for child in sorted(n.children, key=_node_sort_step)]
+    execution_output = (
+        "Not executed yet. Execution output is unknown."
+        if not_executed
+        else format_prompt_execution_output(
+            "".join(n._term_out or []), is_buggy=bool(n.is_buggy)
+        )
+    )
+    include_execution_output = bool(not_executed or n.is_buggy is True)
+    output_check_block = (
+        f"\n\nOutput Check:\n{artifact_facts}" if artifact_facts.strip() else ""
+    )
+    execution_output_block = (
+        f"\n\nExecution Output:\n```\n{execution_output}\n```"
+        if include_execution_output
+        else ""
+    )
     return (
         f"Node {n.id[:8]} full record\n"
-        f"Selection reason for including this record: {reason}\n"
         f"step: {n.step}\n"
-        f"id: {n.id}\n"
-        f"parent_id: {n.parent.id if n.parent is not None else None}\n"
-        f"children_ids: {[child.id for child in sorted(n.children, key=_node_sort_step)]}\n"
+        f"node_id: {n.id[:8]}\n"
+        f"parent_id: {parent_id}\n"
+        f"children_ids: {children_ids}\n"
         f"stage: {n.node_status}\n"
-        f"status: {_node_status_text(n)}\n"
-        f"metric: {_metric_text(n)}\n"
+        f"result: {result_text}\n"
+        f"val_metric: {metric_text}\n"
         f"maximize: {n.metric.maximize if n.metric is not None else None}\n"
         f"delta_vs_parent: {_format_delta(n.delta_vs_parent)}\n"
-        f"delta_vs_best_before: {_format_delta(n.delta_vs_best)}\n"
-        f"outcome: {n.outcome}\n"
-        f"selected_by_search_policy: {n.selection_reason}\n"
-        f"exec_time: {_format_runtime(n.exec_time)}\n"
+        f"execution_time: {exec_time}\n"
         f"resource_usage: {resource_usage}\n"
-        f"artifact_status: {_artifact_status(n.artifact_report)}\n"
-        f"artifact_report: {artifact_report}\n"
-        f"exception: {json_dumps_compact(exception_info)}\n\n"
+        f"exception: {json_dumps_compact(exception_info)}"
+        f"{output_check_block}\n\n"
         f"Plan:\n{n.plan or ''}\n\n"
-        f"Code:\n```python\n{n.code or ''}\n```\n\n"
-        f"Compact execution output:\n```\n{n.term_out or ''}\n```\n\n"
-        f"Empirical finding:\n{n.analysis or ''}"
+        f"Code:\n```python\n{n.code or ''}\n```"
+        f"{execution_output_block}"
     )

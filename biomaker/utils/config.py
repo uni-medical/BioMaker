@@ -93,7 +93,6 @@ class AgentConfig:
     enable_web_search: bool
     web_search_topk: int
     enable_node_tools: bool
-    max_node_tool_rounds: int
     max_node_tool_calls: int
 
     code: StageConfig
@@ -114,6 +113,18 @@ class ExecConfig:
 
 
 @dataclass
+class InputCacheConfig:
+    enabled: bool
+    decode_arrays: bool
+    reuse: bool
+
+
+@dataclass
+class EvaluatorCacheConfig:
+    enabled: bool
+
+
+@dataclass
 class Config(Hashable):
     data_dir: Path
     desc_file: Path | None
@@ -126,10 +137,13 @@ class Config(Hashable):
 
     preprocess_data: bool
     copy_data: bool
+    resource_dir: Path | None
 
     exp_name: str
 
     exec: ExecConfig
+    input_cache: InputCacheConfig
+    evaluator_cache: EvaluatorCacheConfig
     generate_report: bool
     report: StageConfig
     agent: AgentConfig
@@ -207,6 +221,13 @@ def prep_cfg(cfg: Config):
 
     top_workspace_dir = Path(cfg.workspace_dir).resolve()
     top_workspace_dir.mkdir(parents=True, exist_ok=True)
+    resource_dir = getattr(cfg, "resource_dir", None)
+    cfg.resource_dir = (
+        Path(resource_dir).resolve()
+        if resource_dir is not None
+        else (top_workspace_dir / "_shared").resolve()
+    )
+    cfg.resource_dir.mkdir(parents=True, exist_ok=True)
 
     # generate experiment name and prefix with consecutive index
     ind = max(_get_next_logindex(top_log_dir), _get_next_logindex(top_workspace_dir))
@@ -562,6 +583,9 @@ def _write_results_table(log_dir: Path, journal) -> None:
         "delta_vs_best",
         "runtime_s",
         "peak_rss_mb",
+        "peak_gpu_memory_mb",
+        "gpu_backend",
+        "gpu_memory_source",
         "avg_cpu_percent",
         "artifact_available",
         "alignment_method",
@@ -598,6 +622,9 @@ def _write_results_table(log_dir: Path, journal) -> None:
                     ),
                     "runtime_s": "" if node.exec_time is None else node.exec_time,
                     "peak_rss_mb": resources.get("peak_rss_mb", ""),
+                    "peak_gpu_memory_mb": resources.get("peak_gpu_memory_mb", ""),
+                    "gpu_backend": resources.get("gpu_backend", ""),
+                    "gpu_memory_source": resources.get("gpu_memory_source", ""),
                     "avg_cpu_percent": resources.get("avg_cpu_percent", ""),
                     "artifact_available": (
                         "" if not isinstance(report, dict) else report.get("available")

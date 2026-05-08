@@ -28,8 +28,17 @@ excluded_dirs = {
     "_private_truth",
     "_score_truth",
     "working",
+    "node_workspaces",
+    "biomaker_cache",
 }
 excluded_files = {"evaluator_prediction_spec.json"}
+internal_generated_preview_files = {
+    "input/biomaker_splits/dataset_report.json",
+    "input/biomaker_splits/split_plan.json",
+}
+task_description_protocol_files = {
+    "input/biomaker_splits/split_protocol.txt",
+}
 
 
 def _compact_json(value, max_chars=1600) -> str:
@@ -154,16 +163,6 @@ def biomaker_essentials(base_path: Path) -> str:
         return ""
 
     lines = ["BioMaker essentials:"]
-    protocol_path = split_dir / "split_protocol.txt"
-    if protocol_path.is_file():
-        protocol = truncate_text(
-            protocol_path.read_text(encoding="utf-8"),
-            max_chars=1000,
-            marker="split protocol trimmed",
-        )
-        lines.append("Split protocol:")
-        lines.append(protocol)
-
     split_lines = []
     for filename in [
         "agent_train.csv",
@@ -187,15 +186,25 @@ def biomaker_essentials(base_path: Path) -> str:
         lines.append("Visible target summary:")
         lines.extend(target_lines)
 
+    cache_manifest_path = base_path / "input" / "biomaker_cache" / "manifest.json"
+    cache_files_path = base_path / "input" / "biomaker_cache" / "files.csv"
+    cache_manifest = _load_json_file(cache_manifest_path)
+    if cache_manifest is not None:
+        lines.append("Input cache:")
+        lines.append(
+            "- `./input/biomaker_cache/files.csv`: deterministic agent-visible file cache "
+            f"with {cache_manifest.get('files_total', 'unknown')} referenced files, "
+            f"{cache_manifest.get('arrays_decoded', 'unknown')} decoded arrays, "
+            f"{cache_manifest.get('errors', 'unknown')} errors."
+        )
+        if cache_files_path.is_file():
+            lines.append(
+                "  Use `cache_array_path` when present for faster loading; original files remain available."
+            )
+
     segmentation_facts = _segmentation_sample_facts(split_dir)
     if segmentation_facts:
         lines.append(segmentation_facts)
-
-    spec_path = base_path / "evaluator_prediction_spec.json"
-    spec = _load_json_file(spec_path)
-    if spec is not None:
-        lines.append("Output spec from the frozen evaluator:")
-        lines.append("```json\n" + _compact_json(spec) + "\n```")
 
     return "\n".join(lines)
 
@@ -341,6 +350,114 @@ def preview_json(p: Path, file_name: str):
     )
 
 
+def preview_internal_generated_json(p: Path, file_name: str) -> str:
+    """Preview BioMaker-generated metadata as task facts instead of JSON schema."""
+    data = _load_json_file(p)
+    if not isinstance(data, dict):
+        return (
+            f"-> {file_name} is an internal BioMaker generated metadata file, "
+            "but it could not be summarized."
+        )
+    if file_name.endswith("split_plan.json"):
+        return _preview_split_plan(data, file_name)
+    if file_name.endswith("dataset_report.json"):
+        return _preview_dataset_report(data, file_name)
+    return (
+        f"-> {file_name} is an internal BioMaker generated metadata file. "
+        "Its relevant facts are summarized elsewhere in Data Overview."
+    )
+
+
+def _preview_split_plan(plan: dict, file_name: str) -> str:
+    lines = [f"-> {file_name} split plan summary:"]
+    strategy = plan.get("strategy")
+    if strategy:
+        lines.append(f"- strategy: {strategy}")
+
+    sources = plan.get("sources")
+    if isinstance(sources, dict):
+        for key in ["train", "val", "test"]:
+            value = sources.get(key)
+            if value is not None:
+                lines.append(f"- source {key}: {value}")
+
+    agent_visible = plan.get("agent_visible")
+    if isinstance(agent_visible, dict) and agent_visible:
+        visible = ", ".join(f"{key}={value}" for key, value in agent_visible.items())
+        lines.append(f"- agent-visible split files: {visible}")
+
+    score_validation = plan.get("score_validation")
+    if isinstance(score_validation, dict):
+        public = score_validation.get("public")
+        labels_visible = score_validation.get("labels_visible_to_agent")
+        if public:
+            lines.append(
+                f"- score validation: {public}; labels_visible_to_agent={labels_visible}"
+            )
+    metric_split = plan.get("metric_split")
+    if metric_split:
+        lines.append(f"- metric split used by evaluator: {metric_split}")
+
+    private_sources = []
+    for item in plan.get("private_evaluation", []) or []:
+        if isinstance(item, dict):
+            source = item.get("source")
+            visible = item.get("visible_to_agent")
+            if source:
+                private_sources.append(f"{source} (visible_to_agent={visible})")
+    if private_sources:
+        lines.append("- private evaluation sources: " + ", ".join(private_sources))
+
+    columns = plan.get("columns")
+    if isinstance(columns, dict):
+        column_parts = [
+            f"{key}={value}"
+            for key, value in columns.items()
+            if value is not None
+        ]
+        if column_parts:
+            lines.append("- detected columns: " + ", ".join(column_parts))
+
+    diagnostics = plan.get("diagnostics")
+    if isinstance(diagnostics, dict) and diagnostics:
+        lines.append("- split diagnostics: " + _compact_json(diagnostics, max_chars=500))
+    warnings = plan.get("warnings")
+    if warnings:
+        lines.append("- warnings: " + "; ".join(str(w) for w in warnings[:3]))
+    return "\n".join(lines)
+
+
+def _preview_dataset_report(report: dict, file_name: str) -> str:
+    lines = [f"-> {file_name} dataset report summary:"]
+    tables = report.get("tables")
+    if not isinstance(tables, dict) or not tables:
+        lines.append("- no table summaries available")
+        return "\n".join(lines)
+
+    for rel, summary in sorted(tables.items()):
+        if not isinstance(summary, dict):
+            continue
+        if summary.get("error"):
+            lines.append(f"- {rel}: error={summary.get('error')}")
+            continue
+        parts = [
+            f"rows={summary.get('rows')}",
+            "columns=[" + ", ".join(map(str, summary.get("columns", []))) + "]",
+        ]
+        for key in ["id_column", "label_column", "path_column", "mask_column", "group_column"]:
+            value = summary.get(key)
+            if value:
+                parts.append(f"{key}={value}")
+        label_distribution = summary.get("label_distribution")
+        if isinstance(label_distribution, dict) and label_distribution:
+            parts.append(
+                "label_distribution="
+                + _compact_json(label_distribution, max_chars=300).replace("\n", " ")
+            )
+        lines.append(f"- {rel}: " + "; ".join(parts))
+    return "\n".join(lines)
+
+
 def preview_xlsx(p: Path, file_name: str, simple=True) -> str:
     """Generate a textual preview of an Excel file
 
@@ -397,7 +514,7 @@ def preview_xlsx(p: Path, file_name: str, simple=True) -> str:
     return "\n".join(out)
 
 
-def generate(base_path, include_file_details=True, simple=False, max_chars=6000):
+def generate(base_path, include_file_details=True, simple=False, max_chars=None):
     """
     Generate a directory preview with aggregated image size information.
     Summarizes images by type, count, and size ranges instead of individual entries.
@@ -425,6 +542,13 @@ def generate(base_path, include_file_details=True, simple=False, max_chars=6000)
                 out.append(
                     f"-> {file_name} is reserved for private user evaluation. "
                     "Detailed label/artifact values are hidden from the agent; use input/biomaker_splits/agent_test.csv for test-time prediction inputs."
+                )
+            elif file_name in internal_generated_preview_files:
+                out.append(preview_internal_generated_json(fn, file_name))
+            elif file_name in task_description_protocol_files:
+                out.append(
+                    f"-> {file_name} is the BioMaker split protocol. "
+                    "Its full text is provided in Task Description under Data split protocol."
                 )
             elif fn.name.endswith("submission.csv"):
                 out.append(preview_csv(fn, file_name, simple=False))
@@ -471,7 +595,7 @@ def generate(base_path, include_file_details=True, simple=False, max_chars=6000)
 
     result = "\n\n".join(out)
 
-    if len(result) > 6000 and not simple:
+    if max_chars is not None and len(result) > 6000 and not simple:
         return generate(
             base_path,
             include_file_details=include_file_details,
@@ -479,6 +603,8 @@ def generate(base_path, include_file_details=True, simple=False, max_chars=6000)
             max_chars=max_chars,
         )
 
+    if max_chars is None:
+        return result
     return truncate_text(result, max_chars=max_chars, marker="data preview trimmed")
 
 

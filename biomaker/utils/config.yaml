@@ -15,17 +15,29 @@ preprocess_data: False
 # whether to copy the data to the workspace directory (otherwise it will be symlinked)
 # by default BioMaker creates a shallow symlinked input workspace so large datasets are not copied
 copy_data: False
+# Shared deterministic run resources. Null defaults to <workspace_dir>/_shared.
+resource_dir: null
 
 exp_name: null # a random experiment name will be generated if not provided
 
 model_for_all_agents: null # optional CLI override for all model roles
 
+# Deterministic agent-visible input cache. This is an I/O cache, not modeling preprocessing.
+input_cache:
+  enabled: True
+  decode_arrays: True
+  reuse: True
+
+# Reuse smoke-tested frozen evaluators when the task/split/evaluator prompt is unchanged.
+evaluator_cache:
+  enabled: True
+
 # agent hyperparams
 agent:
   # how many proposal/debug/improve iterations to run
   steps: 15
-  # Hard safety limit for the whole run in seconds. This is a longest tolerated runtime, not a target budget.
-  total_time_limit: 14400
+  # Hard safety limit for the whole run in seconds. Step count and this limit both apply; whichever is reached first stops the run.
+  total_time_limit: 86400
   # whether to instruct the agent to use CV (set to 1 to disable)
   k_fold_validation: 1
   # whether to instruct the agent to generate a prediction function
@@ -37,8 +49,6 @@ agent:
   enable_web_search: True
   web_search_topk: 2
   enable_node_tools: True
-  # Kept for config compatibility; node tools currently run one request round.
-  max_node_tool_rounds: 6
   max_node_tool_calls: 20
 
   # hyperparameters for the tree search
@@ -66,7 +76,7 @@ agent:
 # settings for code execution
 exec:
   # Hard safety timeout for one generated node in seconds. This is a longest tolerated runtime, not a target budget.
-  timeout: 600
+  timeout: 1800
   # Number of generated nodes that may execute concurrently. Use 1 for shared GPU-heavy runs.
   # Even with 1 worker, BioMaker overlaps node execution with generation of later same-round nodes.
   parallel_workers: 2
