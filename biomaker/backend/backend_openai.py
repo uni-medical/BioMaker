@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import time
 
@@ -19,9 +20,25 @@ _client: openai.OpenAI = None  # type: ignore
 OPENAI_TIMEOUT_EXCEPTIONS = (
     openai.RateLimitError,
     openai.APIConnectionError,
-    openai.APITimeoutError,
     openai.InternalServerError,
 )
+
+
+def _request_timeout_seconds() -> float:
+    raw = os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "300")
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid OPENAI_REQUEST_TIMEOUT_SECONDS=%r; using 300 seconds.", raw
+        )
+        return 300.0
+    if value <= 0:
+        logger.warning(
+            "OPENAI_REQUEST_TIMEOUT_SECONDS must be positive; using 300 seconds."
+        )
+        return 300.0
+    return value
 
 
 def _supports_openai_tool_choice(model_name: str) -> bool:
@@ -59,7 +76,7 @@ def _parse_json_object(text: str, func_spec: FunctionSpec) -> dict:
 def _setup_openai_client():
     global _client
     load_local_env()
-    _client = openai.OpenAI(max_retries=0)
+    _client = openai.OpenAI(max_retries=0, timeout=_request_timeout_seconds())
 
 
 def query(

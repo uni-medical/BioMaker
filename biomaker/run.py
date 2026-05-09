@@ -1031,16 +1031,39 @@ def run():
             placeholder = meta["placeholder"]
             try:
                 node = future.result()
-            except Exception:
+            except Exception as exc:
                 task = meta["task"]
-                if meta["speculative"] and task.parent is not None:
+                if task.parent is not None:
+                    key = task_key(task)
                     speculative_keys_by_round.setdefault(
                         meta["round_index"], set()
-                    ).discard(task_key(task))
+                    ).discard(key)
+                    scheduled_keys_by_round.setdefault(
+                        meta["round_index"], set()
+                    ).discard(key)
                 if placeholder in generating_nodes:
                     generating_nodes.remove(placeholder)
+                append_event(
+                    cfg.log_dir,
+                    "node_generation_failed",
+                    round_index=meta["round_index"],
+                    round_item_index=meta["item_index"],
+                    round_item_count=meta["item_count"],
+                    scheduled_step=meta.get("scheduled_step"),
+                    speculative=meta["speculative"],
+                    placeholder_id=placeholder.id,
+                    stage=placeholder.node_status,
+                    parent_id=(
+                        placeholder.parent.id
+                        if placeholder.parent is not None
+                        else None
+                    ),
+                    exc_type=type(exc).__name__,
+                    error=str(exc),
+                )
                 refresh_live_tree(log_tree=True)
-                raise
+                changed = True
+                continue
             if node.parent is not None:
                 node.parent.children.discard(node)
             node.id = placeholder.id
