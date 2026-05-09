@@ -20,7 +20,7 @@ from PIL import Image
 import numpy as np
 
 from .. import backend
-from . import data_preview
+from . import data_summary
 from .environment import environment_manifest_text, validate_code_environment
 from .events import append_event
 from .response import extract_code, truncate_text
@@ -94,6 +94,20 @@ def parse_external_validation(term_out: list[str] | str) -> tuple[float, bool] |
     return None
 
 
+def parse_external_validation_details(term_out: list[str] | str) -> dict[str, Any] | None:
+    text = "\n".join(term_out) if isinstance(term_out, list) else term_out
+    for line in reversed(text.splitlines()):
+        if not line.startswith(EXTERNAL_VALIDATION_PREFIX):
+            continue
+        payload = line[len(EXTERNAL_VALIDATION_PREFIX) :].strip()
+        try:
+            data = json.loads(payload)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+    return None
+
+
 def parse_artifact_report(term_out: list[str] | str) -> dict[str, Any] | None:
     text = "\n".join(term_out) if isinstance(term_out, list) else term_out
     for line in reversed(text.splitlines()):
@@ -115,16 +129,13 @@ def _task_payload(task_desc: Any) -> str:
 
 
 def _artifact_contract_facts(
-    workspace_dir: Path, score_truth_path: Path | None = None
+    workspace_dir: Path, hidden_score_path: Path | None = None
 ) -> dict[str, Any]:
     split_dir = workspace_dir / "input" / "biomaker_splits"
     val_path = split_dir / "score_val.csv"
-    legacy_val_path = split_dir / "agent_val.csv"
-    if not val_path.is_file():
-        val_path = legacy_val_path
     dev_path = split_dir / "agent_dev.csv"
-    score_truth_path = score_truth_path or (
-        workspace_dir / "_score_truth" / "score_val.csv"
+    hidden_score_path = hidden_score_path or (
+        workspace_dir / "private_gt" / "score_val.csv"
     )
     test_path = split_dir / "agent_test.csv"
     if not val_path.is_file() or not test_path.is_file():
@@ -134,9 +145,9 @@ def _artifact_contract_facts(
         val_df = pd.read_csv(val_path, nrows=3)
         test_df = pd.read_csv(test_path, nrows=3)
         dev_df = pd.read_csv(dev_path, nrows=3) if dev_path.is_file() else None
-        score_truth_df = (
-            pd.read_csv(score_truth_path, nrows=3)
-            if score_truth_path.is_file()
+        hidden_score_df = (
+            pd.read_csv(hidden_score_path, nrows=3)
+            if hidden_score_path.is_file()
             else None
         )
     except Exception as exc:
@@ -177,14 +188,27 @@ def _artifact_contract_facts(
         if not any(token in column.lower() for token in ["path", "image", "mask"])
     ]
 
+    private_gt_manifest = None
+    for candidate in [
+        hidden_score_path.parent / "private_gt.json",
+        workspace_dir / "private_gt" / "private_gt.json",
+    ]:
+        if candidate.is_file():
+            try:
+                private_gt_manifest = json.loads(candidate.read_text(encoding="utf-8"))
+                break
+            except Exception:
+                private_gt_manifest = None
+
     return {
         "score_val_public_columns": val_columns,
         "agent_dev_columns": list(dev_df.columns) if dev_df is not None else None,
-        "hidden_score_truth_columns": (
-            list(score_truth_df.columns) if score_truth_df is not None else None
+        "hidden_score_answer_columns": (
+            list(hidden_score_df.columns) if hidden_score_df is not None else None
         ),
         "agent_test_columns": test_columns,
         "ground_truth_only_columns": ground_truth_only,
+        "private_gt": private_gt_manifest,
         "likely_key_columns": likely_key_columns,
         "note": (
             "Candidate validation artifacts are predictions for score_val.csv and may use "
@@ -196,7 +220,7 @@ def _artifact_contract_facts(
 
 
 def _evaluator_prompt(
-    task_desc: Any, workspace_dir: Path, score_truth_path: Path | None = None
+    task_desc: Any, workspace_dir: Path, hidden_score_path: Path | None = None
 ) -> dict[str, Any]:
     return {
         "Introduction": (
@@ -206,9 +230,11 @@ def _evaluator_prompt(
             "after each candidate finishes, so all candidates are scored with the same code."
         ),
         "Task description": _task_payload(task_desc),
-        "Data overview": data_preview.generate(workspace_dir),
+        "Data and evaluation summary": data_summary.data_and_evaluation_summary(
+            workspace_dir
+        ),
         "Observed artifact contract facts": _artifact_contract_facts(
-            workspace_dir, score_truth_path
+            workspace_dir, hidden_score_path
         ),
         "Environment contract": environment_manifest_text(include_medical=True),
         "Evaluator requirements": [
@@ -220,10 +246,10 @@ def _evaluator_prompt(
             "Define prediction_spec() returning a concise JSON-serializable dict with these top-level keys: validation_artifact, test_submission, key_columns, prediction_columns, primary_metric. key_columns may be [] only when row order is the contract.",
             "test_submission must be exactly './working/submission.csv'.",
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
-            "The candidate validation artifact must contain predictions for rows in ./input/biomaker_splits/score_val.csv when that file exists, otherwise ./input/biomaker_splits/agent_val.csv for backward compatibility.",
+            "The candidate validation artifact must contain predictions for rows in ./input/biomaker_splits/score_val.csv.",
             "The candidate validation artifact must follow the same public prediction contract as the test submission: key_columns plus prediction_columns only. Do not require candidates to output validation ground-truth columns such as label, class, target, or true_class. score_val() must load hidden score labels from os.environ['BIOMAKER_SCORE_VAL_PATH'] and align them to the validation artifact by key columns.",
             "When reading candidate artifacts, validate the required columns and then restrict the dataframe to key_columns plus prediction_columns before merging with ground truth. Extra candidate columns such as class, label, target, or true_class must not collide with ground-truth columns or change scoring.",
-            "For tabular score_val(), use this safe merge pattern: copy the hidden ground-truth label column to a private column named `y_true_private`, build `truth_view = score_truth[key_columns + ['y_true_private']]`, build `pred_view = predictions[key_columns + prediction_columns]`, convert every key column in both views to string before merging, merge those restricted views only, and read labels with dataframe/series indexing such as `merged['y_true_private']` or `row['y_true_private']`. Never rely on tuple attribute access for helper columns, and never read `merged['class']`, `merged['label']`, `merged['target']`, or candidate-supplied label-like columns after merge.",
+            "For tabular score_val(), use this safe merge pattern: copy the hidden ground-truth label column to a private column named `y_true_private`, build `truth_view = hidden_answers[key_columns + ['y_true_private']]`, build `pred_view = predictions[key_columns + prediction_columns]`, convert every key column in both views to string before merging, merge those restricted views only, and read labels with dataframe/series indexing such as `merged['y_true_private']` or `row['y_true_private']`. Never rely on tuple attribute access for helper columns, and never read `merged['class']`, `merged['label']`, `merged['target']`, or candidate-supplied label-like columns after merge.",
             "For tabular validate_submission(), apply the same key-column string normalization and restrict submission data to key_columns plus prediction_columns before checking duplicates, missing keys, or shapes.",
             "For probability outputs, include class_labels when prediction_columns do not directly encode class names; for single-column binary probability outputs, include positive_class.",
             "The submission contract must preserve enough information for the requested user-only test metrics. For classification with AUC, require probabilities rather than only hard labels.",
@@ -272,16 +298,16 @@ def _uses_eval_or_exec(code: str) -> bool:
     return False
 
 
-def _score_truth_env(
-    workspace_dir: Path, score_truth_path: Path | str | None = None
+def _hidden_score_env(
+    workspace_dir: Path, hidden_score_path: Path | str | None = None
 ) -> dict[str, str]:
-    truth_path = Path(score_truth_path) if score_truth_path is not None else None
+    truth_path = Path(hidden_score_path) if hidden_score_path is not None else None
     if truth_path is None:
-        truth_path = workspace_dir / "_score_truth" / "score_val.csv"
+        truth_path = workspace_dir / "private_gt" / "score_val.csv"
     if not truth_path.is_file():
         input_path = workspace_dir / "input"
         try:
-            truth_path = input_path.resolve().parent / "_score_truth" / "score_val.csv"
+            truth_path = input_path.resolve().parent / "private_gt" / "score_val.csv"
         except Exception:
             pass
     return {_SCORE_ENV_VAR: str(truth_path)}
@@ -290,21 +316,29 @@ def _score_truth_env(
 def _run_self_test(
     workspace_dir: Path,
     timeout: int,
-    score_truth_path: Path | str | None = None,
+    hidden_score_path: Path | str | None = None,
 ) -> str:
     code = (
         "import evaluator\n"
+        "import json\n"
         "assert hasattr(evaluator, 'prediction_spec')\n"
         "assert hasattr(evaluator, 'score_val')\n"
         "assert hasattr(evaluator, 'validate_submission')\n"
-        "assert hasattr(evaluator, 'self_test')\n"
-        "evaluator.self_test()\n"
+        "spec = evaluator.prediction_spec()\n"
+        "if isinstance(spec, str):\n"
+        "    spec = json.loads(spec)\n"
+        "assert isinstance(spec, dict)\n"
+        "assert 'validation_artifact' in spec\n"
+        "assert 'test_submission' in spec\n"
+        "assert 'key_columns' in spec\n"
+        "assert ('prediction_columns' in spec) or ('file_reference_columns' in spec)\n"
+        "print('EVALUATOR_OK')\n"
     )
     completed = _run_python(
         workspace_dir,
         code,
         timeout=timeout,
-        env=_score_truth_env(workspace_dir, score_truth_path),
+        env=_hidden_score_env(workspace_dir, hidden_score_path),
     )
     output = (completed.stdout or "") + (completed.stderr or "")
     if completed.returncode != 0 or "EVALUATOR_OK" not in output:
@@ -511,7 +545,7 @@ def _run_public_artifact_contract_test(
     workspace_dir: Path,
     prediction_spec: str,
     timeout: int,
-    score_truth_path: Path | str | None = None,
+    hidden_score_path: Path | str | None = None,
 ) -> None:
     """Reject evaluators whose score_val requires hidden columns in predictions."""
     try:
@@ -529,8 +563,6 @@ def _run_public_artifact_contract_test(
 
     clean_candidate_outputs(workspace_dir)
     score_split = workspace_dir / "input" / "biomaker_splits" / "score_val.csv"
-    if not score_split.is_file():
-        score_split = workspace_dir / "input" / "biomaker_splits" / "agent_val.csv"
     _write_dummy_tabular_artifact(
         score_split,
         workspace_dir / str(spec["validation_artifact"]).removeprefix("./"),
@@ -558,7 +590,7 @@ def _run_public_artifact_contract_test(
         workspace_dir,
         code,
         timeout=timeout,
-        env=_score_truth_env(workspace_dir, score_truth_path),
+        env=_hidden_score_env(workspace_dir, hidden_score_path),
     )
     output = (completed.stdout or "") + (completed.stderr or "")
     if completed.returncode != 0:
@@ -793,8 +825,6 @@ def inspect_candidate_artifacts(
             )
 
         truth_path = workspace_dir / "input" / "biomaker_splits" / "score_val.csv"
-        if not truth_path.is_file():
-            truth_path = workspace_dir / "input" / "biomaker_splits" / "agent_val.csv"
         truth_df = pd.read_csv(truth_path) if truth_path.is_file() else pd.DataFrame()
         report["target_artifact"] = {
             "path": str(truth_path),
@@ -892,7 +922,7 @@ def _try_reuse_cached_evaluator(
     workspace_dir: Path,
     log_dir: Path,
     timeout: int,
-    score_truth_path: Path,
+    hidden_score_path: Path,
 ) -> PreparedEvaluator | None:
     cached_evaluator = cache_entry / "evaluator.py"
     cached_spec = cache_entry / "evaluator_prediction_spec.json"
@@ -908,13 +938,13 @@ def _try_reuse_cached_evaluator(
         _run_self_test(
             workspace_dir,
             timeout=timeout,
-            score_truth_path=score_truth_path,
+            hidden_score_path=hidden_score_path,
         )
         _run_public_artifact_contract_test(
             workspace_dir,
             prediction_spec,
             timeout=timeout,
-            score_truth_path=score_truth_path,
+            hidden_score_path=hidden_score_path,
         )
     except Exception as exc:
         append_event(
@@ -976,26 +1006,45 @@ def prepare_evaluator(
     attempts: int = 5,
     timeout: int = 120,
     cache_root: Path | str | None = None,
+    hidden_score_path: Path | str | None = None,
 ) -> PreparedEvaluator:
     """Generate, smoke-test, and freeze evaluator.py in the workspace."""
     workspace_dir = Path(workspace_dir)
     log_dir = Path(log_dir)
     evaluator_path = workspace_dir / "evaluator.py"
-    score_truth_path = log_dir / "private_truth" / "score_val_truth.csv"
-    prompt = _evaluator_prompt(task_desc, workspace_dir, score_truth_path)
+    hidden_score_path = (
+        Path(hidden_score_path)
+        if hidden_score_path is not None
+        else log_dir / "private_gt" / "score_val.csv"
+    )
+    prompt = _evaluator_prompt(task_desc, workspace_dir, hidden_score_path)
     cache_entry = None
     if cache_root is not None:
         cache_key = _stable_evaluator_cache_key(prompt, model=model)
         cache_entry = Path(cache_root) / cache_key
+        append_event(
+            log_dir,
+            "evaluator_cache_lookup",
+            cache_key=cache_key,
+            cache_entry=str(cache_entry),
+            exists=cache_entry.is_dir(),
+        )
         reused = _try_reuse_cached_evaluator(
             cache_entry,
             workspace_dir=workspace_dir,
             log_dir=log_dir,
             timeout=timeout,
-            score_truth_path=score_truth_path,
+            hidden_score_path=hidden_score_path,
         )
         if reused is not None:
             return reused
+        if not cache_entry.is_dir():
+            append_event(
+                log_dir,
+                "evaluator_cache_miss",
+                cache_key=cache_key,
+                cache_entry=str(cache_entry),
+            )
     errors: list[str] = []
 
     for attempt in range(1, attempts + 1):
@@ -1049,7 +1098,7 @@ def prepare_evaluator(
             _run_self_test(
                 workspace_dir,
                 timeout=timeout,
-                score_truth_path=score_truth_path,
+                hidden_score_path=hidden_score_path,
             )
             prediction_spec = _normalize_prediction_spec_json(
                 _load_prediction_spec(workspace_dir)
@@ -1058,7 +1107,7 @@ def prepare_evaluator(
                 workspace_dir,
                 prediction_spec,
                 timeout=timeout,
-                score_truth_path=score_truth_path,
+                hidden_score_path=hidden_score_path,
             )
         except Exception as exc:
             errors.append(str(exc))
@@ -1104,7 +1153,7 @@ def prepare_evaluator(
 def score_candidate_with_evaluator(
     workspace_dir: Path | str,
     timeout: int = 120,
-    score_truth_path: Path | str | None = None,
+    hidden_score_path: Path | str | None = None,
 ) -> EvaluatorRunResult:
     """Run the frozen evaluator against the current ./working artifacts."""
     workspace_dir = Path(workspace_dir)
@@ -1122,7 +1171,7 @@ def score_candidate_with_evaluator(
             workspace_dir,
             code,
             timeout=timeout,
-            env=_score_truth_env(workspace_dir, score_truth_path),
+            env=_hidden_score_env(workspace_dir, hidden_score_path),
         )
     except subprocess.TimeoutExpired as exc:
         output = (exc.stdout or "") + (exc.stderr or "")

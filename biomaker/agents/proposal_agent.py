@@ -147,6 +147,8 @@ class ProposalAgent(BaseAgent):
         """Return same-round generated siblings that have not executed yet."""
         nodes = []
         for node in self._pending_round_nodes:
+            if node.tag == "generating" and not str(node.code or "").strip():
+                continue
             same_parent = node.parent is selected_parent
             same_virtual_root = node.parent is None and selected_parent is None
             if same_parent or same_virtual_root:
@@ -293,9 +295,9 @@ class ProposalAgent(BaseAgent):
             "Stage": stage,
             "Task Description": truncate_text(str(self.task_desc), max_chars=1200),
         }
-        essentials = self.get_run_facts()
-        if essentials:
-            context["Cached run facts"] = truncate_text(essentials, max_chars=1600)
+        summary = self.get_data_summary()
+        if summary:
+            context["Data and evaluation summary"] = truncate_text(summary, max_chars=1600)
         context["Cached environment facts"] = truncate_text(
             self.environment_facts, max_chars=1600
         )
@@ -630,8 +632,8 @@ class ProposalAgent(BaseAgent):
 
     def generate_node(self, task: RoundTask) -> Node:
         """Generate plan/code for one selected tree task without executing it."""
-        if not self.journal.nodes or self.data_preview is None:
-            self.update_data_preview()
+        if not self.journal.nodes or self.data_summary is None:
+            self.update_data_summary()
 
         parent_node = task.parent
         selection_reason = task.selection_reason

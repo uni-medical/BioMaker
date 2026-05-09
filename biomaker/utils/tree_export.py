@@ -21,7 +21,7 @@ class VisualNode:
 def _sorted_children(node) -> list:
     return sorted(
         node.children,
-        key=lambda child: child.step if child.step is not None else 10**9,
+        key=lambda child: _display_step(child) if _display_step(child) is not None else 10**9,
     )
 
 
@@ -36,7 +36,7 @@ def _build_visual_tree(journal: Journal) -> tuple[list[VisualNode], list[list[in
     edges: list[list[int]] = []
     ordered_nodes = sorted(
         list(journal),
-        key=lambda node: node.step if node.step is not None else 10**9,
+        key=lambda node: _display_step(node) if _display_step(node) is not None else 10**9,
     )
     for node in ordered_nodes:
         child_index = index_by_node[node]
@@ -112,26 +112,38 @@ def _node_metric_short(node) -> str:
         return str(node.metric.value_npsafe)
 
 
+def _display_step(node) -> int | None:
+    if node is None:
+        return None
+    if node.step is not None:
+        return node.step
+    value = getattr(node, "scheduled_step", None)
+    return value if isinstance(value, int) else None
+
+
 def _node_label(node) -> str:
     if node is None:
         return ""
+    display_step = _display_step(node)
     if node.step is None:
+        step = "?" if display_step is None else str(display_step)
         if node.tag == "completed":
             if node.is_buggy:
-                return "?: bug"
+                return f"{step}: bug"
             metric = _node_metric(node)
-            return f"?: completed {metric}" if metric != "n/a" else "?: completed"
-        return f"?: {_transient_status(node)}"
+            return f"{step}: completed {metric}" if metric != "n/a" else f"{step}: completed"
+        return f"{step}: {_transient_status(node)}"
     prefix = "bug" if node.is_buggy else node.node_status
     metric = _node_metric(node)
-    step = "na" if node.step is None else str(node.step)
+    step = "na" if display_step is None else str(display_step)
     return f"{step}: {prefix} {metric}"
 
 
 def _node_display_label(node) -> str:
     if node is None:
         return ""
-    step = "?" if node.step is None else str(node.step)
+    display_step = _display_step(node)
+    step = "?" if display_step is None else str(display_step)
     if node.step is None:
         if node.tag == "completed":
             if node.is_buggy:
@@ -266,7 +278,7 @@ def _node_summary(node, best_node) -> dict:
     return {
         "title": _node_label(node),
         "node_id": node.id[:8],
-        "step": "" if node.step is None else str(node.step),
+        "step": "" if _display_step(node) is None else str(_display_step(node)),
         "stage": node.node_status,
         "status": status,
         "metric": "" if metric == "n/a" else metric,
@@ -279,7 +291,7 @@ def _node_summary(node, best_node) -> dict:
             else f"{float(resources.get('avg_cpu_percent')):.1f}%"
         ),
         "outcome": node.outcome or ("not yet appended" if node.step is None else ""),
-        "plan": truncate_text(str(node.plan or ""), max_chars=900),
+        "plan": str(node.plan or ""),
         "error": truncate_text(
             str(node.exc_info or node.exc_type or ""), max_chars=600
         ),
@@ -296,7 +308,7 @@ def _node_plan_text(node) -> str:
         f"metric:{_node_metric(node)}",
         f"outcome:{node.outcome}",
         f"selected:{truncate_text(str(node.selection_reason or ''), max_chars=220)}",
-        f"plan:{truncate_text(str(node.plan or ''), max_chars=900)}",
+        f"plan:{str(node.plan or '')}",
     ]
     return "\n".join(textwrap.fill(str(line), width=88) for line in original_lines)
 

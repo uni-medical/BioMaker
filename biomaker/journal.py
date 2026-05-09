@@ -46,12 +46,16 @@ class Node(DataClassJsonMixin):
     parent: Optional["Node"] = field(default=None, kw_only=True)
     children: set["Node"] = field(default_factory=set, kw_only=True)
     selection_reason: str | None = field(default=None, kw_only=True)
+    round_index: int = field(default=0, kw_only=True)
+    scheduled_step: int | None = field(default=None, kw_only=True)
+    status_started_at: float | None = field(default=None, kw_only=True)
 
     # ---- execution info ----
     _term_out: list[str] = field(default=None, kw_only=True)  # type: ignore
     exec_time: float = field(default=None, kw_only=True)  # type: ignore
     resource_usage: dict | None = field(default=None, kw_only=True)
     artifact_report: dict | None = field(default=None, kw_only=True)
+    evaluator_details: dict | None = field(default=None, kw_only=True)
     exc_type: str | None = field(default=None, kw_only=True)
     exc_info: dict | None = field(default=None, kw_only=True)
     exc_stack: list[tuple] | None = field(default=None, kw_only=True)
@@ -93,6 +97,46 @@ class Node(DataClassJsonMixin):
         self.exc_type = exec_result.exc_type
         self.exc_info = exec_result.exc_info
         self.exc_stack = exec_result.exc_stack
+
+    def assign_schedule(
+        self,
+        *,
+        round_index: int | None = None,
+        scheduled_step: int | None = None,
+    ) -> None:
+        """Record scheduler metadata used for live, in-flight nodes."""
+        if round_index is not None:
+            self.round_index = int(round_index)
+        self.scheduled_step = scheduled_step
+
+    def mark_status(self, status: str, started_at: float | None = None) -> None:
+        """Record a live execution/generation status and optional start time."""
+        self.tag = status
+        self.status_started_at = started_at
+
+    @property
+    def _round_index(self) -> int:
+        return self.round_index
+
+    @_round_index.setter
+    def _round_index(self, value: int) -> None:
+        self.round_index = int(value)
+
+    @property
+    def _scheduled_step(self) -> int | None:
+        return self.scheduled_step
+
+    @_scheduled_step.setter
+    def _scheduled_step(self, value: int | None) -> None:
+        self.scheduled_step = value
+
+    @property
+    def _status_started_at(self) -> float | None:
+        return self.status_started_at
+
+    @_status_started_at.setter
+    def _status_started_at(self, value: float | None) -> None:
+        self.status_started_at = value
 
     def record_experiment_context(self, best_node_before: Optional["Node"]) -> None:
         """Record simple experiment deltas after execution, before appending."""
@@ -180,7 +224,8 @@ class Journal(DataClassJsonMixin):
 
     def append(self, node: Node) -> None:
         """Append a new node to the journal."""
-        node.step = len(self.nodes)
+        scheduled_step = node.scheduled_step
+        node.step = scheduled_step if isinstance(scheduled_step, int) else len(self.nodes)
         self.nodes.append(node)
 
     def pop(self) -> Optional["Node"]:
@@ -281,7 +326,7 @@ class Journal(DataClassJsonMixin):
         """Choose which previous nodes receive full detail records.
 
         The policy is deterministic. It only chooses nodes; every chosen node is
-        represented by a full record that includes its complete plan and code.
+        represented by a full factual record.
         """
         if not self.nodes:
             return []
@@ -410,14 +455,31 @@ class Journal(DataClassJsonMixin):
             sibling_nodes.extend(
                 node for node in pending_same_round_nodes if node not in sibling_nodes
             )
-        if sibling_nodes:
+        completed_sibling_nodes = [
+            node for node in sibling_nodes if node.step is not None
+        ]
+        pending_sibling_nodes = [
+            node for node in sibling_nodes if node.step is None
+        ]
+
+        if completed_sibling_nodes:
             parts.append(_tree_record_sibling_intro(stage, selected_parent))
             parts.extend(
                 _format_detail_record(node, _tree_record_sibling_reason(stage))
-                for node in sorted(sibling_nodes, key=_node_sort_step)
+                for node in sorted(completed_sibling_nodes, key=_node_context_sort_key)
             )
         else:
-            parts.append(_tree_record_sibling_intro(stage, selected_parent) + "\nNone.")
+            parts.append(
+                _tree_record_sibling_intro(stage, selected_parent)
+                + "\nNo completed sibling records were available when this prompt was built."
+            )
+
+        if pending_sibling_nodes:
+            parts.append(_tree_record_pending_sibling_intro(stage, selected_parent))
+            parts.extend(
+                _format_detail_record(node, _tree_record_pending_sibling_reason(stage))
+                for node in sorted(pending_sibling_nodes, key=_node_context_sort_key)
+            )
 
         return "\n\n---\n\n".join(parts)
 
@@ -461,65 +523,6 @@ class Journal(DataClassJsonMixin):
         if not regressions:
             return ""
         return "Previous valid regressions:\n" + "\n".join(regressions)
-
-    def generate_branch_history(
-        self,
-        node: Node,
-        max_children: int = 6,
-        max_chars: int = 3000,
-    ) -> str:
-        """Summarize factual child experiments already tried from this node."""
-        parts = ["Selected parent\n" + _format_memory_node(node)]
-        children = sorted(
-            node.children,
-            key=lambda n: n.step if n.step is not None else 10**9,
-        )
-        if not children:
-            parts.append("Direct child experiments from this parent: none yet.")
-        else:
-            recent_children = children[-max_children:]
-            parts.append(
-                "Direct child experiments from this parent\n"
-                + "\n".join(_format_child_experiment(n) for n in recent_children)
-            )
-
-        if node.parent is not None:
-            siblings = sorted(
-                [n for n in node.parent.children if n != node],
-                key=lambda n: n.step if n.step is not None else 10**9,
-            )
-            if siblings:
-                parts.append(
-                    "Sibling experiments under the same grandparent\n"
-                    + "\n".join(_format_child_experiment(n) for n in siblings[-3:])
-                )
-
-        return truncate_text(
-            "\n-------------------------------\n".join(parts),
-            max_chars=max_chars,
-        )
-
-    def generate_debug_summary(
-        self,
-        buggy_node: Node,
-        max_chars: int = 2500,
-    ) -> str:
-        """Summarize factual context useful for fixing the current buggy node."""
-        parts = ["Current buggy node\n" + _format_memory_node(buggy_node)]
-        reference_node = self.get_nearest_successful_ancestor(buggy_node)
-        if reference_node is not None:
-            parts.append(
-                "Nearest successful ancestor\n" + _format_memory_node(reference_node)
-            )
-
-        avoid_summary = self._avoid_summary(max_items=3)
-        if avoid_summary:
-            parts.append(avoid_summary)
-
-        return truncate_text(
-            "\n-------------------------------\n".join(parts),
-            max_chars=max_chars,
-        )
 
     def generate_summary(
         self,
@@ -618,6 +621,20 @@ def _format_resource_usage(resource_usage: dict | None) -> str:
 
 def _node_sort_step(n: Node) -> int:
     return n.step if n.step is not None else 10**9
+
+
+def _node_display_step(n: Node) -> int | None:
+    if n.step is not None:
+        return n.step
+    value = n.scheduled_step
+    return value if isinstance(value, int) else None
+
+
+def _node_context_sort_key(n: Node) -> tuple[int, int | float]:
+    display_step = _node_display_step(n)
+    if display_step is not None:
+        return (0, display_step)
+    return (1, getattr(n, "ctime", 0) or 0)
 
 
 def _recent_nodes(nodes) -> list[Node]:
@@ -745,7 +762,37 @@ def _tree_record_sibling_intro(
     else:
         instruction = (
             "These are previous root drafts. Use them as alternative starting points "
-            "and make the new draft meaningfully distinct."
+            "and avoid duplicating an existing attempt. If reusing any component, "
+            "make the overall attempt substantively different."
+        )
+    return f"{title}\n{instruction}"
+
+
+def _tree_record_pending_sibling_intro(
+    stage: Literal["draft", "debug", "improve"], selected_parent: Node | None
+) -> str:
+    if stage == "debug":
+        title = "Same-Round Siblings Not Yet Scored"
+        instruction = (
+            "These related sibling nodes had code generated when this prompt was built, "
+            "but their execution result and validation metric were not available yet. "
+            "Use their plan and code only as tentative context."
+        )
+    elif stage == "improve":
+        title = "Same-Parent Children Not Yet Scored"
+        instruction = (
+            "These are other children of the selected parent whose code was already "
+            "generated, but whose execution result and validation metric were not "
+            "available yet. Use them as tentative sibling context and avoid repeating "
+            "the same direction."
+        )
+    else:
+        title = "Same-Round Root Drafts Not Yet Scored"
+        instruction = (
+            "These root drafts had code generated when this prompt was built, but "
+            "their execution result and validation metric were not available yet. "
+            "Use their plan and code as factual but unscored context; avoid "
+            "duplicating the same attempt."
         )
     return f"{title}\n{instruction}"
 
@@ -762,6 +809,16 @@ def _tree_record_sibling_reason(stage: Literal["draft", "debug", "improve"]) -> 
             "node"
         )
     return "existing root draft; sibling of the new draft node"
+
+
+def _tree_record_pending_sibling_reason(
+    stage: Literal["draft", "debug", "improve"]
+) -> str:
+    if stage == "debug":
+        return "same-round sibling of the buggy parent; generated but not scored yet"
+    if stage == "improve":
+        return "same-parent child; generated but not scored yet"
+    return "same-round root draft; generated but not scored yet"
 
 
 def _format_current_target(
@@ -842,19 +899,6 @@ def _one_line(text: str, max_chars: int) -> str:
 
 def json_dumps_compact(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-
-
-def _format_artifact_report(report: dict) -> str:
-    compact = {
-        "warnings": report.get("warnings"),
-        "alignment": report.get("alignment"),
-        "validation_artifact": report.get("validation_artifact"),
-        "target_artifact": report.get("target_artifact"),
-    }
-    samples = report.get("sample_reports")
-    if isinstance(samples, list) and samples:
-        compact["sample_0"] = samples[0]
-    return json_dumps_compact(compact)
 
 
 def _format_artifact_facts(
@@ -961,28 +1005,47 @@ def _format_artifact_facts(
     return "\n".join(lines)
 
 
+def _format_evaluator_details(details: dict | None) -> str:
+    if not isinstance(details, dict):
+        return ""
+
+    payload = details.get("details")
+    if not isinstance(payload, dict):
+        payload = details
+    score = payload.get("score")
+    if not isinstance(score, dict):
+        return ""
+
+    parts = []
+    skip_keys = {"metric", "maximize"}
+    for key, value in score.items():
+        if key in skip_keys or isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            parts.append(f"{key}={value}")
+        elif isinstance(value, float):
+            parts.append(f"{key}={value:.4f}")
+        if len(parts) >= 8:
+            break
+    return ", ".join(parts)
+
+
 def _format_node_header(n: Node) -> str:
     metric = n.metric.value if n.metric is not None else None
     metric_text = "n/a" if metric is None else f"{float(metric):.4f}"
+    detail_text = _format_evaluator_details(n.evaluator_details)
+    if detail_text:
+        detail_text = f" | validation_metrics: {detail_text}"
     return (
         f"Node {n.id[:8]} | status: {n.node_status} | "
         f"metric: {metric_text} | runtime: {_format_runtime(n.exec_time)} | "
         f"resources: {_format_resource_usage(n.resource_usage)} | "
         f"outcome: {n.outcome or 'unknown'}"
+        f"{detail_text}"
     )
 
 
 def _format_memory_node(n: Node) -> str:
-    artifact_text = ""
-    if n.artifact_report:
-        artifact_text = "\nArtifact facts: " + truncate_text(
-            _format_artifact_facts(n.artifact_report), max_chars=520
-        )
-    selection_text = ""
-    if n.selection_reason:
-        selection_text = "\nSelected because: " + truncate_text(
-            str(n.selection_reason), max_chars=180
-        )
     finding_text = (
         f"\nEmpirical finding: {truncate_text(str(n.analysis), max_chars=260)}"
         if n.analysis
@@ -994,28 +1057,7 @@ def _format_memory_node(n: Node) -> str:
         f"delta_vs_best_before: {_format_delta(n.delta_vs_best)}\n"
         f"Core idea: {truncate_text(str(n.plan), max_chars=320)}"
         f"{finding_text}"
-        f"{selection_text}"
-        f"{artifact_text}"
     )
-
-
-def _format_child_experiment(n: Node) -> str:
-    line = (
-        "- "
-        + _format_node_header(n)
-        + f" | delta_vs_parent: {_format_delta(n.delta_vs_parent)}"
-    )
-    if n.plan:
-        line += f"\n  Attempt: {truncate_text(str(n.plan), max_chars=180)}"
-    if n.analysis:
-        line += f"\n  Finding: {truncate_text(str(n.analysis), max_chars=180)}"
-    elif n.exc_info:
-        line += f"\n  Error info: {truncate_text(str(n.exc_info), max_chars=180)}"
-    if n.artifact_report:
-        line += "\n  Artifact facts: " + truncate_text(
-            _format_artifact_report(n.artifact_report), max_chars=320
-        )
-    return line
 
 
 def _format_detail_record(n: Node, reason: str) -> str:
@@ -1038,19 +1080,33 @@ def _format_detail_record(n: Node, reason: str) -> str:
     resource_usage = (
         json_dumps_compact(n.resource_usage) if n.resource_usage is not None else "n/a"
     )
+    evaluator_details = _format_evaluator_details(n.evaluator_details)
     exception_info = {
         "exc_type": n.exc_type,
         "exc_info": n.exc_info,
         "exc_stack": n.exc_stack,
     }
-    result_text = (
-        "not_executed_yet"
-        if not_executed
-        else ("bug" if n.is_buggy is True else "success")
-    )
+    if not_executed:
+        result_text = (
+            "generated_not_scored_yet"
+            if str(n.code or "").strip()
+            else "generation_in_progress"
+        )
+    else:
+        result_text = "bug" if n.is_buggy is True else "success"
     metric_text = "unknown_not_executed" if not_executed else _metric_text(n)
     exec_time = "unknown_not_executed" if not_executed else _format_runtime(n.exec_time)
     parent_id = n.parent.id[:8] if n.parent is not None else "root"
+    display_step = _node_display_step(n)
+    if display_step is not None:
+        step_title = f"Step {display_step}"
+        step_value = str(display_step)
+    elif str(n.code or "").strip():
+        step_title = "generated, not scored"
+        step_value = "generated_not_scored"
+    else:
+        step_title = "generating"
+        step_value = "generating"
     children_ids = [child.id[:8] for child in sorted(n.children, key=_node_sort_step)]
     execution_output = (
         "Not executed yet. Execution output is unknown."
@@ -1069,14 +1125,15 @@ def _format_detail_record(n: Node, reason: str) -> str:
         else ""
     )
     return (
-        f"Node {n.id[:8]} full record\n"
-        f"step: {n.step}\n"
+        f"Node {n.id[:8]} · {step_title} · {n.node_status} · parent {parent_id}\n"
+        f"step: {step_value}\n"
         f"node_id: {n.id[:8]}\n"
         f"parent_id: {parent_id}\n"
         f"children_ids: {children_ids}\n"
         f"stage: {n.node_status}\n"
         f"result: {result_text}\n"
         f"val_metric: {metric_text}\n"
+        f"validation_metrics: {evaluator_details or 'n/a'}\n"
         f"maximize: {n.metric.maximize if n.metric is not None else None}\n"
         f"delta_vs_parent: {_format_delta(n.delta_vs_parent)}\n"
         f"execution_time: {exec_time}\n"

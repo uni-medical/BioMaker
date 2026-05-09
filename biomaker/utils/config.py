@@ -86,7 +86,7 @@ class AgentConfig:
     search: SearchConfig
 
     expose_prediction: bool
-    data_preview: bool
+    data_summary: bool
 
     enable_monai_knowledge_base: bool
     enable_query2doc: bool
@@ -125,6 +125,12 @@ class EvaluatorCacheConfig:
 
 
 @dataclass
+class FinalRetrainConfig:
+    enabled: bool
+    timeout: int | None
+
+
+@dataclass
 class Config(Hashable):
     data_dir: Path
     desc_file: Path | None
@@ -144,6 +150,7 @@ class Config(Hashable):
     exec: ExecConfig
     input_cache: InputCacheConfig
     evaluator_cache: EvaluatorCacheConfig
+    final_retrain: FinalRetrainConfig
     generate_report: bool
     report: StageConfig
     agent: AgentConfig
@@ -337,7 +344,18 @@ def prep_agent_workspace(cfg: Config):
         )
         cfg.copy_data = True
     use_symlinks = (not cfg.copy_data) and (not cfg.preprocess_data)
-    copytree(cfg.data_dir, cfg.workspace_dir / "input", use_symlinks=use_symlinks)
+    generated_input_names = {
+        "biomaker_splits",
+        "biomaker_cache",
+        "private_gt",
+        "_split_builder",
+    }
+    copytree(
+        cfg.data_dir,
+        cfg.workspace_dir / "input",
+        use_symlinks=use_symlinks,
+        exclude_names=generated_input_names,
+    )
     if cfg.preprocess_data:
         preproc_data(cfg.workspace_dir / "input")
 
@@ -503,6 +521,7 @@ def _copy_node_artifacts(cfg: Config, node) -> None:
         "outcome": node.outcome,
         "exec_time": node.exec_time,
         "resource_usage": node.resource_usage,
+        "evaluator_details": node.evaluator_details,
         "exc_type": node.exc_type,
         "exc_info": node.exc_info,
         "plan": node.plan,

@@ -15,11 +15,33 @@ from scipy.stats import rankdata
 from .artifact_validation import _resolve_artifact_path
 
 
-def _load_split_plan(private_dir: Path) -> dict[str, Any] | None:
-    private_path = private_dir / "private_split_plan.json"
-    if private_path.is_file():
-        return json.loads(private_path.read_text(encoding="utf-8"))
-    return None
+def _load_private_test_plan(private_dir: Path) -> dict[str, Any] | None:
+    private_path = private_dir / "private_gt.json"
+    if not private_path.is_file():
+        return None
+    private_gt = json.loads(private_path.read_text(encoding="utf-8"))
+    test_entry = private_gt.get("test") if isinstance(private_gt, dict) else None
+    if not isinstance(test_entry, dict):
+        return None
+    answer_columns = [str(c) for c in test_entry.get("answer_columns", [])]
+    mask_column = next(
+        (
+            column
+            for column in answer_columns
+            if "path" in column.lower()
+            or "mask" in column.lower()
+            or "annotation" in column.lower()
+            or "bbox" in column.lower()
+        ),
+        None,
+    )
+    label_column = None if mask_column else (answer_columns[0] if answer_columns else None)
+    return {
+        "source": str(test_entry.get("file") or "test.csv"),
+        "label_column": label_column,
+        "mask_column": mask_column,
+        "id_column": None,
+    }
 
 
 def _load_prediction_spec(workspace_dir: Path) -> dict[str, Any]:
@@ -445,7 +467,7 @@ def _private_mask_metrics(
     dice_scores = []
     aji_scores = []
     for _, row in rows.iterrows():
-        true_path = _private_truth_path(private_dir, row[mask_column])
+        true_path = _private_gt_path(private_dir, row[mask_column])
         if not true_path.is_file():
             return None
         with Image.open(true_path) as true_image:
@@ -484,7 +506,7 @@ def _private_mask_metrics(
     }
 
 
-def _private_truth_path(private_dir: Path, value: Any) -> Path:
+def _private_gt_path(private_dir: Path, value: Any) -> Path:
     path = Path(str(value).removeprefix("./"))
     if path.is_absolute():
         return path
@@ -499,8 +521,8 @@ def evaluate_private_outputs(
     """Evaluate private test metrics for user inspection only."""
     workspace_dir = Path(workspace_dir)
     private_dir = Path(private_dir)
-    split_plan = _load_split_plan(private_dir)
-    if not split_plan:
+    private_test = _load_private_test_plan(private_dir)
+    if not private_test:
         return None
 
     prediction_spec = _load_prediction_spec(workspace_dir)
@@ -513,46 +535,43 @@ def evaluate_private_outputs(
 
     submission = pd.read_csv(submission_path)
     results = []
-    for private_eval in split_plan.get("private_evaluation", []):
-        source = private_eval.get("source")
-        if not source:
-            continue
-        truth_path = private_dir / source
-        if not truth_path.is_file():
-            continue
+    source = private_test.get("source")
+    truth_path = private_dir / str(source)
+    if not truth_path.is_file():
+        return None
 
-        truth = pd.read_csv(truth_path)
-        label_column = private_eval.get("label_column")
-        mask_column = private_eval.get("mask_column")
-        id_column = private_eval.get("id_column")
-        result = None
-        if mask_column:
-            result = _private_mask_metrics(
-                workspace_dir,
-                private_dir,
-                truth,
-                submission,
-                mask_column,
-                prediction_columns,
-                key_columns,
-                primary_metric,
-            )
-        elif label_column:
-            result = _classification_metrics_from_submission(
-                truth,
-                submission,
-                label_column,
-                id_column,
-                prediction_columns,
-                key_columns,
-                primary_metric,
-                prediction_spec,
-            )
-        if result:
-            result["name"] = private_eval.get("name", "private_eval")
-            result["source"] = source
-            result["visible_to_agent"] = False
-            results.append(result)
+    truth = pd.read_csv(truth_path)
+    label_column = private_test.get("label_column")
+    mask_column = private_test.get("mask_column")
+    id_column = private_test.get("id_column")
+    result = None
+    if mask_column:
+        result = _private_mask_metrics(
+            workspace_dir,
+            private_dir,
+            truth,
+            submission,
+            mask_column,
+            prediction_columns,
+            key_columns,
+            primary_metric,
+        )
+    elif label_column:
+        result = _classification_metrics_from_submission(
+            truth,
+            submission,
+            label_column,
+            id_column,
+            prediction_columns,
+            key_columns,
+            primary_metric,
+            prediction_spec,
+        )
+    if result:
+        result["name"] = "private_test"
+        result["source"] = source
+        result["visible_to_agent"] = False
+        results.append(result)
 
     if not results:
         return None

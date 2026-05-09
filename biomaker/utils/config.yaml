@@ -32,6 +32,14 @@ input_cache:
 evaluator_cache:
   enabled: True
 
+# After the search selects the best node, rerun that code once with the hidden
+# score-validation labels merged into the training table. This is a final-only
+# retrain and does not affect node selection.
+final_retrain:
+  enabled: True
+  # Null uses exec.timeout.
+  timeout: null
+
 # agent hyperparams
 agent:
   # how many proposal/debug/improve iterations to run
@@ -42,8 +50,8 @@ agent:
   k_fold_validation: 1
   # whether to instruct the agent to generate a prediction function
   expose_prediction: True
-  # whether to provide the agent with a preview of the data
-  data_preview: True
+  # whether to provide the agent with the unified data/evaluator summary
+  data_summary: True
   enable_monai_knowledge_base: True
   enable_query2doc: False
   enable_web_search: True
@@ -76,7 +84,7 @@ agent:
 # settings for code execution
 exec:
   # Hard safety timeout for one generated node in seconds. This is a longest tolerated runtime, not a target budget.
-  timeout: 1800
+  timeout: 1200
   # Number of generated nodes that may execute concurrently. Use 1 for shared GPU-heavy runs.
   # Even with 1 worker, BioMaker overlaps node execution with generation of later same-round nodes.
   parallel_workers: 2

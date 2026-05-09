@@ -305,9 +305,6 @@ class Interpreter:
         self.enforce_environment = enforce_environment
         self.include_medical_packages = include_medical_packages
 
-    def cleanup_session(self):
-        return
-
     def run(self, code: str, reset_session=True) -> ExecutionResult:
         """
         Execute the provided Python command in a separate process and return its output.

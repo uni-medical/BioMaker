@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import humanize
-
 from ..backend import compile_prompt_to_md
 from ..journal import Node
 
@@ -65,7 +63,7 @@ class ContextBuilder:
         order = [
             "Introduction",
             "Task Description",
-            "Data Overview",
+            "Data and Evaluation Summary",
             "Tree Records",
             "Instructions",
         ]
@@ -85,21 +83,20 @@ class ContextBuilder:
         )
         prompt["Instructions"] |= {
             "Solution sketch guideline": [
-                "This first solution design should be relatively simple, without ensembling or hyper-parameter optimization.",
-                "Use Tree Records as factual experiment history. Do not repeat an already tried modelling solution unless the factual results justify revisiting it.",
-                "If Sibling records include not-yet-executed same-round nodes, use their plan and code to choose a meaningfully different draft direction.",
+                "Use Tree Records as factual experiment history. Do not duplicate an already tried draft.",
+                "If sibling draft records are present, use their plan and code as factual context; if reusing any component, make the overall attempt substantively different.",
+                "For a root draft, implement the smallest complete run that tests the core idea and writes all required artifacts; later nodes can scale or refine the approach using observed results.",
+                "Avoid exhaustive tuning, repeated full retraining, large ensembles, or long training schedules in a root draft.",
                 "Keep the frozen evaluator protocol unchanged.",
                 "The solution sketch should be 3-5 sentences.",
                 "Use the frozen evaluator as the source of truth for validation scoring.",
                 "Don't suggest to do EDA.",
                 "The data is already prepared and available in the `./input` directory. There is no need to unzip any files.",
-                "Check the data preview of `./input` directory carefully, and make sure the data loading and batching logic matches the actual files.",
-                "Keep the first solution cheap; one epoch is enough to validate the workflow.",
-                "If the dataset is large, use a small representative training subset for the first draft so the full workflow finishes quickly.",
+                "Check Data and Evaluation Summary carefully, and make sure the data loading, prediction, and artifact-writing logic matches the actual files and evaluator requirements.",
             ],
         }
         self._finish_common(prompt)
-        self.agent.attach_data_overview(prompt)
+        self.agent.attach_data_summary(prompt)
         return self._ordered_prompt(prompt)
 
     def build_debug(self, parent_node: Node) -> dict[str, Any]:
@@ -124,7 +121,7 @@ class ContextBuilder:
             ],
         }
         self._finish_common(prompt)
-        self.agent.attach_data_overview(prompt)
+        self.agent.attach_data_summary(prompt)
         return self._ordered_prompt(prompt)
 
     def build_improve(self, parent_node: Node) -> dict[str, Any]:
@@ -149,9 +146,8 @@ class ContextBuilder:
                 "The solution sketch should be 3-5 sentences.",
                 "Don't suggest to do EDA.",
                 "Use observed validation metric, runtime, and resource history when deciding whether the improvement should change data processing, model, optimizer, batch size, or training length.",
-                f"The improved solution must stay within the per-node hard safety timeout of {humanize.naturaldelta(self.agent.cfg.exec.timeout)}.",
             ],
         }
         self._finish_common(prompt)
-        self.agent.attach_data_overview(prompt)
+        self.agent.attach_data_summary(prompt)
         return self._ordered_prompt(prompt)

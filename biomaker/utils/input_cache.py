@@ -48,6 +48,16 @@ def _json_hash(value: Any, length: int = 16) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
 
 
+def _path_candidates(value: str, input_dir: Path, base_dir: Path) -> list[Path]:
+    path = Path(value)
+    candidates = [path] if path.is_absolute() else [input_dir / path, base_dir / path]
+    if path.parts and path.parts[0] == "input":
+        candidates.append(input_dir.parent / path)
+        if len(path.parts) > 1:
+            candidates.append(input_dir / Path(*path.parts[1:]))
+    return candidates
+
+
 def _file_fingerprint(path: Path) -> dict[str, Any]:
     try:
         stat = path.stat()
@@ -74,12 +84,14 @@ def _looks_like_path_column(series: pd.Series, input_dir: Path, base_dir: Path) 
     if not values:
         return False
     hits = 0
+    resolved: set[str] = set()
     for value in values[:8]:
-        path = Path(value)
-        candidates = [path] if path.is_absolute() else [input_dir / path, base_dir / path]
-        if any(candidate.exists() for candidate in candidates):
+        candidates = _path_candidates(value, input_dir, base_dir)
+        file_hits = [candidate for candidate in candidates if candidate.is_file()]
+        if file_hits:
             hits += 1
-    return hits > 0
+            resolved.add(str(file_hits[0].resolve()))
+    return hits > 0 and len(resolved) > 1
 
 
 def _resolve_visible_path(value: Any, input_dir: Path, base_dir: Path) -> Path | None:
@@ -89,10 +101,14 @@ def _resolve_visible_path(value: Any, input_dir: Path, base_dir: Path) -> Path |
     if not raw:
         return None
     path = Path(raw)
-    candidates = [path] if path.is_absolute() else [input_dir / path, base_dir / path]
+    candidates = _path_candidates(raw, input_dir, base_dir)
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.is_file():
             return candidate
+    if any(candidate.exists() for candidate in candidates):
+        return None
+    if not path.suffix and "/" not in raw and "\\" not in raw:
+        return None
     return candidates[0]
 
 

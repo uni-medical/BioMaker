@@ -1,4 +1,5 @@
 import atexit
+import copy
 import csv
 import json
 import logging
@@ -17,7 +18,7 @@ from rich.tree import Tree
 
 from . import backend
 from .agent import BioMakerWorkflow, RoundNode, WorkflowAgent
-from .agents.base_agent import RoundTask
+from .agents.base_agent import RoundTask, parse_factual_exec_result
 from .interpreter import Interpreter
 from .journal import Journal, Node
 from .journal2report import journal2report
@@ -37,13 +38,11 @@ from .utils.config import (
 from .utils.events import append_event
 from .utils.evaluator_setup import (
     clean_candidate_outputs,
-    parse_artifact_report,
-    parse_external_validation,
     prepare_evaluator,
     score_candidate_with_evaluator,
 )
+from .utils.final_retrain import run_final_retrain
 from .utils.input_cache import prepare_input_cache
-from .utils.metric import MetricValue, WorstMetricValue
 from .utils.private_evaluation import evaluate_private_outputs
 from .utils.run_manifest import write_run_manifest
 from .utils.split_protocol import prepare_split_protocol
@@ -81,6 +80,13 @@ def journal_to_rich_tree(
     nodes: list[Node] | None = None,
 ):
     now = time.monotonic()
+
+    def display_step(node: Node) -> int | None:
+        if node.step is not None:
+            return node.step
+        value = node.scheduled_step
+        return value if isinstance(value, int) else None
+
     display_nodes = journal.nodes if nodes is None else nodes
     completed_nodes = [node for node in display_nodes if node.step is not None]
     display_good_nodes = [
@@ -100,14 +106,20 @@ def journal_to_rich_tree(
         parent = node.parent if node.parent in display_node_set else None
         children_by_parent.setdefault(parent, []).append(node)
     for children in children_by_parent.values():
-        children.sort(key=lambda child: child.step if child.step is not None else 10**9)
+        children.sort(
+            key=lambda child: (
+                display_step(child) if display_step(child) is not None else 10**9
+            )
+        )
 
     def append_rec(node: Node, tree):
         if node.step is None:
+            step = display_step(node)
+            step_prefix = "" if step is None else f"{step}: "
             status = node.tag or "pending"
             elapsed = ""
             if status in {"generating", "running"}:
-                status_started_at = getattr(node, "_status_started_at", None)
+                status_started_at = node.status_started_at
                 if status_started_at is not None:
                     elapsed = f" ({max(0, int(now - status_started_at))}s)"
             color = (
@@ -116,15 +128,15 @@ def journal_to_rich_tree(
                 else "magenta" if status == "running" else "yellow"
             )
             if status == "completed" and node.is_buggy:
-                s = "[red]◍ bug"
+                s = f"[red]◍ {step_prefix}bug"
             elif status == "completed" and node.metric is not None:
-                s = f"[cyan]● {node.metric.value:.3f}"
+                s = f"[cyan]● {step_prefix}{node.metric.value:.3f}"
                 if node is best_node:
                     s += " (best)"
             elif status == "completed":
-                s = "[yellow]◌ executed"
+                s = f"[yellow]◌ {step_prefix}executed"
             else:
-                s = f"[{color}]◌ {status}{elapsed}"
+                s = f"[{color}]◌ {step_prefix}{status}{elapsed}"
         elif node.is_buggy:
             s = "[red]◍ bug"
         elif node.metric is None or node.metric.value is None:
@@ -198,7 +210,9 @@ def _compact_task_description(task_desc, max_chars: int = 900) -> str:
     return text
 
 
-def _run_overview_text(task_desc, split_protocol, workspace_dir: Path, private_dir: Path) -> tuple[str, dict]:
+def _run_overview_text(
+    task_desc, split_protocol, workspace_dir: Path, private_dir: Path
+) -> tuple[str, dict]:
     plan = split_protocol.split_plan
     agent_visible = plan.get("agent_visible", {})
     train_rel = agent_visible.get("train")
@@ -211,17 +225,15 @@ def _run_overview_text(task_desc, split_protocol, workspace_dir: Path, private_d
 
     private_sources = []
     private_test_rows = None
-    for private_eval in plan.get("private_evaluation", []):
-        if not isinstance(private_eval, dict):
-            continue
-        source = private_eval.get("source")
-        if not source:
-            continue
-        private_sources.append(str(source))
-        private_rows = _count_csv_rows(private_dir / str(source))
-        if private_rows is not None:
-            private_test_rows = private_rows
-            break
+    private_gt = plan.get("private_gt", {})
+    if isinstance(private_gt, dict):
+        test_gt = private_gt.get("test")
+        if isinstance(test_gt, dict):
+            source = str(test_gt.get("file") or "test.csv")
+            private_sources.append(source)
+            private_rows = _count_csv_rows(private_dir / source)
+            if private_rows is not None:
+                private_test_rows = private_rows
     if private_test_rows is None:
         private_test_rows = test_rows
 
@@ -387,9 +399,7 @@ def _private_metrics_summary(history: list) -> dict:
             return None
         return value if maximize else -value
 
-    val_candidates = [
-        entry for entry in entries if better_by_val(entry) is not None
-    ]
+    val_candidates = [entry for entry in entries if better_by_val(entry) is not None]
     test_candidates = [
         entry for entry in entries if better_by_private_test(entry) is not None
     ]
@@ -464,9 +474,15 @@ def run():
     logger.info("Preparing agent workspace (copying and extracting files) ...")
     prep_agent_workspace(cfg)
     append_event(cfg.log_dir, "workspace_prepared", workspace_dir=cfg.workspace_dir)
-    private_dir = cfg.log_dir / "private_truth"
+    private_dir = cfg.log_dir / "private_gt"
     split_protocol = prepare_split_protocol(
-        cfg.workspace_dir / "input", private_dir=private_dir
+        cfg.workspace_dir / "input",
+        private_dir=private_dir,
+        task_desc=task_desc,
+        model=cfg.agent.feedback.model,
+        temperature=0.0,
+        attempts=3,
+        cache_root=cfg.resource_dir / "split_builder",
     )
     append_event(
         cfg.log_dir,
@@ -519,24 +535,27 @@ def run():
         cfg.workspace_dir,
         **_interpreter_kwargs(cfg),
     )
-    if isinstance(task_desc, dict):
-        task_desc["Data split protocol"] = split_protocol.prompt_text
+    agent_task_desc = copy.deepcopy(task_desc)
+    evaluator_task_desc = copy.deepcopy(task_desc)
+    if isinstance(evaluator_task_desc, dict):
+        evaluator_task_desc["Data split protocol"] = split_protocol.prompt_text
     else:
-        task_desc = {
-            "Task description": task_desc,
+        evaluator_task_desc = {
+            "Task description": evaluator_task_desc,
             "Data split protocol": split_protocol.prompt_text,
         }
     if input_cache_prompt:
-        task_desc["Input cache protocol"] = input_cache_prompt
+        evaluator_task_desc["Input cache protocol"] = input_cache_prompt
 
     logger.info("Preparing frozen evaluator ...")
     prepared_evaluator = prepare_evaluator(
         workspace_dir=cfg.workspace_dir,
         log_dir=cfg.log_dir,
-        task_desc=task_desc,
+        task_desc=evaluator_task_desc,
         model=cfg.agent.feedback.model,
         temperature=0.0,
         timeout=min(180, cfg.exec.timeout),
+        hidden_score_path=cfg.log_dir / "private_gt" / "score_val.csv",
         cache_root=(
             cfg.resource_dir / "evaluators" if cfg.evaluator_cache.enabled else None
         ),
@@ -545,16 +564,6 @@ def run():
         cfg.log_dir,
         "evaluator_prepared",
         prediction_spec_chars=len(prepared_evaluator.prediction_spec),
-    )
-    task_desc["Evaluation protocol"] = (
-        "A frozen evaluator has been generated and smoke-tested at `./evaluator.py`. "
-        "Strictly follow `evaluator.prediction_spec()` for validation predictions and test submission. "
-        "BioMaker computes the final node score after your script exits using hidden score labels that are not available to generated code. "
-        "Generated code may call `evaluator.validate_submission()` after writing outputs, but should not call `evaluator.score_val()` because hidden score labels are only supplied to BioMaker's external scoring process. "
-        "Key columns in prediction artifacts must exactly match the split CSV values. "
-        "If a framework returns key values as tensors or arrays, convert them to ordinary Python scalars or read the key column directly from the source table; never write serialized framework objects such as `tensor(1)`. "
-        "For classification probability artifacts, follow `prediction_spec()` exactly: write only the requested probability columns, use valid numeric probabilities, make mutually exclusive class probabilities sum to 1 only when all class probabilities are requested, and do not fill missing rows with zeros. "
-        f"Prediction spec: {prepared_evaluator.prediction_spec}"
     )
     try:
         prediction_spec = json.loads(prepared_evaluator.prediction_spec)
@@ -566,9 +575,7 @@ def run():
         if metric_value is None and isinstance(
             prediction_spec.get("validation_artifact"), dict
         ):
-            metric_value = prediction_spec["validation_artifact"].get(
-                "primary_metric"
-            )
+            metric_value = prediction_spec["validation_artifact"].get("primary_metric")
         if metric_value is None and isinstance(prediction_spec.get("metrics"), list):
             metrics = prediction_spec["metrics"]
             if metrics:
@@ -577,7 +584,7 @@ def run():
             metric_name = str(metric_value)
     manifest_path = write_run_manifest(
         cfg,
-        task_desc,
+        agent_task_desc,
         split_protocol_text=split_protocol.prompt_text,
         prediction_spec=prediction_spec,
     )
@@ -586,7 +593,7 @@ def run():
     journal = Journal()
 
     agent = BioMakerWorkflow(
-        task_desc=task_desc,
+        task_desc=agent_task_desc,
         cfg=cfg,
         journal=journal,
         interpreter=interpreter,
@@ -606,8 +613,7 @@ def run():
         node_start_time = time.monotonic()
         node = kwargs.pop("node", None)
         if node is not None:
-            node.tag = "running"
-            setattr(node, "_status_started_at", node_start_time)
+            node.mark_status("running", node_start_time)
         execution_workspace = (
             prepare_node_workspace(cfg, node) if node is not None else cfg.workspace_dir
         )
@@ -617,6 +623,7 @@ def run():
             code_chars=len(str(args[0])) if args else None,
             node_id=node.id if node is not None else None,
             execution_workspace=str(execution_workspace),
+            timeout_seconds=cfg.exec.timeout,
         )
         clean_candidate_outputs(execution_workspace)
         node_interpreter = Interpreter(
@@ -626,12 +633,12 @@ def run():
         res = node_interpreter.run(*args, **kwargs)
         if res.exc_type is None:
             normalization_messages = normalize_working_outputs(
-                execution_workspace, str(task_desc)
+                execution_workspace, str(agent_task_desc)
             )
             if normalization_messages:
                 res.term_out.append("\n" + "\n".join(normalization_messages))
             artifact_check = validate_working_outputs(
-                execution_workspace, str(task_desc)
+                execution_workspace, str(agent_task_desc)
             )
             if artifact_check.messages:
                 res.term_out.append("\n" + "\n".join(artifact_check.messages))
@@ -642,7 +649,7 @@ def run():
             evaluator_result = score_candidate_with_evaluator(
                 execution_workspace,
                 timeout=min(180, cfg.exec.timeout),
-                score_truth_path=cfg.log_dir / "private_truth" / "score_val_truth.csv",
+                hidden_score_path=cfg.log_dir / "private_gt" / "score_val.csv",
             )
             if evaluator_result.output:
                 res.term_out.append("\n" + evaluator_result.output)
@@ -695,7 +702,7 @@ def run():
 
         if cfg.generate_report and not end_with_exception:
             print("Generating final report from journal...")
-            report = journal2report(journal, task_desc, cfg.report)
+            report = journal2report(journal, agent_task_desc, cfg.report)
             print(report)
             report_file_path = cfg.log_dir / "report.md"
             with open(report_file_path, "w") as f:
@@ -727,6 +734,8 @@ def run():
     generating_nodes: list[Node] = []
     appended_node_ids_by_round: dict[int, list[str]] = {}
     pending_execution_queue: list[RoundNode] = []
+    round_start_step_by_round: dict[int, int] = {}
+    round_item_count_by_round: dict[int, int] = {}
     max_generated_backlog = max(0, int(cfg.exec.max_generated_backlog))
     max_draft_generated_backlog = max(0, int(cfg.exec.max_draft_generated_backlog))
     live_tree_refresh_seconds = 1
@@ -763,7 +772,10 @@ def run():
     def live_backlog_count(next_task: RoundTask | None = None) -> int:
         nodes = [
             node
-            for node in [*generating_nodes, *(rn.node for rn in pending_execution_queue)]
+            for node in [
+                *generating_nodes,
+                *(rn.node for rn in pending_execution_queue),
+            ]
             if node.step is None
         ]
         if next_task is not None and task_stage(next_task) == "draft":
@@ -771,7 +783,9 @@ def run():
         return len(nodes)
 
     def live_progress_line() -> str:
-        generated = sum(len(round_nodes) for round_nodes in round_nodes_by_round.values())
+        generated = sum(
+            len(round_nodes) for round_nodes in round_nodes_by_round.values()
+        )
         executed = len(raw_exec_results)
         live = live_nodes()
         generating = sum(1 for node in live if node.tag == "generating")
@@ -801,26 +815,6 @@ def run():
             f"executed {executed}/{total_steps} · "
             f"live generating {generating}, running {running}, queued {queued} · "
             f"best {best_text}"
-        )
-
-    def completed_nodes_through_round(current_round_index: int) -> list[Node]:
-        nodes: list[Node] = []
-        for node_round_index in sorted(round_nodes_by_round):
-            if node_round_index > current_round_index:
-                continue
-            nodes.extend(
-                round_node.node
-                for round_node in round_nodes_by_round[node_round_index]
-                if round_node.node.step is not None
-            )
-        return nodes
-
-    def round_completed_tree(current_round_index: int) -> Tree:
-        return journal_to_rich_tree(
-            journal,
-            mark_new=False,
-            title=f"[bold cyan]Solution tree through round {current_round_index}",
-            nodes=completed_nodes_through_round(current_round_index),
         )
 
     def live_tree_view(display_journal: Journal):
@@ -864,7 +858,7 @@ def run():
         return (task_stage(task), parent_id)
 
     def node_round_index(node: Node) -> int:
-        value = getattr(node, "_round_index", 0)
+        value = node.round_index
         return int(value) if isinstance(value, int) else 0
 
     def select_tasks_visible_before_round(task_round_index: int) -> list[RoundTask]:
@@ -915,7 +909,7 @@ def run():
                 continue
             if round_node.node.tag == "completed":
                 continue
-            round_node.node.tag = "running"
+            round_node.node.mark_status("running")
             future = executor.submit(
                 exec_callback,
                 round_node.node.code,
@@ -931,9 +925,11 @@ def run():
                 round_item_count=round_node.round_item_count,
                 node_id=round_node.node.id,
                 stage=round_node.node.node_status,
-                parent_id=round_node.node.parent.id
-                if round_node.node.parent is not None
-                else None,
+                parent_id=(
+                    round_node.node.parent.id
+                    if round_node.node.parent is not None
+                    else None
+                ),
             )
             changed = True
         if changed:
@@ -945,6 +941,7 @@ def run():
         task_round_index: int,
         item_index: int,
         item_count: int,
+        scheduled_step: int | None = None,
         speculative: bool = False,
     ) -> bool:
         if remaining_schedule_budget() <= 0:
@@ -953,12 +950,14 @@ def run():
             code="",
             plan="Code generation in progress.",
             parent=task.parent,
-            tag="generating",
             selection_reason=task.selection_reason,
         )
         placeholder.agent_name = workflow_agent.name
-        setattr(placeholder, "_round_index", task_round_index)
-        setattr(placeholder, "_status_started_at", time.monotonic())
+        placeholder.assign_schedule(
+            round_index=task_round_index,
+            scheduled_step=scheduled_step,
+        )
+        placeholder.mark_status("generating", time.monotonic())
         if placeholder.parent is not None:
             placeholder.parent.children.discard(placeholder)
         generating_nodes.append(placeholder)
@@ -968,6 +967,7 @@ def run():
             round_index=task_round_index,
             round_item_index=item_index,
             round_item_count=item_count,
+            scheduled_step=scheduled_step,
             speculative=speculative,
             placeholder_id=placeholder.id,
             stage=placeholder.node_status,
@@ -1003,6 +1003,7 @@ def run():
             "round_index": task_round_index,
             "item_index": item_index,
             "item_count": item_count,
+            "scheduled_step": scheduled_step,
             "speculative": speculative,
         }
         return True
@@ -1045,17 +1046,20 @@ def run():
             node.id = placeholder.id
             node.ctime = placeholder.ctime
             node.agent_name = workflow_agent.name
-            setattr(node, "_round_index", meta["round_index"])
-            node.tag = "generated"
+            node.assign_schedule(
+                round_index=meta["round_index"],
+                scheduled_step=meta.get("scheduled_step"),
+            )
+            node.mark_status("generated")
             if placeholder in generating_nodes:
                 generating_nodes.remove(placeholder)
 
             task = meta["task"]
             if meta["speculative"]:
                 key = task_key(task)
-                speculative_keys_by_round.setdefault(meta["round_index"], set()).discard(
-                    key
-                )
+                speculative_keys_by_round.setdefault(
+                    meta["round_index"], set()
+                ).discard(key)
                 scheduled_keys_by_round.setdefault(meta["round_index"], set()).add(key)
 
             round_node = RoundNode(
@@ -1076,6 +1080,7 @@ def run():
                 round_index=meta["round_index"],
                 round_item_index=meta["item_index"],
                 round_item_count=meta["item_count"],
+                scheduled_step=meta.get("scheduled_step"),
                 speculative=meta["speculative"],
                 node_id=node.id,
                 stage=node.node_status,
@@ -1088,6 +1093,7 @@ def run():
                 round_index=meta["round_index"],
                 round_item_index=meta["item_index"],
                 round_item_count=meta["item_count"],
+                scheduled_step=meta.get("scheduled_step"),
                 speculative=meta["speculative"],
                 node_id=node.id,
                 stage=node.node_status,
@@ -1125,6 +1131,7 @@ def run():
         task_round_index: int,
         item_index: int,
         item_count: int,
+        scheduled_step: int | None = None,
     ) -> bool:
         if task.parent is None:
             return False
@@ -1144,7 +1151,13 @@ def run():
             )
         else:
             node.selection_reason = task.selection_reason
-        node.tag = "generated"
+        node.assign_schedule(
+            round_index=task_round_index,
+            scheduled_step=(
+                scheduled_step if scheduled_step is not None else node.scheduled_step
+            ),
+        )
+        node.mark_status("generated")
         round_node = RoundNode(
             workflow_agent=workflow_agent,
             node=node,
@@ -1160,6 +1173,7 @@ def run():
             round_index=task_round_index,
             round_item_index=item_index,
             round_item_count=item_count,
+            scheduled_step=scheduled_step,
             node_id=node.id,
             stage=node.node_status,
             parent_id=node.parent.id if node.parent is not None else None,
@@ -1173,6 +1187,7 @@ def run():
             round_index=task_round_index,
             round_item_index=item_index,
             round_item_count=item_count,
+            scheduled_step=scheduled_step,
             speculative=False,
             prefetched=True,
             node_id=node.id,
@@ -1228,9 +1243,7 @@ def run():
 
     def in_flight_child_count(parent: Node) -> int:
         return sum(
-            1
-            for node in live_nodes()
-            if node.parent is parent and node.step is None
+            1 for node in live_nodes() if node.parent is parent and node.step is None
         )
 
     def guaranteed_next_round_tasks(
@@ -1243,10 +1256,9 @@ def run():
         if len(journal.draft_nodes) + pending_drafts < search_cfg.max_children_per_node:
             return []
 
-        unavailable_keys = (
-            set(scheduled_keys_by_round.setdefault(next_round_index, set()))
-            | active_speculative_keys(next_round_index)
-        )
+        unavailable_keys = set(
+            scheduled_keys_by_round.setdefault(next_round_index, set())
+        ) | active_speculative_keys(next_round_index)
         improve_candidates = [
             node
             for node in proposal_agent.journal.good_nodes
@@ -1322,7 +1334,7 @@ def run():
             best_node_before=None,
         )
         parsed_node_ids.add(round_node.node.id)
-        round_node.node.tag = "completed"
+        round_node.node.mark_status("completed")
         append_result_for_round_node(round_node)
         refresh_live_tree(log_tree=False)
 
@@ -1330,18 +1342,8 @@ def run():
         node = round_node.node
         if node.id in parsed_node_ids:
             return
-        node.absorb_exec_result(exec_result)
-        node.artifact_report = parse_artifact_report(exec_result.term_out)
-        external_metric = parse_external_validation(exec_result.term_out)
-        if node.exc_type is not None or external_metric is None:
-            node.is_buggy = True
-            node.metric = WorstMetricValue()
-            node.outcome = "bug"
-        else:
-            metric, maximize = external_metric
-            node.is_buggy = False
-            node.metric = MetricValue(metric, maximize=maximize)
-        node.tag = "completed"
+        parse_factual_exec_result(node, exec_result, record_context=False)
+        node.mark_status("completed")
         refresh_live_tree(log_tree=False)
 
     def handle_finished_futures(
@@ -1360,7 +1362,7 @@ def run():
             round_node = future_to_round_node.pop(future)
             exec_result = future.result()
             raw_exec_results.setdefault(round_node.node.id, exec_result)
-            round_node.node.tag = "completed"
+            round_node.node.mark_status("completed")
             preview_exec_result(round_node, exec_result)
             finished_round_nodes.append(round_node)
         if executor is not None:
@@ -1398,7 +1400,7 @@ def run():
         if (
             private_metrics
             or private_error
-            or (private_dir / "private_split_plan.json").is_file()
+            or (private_dir / "private_gt.json").is_file()
         ):
             _append_private_metrics_entry(
                 cfg,
@@ -1426,7 +1428,7 @@ def run():
             round_index=round_node.round_index,
             round_item_index=round_node.round_item_index,
             round_item_count=round_node.round_item_count,
-            step=global_step,
+            step=solution_node.step,
             node_id=solution_node.id,
             best_node_id=best_node.id if best_node is not None else None,
         )
@@ -1475,6 +1477,8 @@ def run():
                 item_count = len(round_nodes_by_round.get(round_index, [])) + len(
                     filtered_tasks
                 )
+                round_start_step_by_round[round_index] = global_step
+                round_item_count_by_round[round_index] = item_count
                 append_event(
                     cfg.log_dir,
                     "round_started",
@@ -1491,12 +1495,18 @@ def run():
                         executor, task, append_round_index=round_index
                     )
                     item_index = len(round_nodes_by_round.get(round_index, [])) + 1
+                    scheduled_step = (
+                        round_start_step_by_round.get(round_index, global_step)
+                        + item_index
+                        - 1
+                    )
                     adopted = adopt_speculative_node(
                         executor,
                         task,
                         round_index,
                         item_index,
                         item_count,
+                        scheduled_step=scheduled_step,
                     )
                     if not adopted:
                         submit_generation_task(
@@ -1505,6 +1515,7 @@ def run():
                             round_index,
                             item_index,
                             item_count,
+                            scheduled_step=scheduled_step,
                             speculative=False,
                         )
                     handle_scheduler_events(
@@ -1519,9 +1530,10 @@ def run():
                     logger.info("No round tasks selected; stopping the run.")
                     break
 
-                while not round_ready_to_commit(
-                    round_index
-                ) and not total_timer.is_timeout():
+                while (
+                    not round_ready_to_commit(round_index)
+                    and not total_timer.is_timeout()
+                ):
                     submit_ready_nodes(executor)
                     next_round_index = round_index + 1
                     guaranteed_tasks = guaranteed_next_round_tasks(
@@ -1546,12 +1558,20 @@ def run():
                             item_index,
                             cfg.agent.search.topk_improve + len(guaranteed_tasks),
                         )
+                        next_round_start_step = round_start_step_by_round.get(
+                            round_index, global_step
+                        ) + round_item_count_by_round.get(
+                            round_index,
+                            len(round_nodes_by_round.get(round_index, [])),
+                        )
+                        scheduled_step = next_round_start_step + item_index - 1
                         submitted = submit_generation_task(
                             generation_executor,
                             task,
                             next_round_index,
                             item_index,
                             item_count,
+                            scheduled_step=scheduled_step,
                             speculative=True,
                         )
                         if not submitted:
@@ -1585,7 +1605,60 @@ def run():
                 live_tree_display.stop()
         generation_executor.shutdown(wait=True)
         executor.shutdown(wait=True)
-    interpreter.cleanup_session()
+    best_node = journal.get_best_node(only_good=True)
+    if cfg.final_retrain.enabled and best_node is not None and not end_with_exception:
+        retrain_timeout = cfg.final_retrain.timeout or cfg.exec.timeout
+        append_event(
+            cfg.log_dir,
+            "final_retrain_started",
+            node_id=best_node.id,
+            node_step=best_node.step,
+            timeout_seconds=retrain_timeout,
+        )
+        retrain_result = run_final_retrain(
+            cfg,
+            best_node,
+            private_dir,
+            timeout=retrain_timeout,
+        )
+        append_event(
+            cfg.log_dir,
+            "final_retrain_finished",
+            ok=retrain_result.ok,
+            workspace_dir=str(retrain_result.workspace_dir),
+            train_rows_before=retrain_result.train_rows_before,
+            score_rows_added=retrain_result.score_rows_added,
+            train_rows_after=retrain_result.train_rows_after,
+            private_metrics=retrain_result.private_metrics,
+            error=retrain_result.error,
+        )
+        _append_private_metrics_entry(
+            cfg,
+            {
+                "workflow_step": global_step,
+                "node_step": best_node.step,
+                "node_id": best_node.id,
+                "parent_id": (
+                    best_node.parent.id if best_node.parent is not None else None
+                ),
+                "stage": "final_retrain",
+                "is_buggy": not retrain_result.ok,
+                "outcome": (
+                    "final_retrain" if retrain_result.ok else "final_retrain_failed"
+                ),
+                "metric": _metric_payload(best_node),
+                "is_current_best": True,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "private_metrics_available": retrain_result.private_metrics is not None,
+                "private_metrics": retrain_result.private_metrics,
+                "private_error": retrain_result.error,
+                "train_rows_before": retrain_result.train_rows_before,
+                "score_rows_added": retrain_result.score_rows_added,
+                "train_rows_after": retrain_result.train_rows_after,
+            },
+        )
+    elif cfg.final_retrain.enabled and best_node is None and not end_with_exception:
+        append_event(cfg.log_dir, "final_retrain_skipped", reason="no_best_node")
     append_event(cfg.log_dir, "run_finished", completed_steps=global_step)
     agent_loop_exit_handler(end_with_exception=end_with_exception)
 

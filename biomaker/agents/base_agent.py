@@ -3,15 +3,17 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable, cast
 
-import humanize
-
 from ..backend import compile_prompt_to_md, query
 from ..interpreter import ExecutionResult
 from ..journal import Journal, Node
-from ..utils import data_preview
+from ..utils import data_summary
 from ..utils.config import Config
 from ..utils.events import append_event
-from ..utils.evaluator_setup import parse_artifact_report, parse_external_validation
+from ..utils.evaluator_setup import (
+    parse_artifact_report,
+    parse_external_validation,
+    parse_external_validation_details,
+)
 from ..utils.environment import environment_manifest_text
 from ..utils.metric import MetricValue, WorstMetricValue
 from ..utils.response import (
@@ -24,10 +26,38 @@ from ..utils.response import (
 logger = logging.getLogger("biomaker")
 ExecCallbackType = Callable[..., ExecutionResult]
 
+
 @dataclass(frozen=True)
 class RoundTask:
     parent: Node | None
     selection_reason: str
+
+
+def parse_factual_exec_result(
+    node: Node,
+    exec_result: ExecutionResult,
+    *,
+    best_node_before: Node | None = None,
+    record_context: bool = False,
+) -> None:
+    """Parse factual execution/evaluator output into a node."""
+    node.absorb_exec_result(exec_result)
+    node.evaluator_details = parse_external_validation_details(exec_result.term_out)
+    node.artifact_report = parse_artifact_report(exec_result.term_out)
+
+    external_metric = parse_external_validation(exec_result.term_out)
+    node.analysis = ""
+    node.is_buggy = node.exc_type is not None or external_metric is None
+    if node.is_buggy:
+        node.metric = WorstMetricValue()
+        if not record_context:
+            node.outcome = "bug"
+    else:
+        metric, maximize = external_metric
+        node.metric = MetricValue(metric, maximize=maximize)
+
+    if record_context:
+        node.record_experiment_context(best_node_before=best_node_before)
 
 
 def _estimated_tokens(text: str) -> int:
@@ -50,8 +80,7 @@ class BaseAgent:
         self.cfg = cfg
         self.acfg = cfg.agent
         self.journal = journal
-        self.data_preview: str | None = None
-        self.run_facts: str | None = None
+        self.data_summary: str | None = None
         self._last_selection_reason: str | None = None
         self.environment_facts = environment_manifest_text(
             include_medical=self.cfg.exec.include_medical_packages
@@ -182,7 +211,8 @@ class BaseAgent:
             "Do not import unlisted third-party packages, and do not install packages.",
             "You may use pretrained model weights from installed libraries when useful, including downloading those weights at runtime. Do not install packages or modify the uv environment.",
             "Use observed validation metric, runtime, and resource history when deciding training budget; if you change the budget, make it an explicit part of the proposed experiment.",
-            f"The per-node execution timeout is a hard safety limit of {humanize.naturaldelta(self.cfg.exec.timeout)}, not a target budget. Choose the experiment scale from the task, data, observed validation metric, runtime, and resource history.",
+            "When relevant, consider reducing execution time and improving GPU utilization while preserving validation quality.",
+            "The per-node execution timeout is a hard safety limit, not a target budget. Choose the experiment scale from the task, data, observed validation metric, runtime, and resource history.",
             'All the provided input data is stored in "./input" directory.',
             "When building data loading code, base it on the actual existing data files rather than relying entirely on the annotation file.",
             "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` for score-validation predictions and `./working/submission.csv`.",
@@ -285,50 +315,42 @@ class BaseAgent:
         """Return the execution output in the form shown to debug prompts."""
         return wrap_code(node.term_out, lang="")
 
-    def update_data_preview(self):
-        self.data_preview = data_preview.generate(self.cfg.workspace_dir, max_chars=None)
-        self.run_facts = data_preview.biomaker_essentials(self.cfg.workspace_dir)
+    def update_data_summary(self):
+        self.data_summary = data_summary.data_and_evaluation_summary(
+            self.cfg.workspace_dir,
+            max_chars=None,
+        )
 
-    def get_run_facts(self) -> str:
-        """Return deterministic task facts that should be stable for the whole run."""
-        if self.run_facts is None:
-            self.run_facts = data_preview.biomaker_essentials(self.cfg.workspace_dir)
-        return self.run_facts
+    def get_data_summary(self) -> str:
+        """Return deterministic data/evaluator facts that are stable for the run."""
+        if self.data_summary is None:
+            self.update_data_summary()
+        return self.data_summary or ""
 
-    def attach_data_overview(
+    def attach_data_summary(
         self,
         prompt: dict,
         max_chars: int | None = None,
         essentials_first: bool = False,
     ) -> None:
-        if self.acfg.data_preview and self.data_preview:
-            overview = self.data_preview
-            if essentials_first and max_chars is not None:
-                essentials = self.get_run_facts()
-                if essentials:
-                    remaining = max_chars - len(essentials) - 80
-                    if remaining > 300:
-                        excerpt_source = self.data_preview.replace(essentials, "", 1).strip()
-                        overview = (
-                            essentials
-                            + "\n\nAdditional dataset preview excerpt:\n"
-                            + truncate_text(
-                                excerpt_source,
-                                max_chars=remaining,
-                                marker="data overview excerpt trimmed",
-                            )
-                        )
-                    else:
-                        overview = essentials
-            prompt["Data Overview"] = (
-                truncate_text(
-                    overview,
-                    max_chars=max_chars,
-                    marker="data overview trimmed",
-                )
-                if max_chars is not None
-                else overview
+        if not self.acfg.data_summary:
+            return
+        if self.data_summary is None:
+            self.data_summary = data_summary.data_and_evaluation_summary(
+                self.cfg.workspace_dir,
+                max_chars=None,
             )
+        if not self.data_summary:
+            return
+        prompt["Data and Evaluation Summary"] = (
+            truncate_text(
+                self.data_summary,
+                max_chars=max_chars,
+                marker="data and evaluation summary trimmed",
+            )
+            if max_chars is not None
+            else self.data_summary
+        )
 
     def parse_exec_result(
         self,
@@ -338,23 +360,14 @@ class BaseAgent:
     ):
         """Parse factual execution results and evaluator output for a node."""
         logger.debug(f"Agent is parsing execution results for node {node.id}")
-
-        node.absorb_exec_result(exec_result)
-        external_metric = parse_external_validation(exec_result.term_out)
-        artifact_report = parse_artifact_report(exec_result.term_out)
-        node.artifact_report = artifact_report
-
-        node.analysis = ""
-        node.is_buggy = node.exc_type is not None or external_metric is None
-
-        if node.is_buggy:
-            node.metric = WorstMetricValue()
-        else:
-            metric, maximize = external_metric
-            node.metric = MetricValue(metric, maximize=maximize)
         if best_node_before is None:
             best_node_before = self.journal.get_best_node(only_good=True, topk=1)
-        node.record_experiment_context(best_node_before=best_node_before)
+        parse_factual_exec_result(
+            node,
+            exec_result,
+            best_node_before=best_node_before,
+            record_context=True,
+        )
         append_event(
             self.cfg.log_dir,
             "node_evaluated",

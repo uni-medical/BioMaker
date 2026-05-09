@@ -110,7 +110,7 @@ const renderDetailRecords = (text) => {
 };
 
 const isNodeDetailRecord = (record) =>
-  /^Node\s+[0-9a-fA-F]+\s+full record/.test(String(record || ""));
+  /^Node\s+[0-9a-fA-F]+(?:\s+full record|\s+·)/.test(String(record || ""));
 
 const lineageRole = (distanceFromParent) => {
   if (distanceFromParent === 0) return "parent";
@@ -127,7 +127,9 @@ const detailRecordRoles = (records) => {
   const siblingStart = records.findIndex((record) =>
     String(record || "").startsWith("Existing Children") ||
       String(record || "").startsWith("Existing Root Drafts") ||
-      String(record || "").startsWith("Siblings of the Buggy Parent"),
+      String(record || "").startsWith("Siblings of the Buggy Parent") ||
+      String(record || "").startsWith("Same-Round") ||
+      String(record || "").startsWith("Same-Parent"),
   );
 
   if (lineageStart >= 0) {
@@ -189,7 +191,7 @@ const renderDetailRecordBody = (record) => {
 
 const parseNodeDetailRecord = (record) => {
   const text = String(record || "");
-  if (!/^Node\s+[0-9a-fA-F]+\s+full record/.test(text)) return null;
+  if (!/^Node\s+[0-9a-fA-F]+(?:\s+full record|\s+·)/.test(text)) return null;
   const outputCheckMarker = "\n\nOutput Check:\n";
   const planMarker = "\n\nPlan:\n";
   const outputCheckStart = text.indexOf(outputCheckMarker);
@@ -230,7 +232,7 @@ const parseNodeDetailRecord = (record) => {
 const detailRecordSummary = (record, index, role = "") => {
   const lines = String(record || "").split("\n");
   const firstLine = lines.find((line) => line.trim()) || `Detail record ${index + 1}`;
-  const nodeMatch = firstLine.match(/^Node\s+([0-9a-fA-F]+)\s+full record/);
+  const nodeMatch = firstLine.match(/^Node\s+([0-9a-fA-F]+)(?:\s+full record|\s+·)?/);
   if (!nodeMatch) return firstLine;
 
   const fields = {};
@@ -239,14 +241,30 @@ const detailRecordSummary = (record, index, role = "") => {
     if (match) fields[match[1]] = match[2];
   }
   const nodeId = fields.node_id || nodeMatch[1];
-  const step = fields.step && fields.step !== "None" ? fields.step : "pending";
-  const parts = [`Node ${nodeId}`, `Step ${step}`];
+  const firstLineParts = firstLine.split(" · ").map((part) => part.trim()).filter(Boolean);
+  const parts =
+    firstLineParts.length > 1
+      ? firstLineParts
+      : [`Node ${nodeId}`, detailRecordStepLabel(fields.step, fields.result)];
   if (role) parts.push(role);
   const valMetric = fields.val_metric || fields.metric;
   if (valMetric && valMetric !== "n/a") {
     parts.push(`val metric ${formatMetric(valMetric)}`);
   }
   return parts.join(" · ");
+};
+
+const detailRecordStepLabel = (step, result) => {
+  const normalized = String(step ?? "").trim();
+  if (normalized && normalized !== "None") {
+    if (normalized === "generated_not_scored") return "generated, not scored";
+    if (normalized === "generating") return "generating";
+    return `Step ${normalized}`;
+  }
+  const resultText = String(result ?? "").trim();
+  if (resultText === "generated_not_scored_yet") return "generated, not scored";
+  if (resultText === "generation_in_progress") return "generating";
+  return "not scored";
 };
 
 const renderPromptDetails = (treeInd) => {

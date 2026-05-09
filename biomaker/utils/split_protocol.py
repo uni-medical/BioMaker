@@ -1,4 +1,4 @@
-"""Deterministic dataset inspection and split planning."""
+"""Agentic dataset observation and split preparation."""
 
 from __future__ import annotations
 
@@ -10,51 +10,11 @@ from typing import Any
 
 import pandas as pd
 
-ID_CANDIDATES = ["patient", "patient_id", "case", "case_id", "study", "Id", "id"]
-METADATA_TABLE_CANDIDATES = [
-    "metadata.csv",
-    "labels.csv",
-    "label.csv",
-    "annotations.csv",
-    "annotation.csv",
-]
-LABEL_CANDIDATES = [
-    "label",
-    "class",
-    "target",
-    "diagnosis",
-    "category",
-    "grade",
-    "finding",
-    "y",
-    "mask_path",
-]
-PATH_CANDIDATES = [
-    "path",
-    "image_path",
-    "data_path",
-    "volume_path",
-    "filename",
-    "file_path",
-    "filepath",
-]
-MASK_CANDIDATES = ["mask_path", "mask", "label_path"]
-GROUP_CANDIDATES = ["patient", "patient_id", "case", "case_id", "study"]
-PRIVATE_TEST_COLUMN_TOKENS = [
-    "annotation",
-    "ground_truth",
-    "gt",
-    "instance",
-    "label",
-    "mask",
-    "overlap",
-    "target",
-    "category",
-    "grade",
-    "finding",
-]
-SCORE_VAL_PUBLIC_FILENAME = "score_val.csv"
-SCORE_VAL_TRUTH_FILENAME = "score_val_truth.csv"
+from .agentic_data_planner import (
+    build_dataset_facts,
+    run_agentic_split_builder_probe,
+    split_builder_cache_key,
+)
 
 
 @dataclass(frozen=True)
@@ -64,625 +24,456 @@ class SplitProtocol:
     prompt_text: str
 
 
-def _read_table(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path)
-
-
-def _first_existing(columns: list[str], candidates: list[str]) -> str | None:
-    lower_to_original = {column.lower(): column for column in columns}
-    for candidate in candidates:
-        if candidate.lower() in lower_to_original:
-            return lower_to_original[candidate.lower()]
-    return None
-
-
-def _table_summary(path: Path, input_dir: Path) -> dict[str, Any]:
-    df = _read_table(path)
-    columns = list(df.columns)
-    label_column = _first_existing(columns, LABEL_CANDIDATES)
-    summary: dict[str, Any] = {
-        "path": str(path.relative_to(input_dir)),
-        "rows": len(df),
-        "columns": columns,
-        "id_column": _first_existing(columns, ID_CANDIDATES),
-        "label_column": label_column,
-        "path_column": _first_existing(columns, PATH_CANDIDATES),
-        "mask_column": _first_existing(columns, MASK_CANDIDATES),
-        "group_column": _first_existing(columns, GROUP_CANDIDATES),
-    }
-    if label_column and df[label_column].nunique(dropna=True) <= 30:
-        counts = df[label_column].value_counts(dropna=False).head(30)
-        summary["label_distribution"] = {
-            str(label): int(count) for label, count in counts.items()
-        }
-    return summary
-
-
-def inspect_dataset(input_dir: Path | str) -> dict[str, Any]:
-    input_dir = Path(input_dir)
-    table_paths = sorted(input_dir.rglob("*.csv"))
-    tables = {}
-    for path in table_paths:
-        if "biomaker_splits" in path.parts or not path.exists():
-            continue
-        try:
-            tables[str(path.relative_to(input_dir))] = _table_summary(path, input_dir)
-        except Exception as exc:
-            tables[str(path.relative_to(input_dir))] = {
-                "path": str(path.relative_to(input_dir)),
-                "error": str(exc),
-            }
-    return {"tables": tables}
-
-
-def _candidate_table(input_dir: Path, *names: str) -> Path | None:
-    for name in names:
-        path = input_dir / name
-        if path.is_file():
-            return path
-    for name in names:
-        parts = Path(name).parts
-        if len(parts) < 2:
-            continue
-        for path in sorted(input_dir.rglob(parts[-1])):
-            if "biomaker_splits" in path.parts or not path.is_file():
-                continue
-            if path.parts[-len(parts) :] == parts:
-                return path
-    return None
-
-
-def _split_dataframe(
-    df: pd.DataFrame,
-    label_column: str | None,
-    group_column: str | None,
-    val_fraction: float = 0.2,
-    seed: int = 42,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    diagnostics: dict[str, Any] = {"seed": seed, "val_fraction": val_fraction}
-
-    if (
-        group_column
-        and group_column in df.columns
-        and df[group_column].nunique() > 1
-        and df[group_column].nunique() < len(df)
-    ):
-        groups = pd.Series(df[group_column].dropna().unique()).sample(
-            frac=1.0, random_state=seed
-        )
-        n_val_groups = max(1, int(round(len(groups) * val_fraction)))
-        val_groups = set(groups.iloc[:n_val_groups])
-        val_mask = df[group_column].isin(val_groups)
-        diagnostics["grouped_by"] = group_column
-        return df[~val_mask].copy(), df[val_mask].copy(), diagnostics
-
-    if (
-        label_column
-        and label_column in df.columns
-        and df[label_column].nunique(dropna=True) > 1
-        and df[label_column].value_counts().min() >= 2
-    ):
-        try:
-            from sklearn.model_selection import train_test_split
-
-            train_df, val_df = train_test_split(
-                df,
-                test_size=val_fraction,
-                random_state=seed,
-                stratify=df[label_column],
-            )
-            diagnostics["stratified_by"] = label_column
-            return train_df.copy(), val_df.copy(), diagnostics
-        except Exception as exc:
-            diagnostics["warnings"] = [f"Stratified split failed: {exc}"]
-
-    val_df = df.sample(frac=val_fraction, random_state=seed)
-    train_df = df.drop(val_df.index)
-    diagnostics["random_split"] = True
-    return train_df.copy(), val_df.copy(), diagnostics
-
-
-def _sanitize_test_table(
-    df: pd.DataFrame, label_column: str | None, mask_column: str | None
-) -> pd.DataFrame:
-    private_columns = {column for column in [label_column, mask_column] if column}
-    for column in df.columns:
-        normalized = column.lower()
-        if any(token in normalized for token in PRIVATE_TEST_COLUMN_TOKENS):
-            private_columns.add(column)
-    keep_columns = [column for column in df.columns if column not in private_columns]
-    return df[keep_columns].copy()
-
-
-def _sanitize_score_table(
-    df: pd.DataFrame, label_column: str | None, mask_column: str | None
-) -> pd.DataFrame:
-    return _sanitize_test_table(df, label_column, mask_column)
-
-
-def _copy_private_truth(
-    input_dir: Path,
-    private_dir: Path,
-    test_source: Path,
-    test_df: pd.DataFrame,
-    test_mask_column: str | None,
-) -> None:
-    source_rel = test_source.relative_to(input_dir)
-    private_source = private_dir / source_rel
-    private_source.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(test_source, private_source)
-
-    if not test_mask_column or test_mask_column not in test_df.columns:
-        return
-
-    for value in test_df[test_mask_column].dropna():
-        mask_rel = _path_value_to_relative_path(str(value))
-        if mask_rel.is_absolute():
-            matches = [mask_rel] if mask_rel.is_file() else []
-            private_mask = private_dir / mask_rel.name
-        else:
-            matches = _observe_existing_paths(str(value), input_dir, test_source.parent)
-            if mask_rel.parts and mask_rel.parts[0] == "input":
-                private_mask = private_dir / Path(*mask_rel.parts[1:])
-            else:
-                private_mask = private_dir / mask_rel
-        if len(matches) != 1:
-            continue
-        mask_path = matches[0]
-        if not mask_path.is_file():
-            continue
-        private_mask.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(mask_path, private_mask)
-
-
-def _is_private_test_child(path: Path, test_source: Path) -> bool:
-    name = path.name.lower()
-    if path.name == test_source.name:
-        return True
-    return any(token in name for token in PRIVATE_TEST_COLUMN_TOKENS)
-
-
-def _replace_symlinked_test_dir_with_visible_view(
-    test_dir: Path, test_source: Path, visible_test_df: pd.DataFrame
-) -> None:
-    original_dir = test_dir.resolve()
-    metadata_name = test_source.name
-    test_dir.unlink()
-    test_dir.mkdir(parents=True, exist_ok=True)
-
-    for child in original_dir.iterdir():
-        if _is_private_test_child(child, test_source):
-            continue
-        target = test_dir / child.name
-        target.symlink_to(child)
-
-    visible_test_df.to_csv(test_dir / metadata_name, index=False)
-
-
-def _sanitize_private_test_view(
-    input_dir: Path, test_source: Path, visible_test_df: pd.DataFrame
-) -> None:
-    """Hide private test labels from the agent-visible input tree."""
-    if test_source.parent != input_dir and test_source.parent.is_symlink():
-        _replace_symlinked_test_dir_with_visible_view(
-            test_source.parent, test_source, visible_test_df
-        )
-        return
-
-    if test_source.is_symlink():
-        test_source.unlink()
-    visible_test_df.to_csv(test_source, index=False)
-
-    test_dir = test_source.parent
-    if test_dir == input_dir:
-        return
-    for child in list(test_dir.iterdir()):
-        if child == test_source:
-            continue
-        if _is_private_test_child(child, test_source):
-            if child.is_symlink() or child.is_file():
-                child.unlink()
-            elif child.is_dir():
-                shutil.rmtree(child)
-
-
-def _remove_private_workspace_dir(input_dir: Path) -> None:
-    private_dir = input_dir.parent / "private"
-    if private_dir.is_dir():
-        shutil.rmtree(private_dir)
-    score_dir = input_dir.parent / "_score_truth"
-    if score_dir.is_dir():
-        shutil.rmtree(score_dir)
-
-
-def _path_suffix_matches(path: Path, suffix: Path) -> bool:
-    suffix_parts = suffix.parts
-    if not suffix_parts or len(suffix_parts) > len(path.parts):
-        return False
-    return path.parts[-len(suffix_parts) :] == suffix_parts
-
-
-def _path_value_to_relative_path(value: str) -> Path:
-    text = value.strip().removeprefix("./")
-    if "\\" in text and not Path(text).is_absolute():
-        text = text.replace("\\", "/")
-    return Path(text)
-
-
-def _observe_existing_paths(value: str, input_dir: Path, base_dir: Path | None) -> list[Path]:
-    normalized = _path_value_to_relative_path(value)
-    if normalized.parts and normalized.parts[0] == "input":
-        direct_bases = [input_dir.parent]
-    else:
-        direct_bases = [input_dir]
-        if base_dir is not None and base_dir != input_dir:
-            direct_bases.append(base_dir)
-
-    matches: dict[str, Path] = {}
-    for base in direct_bases:
-        candidate = base / normalized
-        if candidate.exists():
-            matches[str(candidate.resolve())] = candidate
-
-    if matches or not normalized.parts:
-        return list(matches.values())
-
-    name = normalized.name
-    for candidate in input_dir.rglob(name):
-        if "biomaker_splits" in candidate.parts or not candidate.exists():
-            continue
-        try:
-            relative = candidate.relative_to(input_dir)
-        except ValueError:
-            continue
-        if _path_suffix_matches(relative, normalized):
-            matches[str(candidate.resolve())] = candidate
-    return list(matches.values())
-
-
-def _record_path_warning(
-    warnings: list[str] | None,
-    seen: set[str] | None,
-    message: str,
-) -> None:
-    if warnings is None or seen is None or message in seen:
-        return
-    seen.add(message)
-    warnings.append(message)
-
-
-def _as_workspace_absolute(
-    value: Any,
-    input_dir: Path,
-    base_dir: Path | None,
-    column: str | None = None,
-    warnings: list[str] | None = None,
-    seen_warnings: set[str] | None = None,
-) -> Any:
-    if not isinstance(value, str) or not value.strip():
-        return value
-    path = Path(value)
-    if path.is_absolute():
-        if not path.exists():
-            _record_path_warning(
-                warnings,
-                seen_warnings,
-                f"Path value in `{column or 'unknown'}` does not exist: `{value}`.",
-            )
-        return value
-
-    matches = _observe_existing_paths(value, input_dir, base_dir)
-    if len(matches) == 1:
-        return str(matches[0])
-    if len(matches) > 1:
-        _record_path_warning(
-            warnings,
-            seen_warnings,
-            f"Path value in `{column or 'unknown'}` is ambiguous and was left unchanged: `{value}`.",
-        )
-        return value
-
-    _record_path_warning(
-        warnings,
-        seen_warnings,
-        f"Path value in `{column or 'unknown'}` could not be grounded to an existing file and was left unchanged: `{value}`.",
-    )
-    return value
-
-
-def _normalize_agent_paths(
-    df: pd.DataFrame,
-    input_dir: Path,
-    path_column: str | None,
-    mask_column: str | None,
-    base_dir: Path | None = None,
-    warnings: list[str] | None = None,
-) -> pd.DataFrame:
-    df = df.copy()
-    seen_warnings: set[str] = set()
-    for column in {path_column, mask_column}:
-        if column and column in df.columns:
-            df[column] = df[column].map(
-                lambda value: _as_workspace_absolute(
-                    value,
-                    input_dir,
-                    base_dir,
-                    column=column,
-                    warnings=warnings,
-                    seen_warnings=seen_warnings,
-                )
-            )
-    return df
-
-
-def _write_csv(df: pd.DataFrame, path: Path) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
-    return str(path)
-
-
-def _relative(path: Path, input_dir: Path) -> str:
-    return str(path.relative_to(input_dir))
-
-
 def _render_prompt(split_plan: dict[str, Any]) -> str:
-    lines = [
-        "Use the BioMaker split protocol below. Treat it as the source of truth for this run."
-    ]
     agent_visible = split_plan.get("agent_visible", {})
+    private_gt = split_plan.get("private_gt", {})
+    lines = ["Use the BioMaker data split below as the source of truth for this run."]
     train_path = agent_visible.get("train")
     score_path = agent_visible.get("score_val")
-    if train_path and score_path:
-        lines.extend(
-            [
-                f"- Use `./input/{train_path}` as the only labeled agent-visible training table. Candidate code may create its own internal holdout, OOF, CV, calibration, or stacking scheme from this training table.",
-                f"- Generate `./working/validation_predictions.csv` for every row in `./input/{score_path}`. This score split is used by BioMaker to score and select nodes; it intentionally has no labels in the agent workspace and must not be used for training, calibration, model selection, debugging, or metric reporting by generated code.",
-            ]
-        )
-    else:
-        lines.append(
-            "- No deterministic train/score CSV split was inferred. Inspect the input folder and create any needed development split from training-eligible data only."
-        )
     test_path = agent_visible.get("test")
+    if train_path:
+        lines.append(
+            f"- Use `./input/{train_path}` as the only agent-visible training table."
+        )
+    if score_path:
+        lines.append(
+            f"- Generate validation predictions for every row in `./input/{score_path}`. "
+            "This score split is used by BioMaker to score and select nodes. Its answers are hidden from generated code and must not be used for training, calibration, model selection, debugging, or metric reporting."
+        )
     if test_path:
         lines.append(
             f"- Use `./input/{test_path}` only to generate `./working/submission.csv`; do not use it for training, model selection, debugging, or metric reporting."
         )
-    for private_eval in split_plan.get("private_evaluation", []):
-        lines.append(
-            "- Private evaluation exists for user inspection only. Do not read private labels or report private metrics to the agent-visible validation output."
-        )
-        if private_eval.get("source"):
+    score_gt = private_gt.get("score_val") if isinstance(private_gt, dict) else None
+    if isinstance(score_gt, dict):
+        answers = score_gt.get("answer_columns") or []
+        if answers:
             lines.append(
-                f"  Private source retained outside the agent metric: `{private_eval['source']}`."
+                "- Hidden score-validation answer columns are held outside the agent workspace: "
+                + ", ".join(f"`{column}`" for column in answers)
+                + "."
             )
-    for warning in split_plan.get("warnings", []):
+    test_gt = private_gt.get("test") if isinstance(private_gt, dict) else None
+    if isinstance(test_gt, dict):
+        answers = test_gt.get("answer_columns") or []
+        if answers:
+            lines.append(
+                "- Private test answers are held outside the agent workspace for user-only evaluation: "
+                + ", ".join(f"`{column}`" for column in answers)
+                + "."
+            )
+    for warning in split_plan.get("warnings", []) or []:
         lines.append(f"- Warning: {warning}")
-    if split_plan.get("columns", {}).get("mask"):
-        lines.append(
-            "- A mask column is present in labeled agent-visible rows. Treat masks as task-provided labels or auxiliary training information only when useful; follow the task description and frozen evaluator for the required metric and prediction artifact format."
-        )
     return "\n".join(lines)
 
 
-def prepare_split_protocol(
-    input_dir: Path | str, private_dir: Path | str | None = None
-) -> SplitProtocol:
-    input_dir = Path(input_dir)
-    split_dir = input_dir / "biomaker_splits"
-    if split_dir.is_dir():
-        shutil.rmtree(split_dir)
-    split_dir.mkdir(parents=True, exist_ok=True)
-    _remove_private_workspace_dir(input_dir)
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
 
-    dataset_report = inspect_dataset(input_dir)
-    warnings: list[str] = []
-    private_evaluation: list[dict[str, Any]] = []
-    private_plan: dict[str, Any] = {"version": 1, "private_evaluation": []}
-    private_dir = (
-        Path(private_dir)
-        if private_dir is not None
-        else input_dir.parent.parent / "_private_truth" / input_dir.parent.name
-    )
-    if private_dir.is_dir():
-        shutil.rmtree(private_dir)
 
-    train_source = _candidate_table(input_dir, "train.csv", "train/metadata.csv")
-    val_source = _candidate_table(
-        input_dir, "val.csv", "validation.csv", "val/metadata.csv"
-    )
-    test_source = _candidate_table(input_dir, "test.csv", "test/metadata.csv")
-    metadata_source = _candidate_table(input_dir, *METADATA_TABLE_CANDIDATES)
+def _copytree_replace(src: Path, dst: Path) -> None:
+    _remove_path(dst)
+    shutil.copytree(src, dst)
 
-    source_for_split = train_source or metadata_source
-    if source_for_split is None:
-        split_plan = {
-            "version": 1,
-            "strategy": "not_inferred",
-            "agent_visible": {},
-            "private_evaluation": [],
-            "warnings": [
-                "No train.csv, train/metadata.csv, or metadata.csv found. Agent must infer data loading from the raw files."
-            ],
-        }
+
+def _looks_like_path(value: str) -> bool:
+    suffixes = {
+        ".csv",
+        ".json",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".tif",
+        ".tiff",
+        ".nii",
+        ".nii.gz",
+        ".dcm",
+        ".xml",
+        ".txt",
+    }
+    lowered = value.lower()
+    return "/" in value or "\\" in value or any(lowered.endswith(suffix) for suffix in suffixes)
+
+
+def _workspace_relative_input_path(value: Any, input_dir: Path) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or not _looks_like_path(text):
+        return None
+
+    raw = Path(text)
+    if not raw.is_absolute():
+        parts = raw.parts
+        if parts and parts[0] == "input":
+            return str(raw)
+        if (input_dir / raw).exists() or raw.parts:
+            return str(Path("input") / raw)
+        return None
+
+    try:
+        return str(Path("input") / raw.relative_to(input_dir))
+    except ValueError:
+        pass
+
+    try:
+        resolved = raw.resolve()
+    except Exception:
+        resolved = raw
+    for child in input_dir.iterdir():
+        if not child.exists():
+            continue
+        try:
+            rel = resolved.relative_to(child.resolve())
+        except Exception:
+            continue
+        return str(Path("input") / child.name / rel)
+    return None
+
+
+def _normalize_split_paths_in_dir(csv_dir: Path, input_dir: Path) -> None:
+    if not csv_dir.is_dir():
+        return
+    for csv_path in sorted(csv_dir.glob("*.csv")):
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception:
+            continue
+        changed = False
+        for column in df.columns:
+            if df[column].dtype != object:
+                continue
+            normalized = []
+            column_changed = False
+            for value in df[column].tolist():
+                replacement = _workspace_relative_input_path(value, input_dir)
+                if replacement is not None:
+                    normalized.append(replacement)
+                    column_changed = column_changed or replacement != value
+                else:
+                    normalized.append(value)
+            if column_changed:
+                df[column] = normalized
+                changed = True
+        if changed:
+            df.to_csv(csv_path, index=False)
+
+
+def _evaluator_visible_path(value: Any, input_dir: Path) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or not _looks_like_path(text):
+        return None
+    raw = Path(text)
+    candidates: list[Path]
+    if raw.is_absolute():
+        candidates = [raw]
     else:
-        train_summary = _table_summary(source_for_split, input_dir)
-        label_column = train_summary.get("label_column")
-        mask_column = train_summary.get("mask_column")
-        group_column = train_summary.get("group_column")
+        candidates = [input_dir / raw]
+        if raw.parts and raw.parts[0] == "input":
+            candidates.append(input_dir.parent / raw)
+            if len(raw.parts) > 1:
+                candidates.append(input_dir / Path(*raw.parts[1:]))
+    for candidate in candidates:
+        if candidate.exists():
+            try:
+                return str(candidate.resolve())
+            except Exception:
+                return str(candidate)
+    return None
 
-        if train_source and val_source:
-            strategy = "official_val_as_hidden_score"
-            val_summary = _table_summary(val_source, input_dir)
-            train_source_df = _read_table(train_source)
-            train_df = train_source_df.copy()
-            score_val_df = _read_table(val_source)
-            train_base_dir = train_source.parent
-            score_base_dir = val_source.parent
-            score_path_column = val_summary.get("path_column") or train_summary.get(
-                "path_column"
-            )
-            score_mask_column = val_summary.get("mask_column") or train_summary.get(
-                "mask_column"
-            )
-            score_label_column = val_summary.get("label_column") or label_column
-            split_diagnostics: dict[str, Any] = {}
+
+def _make_private_paths_evaluator_visible(csv_dir: Path, input_dir: Path) -> None:
+    if not csv_dir.is_dir():
+        return
+    for csv_path in sorted(csv_dir.glob("*.csv")):
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception:
+            continue
+        changed = False
+        for column in df.columns:
+            if df[column].dtype != object:
+                continue
+            values = []
+            column_changed = False
+            for value in df[column].tolist():
+                replacement = _evaluator_visible_path(value, input_dir)
+                if replacement is not None:
+                    values.append(replacement)
+                    column_changed = column_changed or replacement != value
+                else:
+                    values.append(value)
+            if column_changed:
+                df[column] = values
+                changed = True
+        if changed:
+            df.to_csv(csv_path, index=False)
+
+
+def _collect_private_file_answers(input_dir: Path, private_dir: Path) -> set[Path]:
+    manifest_path = private_dir / "private_gt.json"
+    if not manifest_path.is_file():
+        return set()
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if not isinstance(manifest, dict):
+        return set()
+
+    hidden_paths: set[Path] = set()
+    for split_name, entry in manifest.items():
+        if not isinstance(entry, dict):
+            continue
+        answer_columns = [str(column) for column in entry.get("answer_columns", [])]
+        if not answer_columns:
+            continue
+        csv_name = "score_val.csv" if split_name == "score_val" else "test.csv"
+        csv_path = private_dir / csv_name
+        if not csv_path.is_file():
+            continue
+        try:
+            import pandas as pd
+
+            df = pd.read_csv(csv_path, usecols=lambda column: column in answer_columns)
+        except Exception:
+            continue
+        for column in answer_columns:
+            if column not in df.columns:
+                continue
+            for raw_value in df[column].dropna().astype(str):
+                value = raw_value.strip()
+                if not value or not _looks_like_path(value):
+                    continue
+                rel = Path(value)
+                if rel.is_absolute():
+                    try:
+                        rel = rel.resolve().relative_to(input_dir.resolve())
+                    except Exception:
+                        mapped_rel = None
+                        try:
+                            resolved = rel.resolve()
+                        except Exception:
+                            resolved = rel
+                        for child in input_dir.iterdir():
+                            if not child.exists():
+                                continue
+                            try:
+                                subrel = resolved.relative_to(child.resolve())
+                            except Exception:
+                                continue
+                            mapped_rel = Path(child.name) / subrel
+                            break
+                        if mapped_rel is None:
+                            continue
+                        rel = mapped_rel
+                if rel.parts and rel.parts[0] == "input":
+                    rel = Path(*rel.parts[1:])
+                candidate = input_dir / rel
+                if candidate.exists() or candidate.is_symlink():
+                    hidden_paths.add(rel)
+    return hidden_paths
+
+
+def _first_symlink_ancestor(input_dir: Path, rel: Path) -> Path | None:
+    current = input_dir
+    ancestor_parts = []
+    for part in rel.parts:
+        current = current / part
+        ancestor_parts.append(part)
+        if current.is_symlink():
+            return Path(*ancestor_parts)
+    return None
+
+
+def _mirror_tree_excluding(src: Path, dst: Path, root_rel: Path, hidden_rels: set[Path]) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for child in src.iterdir():
+        child_rel = root_rel / child.name
+        if child_rel in hidden_rels:
+            continue
+        if any(rel.parts[: len(child_rel.parts)] == child_rel.parts for rel in hidden_rels):
+            child_dst = dst / child.name
+            if child.is_dir():
+                _mirror_tree_excluding(child, child_dst, child_rel, hidden_rels)
+            else:
+                child_dst.symlink_to(child)
         else:
-            strategy = "hidden_score_split_from_train"
-            source_df = _read_table(source_for_split)
-            train_df, score_val_df, score_diagnostics = _split_dataframe(
-                source_df,
-                label_column=label_column,
-                group_column=group_column,
-                val_fraction=0.2,
-                seed=42,
-            )
-            train_base_dir = source_for_split.parent
-            score_base_dir = source_for_split.parent
-            score_path_column = train_summary.get("path_column")
-            score_mask_column = train_summary.get("mask_column")
-            score_label_column = label_column
-            split_diagnostics = {
-                "score_val": score_diagnostics,
+            (dst / child.name).symlink_to(child)
+
+
+def _hide_private_file_answers(input_dir: Path, private_dir: Path) -> None:
+    hidden_rels = _collect_private_file_answers(input_dir, private_dir)
+    if not hidden_rels:
+        return
+
+    by_symlink_root: dict[Path, set[Path]] = {}
+    direct_rels: set[Path] = set()
+    for rel in hidden_rels:
+        symlink_root = _first_symlink_ancestor(input_dir, rel)
+        if symlink_root is None:
+            direct_rels.add(rel)
+        else:
+            by_symlink_root.setdefault(symlink_root, set()).add(rel)
+
+    for rel in direct_rels:
+        target = input_dir / rel
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+
+    for root_rel, root_hidden_rels in by_symlink_root.items():
+        root_path = input_dir / root_rel
+        if not root_path.is_symlink():
+            continue
+        source_root = root_path.resolve()
+        if source_root.is_file():
+            root_path.unlink()
+            continue
+        tmp_path = input_dir / f".{root_rel.name}.agent_visible"
+        _remove_path(tmp_path)
+        _mirror_tree_excluding(source_root, tmp_path, root_rel, root_hidden_rels)
+        root_path.unlink()
+        tmp_path.rename(root_path)
+
+
+def _copy_split_package_from_cache(cache_entry: Path, split_dir: Path, private_dir: Path) -> dict[str, Any] | None:
+    cached_split = cache_entry / "biomaker_splits"
+    cached_private = cache_entry / "private_gt"
+    cached_verifier = cache_entry / "verifier.json"
+    if not cached_split.is_dir() or not cached_private.is_dir() or not cached_verifier.is_file():
+        return None
+    _copytree_replace(cached_split, split_dir)
+    _copytree_replace(cached_private, private_dir)
+    return json.loads(cached_verifier.read_text(encoding="utf-8"))
+
+
+def _store_split_package_cache(cache_entry: Path, split_dir: Path, private_dir: Path, verifier: dict[str, Any]) -> None:
+    if (cache_entry / "manifest.json").is_file():
+        return
+    cache_entry.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = cache_entry.parent / f".tmp-{cache_entry.name}"
+    _remove_path(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(split_dir, tmp_dir / "biomaker_splits")
+    shutil.copytree(private_dir, tmp_dir / "private_gt")
+    (tmp_dir / "verifier.json").write_text(
+        json.dumps(verifier, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    (tmp_dir / "manifest.json").write_text(
+        json.dumps({"cache": "split_builder", "verifier_ok": verifier.get("ok")}, indent=2),
+        encoding="utf-8",
+    )
+    try:
+        tmp_dir.rename(cache_entry)
+    except FileExistsError:
+        shutil.rmtree(tmp_dir)
+
+
+def prepare_split_protocol(
+    input_dir: Path | str,
+    private_dir: Path | str | None = None,
+    *,
+    task_desc: Any | None = None,
+    model: str = "gpt-5.4",
+    temperature: float = 0.0,
+    attempts: int = 3,
+    cache_root: Path | str | None = None,
+) -> SplitProtocol:
+    """Prepare BioMaker public splits and private ground truth using an LLM-built splitter."""
+    input_dir = Path(input_dir).resolve()
+    private_dir = Path(private_dir).resolve() if private_dir is not None else input_dir.parent / "private_gt"
+    split_dir = input_dir / "biomaker_splits"
+    _remove_path(split_dir)
+    _remove_path(private_dir)
+
+    if isinstance(task_desc, str):
+        task_text = task_desc
+    else:
+        task_text = json.dumps(task_desc or {}, indent=2, ensure_ascii=False, default=str)
+
+    cache_entry = None
+    result_verifier: dict[str, Any] | None = None
+    cache_reused = False
+    if cache_root is not None:
+        cache_key, _facts = split_builder_cache_key(
+            input_dir=input_dir,
+            task_text=task_text,
+            model=model,
+            temperature=temperature,
+        )
+        cache_entry = Path(cache_root) / cache_key
+        result_verifier = _copy_split_package_from_cache(cache_entry, split_dir, private_dir)
+        cache_reused = result_verifier is not None
+
+    run_root = private_dir.parent
+    build_dir = run_root / "_split_builder"
+    if result_verifier is None:
+        _remove_path(build_dir)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        task_file = build_dir / "task.md"
+        task_file.write_text(task_text, encoding="utf-8")
+
+        result = run_agentic_split_builder_probe(
+            input_dir,
+            task_file,
+            build_dir / "package",
+            model=model,
+            temperature=temperature,
+            max_attempts=attempts,
+            debug_artifacts=True,
+        )
+        _copytree_replace(result.split_dir, split_dir)
+        _copytree_replace(result.private_gt_dir, private_dir)
+        result_verifier = result.verifier
+        if cache_entry is not None:
+            _store_split_package_cache(cache_entry, split_dir, private_dir, result_verifier)
+
+    _normalize_split_paths_in_dir(split_dir, input_dir)
+    _make_private_paths_evaluator_visible(private_dir, input_dir)
+    _hide_private_file_answers(input_dir, private_dir)
+
+    private_gt_plan = result_verifier.get("private_gt", {}) or {}
+    if isinstance(private_gt_plan, dict):
+        if isinstance(private_gt_plan.get("score_val"), dict):
+            private_gt_plan["score_val"] = {
+                "file": "score_val.csv",
+                **private_gt_plan["score_val"],
             }
-            warnings.append(
-                "No official validation split found; created a hidden score split from training data. The remaining rows are the labeled agent-visible training table."
-            )
+        if isinstance(private_gt_plan.get("test"), dict):
+            private_gt_plan["test"] = {
+                "file": "test.csv",
+                **private_gt_plan["test"],
+            }
 
-        agent_train = split_dir / "agent_train.csv"
-        public_score_val = split_dir / SCORE_VAL_PUBLIC_FILENAME
-        hidden_score_val = private_dir / SCORE_VAL_TRUTH_FILENAME
-        train_rel = _relative(agent_train, input_dir)
-        score_rel = _relative(public_score_val, input_dir)
-        train_df = _normalize_agent_paths(
-            train_df,
-            input_dir,
-            train_summary.get("path_column"),
-            train_summary.get("mask_column"),
-            train_base_dir,
-            warnings,
-        )
-        score_val_df = _normalize_agent_paths(
-            score_val_df,
-            input_dir,
-            score_path_column,
-            score_mask_column,
-            score_base_dir,
-            warnings,
-        )
-        public_score_val_df = _sanitize_score_table(
-            score_val_df,
-            score_label_column,
-            score_mask_column,
-        )
-        _write_csv(train_df, agent_train)
-        _write_csv(public_score_val_df, public_score_val)
-        _write_csv(score_val_df, hidden_score_val)
-
-        agent_visible: dict[str, str] = {
-            "train": train_rel,
-            "score_val": score_rel,
-        }
-
-        if test_source:
-            test_summary = _table_summary(test_source, input_dir)
-            test_df = _read_table(test_source)
-            test_label_column = test_summary.get("label_column")
-            test_mask_column = test_summary.get("mask_column")
-            _copy_private_truth(
-                input_dir, private_dir, test_source, test_df, test_mask_column
-            )
-            agent_test = split_dir / "agent_test.csv"
-            agent_test_df = _normalize_agent_paths(
-                _sanitize_test_table(test_df, test_label_column, test_mask_column),
-                input_dir,
-                test_summary.get("path_column"),
-                None,
-                test_source.parent,
-                warnings,
-            )
-            _write_csv(
-                agent_test_df,
-                agent_test,
-            )
-            agent_visible["test"] = _relative(agent_test, input_dir)
-            private_evaluation.append(
-                {
-                    "name": "official_test",
-                    "source": str(test_source.relative_to(input_dir)),
-                    "visible_to_agent": False,
-                    "report_to_user": True,
-                }
-            )
-            private_plan["private_evaluation"].append(
-                {
-                    "name": "official_test",
-                    "source": str(test_source.relative_to(input_dir)),
-                    "visible_to_agent": False,
-                    "report_to_user": True,
-                    "label_column": test_label_column,
-                    "mask_column": test_mask_column,
-                    "id_column": test_summary.get("id_column"),
-                }
-            )
-            _sanitize_private_test_view(input_dir, test_source, agent_test_df)
-
-        split_plan = {
-            "version": 1,
-            "strategy": strategy,
-            "agent_visible": agent_visible,
-            "sources": {
-                "train": str(train_source.relative_to(input_dir)) if train_source else str(metadata_source.relative_to(input_dir)),  # type: ignore[union-attr]
-                "val": str(val_source.relative_to(input_dir)) if val_source else None,
-                "test": (
-                    str(test_source.relative_to(input_dir)) if test_source else None
-                ),
-            },
-            "columns": {
-                "id": train_summary.get("id_column"),
-                "label": label_column,
-                "path": train_summary.get("path_column"),
-                "mask": mask_column,
-                "group": group_column,
-            },
-            "score_validation": {
-                "public": score_rel,
-                "labels_visible_to_agent": False,
-            },
-            "metric_split": "score_val",
-            "private_evaluation": private_evaluation,
-            "diagnostics": split_diagnostics,
-            "warnings": warnings,
-        }
-        private_plan["score_validation"] = {
-            "source": (
-                str(val_source.relative_to(input_dir))
-                if val_source
-                else str(source_for_split.relative_to(input_dir))
-            ),
-            "truth_file": SCORE_VAL_TRUTH_FILENAME,
-            "visible_to_agent": False,
-            "label_column": label_column,
-            "mask_column": mask_column,
-            "id_column": train_summary.get("id_column"),
-        }
-
-    dataset_report = inspect_dataset(input_dir)
-    (split_dir / "dataset_report.json").write_text(
-        json.dumps(dataset_report, indent=2), encoding="utf-8"
-    )
+    split_plan = {
+        "strategy": "agentic_builder",
+        "agent_visible": {
+            "train": "biomaker_splits/agent_train.csv",
+            "score_val": "biomaker_splits/score_val.csv",
+            "test": "biomaker_splits/agent_test.csv",
+        },
+        "private_gt": private_gt_plan,
+        "metric_split": "score_val",
+        "row_counts": result_verifier.get("row_counts", {}),
+        "warnings": result_verifier.get("warnings", []),
+        "cache_reused": cache_reused,
+    }
+    if not (split_dir / "agent_test.csv").is_file():
+        split_plan["agent_visible"].pop("test", None)
     (split_dir / "split_plan.json").write_text(
-        json.dumps(split_plan, indent=2), encoding="utf-8"
+        json.dumps(split_plan, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    if private_plan["private_evaluation"]:
-        private_dir.mkdir(parents=True, exist_ok=True)
-        (private_dir / "private_split_plan.json").write_text(
-            json.dumps(private_plan, indent=2), encoding="utf-8"
-        )
-    if (private_dir / SCORE_VAL_TRUTH_FILENAME).is_file():
-        (private_dir / "private_split_plan.json").write_text(
-            json.dumps(private_plan, indent=2), encoding="utf-8"
-        )
+    dataset_report = build_dataset_facts(input_dir)
+    (split_dir / "dataset_report.json").write_text(
+        json.dumps(dataset_report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     prompt_text = _render_prompt(split_plan)
     (split_dir / "split_protocol.txt").write_text(prompt_text, encoding="utf-8")
-    return SplitProtocol(dataset_report, split_plan, prompt_text)
+    return SplitProtocol(dataset_report=dataset_report, split_plan=split_plan, prompt_text=prompt_text)

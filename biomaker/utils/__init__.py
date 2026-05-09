@@ -6,7 +6,12 @@ from pathlib import Path
 logger = logging.getLogger("biomaker")
 
 
-def copytree(src: Path, dst: Path, use_symlinks=True):
+def copytree(
+    src: Path,
+    dst: Path,
+    use_symlinks=True,
+    exclude_names: set[str] | None = None,
+):
     """
     Copy contents of `src` to `dst`. Unlike shutil.copytree, the dst dir can exist and will be merged.
     If src is a file, only that file will be copied. Optionally uses symlinks instead of copying.
@@ -14,10 +19,14 @@ def copytree(src: Path, dst: Path, use_symlinks=True):
     Args:
         src (Path): source directory
         dst (Path): destination directory
+        exclude_names: source basenames to skip when copying directory contents
     """
     assert dst.is_dir()
+    exclude_names = exclude_names or set()
 
     if src.is_file():
+        if src.name in exclude_names:
+            return
         dest_f = dst / src.name
         assert not dest_f.exists(), dest_f
         if use_symlinks:
@@ -27,6 +36,8 @@ def copytree(src: Path, dst: Path, use_symlinks=True):
         return
 
     for f in src.iterdir():
+        if f.name in exclude_names:
+            continue
         dest_f = dst / f.name
         assert not dest_f.exists(), dest_f
         if use_symlinks:
