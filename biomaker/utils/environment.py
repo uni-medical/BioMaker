@@ -61,7 +61,8 @@ BLOCKED_EXAMPLES = [
 LOCAL_GENERATED_MODULES = {"evaluator"}
 
 INSTALL_COMMAND_RE = re.compile(
-    r"\b(pip|conda|mamba|uv|apt-get|brew)\s+(install|add)\b", re.IGNORECASE
+    r"\b(pip|conda|mamba|apt-get|brew)\s+(install|add)\b|\buv\s+(pip\s+)?(install|add)\b",
+    re.IGNORECASE,
 )
 
 
@@ -152,15 +153,82 @@ def environment_manifest_text(include_medical: bool = True) -> str:
     )
 
 
-def _top_level_imports(tree: ast.AST) -> set[str]:
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                names.add(alias.name.split(".", 1)[0])
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            names.add(node.module.split(".", 1)[0])
-    return names
+def _handler_catches_import_error(handler: ast.ExceptHandler) -> bool:
+    if handler.type is None:
+        return True
+    names: list[str] = []
+    if isinstance(handler.type, ast.Name):
+        names = [handler.type.id]
+    elif isinstance(handler.type, ast.Tuple):
+        names = [item.id for item in handler.type.elts if isinstance(item, ast.Name)]
+    return any(
+        name in {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+        for name in names
+    )
+
+
+class _ImportCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.required: set[str] = set()
+        self.optional: set[str] = set()
+        self.opaque_dynamic_import_lines: list[int] = []
+        self._optional_depth = 0
+
+    def _add(self, name: str) -> None:
+        target = self.optional if self._optional_depth else self.required
+        target.add(name.split(".", 1)[0])
+
+    def _add_dynamic_module_name(self, node: ast.AST, name_node: ast.AST) -> None:
+        if isinstance(name_node, ast.Constant) and isinstance(name_node.value, str):
+            module_name = name_node.value.lstrip(".")
+            if module_name:
+                self._add(module_name)
+            return
+        self.opaque_dynamic_import_lines.append(getattr(node, "lineno", 0))
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self._add(alias.name)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.level == 0 and node.module:
+            self._add(node.module)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        call_name = _call_name(node.func)
+        if call_name == "__import__" and node.args:
+            self._add_dynamic_module_name(node, node.args[0])
+        elif call_name == "importlib.import_module" and node.args:
+            self._add_dynamic_module_name(node, node.args[0])
+        self.generic_visit(node)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        catches_import_error = any(
+            _handler_catches_import_error(handler) for handler in node.handlers
+        )
+        if catches_import_error:
+            self._optional_depth += 1
+            for child in node.body:
+                self.visit(child)
+            self._optional_depth -= 1
+        else:
+            for child in node.body:
+                self.visit(child)
+        for handler in node.handlers:
+            for child in handler.body:
+                self.visit(child)
+        for child in [*node.orelse, *node.finalbody]:
+            self.visit(child)
+
+
+def _top_level_imports(tree: ast.AST) -> tuple[set[str], set[str], list[int]]:
+    collector = _ImportCollector()
+    collector.visit(tree)
+    return (
+        collector.required,
+        collector.optional - collector.required,
+        collector.opaque_dynamic_import_lines,
+    )
 
 
 def _is_stdlib_import(name: str) -> bool:
@@ -170,8 +238,62 @@ def _is_stdlib_import(name: str) -> bool:
     return name in stdlib_names
 
 
-def _contains_install_command(code: str) -> bool:
-    return INSTALL_COMMAND_RE.search(code) is not None
+def _call_name(func: ast.AST) -> str | None:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        parts = [func.attr]
+        value = func.value
+        while isinstance(value, ast.Attribute):
+            parts.append(value.attr)
+            value = value.value
+        if isinstance(value, ast.Name):
+            parts.append(value.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _constant_strings(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.JoinedStr):
+        return [
+            part.value
+            for part in node.values
+            if isinstance(part, ast.Constant) and isinstance(part.value, str)
+        ]
+    if isinstance(node, (ast.List, ast.Tuple)):
+        strings: list[str] = []
+        for item in node.elts:
+            strings.extend(_constant_strings(item))
+        return strings
+    return []
+
+
+def _contains_install_command(tree: ast.AST) -> bool:
+    shell_call_names = {
+        "os.system",
+        "subprocess.run",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        call_name = _call_name(node.func)
+        if call_name in {"pip.main", "pip._internal.main"}:
+            return True
+        if call_name not in shell_call_names:
+            continue
+        for arg in node.args:
+            strings = _constant_strings(arg)
+            if any(INSTALL_COMMAND_RE.search(text) for text in strings):
+                return True
+            if strings and INSTALL_COMMAND_RE.search(" ".join(strings)):
+                return True
+    return False
 
 
 def _is_truthy_constant(node: ast.AST) -> bool:
@@ -252,17 +374,6 @@ def validate_code_environment(
     code: str, include_medical: bool = True
 ) -> PreflightResult:
     """Validate generated code against the environment contract before execution."""
-    if _contains_install_command(code):
-        return PreflightResult(
-            ok=False,
-            error_type="DependencyPolicyError",
-            message=(
-                "DependencyPolicyError: generated code attempted to install packages. "
-                "Package installation is disabled. Remove package-manager calls and use only allowed packages."
-            ),
-            exc_info={"reason": "package installation is disabled"},
-        )
-
     try:
         tree = ast.parse(code)
     except SyntaxError as e:
@@ -271,6 +382,17 @@ def validate_code_environment(
             error_type="SyntaxError",
             message=f"SyntaxError: {e.msg} at line {e.lineno}, column {e.offset}.",
             exc_info={"msg": e.msg, "lineno": str(e.lineno), "offset": str(e.offset)},
+        )
+
+    if _contains_install_command(tree):
+        return PreflightResult(
+            ok=False,
+            error_type="DependencyPolicyError",
+            message=(
+                "DependencyPolicyError: generated code attempted to install packages. "
+                "Package installation is disabled. Remove package-manager calls and use only allowed packages."
+            ),
+            exc_info={"reason": "package installation is disabled"},
         )
 
     portable_device_error = _portable_device_violation(tree)
@@ -285,10 +407,27 @@ def validate_code_environment(
                 "and move model/tensors through the selected `device`."
             ),
             exc_info={"lineno": str(lineno), "reason": message},
-        )
+    )
 
     allowed_imports = allowed_import_names(include_medical)
-    for import_name in sorted(_top_level_imports(tree)):
+    required_imports, optional_imports, opaque_dynamic_import_lines = _top_level_imports(
+        tree
+    )
+    if opaque_dynamic_import_lines:
+        line = opaque_dynamic_import_lines[0]
+        return PreflightResult(
+            ok=False,
+            error_type="DependencyPolicyError",
+            message=(
+                f"DependencyPolicyError at line {line}: dynamic import with a non-literal module name is disabled. "
+                "Use normal import statements or literal module names so BioMaker can verify the dependency policy."
+            ),
+            exc_info={
+                "lineno": str(line),
+                "reason": "dynamic import module name is not statically verifiable",
+            },
+        )
+    for import_name in sorted(required_imports):
         if _is_stdlib_import(import_name):
             continue
 
@@ -320,6 +459,26 @@ def validate_code_environment(
                 f"DependencyPolicyError: package `{import_name}` is not allowed in this environment. "
                 f"Allowed third-party imports are: {allowed}. "
                 "Replace the unavailable package with Python standard library or an allowed package."
+            ),
+            exc_info={
+                "package": import_name,
+                "allowed_imports": sorted(allowed_imports),
+            },
+        )
+
+    for import_name in sorted(optional_imports):
+        if _is_stdlib_import(import_name) or import_name in LOCAL_GENERATED_MODULES:
+            continue
+        if import_name in allowed_imports:
+            continue
+        allowed = ", ".join(sorted(f"`{name}`" for name in allowed_imports))
+        return PreflightResult(
+            ok=False,
+            error_type="DependencyPolicyError",
+            message=(
+                f"DependencyPolicyError: optional fallback import `{import_name}` is not allowed in this environment. "
+                f"Allowed third-party imports are: {allowed}. "
+                "Remove the unavailable package import and keep the fallback implementation."
             ),
             exc_info={
                 "package": import_name,

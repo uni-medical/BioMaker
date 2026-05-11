@@ -27,8 +27,13 @@ import pandas as pd
 from PIL import Image
 
 from .. import backend
+from .split_manifest import (
+    legacy_manifest,
+    load_split_manifest,
+    validate_split_manifest,
+    write_split_manifest,
+)
 from .response import extract_code
-
 
 TABLE_SUFFIXES = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".jsonl"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
@@ -38,7 +43,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 1
+SPLIT_BUILDER_CACHE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -160,9 +165,15 @@ def _table_facts(path: Path, input_dir: Path) -> dict[str, Any]:
         if len(series.dropna()) and not _is_private_example_column(str(column), series):
             item["examples"] = [str(v)[:120] for v in series.dropna().head(3).tolist()]
         elif len(series.dropna()):
-            item["examples_hidden"] = "small scalar examples hidden to avoid leaking possible answers"
+            item["examples_hidden"] = (
+                "small scalar examples hidden to avoid leaking possible answers"
+            )
         columns.append(item)
-    return {"path": _relative(path, input_dir), "rows": int(len(df)), "columns": columns}
+    return {
+        "path": _relative(path, input_dir),
+        "rows": int(len(df)),
+        "columns": columns,
+    }
 
 
 def _directory_facts(input_dir: Path, max_dirs: int = 160) -> list[dict[str, Any]]:
@@ -199,7 +210,9 @@ def _directory_facts(input_dir: Path, max_dirs: int = 160) -> list[dict[str, Any
     return facts
 
 
-def _image_group_facts(files: list[Path], input_dir: Path, max_files: int = 3000) -> dict[str, Any]:
+def _image_group_facts(
+    files: list[Path], input_dir: Path, max_files: int = 3000
+) -> dict[str, Any]:
     groups: dict[str, Any] = {}
     errors = 0
     for path in files[:max_files]:
@@ -221,7 +234,9 @@ def _image_group_facts(files: list[Path], input_dir: Path, max_files: int = 3000
     return {"groups": groups, "errors": errors}
 
 
-def build_dataset_facts(input_dir: Path, *, max_files: int = 5000, max_tables: int = 30) -> dict[str, Any]:
+def build_dataset_facts(
+    input_dir: Path, *, max_files: int = 5000, max_tables: int = 30
+) -> dict[str, Any]:
     input_dir = input_dir.resolve()
     files = [
         p
@@ -288,7 +303,7 @@ def _builder_system_prompt() -> str:
         "You are a data-preparation coding agent. You receive an unfamiliar dataset, "
         "a task description, and observed filesystem/table facts. Write the simplest "
         "Python builder that converts the dataset into BioMaker's public split files "
-        "and private ground-truth files. Infer semantics from evidence; do not rely on "
+        "and evaluator-only hidden-answer files. Infer semantics from evidence; do not rely on "
         "a fixed task type or one naming convention."
     )
 
@@ -309,7 +324,20 @@ def _builder_user_prompt(
             "biomaker_splits/agent_test.csv: public test-input rows when a test source exists; must not include private test answers.",
             "private_gt/score_val.csv: validation rows with the hidden answers retained.",
             "private_gt/test.csv: private test rows with hidden answers retained when private answers exist.",
-            "private_gt/private_gt.json: JSON object with keys score_val and test. Each entry must contain answer_columns, for example {\"score_val\":{\"answer_columns\":[\"label\"]},\"test\":{\"answer_columns\":[\"label\"]}}.",
+            'private_gt/private_gt.json: hidden-answer index with keys score_val and test. Each entry must contain answer_columns, for example {"score_val":{"answer_columns":["label"]},"test":{"answer_columns":["label"]}}.',
+            "split_manifest.json: structured data contract for the prepared task.",
+            "public/: optional generated agent-visible files such as anonymized images or copied inputs; CSV paths may reference this directory.",
+        ],
+        "Required split_manifest.json Fields": [
+            "manifest_version: integer 1.",
+            "sample_unit: what one prediction row represents, for example image, volume, patient, slide, study, encounter, window, or row.",
+            "key_columns: public columns that uniquely align score/test predictions with private truth; use [] only when row order is the explicit contract.",
+            "task_heads: list of task heads, each either a string or object with type such as classification, multilabel, segmentation_2d, detection, regression, survival, or segmentation_3d.",
+            "sample_universe: list of objects with sample_id, split (train/score_val/test/dropped), source_paths, and reason for every dropped sample. If one CSV row is not one sample, set row_representation to a short explanation instead of one_row_per_sample.",
+            "visibility: object listing agent_visible, evaluator_only, and forbidden columns/files.",
+            "prediction_contract: object describing required candidate output files/columns and probability/file-path semantics.",
+            "metric_contract: object with primary_metric and maximize.",
+            "hidden_answers: object mirroring private_gt/private_gt.json answer_columns.",
         ],
         "Builder Interface": [
             "Return one Python script.",
@@ -320,8 +348,9 @@ def _builder_user_prompt(
         "Principles": [
             "Treat tables and directories as equally valid sample sources.",
             "If a folder level, table column, or referenced file is evidence of an answer, keep it in agent_train.csv but hide it from score_val.csv and agent_test.csv.",
-            "If an answer is stored as a file path, hide that path from public score/test files and retain it in private_gt.",
+            "If an answer is stored as a file path, hide that path from public score/test files and retain it in hidden answers.",
             "If a column is computed from the answer, hide it from public score/test files too.",
+            "Make your semantic assumptions explicit in split_manifest.json; do not leave task type, key columns, sample unit, or class/mask/box schema implicit.",
             "Do not create modeling code; only prepare split files.",
             "Keep the implementation short and direct.",
         ],
@@ -364,11 +393,15 @@ def _query_builder(
     raw_response = str(response)
     code = extract_code(raw_response)
     if not code.strip():
-        raise RuntimeError("Builder response did not contain a valid Python code block.")
+        raise RuntimeError(
+            "Builder response did not contain a valid Python code block."
+        )
     return code, raw_response, metadata
 
 
-def _read_output_csv(output_dir: Path, rel: str, errors: list[str], required: bool) -> pd.DataFrame | None:
+def _read_output_csv(
+    output_dir: Path, rel: str, errors: list[str], required: bool
+) -> pd.DataFrame | None:
     path = output_dir / rel
     if not path.is_file():
         if required:
@@ -383,40 +416,133 @@ def _read_output_csv(output_dir: Path, rel: str, errors: list[str], required: bo
 
 def _validate_manifest(manifest: Any, errors: list[str]) -> dict[str, Any]:
     if not isinstance(manifest, dict):
-        errors.append("private_gt/private_gt.json must contain a JSON object.")
+        errors.append(
+            "private_gt/private_gt.json hidden-answer index must contain a JSON object."
+        )
         return {}
     for key in ("score_val", "test"):
         if key not in manifest:
             continue
         item = manifest[key]
         if not isinstance(item, dict):
-            errors.append(f"private_gt entry `{key}` must be an object.")
+            errors.append(f"hidden_answers entry `{key}` must be an object.")
             continue
         if "answer_columns" not in item:
             present = ", ".join(sorted(map(str, item.keys())))
             errors.append(
-                f"private_gt entry `{key}` must use the exact key answer_columns; present keys: {present}"
+                f"hidden_answers entry `{key}` must use the exact key answer_columns; present keys: {present}"
             )
             continue
         if not isinstance(item.get("answer_columns"), list):
-            errors.append(f"private_gt entry `{key}` answer_columns must be a list.")
+            errors.append(
+                f"hidden_answers entry `{key}` answer_columns must be a list."
+            )
     return manifest
 
 
-def verify_split_package(output_dir: Path) -> dict[str, Any]:
+def _looks_like_path_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    return (
+        "/" in text
+        or "\\" in text
+        or _compound_suffix(Path(lowered))
+        in (
+            TABLE_SUFFIXES
+            | IMAGE_SUFFIXES
+            | {".txt", ".xml", ".nii", ".nii.gz", ".npy"}
+        )
+    )
+
+
+def _check_referenced_paths(
+    df: pd.DataFrame | None,
+    name: str,
+    output_dir: Path,
+    source_input_dir: Path | None,
+    errors: list[str],
+) -> None:
+    if df is None:
+        return
+    missing: list[str] = []
+    for column in df.columns:
+        if df[column].dtype != object:
+            continue
+        for value in df[column].dropna().astype(str).head(200).tolist():
+            if not _looks_like_path_text(value):
+                continue
+            if _resolve_path(value, output_dir, output_dir) is not None:
+                continue
+            if source_input_dir is not None and _resolve_path(
+                value, source_input_dir, source_input_dir
+            ):
+                continue
+            missing.append(f"{column}={value}")
+            if len(missing) >= 5:
+                break
+        if len(missing) >= 5:
+            break
+    if missing:
+        errors.append(f"{name} references missing files: {missing}")
+
+
+def _check_source_coverage(
+    facts: dict[str, Any], row_counts: dict[str, Any], errors: list[str]
+) -> None:
+    groups = (facts.get("image_groups") or {}).get("groups") or {}
+    source_counts = []
+    for group_path, group in groups.items():
+        lowered = str(group_path).lower()
+        if any(
+            token in lowered for token in ("mask", "label", "annotation", "groundtruth")
+        ):
+            continue
+        count = int(group.get("count") or 0)
+        if count:
+            source_counts.append((str(group_path), count))
+    if not source_counts:
+        return
+    largest_path, largest_count = max(source_counts, key=lambda item: item[1])
+    public_rows = sum(
+        int(row_counts.get(name) or 0)
+        for name in ("agent_train", "score_val", "agent_test")
+    )
+    if largest_count >= 10 and public_rows < int(largest_count * 0.8):
+        errors.append(
+            "Public split rows appear to cover only part of the source images: "
+            f"{public_rows} rows across train/score/test vs {largest_count} images in `{largest_path}`. "
+            "Unless the task explicitly asks for a subset, include all primary samples."
+        )
+
+
+def verify_split_package(
+    output_dir: Path,
+    source_input_dir: Path | None = None,
+    facts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
-    train_df = _read_output_csv(output_dir, "biomaker_splits/agent_train.csv", errors, True)
-    score_df = _read_output_csv(output_dir, "biomaker_splits/score_val.csv", errors, True)
-    test_df = _read_output_csv(output_dir, "biomaker_splits/agent_test.csv", errors, False)
+    train_df = _read_output_csv(
+        output_dir, "biomaker_splits/agent_train.csv", errors, True
+    )
+    score_df = _read_output_csv(
+        output_dir, "biomaker_splits/score_val.csv", errors, True
+    )
+    test_df = _read_output_csv(
+        output_dir, "biomaker_splits/agent_test.csv", errors, False
+    )
     score_gt_df = _read_output_csv(output_dir, "private_gt/score_val.csv", errors, True)
     test_gt_df = _read_output_csv(output_dir, "private_gt/test.csv", errors, False)
 
-    manifest_path = output_dir / "private_gt" / "private_gt.json"
-    if manifest_path.is_file():
+    private_manifest_path = output_dir / "private_gt" / "private_gt.json"
+    if private_manifest_path.is_file():
         try:
             manifest = _validate_manifest(
-                json.loads(manifest_path.read_text(encoding="utf-8")), errors
+                json.loads(private_manifest_path.read_text(encoding="utf-8")), errors
             )
         except Exception as exc:
             errors.append(f"Could not read private_gt/private_gt.json: {exc}")
@@ -425,16 +551,24 @@ def verify_split_package(output_dir: Path) -> dict[str, Any]:
         errors.append("Missing required file: private_gt/private_gt.json")
         manifest = {}
 
+    split_manifest = load_split_manifest(output_dir)
+
     if train_df is not None and len(train_df) == 0:
         errors.append("agent_train.csv has zero rows.")
     if score_df is not None and len(score_df) == 0:
         errors.append("score_val.csv has zero rows.")
+    key_columns = (
+        [str(column) for column in split_manifest.get("key_columns", [])]
+        if isinstance(split_manifest.get("key_columns"), list)
+        else []
+    )
     _check_public_disjoint(
         train_df,
         "agent_train.csv",
         score_df,
         "score_val.csv",
         errors,
+        key_columns,
     )
     _check_public_disjoint(
         train_df,
@@ -442,6 +576,7 @@ def verify_split_package(output_dir: Path) -> dict[str, Any]:
         test_df,
         "agent_test.csv",
         errors,
+        key_columns,
     )
     _check_public_disjoint(
         score_df,
@@ -449,6 +584,7 @@ def verify_split_package(output_dir: Path) -> dict[str, Any]:
         test_df,
         "agent_test.csv",
         errors,
+        key_columns,
     )
 
     if score_df is not None and score_gt_df is not None:
@@ -463,9 +599,13 @@ def verify_split_package(output_dir: Path) -> dict[str, Any]:
                 "private_gt/score_val.csv must retain all public score_val columns; "
                 f"missing {sorted(public_cols - private_cols)}"
             )
-        answers = set(map(str, manifest.get("score_val", {}).get("answer_columns") or []))
+        answers = set(
+            map(str, manifest.get("score_val", {}).get("answer_columns") or [])
+        )
         if not answers:
-            errors.append("score_val answer_columns is empty in private_gt/private_gt.json.")
+            errors.append(
+                "score_val answer_columns is empty in private_gt/private_gt.json."
+            )
         hidden_columns = private_cols - public_cols
         unlisted_hidden = sorted(hidden_columns - answers)
         if unlisted_hidden:
@@ -475,14 +615,18 @@ def verify_split_package(output_dir: Path) -> dict[str, Any]:
             )
         missing_answers = sorted(answers - private_cols)
         if missing_answers:
-            errors.append(f"score_val answer columns missing from private_gt: {missing_answers}")
+            errors.append(
+                f"score_val answer columns missing from private_gt: {missing_answers}"
+            )
         leaked = sorted(answers & public_cols)
         if leaked:
             errors.append(f"score_val public file leaks answer columns: {leaked}")
 
     if test_df is not None and test_gt_df is not None:
         if len(test_df) != len(test_gt_df):
-            errors.append(f"test/private_gt row mismatch: {len(test_df)} vs {len(test_gt_df)}")
+            errors.append(
+                f"test/private_gt row mismatch: {len(test_df)} vs {len(test_gt_df)}"
+            )
         public_cols = set(map(str, test_df.columns))
         private_cols = set(map(str, test_gt_df.columns))
         if not public_cols <= private_cols:
@@ -500,7 +644,9 @@ def verify_split_package(output_dir: Path) -> dict[str, Any]:
             )
         missing_answers = sorted(answers - private_cols)
         if missing_answers:
-            errors.append(f"test answer columns missing from private_gt: {missing_answers}")
+            errors.append(
+                f"test answer columns missing from private_gt: {missing_answers}"
+            )
         leaked = sorted(answers & public_cols)
         if leaked:
             errors.append(f"agent_test public file leaks answer columns: {leaked}")
@@ -512,12 +658,37 @@ def verify_split_package(output_dir: Path) -> dict[str, Any]:
         "score_val_gt": None if score_gt_df is None else int(len(score_gt_df)),
         "test_gt": None if test_gt_df is None else int(len(test_gt_df)),
     }
+    for name, df in (
+        ("agent_train.csv", train_df),
+        ("score_val.csv", score_df),
+        ("agent_test.csv", test_df),
+        ("private_gt/score_val.csv", score_gt_df),
+        ("private_gt/test.csv", test_gt_df),
+    ):
+        _check_referenced_paths(df, name, output_dir, source_input_dir, errors)
+    if facts is not None:
+        _check_source_coverage(facts, row_counts, errors)
+    if not split_manifest:
+        split_manifest = legacy_manifest(
+            output_dir, private_gt=manifest, row_counts=row_counts
+        )
+        write_split_manifest(output_dir, split_manifest)
+    validate_split_manifest(
+        split_manifest,
+        output_dir=output_dir,
+        source_input_dir=source_input_dir,
+        frames={"train": train_df, "score_val": score_df, "test": test_df},
+        errors=errors,
+        warnings=warnings,
+    )
     return {
         "ok": not errors,
         "errors": errors,
         "warnings": warnings,
         "row_counts": row_counts,
+        "hidden_answers": manifest,
         "private_gt": manifest,
+        "split_manifest": split_manifest,
     }
 
 
@@ -527,14 +698,21 @@ def _check_public_disjoint(
     right: pd.DataFrame | None,
     right_name: str,
     errors: list[str],
+    key_columns: list[str],
 ) -> None:
     if left is None or right is None:
         return
-    shared_cols = [c for c in right.columns if c in left.columns]
+    shared_cols = [
+        column for column in key_columns if column in left and column in right
+    ]
     if not shared_cols:
         return
-    left_keys = set(map(tuple, left[shared_cols].astype(str).itertuples(index=False, name=None)))
-    right_keys = set(map(tuple, right[shared_cols].astype(str).itertuples(index=False, name=None)))
+    left_keys = set(
+        map(tuple, left[shared_cols].astype(str).itertuples(index=False, name=None))
+    )
+    right_keys = set(
+        map(tuple, right[shared_cols].astype(str).itertuples(index=False, name=None))
+    )
     overlap = left_keys & right_keys
     if overlap:
         errors.append(
@@ -543,7 +721,9 @@ def _check_public_disjoint(
         )
 
 
-def compare_split_dirs(candidate_dir: Path, reference_dir: Path | None) -> dict[str, Any] | None:
+def compare_split_dirs(
+    candidate_dir: Path, reference_dir: Path | None
+) -> dict[str, Any] | None:
     if reference_dir is None or not reference_dir.is_dir():
         return None
 
@@ -552,7 +732,11 @@ def compare_split_dirs(candidate_dir: Path, reference_dir: Path | None) -> dict[
         if not path.is_file():
             return {"exists": False}
         df = pd.read_csv(path)
-        return {"exists": True, "rows": int(len(df)), "columns": list(map(str, df.columns))}
+        return {
+            "exists": True,
+            "rows": int(len(df)),
+            "columns": list(map(str, df.columns)),
+        }
 
     result = {"reference_dir": str(reference_dir), "files": {}}
     for name in ["agent_train.csv", "score_val.csv", "agent_test.csv"]:
@@ -632,7 +816,9 @@ def run_agentic_split_builder_probe(
             timeout=timeout,
             check=False,
         )
-        verifier = verify_split_package(output_dir)
+        verifier = verify_split_package(
+            output_dir, source_input_dir=input_dir, facts=facts
+        )
         verifier["builder_returncode"] = completed.returncode
         if completed.returncode != 0:
             verifier["ok"] = False
@@ -667,7 +853,8 @@ def run_agentic_split_builder_probe(
         previous_failure = verifier
         previous_stdout = completed.stdout
 
-    assert final_verifier is not None
+    if final_verifier is None:
+        raise RuntimeError("Dataset planning verifier did not run")
     if debug_artifacts:
         debug_dir = output_dir / "_debug"
         debug_dir.mkdir(parents=True, exist_ok=True)

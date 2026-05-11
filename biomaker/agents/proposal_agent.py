@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from threading import BoundedSemaphore, local
 from typing import Any, Callable
 
 from ..backend import FunctionSpec, query
@@ -37,6 +38,8 @@ MONAI_QUERY_HINTS = {
 
 TOOL_OBSERVATION_TOTAL_CHARS = 12000
 TOOL_OBSERVATION_ENTRY_CHARS = 1600
+NODE_TOOL_CONCURRENCY_LIMIT = 4
+_NODE_TOOL_SEMAPHORE = BoundedSemaphore(NODE_TOOL_CONCURRENCY_LIMIT)
 LOW_SIGNAL_API_SYMBOLS = {
     "accuracy",
     "auc",
@@ -104,7 +107,7 @@ tool_request_func_spec = FunctionSpec(
                         },
                         "query": {
                             "type": "string",
-                            "description": "Search query for search_docs or web_search.",
+                            "description": "Search query for search_docs or web_search. Do not include local sample values, file paths, experiment metrics, or private task text.",
                         },
                         "code": {
                             "type": "string",
@@ -129,24 +132,47 @@ class ProposalAgent(BaseAgent):
         journal: Journal,
     ):
         super().__init__(task_desc, cfg, journal)
-        self.profile = (
-            "You are a pragmatic biomedical machine learning engineer. "
-        )
+        self.profile = "You are a pragmatic biomedical machine learning engineer. "
         self.knowledge_base = None
         self.context_builder = ContextBuilder(self)
-        self._pending_round_nodes: list[Node] = []
+        self._generation_context = local()
 
     def set_pending_round_nodes(self, nodes: list[Node]) -> None:
         """Expose generated-but-unevaluated same-round proposals to later prompts."""
-        self._pending_round_nodes = list(nodes)
+        self.set_generation_context(pending_round_nodes=nodes)
 
     def clear_pending_round_nodes(self) -> None:
-        self._pending_round_nodes = []
+        self.clear_generation_context()
+
+    def set_generation_context(
+        self,
+        *,
+        pending_round_nodes: list[Node],
+        round_item_index: int | None = None,
+        round_item_count: int | None = None,
+        scheduled_step: int | None = None,
+        speculative: bool = False,
+    ) -> None:
+        """Set generation-local prompt context for the current worker thread."""
+        self._generation_context.value = {
+            "pending_round_nodes": list(pending_round_nodes),
+            "round_item_index": round_item_index,
+            "round_item_count": round_item_count,
+            "scheduled_step": scheduled_step,
+            "speculative": speculative,
+        }
+
+    def clear_generation_context(self) -> None:
+        self._generation_context.value = {}
+
+    def generation_context(self) -> dict[str, Any]:
+        return getattr(self._generation_context, "value", {}) or {}
 
     def pending_round_nodes_for(self, selected_parent: Node | None) -> list[Node]:
         """Return same-round generated siblings that have not executed yet."""
+        pending_round_nodes = self.generation_context().get("pending_round_nodes", [])
         nodes = []
-        for node in self._pending_round_nodes:
+        for node in pending_round_nodes:
             if node.tag == "generating" and not str(node.code or "").strip():
                 continue
             same_parent = node.parent is selected_parent
@@ -217,6 +243,7 @@ class ProposalAgent(BaseAgent):
             return query
         context_parts = []
         for key in [
+            "Tree Records",
             "Previous (buggy) implementation",
             "Previous solution",
             "Best known solution",
@@ -272,6 +299,10 @@ class ProposalAgent(BaseAgent):
         if not self.acfg.enable_web_search:
             return ""
 
+        query = self._sanitize_web_query(query)
+        if not query:
+            return ""
+
         try:
             from ..tools import web_search
 
@@ -288,6 +319,36 @@ class ProposalAgent(BaseAgent):
         logger.debug("Web search result preview:\n%s", result[:200])
         return result
 
+    def _sanitize_web_query(self, query: str) -> str:
+        """Keep web queries focused on public API/error terms."""
+        lines = []
+        for raw_line in str(query).splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            lowered = line.lower()
+            if any(
+                marker in lowered
+                for marker in [
+                    "/home/",
+                    "./input",
+                    "./working",
+                    "biomaker_splits",
+                    "agent_train",
+                    "score_val",
+                    "agent_test",
+                    "validation metric",
+                    "private_gt",
+                ]
+            ):
+                continue
+            lines.append(line)
+        cleaned = " ".join(" ".join(lines).split())
+        symbols = self._extract_api_symbols(cleaned, limit=16)
+        if symbols:
+            return " ".join(symbols)
+        return cleaned[:200]
+
     def _tool_decision_context(
         self, stage: str, prompt: dict[str, Any]
     ) -> dict[str, Any]:
@@ -297,10 +358,16 @@ class ProposalAgent(BaseAgent):
         }
         summary = self.get_data_summary()
         if summary:
-            context["Data and evaluation summary"] = truncate_text(summary, max_chars=1600)
+            context["Data and evaluation summary"] = truncate_text(
+                summary, max_chars=1600
+            )
         context["Cached environment facts"] = truncate_text(
             self.environment_facts, max_chars=1600
         )
+        if "Current Selection" in prompt:
+            context["Current Selection"] = prompt["Current Selection"]
+        if "Tree Records" in prompt:
+            context["Tree Records"] = prompt["Tree Records"]
         for key in [
             "Memory",
             "Selected parent experiment facts",
@@ -330,12 +397,14 @@ class ProposalAgent(BaseAgent):
             "Available tools": [
                 "inspect_api: run a short read-only Python snippet to inspect installed package versions, imports, function signatures, tiny API examples, local split CSV rows, evaluator specs, or image/mask metadata under ./input. No training, writes, package installs, network access, or shell commands.",
                 "search_docs: query the local MONAI documentation RAG. Use this only for exact MONAI API, signature, or traceback evidence, not for model choice, augmentation strategy, fine-tuning practice, or pipeline recommendations.",
-                "web_search: search the web through the configured Serper/Jina path. Use this only when local context and docs are insufficient for a concrete library/API question, not for broad strategy or model-selection advice.",
+                "web_search: search the web through the configured Serper/Jina path. Use this only when local context and docs are insufficient for a concrete public library/API question, not for broad strategy or model-selection advice. Never include local sample values, local paths, validation metrics, private split names, or private task text in a web query.",
             ],
             "Tool-use style": (
                 "Request only the tools you actually need now. Stable split, sample, "
                 "environment, and evaluator facts are already provided in the prompt; "
-                "do not re-check them unless the current failure contradicts those facts."
+                "do not re-check them unless the current failure contradicts those facts. "
+                f"At most {self.acfg.max_node_tool_calls} tool calls will be executed for this node, "
+                f"and at most {NODE_TOOL_CONCURRENCY_LIMIT} node tool calls run globally at once."
             ),
             "Current context": self._tool_decision_context(stage, prompt),
         }
@@ -551,7 +620,8 @@ class ProposalAgent(BaseAgent):
                 )
                 break
             call_count += 1
-            result = self._execute_node_tool(request, prompt=prompt)
+            with _NODE_TOOL_SEMAPHORE:
+                result = self._execute_node_tool(request, prompt=prompt)
             record = {
                 "stage": stage,
                 "call_index": call_count,
@@ -575,6 +645,7 @@ class ProposalAgent(BaseAgent):
     def _draft(self) -> Node:
         prompt = self.context_builder.build_draft()
         self.attach_node_tool_observations("draft", prompt)
+        prompt = self.context_builder._ordered_prompt(prompt)
         append_event(
             self.cfg.log_dir,
             "context_built",
@@ -593,6 +664,7 @@ class ProposalAgent(BaseAgent):
     def _debug(self, parent_node: Node) -> Node:
         prompt = self.context_builder.build_debug(parent_node)
         self.attach_node_tool_observations("debug", prompt)
+        prompt = self.context_builder._ordered_prompt(prompt)
         append_event(
             self.cfg.log_dir,
             "context_built",
@@ -613,6 +685,7 @@ class ProposalAgent(BaseAgent):
     def _improve(self, parent_node: Node) -> Node:
         prompt = self.context_builder.build_improve(parent_node)
         self.attach_node_tool_observations("improve", prompt)
+        prompt = self.context_builder._ordered_prompt(prompt)
         append_event(
             self.cfg.log_dir,
             "context_built",

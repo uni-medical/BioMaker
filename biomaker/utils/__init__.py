@@ -21,14 +21,16 @@ def copytree(
         dst (Path): destination directory
         exclude_names: source basenames to skip when copying directory contents
     """
-    assert dst.is_dir()
+    if not dst.is_dir():
+        raise NotADirectoryError(f"Destination directory does not exist: {dst}")
     exclude_names = exclude_names or set()
 
     if src.is_file():
         if src.name in exclude_names:
             return
         dest_f = dst / src.name
-        assert not dest_f.exists(), dest_f
+        if dest_f.exists():
+            raise FileExistsError(dest_f)
         if use_symlinks:
             (dest_f).symlink_to(src)
         else:
@@ -39,7 +41,8 @@ def copytree(
         if f.name in exclude_names:
             continue
         dest_f = dst / f.name
-        assert not dest_f.exists(), dest_f
+        if dest_f.exists():
+            raise FileExistsError(dest_f)
         if use_symlinks:
             (dest_f).symlink_to(f)
         elif f.is_dir():

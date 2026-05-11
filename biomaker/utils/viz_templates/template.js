@@ -369,7 +369,9 @@ const animEase = (t) => 1 - (1 - Math.min(t, 1.0)) ** 5;
 
 // ---- global constants ----
 
-const globalAnimSpeed = 1.1;
+const globalAnimSpeed = 2.2;
+const initialSpeedRampMs = 4000;
+const childEdgeStaggerMs = 500;
 const scaleFactor = 1.0;
 
 // ---- global vars ----
@@ -462,7 +464,6 @@ class Node {
     const mouseYlocalCoords = (mouseY - height / 2) / scaleFactor;
     const status = (treeStructData.statuses || [])[this.treeInd] || "unknown";
     const isMouseOver =
-      status !== "virtual" &&
       dist(mouseXlocalCoords, mouseYlocalCoords, this.x, this.y) <
       this.renderSize / 1.5;
     if (isMouseOver) cursor(HAND);
@@ -519,7 +520,9 @@ class Node {
       noFill();
       stroke(this.selected ? accentCol : bestCol);
       strokeWeight(this.selected ? 4 : 3);
-      if (status !== "virtual") {
+      if (status === "virtual") {
+        circle(this.x, this.y, Math.max(14, this.renderSize * 0.7));
+      } else {
         square(
           this.x - this.renderSize / 2 - 4,
           this.y - this.renderSize / 2 - 4,
@@ -581,7 +584,7 @@ class Node {
       this.edges
         .sort((a, b) => a.color() - b.color())
         .forEach((e, i) => {
-          e.startAnimation((i / this.edges.length) ** 2 * 1000);
+          e.startAnimation((i / this.edges.length) ** 2 * childEdgeStaggerMs);
         });
     }
   };
@@ -669,9 +672,16 @@ draw = () => {
   }
   // ---- update global animation state ----
   const initialSpeedScalingEaseIO =
-    (cos(min((millis() - firstFrameTime) / 8000, 1.0) * PI) + 1) / 2;
+    (cos(min((millis() - firstFrameTime) / initialSpeedRampMs, 1.0) * PI) +
+      1) /
+    2;
   const initialSpeedScalingEase =
-    (cos(min((millis() - firstFrameTime) / 8000, 1.0) ** (1 / 2) * PI) + 1) / 2;
+    (cos(
+      min((millis() - firstFrameTime) / initialSpeedRampMs, 1.0) ** (1 / 2) *
+        PI,
+    ) +
+      1) /
+    2;
   const initAnimationSpeedFactor = 1.0 - 0.4 * initialSpeedScalingEaseIO;
   // update global scaling-aware clock
   globalTime += globalAnimSpeed * initAnimationSpeedFactor * deltaTime;

@@ -10,11 +10,13 @@ from typing import Any
 
 import pandas as pd
 
+from . import canonical_paths as cpaths
 from .agentic_data_planner import (
     build_dataset_facts,
     run_agentic_split_builder_probe,
     split_builder_cache_key,
 )
+from .split_manifest import MANIFEST_NAME
 
 
 @dataclass(frozen=True)
@@ -26,7 +28,7 @@ class SplitProtocol:
 
 def _render_prompt(split_plan: dict[str, Any]) -> str:
     agent_visible = split_plan.get("agent_visible", {})
-    private_gt = split_plan.get("private_gt", {})
+    hidden_answers = split_plan.get("hidden_answers", {})
     lines = ["Use the BioMaker data split below as the source of truth for this run."]
     train_path = agent_visible.get("train")
     score_path = agent_visible.get("score_val")
@@ -44,23 +46,21 @@ def _render_prompt(split_plan: dict[str, Any]) -> str:
         lines.append(
             f"- Use `./input/{test_path}` only to generate `./working/submission.csv`; do not use it for training, model selection, debugging, or metric reporting."
         )
-    score_gt = private_gt.get("score_val") if isinstance(private_gt, dict) else None
+    score_gt = (
+        hidden_answers.get("score_val") if isinstance(hidden_answers, dict) else None
+    )
     if isinstance(score_gt, dict):
         answers = score_gt.get("answer_columns") or []
         if answers:
             lines.append(
-                "- Hidden score-validation answer columns are held outside the agent workspace: "
-                + ", ".join(f"`{column}`" for column in answers)
-                + "."
+                "- Hidden score-validation answers are held outside the agent workspace."
             )
-    test_gt = private_gt.get("test") if isinstance(private_gt, dict) else None
+    test_gt = hidden_answers.get("test") if isinstance(hidden_answers, dict) else None
     if isinstance(test_gt, dict):
         answers = test_gt.get("answer_columns") or []
         if answers:
             lines.append(
-                "- Private test answers are held outside the agent workspace for user-only evaluation: "
-                + ", ".join(f"`{column}`" for column in answers)
-                + "."
+                "- Private test answers are held outside the agent workspace for user-only evaluation."
             )
     for warning in split_plan.get("warnings", []) or []:
         lines.append(f"- Warning: {warning}")
@@ -80,61 +80,41 @@ def _copytree_replace(src: Path, dst: Path) -> None:
 
 
 def _looks_like_path(value: str) -> bool:
-    suffixes = {
-        ".csv",
-        ".json",
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".tif",
-        ".tiff",
-        ".nii",
-        ".nii.gz",
-        ".dcm",
-        ".xml",
-        ".txt",
-    }
-    lowered = value.lower()
-    return "/" in value or "\\" in value or any(lowered.endswith(suffix) for suffix in suffixes)
+    return cpaths.looks_like_path(value)
 
 
-def _workspace_relative_input_path(value: Any, input_dir: Path) -> str | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text or not _looks_like_path(text):
-        return None
-
-    raw = Path(text)
-    if not raw.is_absolute():
-        parts = raw.parts
-        if parts and parts[0] == "input":
-            return str(raw)
-        if (input_dir / raw).exists() or raw.parts:
-            return str(Path("input") / raw)
-        return None
-
-    try:
-        return str(Path("input") / raw.relative_to(input_dir))
-    except ValueError:
-        pass
-
-    try:
-        resolved = raw.resolve()
-    except Exception:
-        resolved = raw
-    for child in input_dir.iterdir():
-        if not child.exists():
-            continue
-        try:
-            rel = resolved.relative_to(child.resolve())
-        except Exception:
-            continue
-        return str(Path("input") / child.name / rel)
-    return None
+def _input_relative(candidate: Path, input_dir: Path) -> str | None:
+    return cpaths.input_relative(candidate, input_dir)
 
 
-def _normalize_split_paths_in_dir(csv_dir: Path, input_dir: Path) -> None:
+def _generated_public_relative(
+    candidate: Path, generated_output_dir: Path | None
+) -> str | None:
+    return cpaths.generated_public_relative(candidate, generated_output_dir)
+
+
+def _workspace_relative_input_path(
+    value: Any,
+    input_dir: Path,
+    *,
+    base_dir: Path | None = None,
+    generated_output_dir: Path | None = None,
+) -> str | None:
+    return cpaths.workspace_relative_input_path(
+        value,
+        input_dir,
+        base_dir=base_dir,
+        generated_output_dir=generated_output_dir,
+    )
+
+
+def _normalize_split_paths_in_dir(
+    csv_dir: Path,
+    input_dir: Path,
+    *,
+    base_dir: Path | None = None,
+    generated_output_dir: Path | None = None,
+) -> None:
     if not csv_dir.is_dir():
         return
     for csv_path in sorted(csv_dir.glob("*.csv")):
@@ -149,7 +129,12 @@ def _normalize_split_paths_in_dir(csv_dir: Path, input_dir: Path) -> None:
             normalized = []
             column_changed = False
             for value in df[column].tolist():
-                replacement = _workspace_relative_input_path(value, input_dir)
+                replacement = _workspace_relative_input_path(
+                    value,
+                    input_dir,
+                    base_dir=base_dir,
+                    generated_output_dir=generated_output_dir,
+                )
                 if replacement is not None:
                     normalized.append(replacement)
                     column_changed = column_changed or replacement != value
@@ -162,47 +147,44 @@ def _normalize_split_paths_in_dir(csv_dir: Path, input_dir: Path) -> None:
             df.to_csv(csv_path, index=False)
 
 
-def _evaluator_visible_path(value: Any, input_dir: Path) -> str | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text or not _looks_like_path(text):
-        return None
-    raw = Path(text)
-    candidates: list[Path]
-    if raw.is_absolute():
-        candidates = [raw]
-    else:
-        candidates = [input_dir / raw]
-        if raw.parts and raw.parts[0] == "input":
-            candidates.append(input_dir.parent / raw)
-            if len(raw.parts) > 1:
-                candidates.append(input_dir / Path(*raw.parts[1:]))
-    for candidate in candidates:
-        if candidate.exists():
-            try:
-                return str(candidate.resolve())
-            except Exception:
-                return str(candidate)
-    return None
+def _evaluator_visible_path(value: Any, input_dir: Path, base_dir: Path) -> str | None:
+    return cpaths.evaluator_visible_path(value, input_dir, base_dir)
 
 
 def _make_private_paths_evaluator_visible(csv_dir: Path, input_dir: Path) -> None:
     if not csv_dir.is_dir():
         return
+    answer_columns_by_file: dict[str, set[str]] = {}
+    manifest_path = csv_dir / "private_gt.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+        if isinstance(manifest, dict):
+            for split_name, entry in manifest.items():
+                if not isinstance(entry, dict):
+                    continue
+                file_name = "score_val.csv" if split_name == "score_val" else "test.csv"
+                answer_columns_by_file[file_name] = set(
+                    map(str, entry.get("answer_columns") or [])
+                )
     for csv_path in sorted(csv_dir.glob("*.csv")):
         try:
             df = pd.read_csv(csv_path)
         except Exception:
             continue
+        answer_columns = answer_columns_by_file.get(csv_path.name)
         changed = False
         for column in df.columns:
+            if answer_columns is not None and str(column) not in answer_columns:
+                continue
             if df[column].dtype != object:
                 continue
             values = []
             column_changed = False
             for value in df[column].tolist():
-                replacement = _evaluator_visible_path(value, input_dir)
+                replacement = _evaluator_visible_path(value, input_dir, csv_dir)
                 if replacement is not None:
                     values.append(replacement)
                     column_changed = column_changed or replacement != value
@@ -291,13 +273,17 @@ def _first_symlink_ancestor(input_dir: Path, rel: Path) -> Path | None:
     return None
 
 
-def _mirror_tree_excluding(src: Path, dst: Path, root_rel: Path, hidden_rels: set[Path]) -> None:
+def _mirror_tree_excluding(
+    src: Path, dst: Path, root_rel: Path, hidden_rels: set[Path]
+) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     for child in src.iterdir():
         child_rel = root_rel / child.name
         if child_rel in hidden_rels:
             continue
-        if any(rel.parts[: len(child_rel.parts)] == child_rel.parts for rel in hidden_rels):
+        if any(
+            rel.parts[: len(child_rel.parts)] == child_rel.parts for rel in hidden_rels
+        ):
             child_dst = dst / child.name
             if child.is_dir():
                 _mirror_tree_excluding(child, child_dst, child_rel, hidden_rels)
@@ -343,18 +329,52 @@ def _hide_private_file_answers(input_dir: Path, private_dir: Path) -> None:
         tmp_path.rename(root_path)
 
 
-def _copy_split_package_from_cache(cache_entry: Path, split_dir: Path, private_dir: Path) -> dict[str, Any] | None:
+def _copy_generated_public_assets(package_dir: Path, input_dir: Path) -> None:
+    public_dir = package_dir / "public"
+    if not public_dir.is_dir():
+        return
+    target_dir = input_dir / "public"
+    marker = target_dir / ".biomaker_generated_public"
+    if target_dir.exists():
+        if not marker.is_file():
+            raise RuntimeError(
+                "split builder generated public/ assets, but input/public already exists"
+            )
+        _remove_path(target_dir)
+    shutil.copytree(public_dir, target_dir)
+    (target_dir / ".biomaker_generated_public").write_text(
+        "Generated by BioMaker split builder.\n", encoding="utf-8"
+    )
+
+
+def _copy_split_package_from_cache(
+    cache_entry: Path, split_dir: Path, private_dir: Path, input_dir: Path
+) -> dict[str, Any] | None:
     cached_split = cache_entry / "biomaker_splits"
     cached_private = cache_entry / "private_gt"
     cached_verifier = cache_entry / "verifier.json"
-    if not cached_split.is_dir() or not cached_private.is_dir() or not cached_verifier.is_file():
+    if (
+        not cached_split.is_dir()
+        or not cached_private.is_dir()
+        or not cached_verifier.is_file()
+    ):
         return None
     _copytree_replace(cached_split, split_dir)
     _copytree_replace(cached_private, private_dir)
+    cached_manifest = cache_entry / MANIFEST_NAME
+    if cached_manifest.is_file():
+        shutil.copy2(cached_manifest, split_dir / MANIFEST_NAME)
+    _copy_generated_public_assets(cache_entry, input_dir)
     return json.loads(cached_verifier.read_text(encoding="utf-8"))
 
 
-def _store_split_package_cache(cache_entry: Path, split_dir: Path, private_dir: Path, verifier: dict[str, Any]) -> None:
+def _store_split_package_cache(
+    cache_entry: Path,
+    package_dir: Path,
+    split_dir: Path,
+    private_dir: Path,
+    verifier: dict[str, Any],
+) -> None:
     if (cache_entry / "manifest.json").is_file():
         return
     cache_entry.parent.mkdir(parents=True, exist_ok=True)
@@ -363,11 +383,19 @@ def _store_split_package_cache(cache_entry: Path, split_dir: Path, private_dir: 
     tmp_dir.mkdir(parents=True, exist_ok=True)
     shutil.copytree(split_dir, tmp_dir / "biomaker_splits")
     shutil.copytree(private_dir, tmp_dir / "private_gt")
+    public_dir = package_dir / "public"
+    if public_dir.is_dir():
+        shutil.copytree(public_dir, tmp_dir / "public")
+    manifest_path = package_dir / MANIFEST_NAME
+    if manifest_path.is_file():
+        shutil.copy2(manifest_path, tmp_dir / MANIFEST_NAME)
     (tmp_dir / "verifier.json").write_text(
         json.dumps(verifier, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     (tmp_dir / "manifest.json").write_text(
-        json.dumps({"cache": "split_builder", "verifier_ok": verifier.get("ok")}, indent=2),
+        json.dumps(
+            {"cache": "split_builder", "verifier_ok": verifier.get("ok")}, indent=2
+        ),
         encoding="utf-8",
     )
     try:
@@ -388,7 +416,11 @@ def prepare_split_protocol(
 ) -> SplitProtocol:
     """Prepare BioMaker public splits and private ground truth using an LLM-built splitter."""
     input_dir = Path(input_dir).resolve()
-    private_dir = Path(private_dir).resolve() if private_dir is not None else input_dir.parent / "private_gt"
+    private_dir = (
+        Path(private_dir).resolve()
+        if private_dir is not None
+        else input_dir.parent / "private_gt"
+    )
     split_dir = input_dir / "biomaker_splits"
     _remove_path(split_dir)
     _remove_path(private_dir)
@@ -396,7 +428,9 @@ def prepare_split_protocol(
     if isinstance(task_desc, str):
         task_text = task_desc
     else:
-        task_text = json.dumps(task_desc or {}, indent=2, ensure_ascii=False, default=str)
+        task_text = json.dumps(
+            task_desc or {}, indent=2, ensure_ascii=False, default=str
+        )
 
     cache_entry = None
     result_verifier: dict[str, Any] | None = None
@@ -409,7 +443,9 @@ def prepare_split_protocol(
             temperature=temperature,
         )
         cache_entry = Path(cache_root) / cache_key
-        result_verifier = _copy_split_package_from_cache(cache_entry, split_dir, private_dir)
+        result_verifier = _copy_split_package_from_cache(
+            cache_entry, split_dir, private_dir, input_dir
+        )
         cache_reused = result_verifier is not None
 
     run_root = private_dir.parent
@@ -429,27 +465,49 @@ def prepare_split_protocol(
             max_attempts=attempts,
             debug_artifacts=True,
         )
+        _normalize_split_paths_in_dir(
+            result.split_dir,
+            input_dir,
+            base_dir=result.output_dir,
+            generated_output_dir=result.output_dir,
+        )
+        _normalize_split_paths_in_dir(
+            result.private_gt_dir,
+            input_dir,
+            base_dir=result.output_dir,
+            generated_output_dir=result.output_dir,
+        )
         _copytree_replace(result.split_dir, split_dir)
         _copytree_replace(result.private_gt_dir, private_dir)
+        manifest_path = result.output_dir / MANIFEST_NAME
+        if manifest_path.is_file():
+            shutil.copy2(manifest_path, split_dir / MANIFEST_NAME)
+        _copy_generated_public_assets(result.output_dir, input_dir)
         result_verifier = result.verifier
         if cache_entry is not None:
-            _store_split_package_cache(cache_entry, split_dir, private_dir, result_verifier)
+            _store_split_package_cache(
+                cache_entry, result.output_dir, split_dir, private_dir, result_verifier
+            )
 
     _normalize_split_paths_in_dir(split_dir, input_dir)
     _make_private_paths_evaluator_visible(private_dir, input_dir)
     _hide_private_file_answers(input_dir, private_dir)
 
-    private_gt_plan = result_verifier.get("private_gt", {}) or {}
-    if isinstance(private_gt_plan, dict):
-        if isinstance(private_gt_plan.get("score_val"), dict):
-            private_gt_plan["score_val"] = {
+    hidden_answers_plan = (
+        result_verifier.get("hidden_answers")
+        or result_verifier.get("private_gt", {})
+        or {}
+    )
+    if isinstance(hidden_answers_plan, dict):
+        if isinstance(hidden_answers_plan.get("score_val"), dict):
+            hidden_answers_plan["score_val"] = {
                 "file": "score_val.csv",
-                **private_gt_plan["score_val"],
+                **hidden_answers_plan["score_val"],
             }
-        if isinstance(private_gt_plan.get("test"), dict):
-            private_gt_plan["test"] = {
+        if isinstance(hidden_answers_plan.get("test"), dict):
+            hidden_answers_plan["test"] = {
                 "file": "test.csv",
-                **private_gt_plan["test"],
+                **hidden_answers_plan["test"],
             }
 
     split_plan = {
@@ -459,12 +517,29 @@ def prepare_split_protocol(
             "score_val": "biomaker_splits/score_val.csv",
             "test": "biomaker_splits/agent_test.csv",
         },
-        "private_gt": private_gt_plan,
+        "hidden_answers": hidden_answers_plan,
         "metric_split": "score_val",
         "row_counts": result_verifier.get("row_counts", {}),
         "warnings": result_verifier.get("warnings", []),
         "cache_reused": cache_reused,
     }
+    split_manifest = result_verifier.get("split_manifest")
+    if isinstance(split_manifest, dict):
+        split_plan["split_manifest"] = {
+            "manifest_version": split_manifest.get("manifest_version"),
+            "sample_unit": split_manifest.get("sample_unit"),
+            "key_columns": split_manifest.get("key_columns", []),
+            "task_heads": split_manifest.get("task_heads", []),
+            "metric_contract": split_manifest.get("metric_contract", {}),
+        }
+        if split_manifest.get("key_columns") and not split_plan.get("key_columns"):
+            split_plan["key_columns"] = split_manifest.get("key_columns")
+        metric_contract = split_manifest.get("metric_contract")
+        if isinstance(metric_contract, dict):
+            if metric_contract.get("primary_metric"):
+                split_plan["primary_metric"] = metric_contract["primary_metric"]
+            if "maximize" in metric_contract:
+                split_plan["maximize"] = bool(metric_contract["maximize"])
     if not (split_dir / "agent_test.csv").is_file():
         split_plan["agent_visible"].pop("test", None)
     (split_dir / "split_plan.json").write_text(
@@ -476,4 +551,6 @@ def prepare_split_protocol(
     )
     prompt_text = _render_prompt(split_plan)
     (split_dir / "split_protocol.txt").write_text(prompt_text, encoding="utf-8")
-    return SplitProtocol(dataset_report=dataset_report, split_plan=split_plan, prompt_text=prompt_text)
+    return SplitProtocol(
+        dataset_report=dataset_report, split_plan=split_plan, prompt_text=prompt_text
+    )

@@ -1,13 +1,19 @@
 """Export journal to HTML visualization of tree + code."""
 
 import json
+import os
+import tempfile
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
+from typing import Any
 
 from ..backend import compile_prompt_to_md
 from ..journal import Journal
 from .response import format_human_execution_output, truncate_text
+
+_TREE_EXPORT_LOCK = RLock()
 
 
 @dataclass
@@ -21,7 +27,9 @@ class VisualNode:
 def _sorted_children(node) -> list:
     return sorted(
         node.children,
-        key=lambda child: _display_step(child) if _display_step(child) is not None else 10**9,
+        key=lambda child: (
+            _display_step(child) if _display_step(child) is not None else 10**9
+        ),
     )
 
 
@@ -36,7 +44,9 @@ def _build_visual_tree(journal: Journal) -> tuple[list[VisualNode], list[list[in
     edges: list[list[int]] = []
     ordered_nodes = sorted(
         list(journal),
-        key=lambda node: _display_step(node) if _display_step(node) is not None else 10**9,
+        key=lambda node: (
+            _display_step(node) if _display_step(node) is not None else 10**9
+        ),
     )
     for node in ordered_nodes:
         child_index = index_by_node[node]
@@ -131,7 +141,11 @@ def _node_label(node) -> str:
             if node.is_buggy:
                 return f"{step}: bug"
             metric = _node_metric(node)
-            return f"{step}: completed {metric}" if metric != "n/a" else f"{step}: completed"
+            return (
+                f"{step}: completed {metric}"
+                if metric != "n/a"
+                else f"{step}: completed"
+            )
         return f"{step}: {_transient_status(node)}"
     prefix = "bug" if node.is_buggy else node.node_status
     metric = _node_metric(node)
@@ -179,6 +193,75 @@ def _estimated_tokens(text: str) -> int:
     return max(1, round(len(text) / 4)) if text else 0
 
 
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _json_section(name: str, data: dict[str, Any], max_chars: int = 6000) -> dict:
+    text = json.dumps(data, indent=2, ensure_ascii=False, default=str) if data else ""
+    text = truncate_text(text, max_chars=max_chars, marker=f"{name} trimmed")
+    return {
+        "name": name,
+        "chars": len(text),
+        "estimated_tokens": _estimated_tokens(text),
+        "text": text or "Not available.",
+    }
+
+
+def _root_setup_prompt(cfg) -> dict:
+    workspace_dir = Path(getattr(cfg, "workspace_dir", ""))
+    log_dir = Path(getattr(cfg, "log_dir", ""))
+    split_dir = workspace_dir / "input" / "biomaker_splits"
+    sections = [
+        _json_section(
+            "Run Setup",
+            {
+                "exp_name": getattr(cfg, "exp_name", ""),
+                "workspace_dir": str(workspace_dir),
+                "log_dir": str(log_dir),
+                "data_dir": str(getattr(cfg, "data_dir", "")),
+                "desc_file": str(getattr(cfg, "desc_file", "")),
+            },
+            max_chars=3000,
+        ),
+        _json_section("Run Manifest", _read_json(log_dir / "run_manifest.json")),
+        _json_section("Experiment Guide", _read_json(workspace_dir / "exp_guide.json")),
+        _json_section(
+            "Evaluator Prediction Spec",
+            _read_json(workspace_dir / "evaluator_prediction_spec.json"),
+        ),
+        _json_section("Split Plan", _read_json(split_dir / "split_plan.json")),
+        _json_section("Split Manifest", _read_json(split_dir / "split_manifest.json")),
+    ]
+    sections = [section for section in sections if section["text"] != "Not available."]
+    if not sections:
+        sections = [
+            {
+                "name": "Run Setup",
+                "chars": 0,
+                "estimated_tokens": 0,
+                "text": "No pre-node setup artifacts were available when this tree was exported.",
+            }
+        ]
+    return {
+        "available": True,
+        "stats": {
+            "model": "pre-node setup",
+            "estimated_input_tokens": sum(
+                section.get("estimated_tokens", 0) for section in sections
+            ),
+        },
+        "sections": sections,
+        "messages": [],
+    }
+
+
 def _transient_status(node) -> str:
     if node is None:
         return "virtual"
@@ -191,9 +274,9 @@ def _transient_status(node) -> str:
     return node.node_status
 
 
-def _node_prompt(node) -> dict:
+def _node_prompt(node, cfg=None) -> dict:
     if node is None:
-        return {"available": False}
+        return _root_setup_prompt(cfg) if cfg is not None else {"available": False}
 
     prompt = node.prompt
     messages = node.prompt_messages or []
@@ -268,7 +351,11 @@ def _node_summary(node, best_node) -> dict:
             "gpu_memory": "",
             "cpu": "",
             "outcome": "",
-            "plan": "Draft nodes are direct children of this start point.",
+            "plan": (
+                "Pre-node setup and run contract. Use Input Prompt to inspect "
+                "the split protocol, evaluator prediction spec, run manifest, "
+                "and experiment guide that existed before node generation."
+            ),
             "error": "",
         }
 
@@ -316,6 +403,11 @@ def _node_plan_text(node) -> str:
 def _node_term_out(node) -> str:
     if node is None or getattr(node, "_term_out", None) is None:
         return ""
+    execution = getattr(node, "execution", None)
+    if isinstance(execution, dict):
+        candidate = execution.get("candidate")
+        if isinstance(candidate, dict) and isinstance(candidate.get("output"), str):
+            return format_human_execution_output(candidate["output"], max_chars=12000)
     return format_human_execution_output("".join(node._term_out), max_chars=12000)
 
 
@@ -340,10 +432,7 @@ def cfg_to_tree_struct(cfg, jou: Journal, live: bool = False):
             "" if v.source_node is None else strip_code_markers(v.source_node.code)
             for v in visual_nodes
         ],
-        term_out=[
-            _node_term_out(v.source_node)
-            for v in visual_nodes
-        ],
+        term_out=[_node_term_out(v.source_node) for v in visual_nodes],
         artifact_reports=[
             None if v.source_node is None else v.source_node.artifact_report
             for v in visual_nodes
@@ -353,11 +442,8 @@ def cfg_to_tree_struct(cfg, jou: Journal, live: bool = False):
         labels=[_node_label(v.source_node) for v in visual_nodes],
         display_labels=[_node_display_label(v.source_node) for v in visual_nodes],
         summaries=[_node_summary(v.source_node, best_node) for v in visual_nodes],
-        prompts=[_node_prompt(v.source_node) for v in visual_nodes],
-        statuses=[
-            _transient_status(v.source_node)
-            for v in visual_nodes
-        ],
+        prompts=[_node_prompt(v.source_node, cfg) for v in visual_nodes],
+        statuses=[_transient_status(v.source_node) for v in visual_nodes],
         is_best=[
             bool(
                 v.source_node is not None
@@ -391,8 +477,28 @@ def generate_html(tree_graph_str: str):
         return html
 
 
+def _atomic_write_text(out_path: Path, text: str) -> None:
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.",
+        suffix=".tmp",
+        dir=out_path.parent,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_name, out_path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
 def generate(cfg, jou: Journal, out_path: Path, live: bool = False):
-    tree_graph_str = json.dumps(cfg_to_tree_struct(cfg, jou, live=live))
-    html = generate_html(tree_graph_str)
-    with open(out_path, "w") as f:
-        f.write(html)
+    with _TREE_EXPORT_LOCK:
+        tree_graph_str = json.dumps(cfg_to_tree_struct(cfg, jou, live=live))
+        html = generate_html(tree_graph_str)
+        _atomic_write_text(out_path, html)

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import csv
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 from PIL import Image
+
+from .mask_io import load_mask
+from .prediction_contract import (
+    load_prediction_contract,
+    resolve_artifact_path,
+)
 
 
 @dataclass(frozen=True)
@@ -19,29 +23,16 @@ class ArtifactValidationResult:
 
 
 def _resolve_artifact_path(workspace_dir: Path, value: str) -> Path:
-    path = Path(value.strip())
-    if path.is_absolute():
-        return path
-
-    normalized = Path(str(path).removeprefix("./"))
-    candidates = [
-        workspace_dir / normalized,
-        workspace_dir / "working" / normalized,
-        workspace_dir / "input" / normalized,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return workspace_dir / "working" / normalized
+    return resolve_artifact_path(workspace_dir, value)
 
 
 def _canonical_working_ref(workspace_dir: Path, value: str) -> str:
     artifact_path = _resolve_artifact_path(workspace_dir, value)
     try:
-        artifact_path.relative_to(workspace_dir / "working")
+        rel = artifact_path.resolve().relative_to((workspace_dir / "working").resolve())
     except ValueError:
         return value
-    return str(artifact_path.resolve())
+    return str(Path("working") / rel)
 
 
 def _normalize_csv_path_refs(workspace_dir: Path, csv_path: Path) -> list[str]:
@@ -72,33 +63,9 @@ def _normalize_csv_path_refs(workspace_dir: Path, csv_path: Path) -> list[str]:
     if not changed:
         return []
     df.to_csv(csv_path, index=False)
-    return [f"ArtifactNormalization: normalized working file references in {csv_path.name}"]
-
-
-def _load_prediction_spec(workspace_dir: Path) -> dict[str, Any]:
-    spec_path = workspace_dir / "evaluator_prediction_spec.json"
-    if not spec_path.is_file():
-        return {}
-    try:
-        data = json.loads(spec_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _path_from_spec(workspace_dir: Path, value: Any, fallback: Path) -> Path:
-    if not isinstance(value, str) or not value.strip():
-        return fallback
-    path = Path(value.strip())
-    if path.is_absolute():
-        return path
-    return workspace_dir / str(path).removeprefix("./")
-
-
-def _list_of_strings(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(item) for item in value if isinstance(item, str) and item]
-    return []
+    return [
+        f"ArtifactNormalization: normalized working file references in {csv_path.name}"
+    ]
 
 
 def _submission_expected_rows(input_dir: Path) -> int | None:
@@ -142,14 +109,9 @@ def validate_working_outputs(
 ) -> ArtifactValidationResult:
     """Check common generated artifacts before the agent accepts a run."""
     workspace_dir = Path(workspace_dir)
-    working_dir = workspace_dir / "working"
     input_dir = workspace_dir / "input"
-    spec = _load_prediction_spec(workspace_dir)
-    submission_path = _path_from_spec(
-        workspace_dir,
-        spec.get("test_submission"),
-        working_dir / "submission.csv",
-    )
+    contract = load_prediction_contract(workspace_dir)
+    submission_path = contract.test_submission
     messages: list[str] = []
 
     test_split = workspace_dir / "input" / "biomaker_splits" / "agent_test.csv"
@@ -177,24 +139,32 @@ def validate_working_outputs(
         )
 
     required_columns = [
-        * _list_of_strings(spec.get("key_columns")),
-        * _list_of_strings(spec.get("prediction_columns")),
+        *contract.key_columns,
+        *contract.prediction_columns,
     ]
-    missing_columns = [column for column in required_columns if column not in submission]
+    missing_columns = [
+        column for column in required_columns if column not in submission
+    ]
     if missing_columns:
         messages.append(
             "ArtifactValidationError: submission is missing required evaluator "
             "contract columns: " + ", ".join(missing_columns)
         )
 
-    prediction_columns = set(_list_of_strings(spec.get("prediction_columns")))
-    declared_file_columns = set(_list_of_strings(spec.get("file_reference_columns")))
+    prediction_columns = set(contract.prediction_columns)
+    declared_file_columns = set(contract.file_reference_columns)
     path_columns = [
         column
         for column in submission.columns
         if column in declared_file_columns
-        or (column in prediction_columns and ("path" in column.lower() or "file" in column.lower()))
-        or (not prediction_columns and ("path" in column.lower() or "file" in column.lower()))
+        or (
+            column in prediction_columns
+            and ("path" in column.lower() or "file" in column.lower())
+        )
+        or (
+            not prediction_columns
+            and ("path" in column.lower() or "file" in column.lower())
+        )
     ]
     if not path_columns:
         return ArtifactValidationResult(ok=not messages, messages=messages)
@@ -220,8 +190,7 @@ def validate_working_outputs(
                     continue
 
                 try:
-                    with Image.open(artifact_path) as mask:
-                        mask.verify()
+                    load_mask(artifact_path)
                 except Exception as exc:
                     invalid_masks.append(f"{value}: mask file is not readable: {exc}")
 

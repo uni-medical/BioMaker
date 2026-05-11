@@ -13,8 +13,9 @@ import shutil
 import sys
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import humanize
 from dataclasses_json import DataClassJsonMixin
@@ -22,6 +23,26 @@ from dataclasses_json import DataClassJsonMixin
 from .utils.environment import validate_code_environment
 
 logger = logging.getLogger("biomaker")
+
+_IPYTHON_TRACEBACK_WRAPPER = r"""
+import runpy
+import sys
+import traceback
+
+try:
+    runpy.run_path(sys.argv[1], run_name="__main__")
+except SystemExit:
+    raise
+except BaseException:
+    etype, evalue, tb = sys.exc_info()
+    try:
+        from IPython.core.ultratb import VerboseTB
+
+        VerboseTB(color_scheme="NoColor")(etype, evalue, tb)
+    except Exception:
+        traceback.print_exception(etype, evalue, tb)
+    sys.exit(1)
+"""
 
 
 @dataclass
@@ -37,6 +58,76 @@ class ExecutionResult(DataClassJsonMixin):
     exc_info: dict | None = None
     exc_stack: list[tuple] | None = None
     resource_usage: dict | None = None
+    stdout: str = ""
+    stderr: str = ""
+    candidate_output: str = ""
+    candidate_exec_time: float | None = None
+    candidate_returncode: int | None = None
+    candidate_exc_type: str | None = None
+    candidate_exc_info: dict | None = None
+    failure_phase: str | None = None
+    artifact_validation: dict[str, Any] | None = None
+    evaluator_result: dict[str, Any] | None = None
+    system_outputs: list[dict[str, Any]] = field(default_factory=list)
+
+    def append_system_output(
+        self,
+        phase: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+        append_to_term_out: bool = True,
+    ) -> None:
+        """Record BioMaker-owned post-processing output separately from candidate stdout."""
+        record: dict[str, Any] = {"phase": phase, "message": str(message)}
+        if details is not None:
+            record["details"] = details
+        self.system_outputs.append(record)
+        if append_to_term_out and message:
+            self.term_out.append("\n" + str(message))
+
+    def execution_record(self) -> dict[str, Any]:
+        """Return the structured execution facts used by prompts and run exports."""
+        candidate_failure = None
+        if self.candidate_exc_type is not None:
+            candidate_failure = {
+                "phase": (
+                    self.failure_phase
+                    if self.failure_phase in {"candidate_run", "environment_preflight"}
+                    else "candidate_run"
+                ),
+                "type": self.candidate_exc_type,
+                "info": self.candidate_exc_info,
+                "returncode": self.candidate_returncode,
+            }
+        final_failure = None
+        if self.exc_type is not None:
+            final_failure = {
+                "phase": self.failure_phase or "candidate_run",
+                "type": self.exc_type,
+                "info": self.exc_info,
+            }
+        return {
+            "schema_version": 1,
+            "candidate": {
+                "stdout": self.stdout,
+                "stderr": self.stderr,
+                "output": self.candidate_output,
+                "returncode": self.candidate_returncode,
+                "runtime_s": (
+                    self.candidate_exec_time
+                    if self.candidate_exec_time is not None
+                    else self.exec_time
+                ),
+                "resources": self.resource_usage,
+                "failure": candidate_failure,
+            },
+            "node_runtime_s": self.exec_time,
+            "artifact_validation": self.artifact_validation,
+            "evaluator": self.evaluator_result,
+            "final_failure": final_failure,
+            "system_outputs": list(self.system_outputs),
+        }
 
 
 def _infer_exception_type(output: str, returncode: int) -> str:
@@ -243,9 +334,7 @@ def _summarize_usage(
         summary["peak_gpu_memory_mb"] = max(rss_values)
         summary["gpu_backend"] = "mps"
         summary["gpu_memory_source"] = "unified_memory_rss_proxy"
-    process_counts = [
-        int(s["process_count"]) for s in samples if "process_count" in s
-    ]
+    process_counts = [int(s["process_count"]) for s in samples if "process_count" in s]
     if process_counts:
         summary["peak_process_count"] = max(process_counts)
     summary["scope"] = "generated_script_process_tree"
@@ -296,9 +385,10 @@ class Interpreter:
         """
         # this really needs to be a path, otherwise causes issues that don't raise exc
         self.working_dir = Path(working_dir).resolve()
-        assert (
-            self.working_dir.exists()
-        ), f"Working directory {self.working_dir} does not exist"
+        if not self.working_dir.exists():
+            raise FileNotFoundError(
+                f"Working directory {self.working_dir} does not exist"
+            )
         self.timeout = timeout
         self.format_tb_ipython = format_tb_ipython
         self.agent_file_name = agent_file_name
@@ -332,6 +422,12 @@ class Interpreter:
                     exc_info=preflight.exc_info,
                     exc_stack=None,
                     resource_usage=None,
+                    stderr=preflight.message,
+                    candidate_output=preflight.message,
+                    candidate_exec_time=0.0,
+                    candidate_exc_type=preflight.error_type,
+                    candidate_exc_info=preflight.exc_info,
+                    failure_phase="environment_preflight",
                 )
 
         script_path = self.working_dir / self.agent_file_name
@@ -339,9 +435,14 @@ class Interpreter:
         start_time = time.time()
         usage_samples: list[dict] = []
         gpu_baseline_mb = _sample_cuda_total_gpu_memory_mb()
+        command = (
+            [sys.executable, "-c", _IPYTHON_TRACEBACK_WRAPPER, self.agent_file_name]
+            if self.format_tb_ipython
+            else [sys.executable, self.agent_file_name]
+        )
         try:
             process = subprocess.Popen(
-                [sys.executable, self.agent_file_name],
+                command,
                 cwd=self.working_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -401,6 +502,14 @@ class Interpreter:
                     {"timeout": str(self.timeout)},
                     None,
                     resource_usage,
+                    stdout=stdout or "",
+                    stderr=stderr or "",
+                    candidate_output=output_text,
+                    candidate_exec_time=float(self.timeout),
+                    candidate_returncode=process.returncode,
+                    candidate_exc_type="TimeoutError",
+                    candidate_exc_info={"timeout": str(self.timeout)},
+                    failure_phase="candidate_run",
                 )
 
             if process.returncode == 0:
@@ -409,18 +518,37 @@ class Interpreter:
                     f"(time limit is {humanize.naturaldelta(self.timeout)})."
                 )
                 return ExecutionResult(
-                    output, exec_time, None, None, None, resource_usage
+                    output,
+                    exec_time,
+                    None,
+                    None,
+                    None,
+                    resource_usage,
+                    stdout=stdout or "",
+                    stderr=stderr or "",
+                    candidate_output=output_text,
+                    candidate_exec_time=exec_time,
+                    candidate_returncode=process.returncode,
                 )
 
             exc_type = _infer_exception_type(output_text, process.returncode)
             output.append(f"Process exited with return code {process.returncode}.")
+            exc_info = {"returncode": str(process.returncode)}
             return ExecutionResult(
                 output,
                 exec_time,
                 exc_type,
-                {"returncode": str(process.returncode)},
+                exc_info,
                 None,
                 resource_usage,
+                stdout=stdout or "",
+                stderr=stderr or "",
+                candidate_output=output_text,
+                candidate_exec_time=exec_time,
+                candidate_returncode=process.returncode,
+                candidate_exc_type=exc_type,
+                candidate_exc_info=exc_info,
+                failure_phase="candidate_run",
             )
         except subprocess.TimeoutExpired as e:
             resource_usage = _summarize_usage(
@@ -441,6 +569,13 @@ class Interpreter:
                 {"timeout": str(self.timeout)},
                 None,
                 resource_usage,
+                stdout=e.stdout or "",
+                stderr=e.stderr or "",
+                candidate_output=output_text,
+                candidate_exec_time=float(self.timeout),
+                candidate_exc_type="TimeoutError",
+                candidate_exc_info={"timeout": str(self.timeout)},
+                failure_phase="candidate_run",
             )
         finally:
             try:

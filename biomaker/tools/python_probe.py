@@ -49,7 +49,9 @@ def _guard_probe_code(code: str) -> str | None:
         elif isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Name) and func.id in BLOCKED_CALLS:
-                return f"ProbeRejected: call `{func.id}()` is not allowed in API probes."
+                return (
+                    f"ProbeRejected: call `{func.id}()` is not allowed in API probes."
+                )
             if isinstance(func, ast.Attribute) and func.attr in {
                 "system",
                 "popen",
@@ -107,9 +109,83 @@ def _echo_last_expression(code: str) -> str:
     return ast.unparse(tree)
 
 
-def python_probe(
-    code: str, timeout: int = 20, cwd: Path | str | None = None
-) -> str:
+def _path_guard_prefix(cwd: Path | None) -> str:
+    if cwd is None:
+        return ""
+    cwd_text = str(cwd)
+    return f"""
+import builtins as __biomaker_builtins
+import io as __biomaker_io
+import os as __biomaker_os
+import site as __biomaker_site
+import sys as __biomaker_sys
+from pathlib import Path as __BioMakerPath
+
+__biomaker_cwd = __BioMakerPath({cwd_text!r}).resolve()
+__biomaker_allowed_roots = [
+    (__biomaker_cwd / "input").resolve(),
+]
+__biomaker_allowed_files = [
+    (__biomaker_cwd / "evaluator.py").resolve(),
+    (__biomaker_cwd / "evaluator_prediction_spec.json").resolve(),
+]
+__biomaker_external_roots = [
+    __BioMakerPath(__biomaker_sys.prefix).resolve(),
+    __BioMakerPath(__biomaker_sys.base_prefix).resolve(),
+]
+for __biomaker_site_dir in getattr(__biomaker_site, "getsitepackages", lambda: [])():
+    try:
+        __biomaker_external_roots.append(__BioMakerPath(__biomaker_site_dir).resolve())
+    except Exception:
+        pass
+__biomaker_orig_open = __biomaker_builtins.open
+__biomaker_orig_io_open = __biomaker_io.open
+
+def __biomaker_is_relative_to(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except Exception:
+        return False
+
+def __biomaker_path_allowed(file):
+    try:
+        path = __BioMakerPath(file)
+    except Exception:
+        return True
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path.absolute()
+    if __biomaker_is_relative_to(resolved, __biomaker_cwd):
+        return (
+            any(__biomaker_is_relative_to(resolved, root) for root in __biomaker_allowed_roots)
+            or resolved in __biomaker_allowed_files
+        )
+    for root in __biomaker_allowed_roots:
+        if __biomaker_is_relative_to(resolved, root):
+            return True
+    return any(
+        __biomaker_is_relative_to(resolved, root)
+        for root in __biomaker_external_roots
+    )
+
+def __biomaker_guarded_open(file, mode="r", *args, **kwargs):
+    if any(flag in str(mode) for flag in ("w", "a", "+", "x")):
+        raise PermissionError("inspect_api is read-only")
+    if not __biomaker_path_allowed(file):
+        raise PermissionError(
+            "inspect_api can read only ./input, ./evaluator.py, "
+            "and ./evaluator_prediction_spec.json"
+        )
+    return __biomaker_orig_open(file, mode, *args, **kwargs)
+
+__biomaker_builtins.open = __biomaker_guarded_open
+__biomaker_io.open = __biomaker_guarded_open
+"""
+
+
+def python_probe(code: str, timeout: int = 20, cwd: Path | str | None = None) -> str:
     """Run a short Python snippet for package/API and workspace introspection."""
 
     rejection = _guard_probe_code(code)
@@ -117,7 +193,7 @@ def python_probe(
         return rejection
 
     run_cwd = Path(cwd).resolve() if cwd is not None else None
-    runnable_code = _echo_last_expression(code)
+    runnable_code = _path_guard_prefix(run_cwd) + "\n" + _echo_last_expression(code)
     try:
         result = subprocess.run(
             [sys.executable, "-c", runnable_code],

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import ast
 import hashlib
+from importlib import metadata as importlib_metadata
 import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,9 +23,23 @@ from PIL import Image
 import numpy as np
 
 from .. import backend
-from . import data_summary
 from .environment import environment_manifest_text, validate_code_environment
 from .events import append_event
+from .evaluator_templates import (
+    _FIXED_CLASSIFICATION_EVALUATOR,
+    _FIXED_SEGMENTATION_EVALUATOR,
+)
+from .exp_guide import (
+    build_exp_guide,
+    evaluator_exp_guide_view,
+    load_exp_guide,
+)
+from .experiment_contract import load_experiment_contract
+from .metric_registry import (
+    is_classification_metric_supported,
+    is_segmentation_metric_supported,
+    metric_maximize,
+)
 from .response import extract_code, truncate_text
 
 logger = logging.getLogger("biomaker")
@@ -32,7 +49,7 @@ _RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
 _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 _SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
-_EVALUATOR_CACHE_VERSION = 1
+_EVALUATOR_CACHE_VERSION = 2
 
 
 class EvaluatorSetupError(RuntimeError):
@@ -94,7 +111,9 @@ def parse_external_validation(term_out: list[str] | str) -> tuple[float, bool] |
     return None
 
 
-def parse_external_validation_details(term_out: list[str] | str) -> dict[str, Any] | None:
+def parse_external_validation_details(
+    term_out: list[str] | str,
+) -> dict[str, Any] | None:
     text = "\n".join(term_out) if isinstance(term_out, list) else term_out
     for line in reversed(text.splitlines()):
         if not line.startswith(EXTERNAL_VALIDATION_PREFIX):
@@ -128,95 +147,13 @@ def _task_payload(task_desc: Any) -> str:
     return json.dumps(task_desc, indent=2, ensure_ascii=False, default=str)
 
 
-def _artifact_contract_facts(
+def _exp_guide_prompt_view(
     workspace_dir: Path, hidden_score_path: Path | None = None
 ) -> dict[str, Any]:
-    split_dir = workspace_dir / "input" / "biomaker_splits"
-    val_path = split_dir / "score_val.csv"
-    dev_path = split_dir / "agent_dev.csv"
-    hidden_score_path = hidden_score_path or (
-        workspace_dir / "private_gt" / "score_val.csv"
-    )
-    test_path = split_dir / "agent_test.csv"
-    if not val_path.is_file() or not test_path.is_file():
-        return {}
-
-    try:
-        val_df = pd.read_csv(val_path, nrows=3)
-        test_df = pd.read_csv(test_path, nrows=3)
-        dev_df = pd.read_csv(dev_path, nrows=3) if dev_path.is_file() else None
-        hidden_score_df = (
-            pd.read_csv(hidden_score_path, nrows=3)
-            if hidden_score_path.is_file()
-            else None
-        )
-    except Exception as exc:
-        return {"error": str(exc)}
-
-    val_columns = list(val_df.columns)
-    test_columns = list(test_df.columns)
-    test_set = set(test_columns)
-    label_tokens = {
-        "annotation",
-        "class",
-        "diagnosis",
-        "finding",
-        "grade",
-        "ground_truth",
-        "gt",
-        "instance",
-        "label",
-        "mask",
-        "target",
-        "y",
-    }
-    ground_truth_only = []
-    for column in val_columns:
-        normalized = column.lower()
-        if column not in test_set or any(token in normalized for token in label_tokens):
-            if column not in test_set or column not in {
-                "image_path",
-                "path",
-                "file_path",
-            }:
-                ground_truth_only.append(column)
-
-    common_columns = [column for column in val_columns if column in test_set]
-    likely_key_columns = [
-        column
-        for column in common_columns
-        if not any(token in column.lower() for token in ["path", "image", "mask"])
-    ]
-
-    private_gt_manifest = None
-    for candidate in [
-        hidden_score_path.parent / "private_gt.json",
-        workspace_dir / "private_gt" / "private_gt.json",
-    ]:
-        if candidate.is_file():
-            try:
-                private_gt_manifest = json.loads(candidate.read_text(encoding="utf-8"))
-                break
-            except Exception:
-                private_gt_manifest = None
-
-    return {
-        "score_val_public_columns": val_columns,
-        "agent_dev_columns": list(dev_df.columns) if dev_df is not None else None,
-        "hidden_score_answer_columns": (
-            list(hidden_score_df.columns) if hidden_score_df is not None else None
-        ),
-        "agent_test_columns": test_columns,
-        "ground_truth_only_columns": ground_truth_only,
-        "private_gt": private_gt_manifest,
-        "likely_key_columns": likely_key_columns,
-        "note": (
-            "Candidate validation artifacts are predictions for score_val.csv and may use "
-            "key columns plus new prediction columns only. Hidden score labels are not "
-            "present in score_val.csv; score_val() must load them from the path in "
-            f"environment variable {_SCORE_ENV_VAR}."
-        ),
-    }
+    guide = load_exp_guide(workspace_dir)
+    if guide is None:
+        guide = build_exp_guide(workspace_dir)
+    return evaluator_exp_guide_view(guide)
 
 
 def _evaluator_prompt(
@@ -230,23 +167,18 @@ def _evaluator_prompt(
             "after each candidate finishes, so all candidates are scored with the same code."
         ),
         "Task description": _task_payload(task_desc),
-        "Data and evaluation summary": data_summary.data_and_evaluation_summary(
-            workspace_dir
-        ),
-        "Observed artifact contract facts": _artifact_contract_facts(
-            workspace_dir, hidden_score_path
-        ),
+        "Experiment guide": _exp_guide_prompt_view(workspace_dir, hidden_score_path),
         "Environment contract": environment_manifest_text(include_medical=True),
         "Evaluator requirements": [
             "Write exactly one Python file.",
             "Use only Python standard library and allowed installed packages.",
             "Do not train a model. Do not install packages. Do not use network access.",
             "Do not use Python eval() or exec(). Parse serialized values with json.loads or ast.literal_eval.",
-            "Use files under ./input/biomaker_splits as the source of truth for public train/development/score/test split.",
+            "Use the Experiment guide as the source of truth for public splits, hidden answers, visibility boundaries, and output paths.",
             "Define prediction_spec() returning a concise JSON-serializable dict with these top-level keys: validation_artifact, test_submission, key_columns, prediction_columns, primary_metric. key_columns may be [] only when row order is the contract.",
             "test_submission must be exactly './working/submission.csv'.",
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
-            "The candidate validation artifact must contain predictions for rows in ./input/biomaker_splits/score_val.csv.",
+            "The candidate validation artifact must contain predictions for rows in the Experiment guide's score validation split, usually ./input/biomaker_splits/score_val.csv and sometimes legacy ./input/biomaker_splits/agent_val.csv.",
             "The candidate validation artifact must follow the same public prediction contract as the test submission: key_columns plus prediction_columns only. Do not require candidates to output validation ground-truth columns such as label, class, target, or true_class. score_val() must load hidden score labels from os.environ['BIOMAKER_SCORE_VAL_PATH'] and align them to the validation artifact by key columns.",
             "When reading candidate artifacts, validate the required columns and then restrict the dataframe to key_columns plus prediction_columns before merging with ground truth. Extra candidate columns such as class, label, target, or true_class must not collide with ground-truth columns or change scoring.",
             "For tabular score_val(), use this safe merge pattern: copy the hidden ground-truth label column to a private column named `y_true_private`, build `truth_view = hidden_answers[key_columns + ['y_true_private']]`, build `pred_view = predictions[key_columns + prediction_columns]`, convert every key column in both views to string before merging, merge those restricted views only, and read labels with dataframe/series indexing such as `merged['y_true_private']` or `row['y_true_private']`. Never rely on tuple attribute access for helper columns, and never read `merged['class']`, `merged['label']`, `merged['target']`, or candidate-supplied label-like columns after merge.",
@@ -258,7 +190,7 @@ def _evaluator_prompt(
             "For tabular prediction artifacts, align rows by the declared key columns after normalizing keys to strings; reject missing keys, duplicate keys, extra keys, bad shapes, and invalid numeric values.",
             "For probability outputs, validate with numeric tolerance and return a clear error when rows are not valid probabilities.",
             "If a primary metric is mathematically undefined on the current validation split, return a deterministic fallback metric with an explanatory field instead of crashing.",
-            f"Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real public score_val and agent_test split CSVs, exactly follow prediction_spec(), call score_val() with os.environ['{_SCORE_ENV_VAR}'] available, call validate_submission(), assert the returned metric is numeric, then print EVALUATOR_OK.",
+            f"Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real public score validation and agent_test split CSVs, exactly follow prediction_spec(), call score_val() with os.environ['{_SCORE_ENV_VAR}'] available, call validate_submission(), assert the returned metric is numeric, then print EVALUATOR_OK.",
             "Keep the evaluator simple and deterministic. Use standard metrics from sklearn when directly applicable and small direct numpy/PIL implementations for image masks.",
             "For segmentation masks, support mask files referenced from CSV. The prediction spec should make this explicit with prediction_type='mask_file_path' or file_reference_columns for the mask path column. Binary Dice should treat nonzero pixels as foreground. AJI/instance metrics should use integer connected/instance labels if the task asks for them.",
         ],
@@ -313,6 +245,24 @@ def _hidden_score_env(
     return {_SCORE_ENV_VAR: str(truth_path)}
 
 
+def _sanitize_private_paths(
+    text: str, hidden_score_path: Path | str | None = None
+) -> str:
+    replacements = {"<hidden_score_path>": set(), "<private_gt_dir>": set()}
+    if hidden_score_path is not None:
+        path = Path(hidden_score_path)
+        replacements["<hidden_score_path>"].update({str(path), str(path.resolve())})
+        replacements["<private_gt_dir>"].update(
+            {str(path.parent), str(path.parent.resolve())}
+        )
+    sanitized = text
+    for token, values in replacements.items():
+        for value in sorted(values, key=len, reverse=True):
+            if value:
+                sanitized = sanitized.replace(value, token)
+    return sanitized
+
+
 def _run_self_test(
     workspace_dir: Path,
     timeout: int,
@@ -321,17 +271,23 @@ def _run_self_test(
     code = (
         "import evaluator\n"
         "import json\n"
-        "assert hasattr(evaluator, 'prediction_spec')\n"
-        "assert hasattr(evaluator, 'score_val')\n"
-        "assert hasattr(evaluator, 'validate_submission')\n"
+        "required = ['prediction_spec', 'score_val', 'validate_submission']\n"
+        "missing = [name for name in required if not hasattr(evaluator, name)]\n"
+        "if missing:\n"
+        "    raise RuntimeError('evaluator missing required functions: ' + ', '.join(missing))\n"
         "spec = evaluator.prediction_spec()\n"
         "if isinstance(spec, str):\n"
         "    spec = json.loads(spec)\n"
-        "assert isinstance(spec, dict)\n"
-        "assert 'validation_artifact' in spec\n"
-        "assert 'test_submission' in spec\n"
-        "assert 'key_columns' in spec\n"
-        "assert ('prediction_columns' in spec) or ('file_reference_columns' in spec)\n"
+        "if not isinstance(spec, dict):\n"
+        "    raise RuntimeError('prediction_spec() must return a dict')\n"
+        "for key in ['validation_artifact', 'test_submission', 'key_columns']:\n"
+        "    if key not in spec:\n"
+        "        raise RuntimeError('prediction_spec() missing key: ' + key)\n"
+        "if 'prediction_columns' not in spec and 'file_reference_columns' not in spec:\n"
+        "    raise RuntimeError('prediction_spec() must declare prediction_columns or file_reference_columns')\n"
+        "if not hasattr(evaluator, 'self_test'):\n"
+        "    raise RuntimeError('evaluator.self_test() is missing')\n"
+        "evaluator.self_test()\n"
         "print('EVALUATOR_OK')\n"
     )
     completed = _run_python(
@@ -342,6 +298,7 @@ def _run_self_test(
     )
     output = (completed.stdout or "") + (completed.stderr or "")
     if completed.returncode != 0 or "EVALUATOR_OK" not in output:
+        output = _sanitize_private_paths(output, hidden_score_path)
         raise EvaluatorSetupError("Evaluator self-test failed.\n" + output[-4000:])
     return output
 
@@ -445,6 +402,11 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         key_columns = _list_of_strings(
             _nested_dict(spec, "test_submission").get("key_columns")
         )
+    file_reference_columns = _list_of_strings(spec.get("file_reference_columns"))
+    if not file_reference_columns:
+        file_reference_columns = _list_of_strings(
+            _nested_dict(spec, "test_submission").get("file_reference_columns")
+        )
     prediction_columns = _prediction_columns_from_raw_spec(spec, key_columns)
     primary_metric = _primary_metric_from_raw_spec(spec)
 
@@ -479,6 +441,12 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         "prediction_columns": prediction_columns,
         "primary_metric": primary_metric,
     }
+    if file_reference_columns:
+        normalized["file_reference_columns"] = [
+            column
+            for column in file_reference_columns
+            if column not in set(key_columns)
+        ]
     metric_lower = primary_metric.lower()
     if any(token in metric_lower for token in ["aji", "dice", "mask", "segmentation"]):
         normalized.setdefault("prediction_type", "mask_file_path")
@@ -489,6 +457,9 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         "class_labels",
         "positive_class",
         "prediction_type",
+        "task_type",
+        "maximize",
+        "score_split",
     ]:
         if optional_key in spec:
             normalized[optional_key] = spec[optional_key]
@@ -561,46 +532,73 @@ def _run_public_artifact_contract_test(
     if not isinstance(class_labels, list):
         class_labels = None
 
-    clean_candidate_outputs(workspace_dir)
-    score_split = workspace_dir / "input" / "biomaker_splits" / "score_val.csv"
-    _write_dummy_tabular_artifact(
-        score_split,
-        workspace_dir / str(spec["validation_artifact"]).removeprefix("./"),
-        key_columns,
-        prediction_columns,
-        class_labels,
-        include_extra_label_like_columns=True,
-    )
-    _write_dummy_tabular_artifact(
-        workspace_dir / "input" / "biomaker_splits" / "agent_test.csv",
-        workspace_dir / str(spec["test_submission"]).removeprefix("./"),
-        key_columns,
-        prediction_columns,
-        class_labels,
-        include_extra_label_like_columns=True,
-    )
+    for artifact_key in ["validation_artifact", "test_submission"]:
+        artifact_value = str(spec.get(artifact_key, "")).removeprefix("./")
+        if not artifact_value.startswith("working/"):
+            raise EvaluatorSetupError(
+                f"prediction_spec {artifact_key} must point under ./working for "
+                "public artifact contract tests."
+            )
 
-    code = (
-        "import evaluator\n"
-        "score = evaluator.score_val()\n"
-        "assert isinstance(score.get('metric'), (int, float)), score\n"
-        "evaluator.validate_submission()\n"
+    working_dir = workspace_dir / "working"
+    original_working_existed = working_dir.exists()
+    backup_root = Path(
+        tempfile.mkdtemp(prefix=".evaluator_contract_test_", dir=workspace_dir)
     )
-    completed = _run_python(
-        workspace_dir,
-        code,
-        timeout=timeout,
-        env=_hidden_score_env(workspace_dir, hidden_score_path),
-    )
-    output = (completed.stdout or "") + (completed.stderr or "")
-    if completed.returncode != 0:
-        raise EvaluatorSetupError(
-            "Evaluator public artifact contract test failed. "
-            "score_val() must accept validation predictions containing only "
-            "key_columns plus prediction_columns from prediction_spec(); it should "
-            f"load hidden score labels from ${_SCORE_ENV_VAR}.\n"
-            + output[-4000:]
+    backup_working = backup_root / "working"
+    try:
+        if original_working_existed:
+            shutil.move(str(working_dir), str(backup_working))
+        working_dir.mkdir(parents=True, exist_ok=True)
+
+        score_split = workspace_dir / str(
+            spec.get("score_split", "./input/biomaker_splits/score_val.csv")
+        ).removeprefix("./")
+        _write_dummy_tabular_artifact(
+            score_split,
+            workspace_dir / str(spec["validation_artifact"]).removeprefix("./"),
+            key_columns,
+            prediction_columns,
+            class_labels,
+            include_extra_label_like_columns=True,
         )
+        _write_dummy_tabular_artifact(
+            workspace_dir / "input" / "biomaker_splits" / "agent_test.csv",
+            workspace_dir / str(spec["test_submission"]).removeprefix("./"),
+            key_columns,
+            prediction_columns,
+            class_labels,
+            include_extra_label_like_columns=True,
+        )
+
+        code = (
+            "import evaluator\n"
+            "score = evaluator.score_val()\n"
+            "if not isinstance(score.get('metric'), (int, float)):\n"
+            "    raise RuntimeError('score_val() metric must be numeric: ' + repr(score))\n"
+            "evaluator.validate_submission()\n"
+        )
+        completed = _run_python(
+            workspace_dir,
+            code,
+            timeout=timeout,
+            env=_hidden_score_env(workspace_dir, hidden_score_path),
+        )
+        output = (completed.stdout or "") + (completed.stderr or "")
+        if completed.returncode != 0:
+            output = _sanitize_private_paths(output, hidden_score_path)
+            raise EvaluatorSetupError(
+                "Evaluator public artifact contract test failed. "
+                "score_val() must accept validation predictions containing only "
+                "key_columns plus prediction_columns from prediction_spec(); it should "
+                f"load hidden score labels from ${_SCORE_ENV_VAR}.\n" + output[-4000:]
+            )
+    finally:
+        if working_dir.exists():
+            shutil.rmtree(working_dir)
+        if original_working_existed:
+            shutil.move(str(backup_working), str(working_dir))
+        shutil.rmtree(backup_root, ignore_errors=True)
 
 
 def _resolve_candidate_path(
@@ -737,7 +735,6 @@ def _align_truth_rows(
     if missing:
         return None, {"method": "key_columns", "missing_key_columns": missing}
     pred_keys = pred_df[key_columns].astype(str)
-    truth_keys = truth_df[key_columns].astype(str)
     truth_lookup = truth_df.copy()
     for column in key_columns:
         truth_lookup[column] = truth_lookup[column].astype(str)
@@ -824,7 +821,10 @@ def inspect_candidate_artifacts(
                 "missing prediction columns: " + ", ".join(missing_prediction_columns)
             )
 
-        truth_path = workspace_dir / "input" / "biomaker_splits" / "score_val.csv"
+        score_split = str(
+            spec.get("score_split", "./input/biomaker_splits/score_val.csv")
+        )
+        truth_path = workspace_dir / score_split.removeprefix("./")
         truth_df = pd.read_csv(truth_path) if truth_path.is_file() else pd.DataFrame()
         report["target_artifact"] = {
             "path": str(truth_path),
@@ -835,7 +835,7 @@ def inspect_candidate_artifacts(
         aligned_truth, alignment = (
             _align_truth_rows(pred_df, truth_df, key_columns)
             if truth_path.is_file()
-            else (None, {"error": "score_val.csv missing"})
+            else (None, {"error": f"{score_split} missing"})
         )
         report["alignment"] = alignment
 
@@ -907,12 +907,763 @@ def inspect_candidate_artifacts(
     return report
 
 
-def _stable_evaluator_cache_key(prompt: dict[str, Any], model: str) -> str:
-    payload = {
+def _json_dict(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _split_manifest(split_dir: Path) -> dict[str, Any]:
+    manifest = _json_dict(split_dir / "split_manifest.json")
+    if manifest:
+        return manifest
+    split_plan = _json_dict(split_dir / "split_plan.json")
+    embedded = split_plan.get("split_manifest")
+    return embedded if isinstance(embedded, dict) else {}
+
+
+def _manifest_head_types(manifest: dict[str, Any]) -> set[str]:
+    heads = manifest.get("task_heads")
+    if isinstance(heads, str):
+        return {heads.lower()}
+    result: set[str] = set()
+    if isinstance(heads, list):
+        for head in heads:
+            if isinstance(head, str):
+                result.add(head.lower())
+            elif isinstance(head, dict) and isinstance(head.get("type"), str):
+                result.add(str(head["type"]).lower())
+    return result
+
+
+def _manifest_key_columns(manifest: dict[str, Any]) -> list[str]:
+    columns = manifest.get("key_columns")
+    if not isinstance(columns, list):
+        return []
+    return [str(column) for column in columns if str(column).strip()]
+
+
+def _manifest_primary_metric(manifest: dict[str, Any]) -> str | None:
+    metric_contract = manifest.get("metric_contract")
+    if isinstance(metric_contract, dict) and metric_contract.get("primary_metric"):
+        return str(metric_contract["primary_metric"])
+    return None
+
+
+def _sort_label_values(values: list[Any]) -> list[Any]:
+    cleaned = [
+        value.item() if isinstance(value, np.generic) else value for value in values
+    ]
+    try:
+        numeric = [float(value) for value in cleaned]
+        order = sorted(range(len(cleaned)), key=lambda index: numeric[index])
+        return [cleaned[index] for index in order]
+    except Exception:
+        return sorted(cleaned, key=lambda value: str(value))
+
+
+def _prediction_column_name(value: Any, used: set[str]) -> str:
+    raw = str(value).strip()
+    match = re.fullmatch(r"(?:class|label|target)[_-]?(\d+)", raw, flags=re.IGNORECASE)
+    if match:
+        text = match.group(1)
+    else:
+        text = re.sub(r"[^0-9A-Za-z_]+", "_", raw).strip("_").lower()
+    text = text or "value"
+    name = f"prob_{text}"
+    if name not in used:
+        used.add(name)
+        return name
+    index = 2
+    while f"{name}_{index}" in used:
+        index += 1
+    unique = f"{name}_{index}"
+    used.add(unique)
+    return unique
+
+
+def _truth_answer_columns(
+    workspace_dir: Path,
+    split_plan: dict[str, Any],
+    hidden_score_path: Path,
+    score_df: pd.DataFrame,
+) -> list[str]:
+    try:
+        columns = load_experiment_contract(workspace_dir).hidden_answer_columns(
+            "score_val"
+        )
+        if columns:
+            return columns
+    except Exception:
+        pass
+    hidden_answers = split_plan.get("hidden_answers") or split_plan.get("private_gt")
+    if isinstance(hidden_answers, dict):
+        score_meta = hidden_answers.get("score_val")
+        if isinstance(score_meta, dict):
+            columns = [str(column) for column in score_meta.get("answer_columns") or []]
+            if columns:
+                return columns
+    columns_plan = split_plan.get("columns")
+    if isinstance(columns_plan, dict):
+        for key in ["label", "target", "mask", "answer"]:
+            value = columns_plan.get(key)
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+    if not hidden_score_path.is_file():
+        return []
+    hidden_df = pd.read_csv(hidden_score_path, nrows=1)
+    legacy_label_columns = []
+    for column in map(str, hidden_df.columns):
+        lower = column.lower()
+        if lower in {"class", "label", "target", "y"} or re.fullmatch(
+            r"(?:class|label|target)[_-]?\d+", lower
+        ):
+            legacy_label_columns.append(column)
+    if legacy_label_columns:
+        return legacy_label_columns
+    public_columns = set(map(str, score_df.columns))
+    return [
+        str(column) for column in hidden_df.columns if str(column) not in public_columns
+    ]
+
+
+def _infer_key_columns(
+    score_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    hidden_df: pd.DataFrame,
+    answer_columns: list[str],
+) -> list[str]:
+    excluded = set(answer_columns)
+    common_columns = [
+        str(column)
+        for column in score_df.columns
+        if str(column) in set(map(str, test_df.columns))
+        and str(column) in set(map(str, hidden_df.columns))
+        and str(column) not in excluded
+    ]
+    common = [
+        column
+        for column in common_columns
+        if "path" not in column.lower() and "file" not in column.lower()
+    ]
+    preferred = [
+        "Id",
+        "id",
+        "ID",
+        "patient",
+        "patient_id",
+        "case_id",
+        "image_id",
+        "uid",
+    ]
+    for column in preferred + common:
+        if column not in common:
+            continue
+        if (
+            score_df[column].astype(str).is_unique
+            and test_df[column].astype(str).is_unique
+            and hidden_df[column].astype(str).is_unique
+        ):
+            return [column]
+    path_like = [
+        column
+        for column in common_columns
+        if "path" in column.lower() or "file" in column.lower()
+    ]
+    for column in path_like:
+        if (
+            score_df[column].astype(str).is_unique
+            and test_df[column].astype(str).is_unique
+            and hidden_df[column].astype(str).is_unique
+        ):
+            return [column]
+    return []
+
+
+def _infer_segmentation_key_columns(
+    score_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    hidden_df: pd.DataFrame,
+    answer_column: str,
+) -> list[str]:
+    key_columns = _infer_key_columns(score_df, test_df, hidden_df, [answer_column])
+    common = set(map(str, test_df.columns)) & set(map(str, hidden_df.columns))
+    metadata_columns = []
+    blocked_tokens = {"path", "file", "mask", "image"}
+    for column in map(str, score_df.columns):
+        lower = column.lower()
+        if column in key_columns or column == answer_column or column not in common:
+            continue
+        if any(token in lower for token in blocked_tokens):
+            continue
+        metadata_columns.append(column)
+    return key_columns + metadata_columns
+
+
+def _looks_like_file_values(values: pd.Series) -> bool:
+    suffixes = (
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".tif",
+        ".tiff",
+        ".nii",
+        ".nii.gz",
+        ".nrrd",
+        ".mha",
+        ".mhd",
+        ".npy",
+        ".npz",
+        ".dcm",
+    )
+    for value in values.dropna().astype(str).head(50):
+        lower = value.lower()
+        if "/" in value or "\\" in value or lower.endswith(suffixes):
+            return True
+    return False
+
+
+def _looks_like_pil_image_file_values(values: pd.Series) -> bool:
+    suffixes = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+    seen = False
+    for value in values.dropna().astype(str).head(50):
+        lower = value.lower()
+        if "/" not in value and "\\" not in value and "." not in lower:
+            continue
+        seen = True
+        if not lower.endswith(suffixes):
+            return False
+    return seen
+
+
+def _looks_like_volume_file_values(values: pd.Series) -> bool:
+    suffixes = (".nii", ".nii.gz", ".nrrd", ".mha", ".mhd", ".npy", ".npz")
+    seen = False
+    for value in values.dropna().astype(str).head(50):
+        lower = value.lower()
+        if "/" not in value and "\\" not in value and "." not in lower:
+            continue
+        seen = True
+        if not lower.endswith(suffixes):
+            return False
+    return seen
+
+
+def _scalar_classification_kind(
+    train_df: pd.DataFrame,
+    hidden_df: pd.DataFrame,
+    answer_columns: list[str],
+    split_plan: dict[str, Any],
+) -> str | None:
+    if not answer_columns:
+        return None
+    declared_task_type = str(split_plan.get("task_type", "")).lower()
+    primary_metric = str(split_plan.get("primary_metric", "")).lower()
+    if any(
+        token in f"{declared_task_type} {primary_metric}"
+        for token in ["aji", "dice", "mask", "segmentation"]
+    ):
+        return None
+    for column in answer_columns:
+        if column not in train_df.columns or column not in hidden_df.columns:
+            return None
+        if (
+            "path" in column.lower()
+            or "file" in column.lower()
+            or "mask" in column.lower()
+        ):
+            return None
+        values = pd.concat([train_df[column], hidden_df[column]], ignore_index=True)
+        if _looks_like_file_values(values):
+            return None
+    if len(answer_columns) == 1:
+        if declared_task_type in {"binary", "multiclass", "ordinal_multiclass"}:
+            return "binary" if declared_task_type == "binary" else "multiclass"
+        return "multiclass"
+    for column in answer_columns:
+        values = pd.concat([train_df[column], hidden_df[column]], ignore_index=True)
+        non_null = values.dropna()
+        if non_null.empty:
+            return None
+        if not set(non_null.astype(str).unique()).issubset({"0", "1", "False", "True"}):
+            return None
+    return "multilabel"
+
+
+def _score_split_path(workspace_dir: Path) -> Path:
+    contract_path = load_experiment_contract(workspace_dir).split_path("score_val")
+    if contract_path is not None:
+        return contract_path
+    split_dir = workspace_dir / "input" / "biomaker_splits"
+    return split_dir / "score_val.csv"
+
+
+def _load_fixed_split_context(
+    workspace_dir: Path, hidden_score_path: Path
+) -> dict[str, Any] | None:
+    split_dir = workspace_dir / "input" / "biomaker_splits"
+    train_path = split_dir / "agent_train.csv"
+    score_path = _score_split_path(workspace_dir)
+    test_path = split_dir / "agent_test.csv"
+    if not (
+        train_path.is_file()
+        and score_path.is_file()
+        and test_path.is_file()
+        and hidden_score_path.is_file()
+    ):
+        return None
+    train_df = pd.read_csv(train_path)
+    score_df = pd.read_csv(score_path)
+    test_df = pd.read_csv(test_path)
+    hidden_df = pd.read_csv(hidden_score_path)
+    split_plan = _json_dict(split_dir / "split_plan.json")
+    split_manifest = _split_manifest(split_dir)
+    return {
+        "score_path": score_path,
+        "train_df": train_df,
+        "score_df": score_df,
+        "test_df": test_df,
+        "hidden_df": hidden_df,
+        "split_plan": split_plan,
+        "split_manifest": split_manifest,
+        "answer_columns": _truth_answer_columns(
+            workspace_dir, split_plan, hidden_score_path, score_df
+        ),
+    }
+
+
+def _infer_fixed_classification_spec(
+    workspace_dir: Path,
+    hidden_score_path: Path,
+) -> dict[str, Any] | None:
+    context = _load_fixed_split_context(workspace_dir, hidden_score_path)
+    if context is None:
+        return None
+    train_df = context["train_df"]
+    score_df = context["score_df"]
+    test_df = context["test_df"]
+    hidden_df = context["hidden_df"]
+    split_plan = context["split_plan"]
+    split_manifest = context["split_manifest"]
+    answer_columns = context["answer_columns"]
+    manifest_heads = _manifest_head_types(split_manifest)
+    if manifest_heads and not (
+        manifest_heads
+        & {
+            "classification",
+            "binary",
+            "multiclass",
+            "multilabel",
+            "single_label_classification",
+            "multi_label_classification",
+        }
+    ):
+        return None
+    task_type = _scalar_classification_kind(
+        train_df, hidden_df, answer_columns, split_plan
+    )
+    if task_type is None:
+        return None
+
+    key_columns = _manifest_key_columns(split_manifest) or _infer_key_columns(
+        score_df, test_df, hidden_df, answer_columns
+    )
+    if not key_columns and not bool(split_plan.get("row_order_contract")):
+        return None
+    primary_metric = str(
+        _manifest_primary_metric(split_manifest)
+        or split_plan.get("primary_metric")
+        or ("mean_binary_accuracy" if task_type == "multilabel" else "accuracy")
+    )
+    spec: dict[str, Any] = {
+        "validation_artifact": "./working/validation_predictions.csv",
+        "test_submission": "./working/submission.csv",
+        "score_split": "./" + str(context["score_path"].relative_to(workspace_dir)),
+        "key_columns": key_columns,
+        "primary_metric": primary_metric,
+        "maximize": True,
+        "task_type": task_type,
+        "answer_columns": answer_columns,
+    }
+    if task_type == "multilabel":
+        used: set[str] = set()
+        spec["prediction_columns"] = [
+            _prediction_column_name(column, used) for column in answer_columns
+        ]
+        return spec
+
+    label_column = answer_columns[0]
+    labels = _sort_label_values(
+        pd.concat([train_df[label_column], hidden_df[label_column]], ignore_index=True)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    if not (2 <= len(labels) <= 200):
+        return None
+    spec["class_labels"] = labels
+    if len(labels) == 2:
+        spec["task_type"] = "binary"
+        spec["positive_class"] = labels[-1]
+    spec["prediction_columns"] = [f"prob_{index}" for index in range(len(labels))]
+    return spec
+
+
+def _primary_metric_from_task_desc(task_desc: Any, task_type: str) -> str | None:
+    text = _task_payload(task_desc)
+    match = re.search(
+        r"primary\s+validation\s+metric\s*:\s*([^\n\r.]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    metric = match.group(1).strip().strip("`*_ ")
+    lower = metric.lower()
+    if "aji" in lower:
+        return "aji"
+    if "dice" in lower:
+        return "binary_dice"
+    if "hd95" in lower or "hausdorff" in lower:
+        return "hd95"
+    if "auc" in lower:
+        return "mean_roc_auc" if task_type == "multilabel" else "auc"
+    if "balanced" in lower and "accuracy" in lower:
+        return "balanced_accuracy"
+    if "accuracy" in lower or lower in {"acc"}:
+        return "mean_binary_accuracy" if task_type == "multilabel" else "accuracy"
+    return metric.replace(" ", "_").lower()
+
+
+def _fixed_classification_metric_supported(metric: str) -> bool:
+    return is_classification_metric_supported(metric)
+
+
+def _write_fixed_evaluator(
+    workspace_dir: Path,
+    log_dir: Path,
+    hidden_score_path: Path,
+    timeout: int,
+    spec: dict[str, Any],
+    template: str,
+    *,
+    run_public_contract: bool,
+    log_message: str,
+) -> PreparedEvaluator | None:
+    evaluator_path = workspace_dir / "evaluator.py"
+    evaluator_code = template.replace("__BIOMAKER_SPEC__", repr(spec)).lstrip()
+    evaluator_path.write_text(evaluator_code, encoding="utf-8")
+    try:
+        _run_self_test(
+            workspace_dir, timeout=timeout, hidden_score_path=hidden_score_path
+        )
+        prediction_spec = _normalize_prediction_spec_json(
+            _load_prediction_spec(workspace_dir)
+        )
+        if run_public_contract:
+            _run_public_artifact_contract_test(
+                workspace_dir,
+                prediction_spec,
+                timeout=timeout,
+                hidden_score_path=hidden_score_path,
+            )
+    except Exception:
+        try:
+            evaluator_path.unlink()
+        except FileNotFoundError:
+            pass
+        clean_candidate_outputs(workspace_dir)
+        raise
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    prediction_spec_path = workspace_dir / "evaluator_prediction_spec.json"
+    prediction_spec_path.write_text(prediction_spec, encoding="utf-8")
+    shutil.copy2(evaluator_path, log_dir / "evaluator.py")
+    (log_dir / "evaluator_prediction_spec.json").write_text(
+        prediction_spec, encoding="utf-8"
+    )
+    append_event(
+        log_dir,
+        "fixed_evaluator_prepared",
+        task_type=spec.get("task_type"),
+        primary_metric=spec.get("primary_metric"),
+        prediction_columns=spec.get("prediction_columns"),
+    )
+    clean_candidate_outputs(workspace_dir)
+    logger.info("%s at %s", log_message, evaluator_path)
+    return PreparedEvaluator(path=evaluator_path, prediction_spec=prediction_spec)
+
+
+def _write_fixed_classification_evaluator(
+    workspace_dir: Path,
+    log_dir: Path,
+    hidden_score_path: Path,
+    timeout: int,
+    task_desc: Any | None = None,
+) -> PreparedEvaluator | None:
+    spec = _infer_fixed_classification_spec(workspace_dir, hidden_score_path)
+    if spec is None:
+        return None
+    if task_desc is not None:
+        metric = _primary_metric_from_task_desc(
+            task_desc, str(spec.get("task_type", ""))
+        )
+        if metric is not None:
+            spec["primary_metric"] = metric
+    if not _fixed_classification_metric_supported(str(spec.get("primary_metric", ""))):
+        return None
+    return _write_fixed_evaluator(
+        workspace_dir=workspace_dir,
+        log_dir=log_dir,
+        hidden_score_path=hidden_score_path,
+        timeout=timeout,
+        spec=spec,
+        template=_FIXED_CLASSIFICATION_EVALUATOR,
+        run_public_contract=True,
+        log_message="Fixed evaluator prepared",
+    )
+
+
+def _infer_fixed_segmentation_spec(
+    workspace_dir: Path,
+    hidden_score_path: Path,
+) -> dict[str, Any] | None:
+    context = _load_fixed_split_context(workspace_dir, hidden_score_path)
+    if context is None:
+        return None
+    score_df = context["score_df"]
+    test_df = context["test_df"]
+    hidden_df = context["hidden_df"]
+    split_plan = context["split_plan"]
+    split_manifest = context["split_manifest"]
+    answer_columns = context["answer_columns"]
+    if not answer_columns:
+        return None
+    manifest_heads = _manifest_head_types(split_manifest)
+    if manifest_heads and not (
+        manifest_heads
+        & {
+            "segmentation",
+            "segmentation_2d",
+            "segmentation_3d",
+            "binary_segmentation",
+            "instance_segmentation",
+            "volume_segmentation",
+            "medical_volume_segmentation",
+        }
+    ):
+        return None
+
+    task_text = " ".join(
+        [
+            str(split_plan.get("task_type", "")),
+            str(split_plan.get("primary_metric", "")),
+            " ".join(sorted(manifest_heads)),
+            json.dumps(split_plan.get("columns", {}), ensure_ascii=False),
+        ]
+    ).lower()
+    segmentation_hint = any(
+        token in task_text
+        for token in ["segmentation", "mask", "dice", "aji", "hd95", "hausdorff"]
+    )
+    mask_candidates = []
+    volume_mask = False
+    for column in answer_columns:
+        if column not in hidden_df.columns:
+            continue
+        values = hidden_df[column]
+        name = column.lower()
+        is_mask_named = "mask" in name or "label_path" in name
+        is_file_column = _looks_like_file_values(values)
+        if is_mask_named or is_file_column:
+            if _looks_like_pil_image_file_values(values):
+                mask_candidates.append(column)
+            elif _looks_like_volume_file_values(values):
+                mask_candidates.append(column)
+                volume_mask = True
+            elif is_mask_named:
+                return None
+    if not segmentation_hint and not mask_candidates:
+        return None
+    if not mask_candidates:
+        return None
+    answer_column = mask_candidates[0]
+
+    key_columns = _manifest_key_columns(
+        split_manifest
+    ) or _infer_segmentation_key_columns(score_df, test_df, hidden_df, answer_column)
+    if not key_columns and not bool(split_plan.get("row_order_contract")):
+        return None
+
+    image_column = None
+    columns_plan = split_plan.get("columns")
+    if isinstance(columns_plan, dict):
+        raw_image_column = columns_plan.get("path") or columns_plan.get("image")
+        if isinstance(raw_image_column, str):
+            image_column = raw_image_column
+    if image_column not in set(map(str, score_df.columns)) | set(
+        map(str, test_df.columns)
+    ):
+        for column in list(score_df.columns) + list(test_df.columns):
+            name = str(column).lower()
+            if ("image" in name or "path" in name or "file" in name) and str(
+                column
+            ) != answer_column:
+                image_column = str(column)
+                break
+
+    primary_metric = str(
+        _manifest_primary_metric(split_manifest)
+        or split_plan.get("primary_metric")
+        or ("binary_dice" if volume_mask else "aji")
+    )
+    if not is_segmentation_metric_supported(primary_metric):
+        return None
+    task_type = (
+        "segmentation_3d"
+        if volume_mask or "segmentation_3d" in manifest_heads
+        else "segmentation"
+    )
+    output_column = (
+        answer_column if answer_column not in key_columns else "pred_mask_path"
+    )
+    return {
+        "validation_artifact": "./working/validation_predictions.csv",
+        "test_submission": "./working/submission.csv",
+        "score_split": "./" + str(context["score_path"].relative_to(workspace_dir)),
+        "key_columns": key_columns,
+        "prediction_columns": [output_column],
+        "file_reference_columns": [output_column],
+        "primary_metric": primary_metric,
+        "maximize": metric_maximize(primary_metric),
+        "task_type": task_type,
+        "prediction_type": "mask_file_path",
+        "answer_columns": [answer_column],
+        "image_column": image_column,
+    }
+
+
+def _write_fixed_segmentation_evaluator(
+    workspace_dir: Path,
+    log_dir: Path,
+    hidden_score_path: Path,
+    timeout: int,
+    task_desc: Any | None = None,
+) -> PreparedEvaluator | None:
+    spec = _infer_fixed_segmentation_spec(workspace_dir, hidden_score_path)
+    if spec is None:
+        return None
+    if task_desc is not None:
+        metric = _primary_metric_from_task_desc(
+            task_desc, str(spec.get("task_type", ""))
+        )
+        if metric is not None and metric != "accuracy":
+            spec["primary_metric"] = metric
+    if not is_segmentation_metric_supported(str(spec.get("primary_metric", ""))):
+        return None
+    spec["maximize"] = metric_maximize(str(spec.get("primary_metric", "")))
+    return _write_fixed_evaluator(
+        workspace_dir=workspace_dir,
+        log_dir=log_dir,
+        hidden_score_path=hidden_score_path,
+        timeout=timeout,
+        spec=spec,
+        template=_FIXED_SEGMENTATION_EVALUATOR,
+        run_public_contract=False,
+        log_message="Fixed segmentation evaluator prepared",
+    )
+
+
+def _sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _evaluator_input_fingerprints(
+    workspace_dir: Path, hidden_score_path: Path | None
+) -> dict[str, str | None]:
+    split_dir = workspace_dir / "input" / "biomaker_splits"
+    fingerprints: dict[str, str | None] = {}
+    for name in [
+        "split_plan.json",
+        "agent_train.csv",
+        "score_val.csv",
+        "agent_val.csv",
+        "agent_test.csv",
+        "dataset_report.json",
+    ]:
+        fingerprints[f"input/biomaker_splits/{name}"] = _sha256_file(split_dir / name)
+    if hidden_score_path is not None:
+        fingerprints["hidden_score_truth"] = _sha256_file(hidden_score_path)
+    return fingerprints
+
+
+def _evaluator_cache_metadata(
+    prompt: dict[str, Any],
+    model: str,
+    workspace_dir: Path,
+    hidden_score_path: Path | None,
+) -> dict[str, Any]:
+    utils_dir = Path(__file__).resolve().parent
+    code_fingerprints = {
+        "evaluator_setup.py": _sha256_file(Path(__file__).resolve()),
+        "evaluator_templates.py": _sha256_file(utils_dir / "evaluator_templates.py"),
+        "exp_guide.py": _sha256_file(utils_dir / "exp_guide.py"),
+        "data_summary.py": _sha256_file(utils_dir / "data_summary.py"),
+    }
+    runtime_versions = {
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "numpy": _package_version("numpy"),
+        "pandas": _package_version("pandas"),
+        "scikit-learn": _package_version("scikit-learn"),
+        "Pillow": _package_version("Pillow"),
+        "scipy": _package_version("scipy"),
+    }
+    prompt_hash = hashlib.sha256(
+        json.dumps(prompt, ensure_ascii=False, sort_keys=True, default=str).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return {
         "cache_version": _EVALUATOR_CACHE_VERSION,
         "model": model,
-        "prompt": prompt,
+        "prompt_hash": prompt_hash,
+        "code_fingerprints": code_fingerprints,
+        "input_fingerprints": _evaluator_input_fingerprints(
+            workspace_dir, hidden_score_path
+        ),
+        "runtime_versions": runtime_versions,
     }
+
+
+def _stable_evaluator_cache_key(
+    prompt: dict[str, Any],
+    model: str,
+    workspace_dir: Path,
+    hidden_score_path: Path | None,
+) -> str:
+    payload = _evaluator_cache_metadata(
+        prompt,
+        model,
+        workspace_dir=workspace_dir,
+        hidden_score_path=hidden_score_path,
+    )
     text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
 
@@ -927,6 +1678,15 @@ def _try_reuse_cached_evaluator(
     cached_evaluator = cache_entry / "evaluator.py"
     cached_spec = cache_entry / "evaluator_prediction_spec.json"
     if not cached_evaluator.is_file() or not cached_spec.is_file():
+        return None
+    manifest = _json_dict(cache_entry / "manifest.json")
+    if manifest.get("cache_version") != _EVALUATOR_CACHE_VERSION:
+        append_event(
+            log_dir,
+            "evaluator_cache_reuse_failed",
+            cache_entry=str(cache_entry),
+            reason="cache manifest missing or version mismatch",
+        )
         return None
 
     evaluator_path = workspace_dir / "evaluator.py"
@@ -947,11 +1707,12 @@ def _try_reuse_cached_evaluator(
             hidden_score_path=hidden_score_path,
         )
     except Exception as exc:
+        reason = _sanitize_private_paths(str(exc), hidden_score_path)
         append_event(
             log_dir,
             "evaluator_cache_reuse_failed",
             cache_entry=str(cache_entry),
-            reason=truncate_text(str(exc), max_chars=1200),
+            reason=truncate_text(reason, max_chars=1200),
         )
         clean_candidate_outputs(workspace_dir)
         return None
@@ -968,7 +1729,10 @@ def _try_reuse_cached_evaluator(
 
 
 def _store_cached_evaluator(
-    cache_entry: Path, evaluator_path: Path, prediction_spec: str
+    cache_entry: Path,
+    evaluator_path: Path,
+    prediction_spec: str,
+    manifest: dict[str, Any] | None = None,
 ) -> None:
     if (cache_entry / "evaluator.py").is_file() and (
         cache_entry / "evaluator_prediction_spec.json"
@@ -983,12 +1747,22 @@ def _store_cached_evaluator(
     (tmp_dir / "evaluator_prediction_spec.json").write_text(
         prediction_spec, encoding="utf-8"
     )
+    cache_manifest = dict(manifest or {})
+    cache_manifest.update(
+        {
+            "cache_version": _EVALUATOR_CACHE_VERSION,
+            "evaluator_sha256": _sha256_file(evaluator_path),
+            "prediction_spec_sha256": hashlib.sha256(
+                prediction_spec.encode("utf-8")
+            ).hexdigest(),
+            "tests_passed": [
+                "self_test",
+                "public_artifact_contract",
+            ],
+        }
+    )
     (tmp_dir / "manifest.json").write_text(
-        json.dumps(
-            {"cache_version": _EVALUATOR_CACHE_VERSION},
-            indent=2,
-            ensure_ascii=False,
-        ),
+        json.dumps(cache_manifest, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     try:
@@ -1017,10 +1791,57 @@ def prepare_evaluator(
         if hidden_score_path is not None
         else log_dir / "private_gt" / "score_val.csv"
     )
+    try:
+        fixed = _write_fixed_classification_evaluator(
+            workspace_dir=workspace_dir,
+            log_dir=log_dir,
+            hidden_score_path=hidden_score_path,
+            timeout=timeout,
+            task_desc=task_desc,
+        )
+        if fixed is not None:
+            return fixed
+    except Exception as exc:
+        reason = _sanitize_private_paths(str(exc), hidden_score_path)
+        append_event(
+            log_dir,
+            "fixed_evaluator_failed",
+            reason=truncate_text(reason, max_chars=1200),
+        )
+    try:
+        fixed = _write_fixed_segmentation_evaluator(
+            workspace_dir=workspace_dir,
+            log_dir=log_dir,
+            hidden_score_path=hidden_score_path,
+            timeout=timeout,
+            task_desc=task_desc,
+        )
+        if fixed is not None:
+            return fixed
+    except Exception as exc:
+        reason = _sanitize_private_paths(str(exc), hidden_score_path)
+        append_event(
+            log_dir,
+            "fixed_segmentation_evaluator_failed",
+            reason=truncate_text(reason, max_chars=1200),
+        )
+
     prompt = _evaluator_prompt(task_desc, workspace_dir, hidden_score_path)
     cache_entry = None
+    cache_metadata = None
     if cache_root is not None:
-        cache_key = _stable_evaluator_cache_key(prompt, model=model)
+        cache_metadata = _evaluator_cache_metadata(
+            prompt,
+            model=model,
+            workspace_dir=workspace_dir,
+            hidden_score_path=hidden_score_path,
+        )
+        cache_key = _stable_evaluator_cache_key(
+            prompt,
+            model=model,
+            workspace_dir=workspace_dir,
+            hidden_score_path=hidden_score_path,
+        )
         cache_entry = Path(cache_root) / cache_key
         append_event(
             log_dir,
@@ -1110,12 +1931,13 @@ def prepare_evaluator(
                 hidden_score_path=hidden_score_path,
             )
         except Exception as exc:
-            errors.append(str(exc))
+            reason = _sanitize_private_paths(str(exc), hidden_score_path)
+            errors.append(reason)
             append_event(
                 log_dir,
                 "evaluator_attempt_failed",
                 attempt=attempt,
-                reason=truncate_text(str(exc), max_chars=1200),
+                reason=truncate_text(reason, max_chars=1200),
             )
             continue
 
@@ -1128,7 +1950,12 @@ def prepare_evaluator(
             prediction_spec, encoding="utf-8"
         )
         if cache_entry is not None:
-            _store_cached_evaluator(cache_entry, evaluator_path, prediction_spec)
+            _store_cached_evaluator(
+                cache_entry,
+                evaluator_path,
+                prediction_spec,
+                manifest=cache_metadata,
+            )
         clean_candidate_outputs(workspace_dir)
         logger.info("Evaluator prepared at %s", evaluator_path)
         append_event(log_dir, "evaluator_attempt_succeeded", attempt=attempt)
@@ -1174,7 +2001,10 @@ def score_candidate_with_evaluator(
             env=_hidden_score_env(workspace_dir, hidden_score_path),
         )
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
+        output = _sanitize_private_paths(
+            (exc.stdout or "") + (exc.stderr or ""),
+            hidden_score_path,
+        )
         return EvaluatorRunResult(
             ok=False,
             metric=None,
@@ -1184,7 +2014,10 @@ def score_candidate_with_evaluator(
             error=f"Evaluator timed out after {timeout} seconds.",
         )
 
-    output = (completed.stdout or "") + (completed.stderr or "")
+    output = _sanitize_private_paths(
+        (completed.stdout or "") + (completed.stderr or ""),
+        hidden_score_path,
+    )
     if completed.returncode != 0:
         return EvaluatorRunResult(
             ok=False,
@@ -1217,6 +2050,20 @@ def score_candidate_with_evaluator(
             if not math.isfinite(metric):
                 raise ValueError("score_val() returned a non-finite metric.")
             maximize = bool(score.get("maximize", True))
+            spec_path = workspace_dir / "evaluator_prediction_spec.json"
+            if spec_path.is_file():
+                try:
+                    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                except Exception:
+                    spec = {}
+                if isinstance(spec, dict) and "maximize" in spec:
+                    expected_maximize = bool(spec["maximize"])
+                    if maximize != expected_maximize:
+                        raise ValueError(
+                            "score_val() returned maximize="
+                            f"{maximize}, but prediction_spec declares "
+                            f"maximize={expected_maximize}."
+                        )
             return EvaluatorRunResult(
                 ok=True,
                 metric=metric,
@@ -1241,4 +2088,75 @@ def score_candidate_with_evaluator(
         details={},
         output=output,
         error="Evaluator did not emit result JSON.",
+    )
+
+
+def validate_submission_with_evaluator(
+    workspace_dir: Path | str,
+    timeout: int = 120,
+) -> EvaluatorRunResult:
+    """Run only the frozen evaluator's public test-submission validation."""
+    workspace_dir = Path(workspace_dir)
+    code = (
+        "import json, evaluator\n"
+        "if not hasattr(evaluator, 'validate_submission'):\n"
+        "    raise RuntimeError('evaluator.validate_submission() is missing')\n"
+        "validation = evaluator.validate_submission()\n"
+        "payload = {'submission_validation': validation}\n"
+        f"print('{_RESULT_PREFIX}' + json.dumps(payload, ensure_ascii=False, default=str))\n"
+    )
+    try:
+        completed = _run_python(workspace_dir, code, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + (exc.stderr or "")
+        return EvaluatorRunResult(
+            ok=False,
+            metric=None,
+            maximize=True,
+            details={},
+            output=output,
+            error=f"Evaluator submission validation timed out after {timeout} seconds.",
+        )
+
+    output = (completed.stdout or "") + (completed.stderr or "")
+    if completed.returncode != 0:
+        return EvaluatorRunResult(
+            ok=False,
+            metric=None,
+            maximize=True,
+            details={},
+            output=output,
+            error=(
+                "Evaluator submission validation exited with return code "
+                f"{completed.returncode}."
+            ),
+        )
+    for line in output.splitlines():
+        if not line.startswith(_RESULT_PREFIX):
+            continue
+        try:
+            payload = json.loads(line[len(_RESULT_PREFIX) :])
+        except Exception as exc:
+            return EvaluatorRunResult(
+                ok=False,
+                metric=None,
+                maximize=True,
+                details={},
+                output=output,
+                error=f"Could not parse evaluator validation result: {exc}",
+            )
+        return EvaluatorRunResult(
+            ok=True,
+            metric=None,
+            maximize=True,
+            details=payload,
+            output=output,
+        )
+    return EvaluatorRunResult(
+        ok=False,
+        metric=None,
+        maximize=True,
+        details={},
+        output=output,
+        error="Evaluator did not emit submission validation JSON.",
     )

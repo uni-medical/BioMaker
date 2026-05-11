@@ -7,6 +7,7 @@ from typing import Any
 from ..backend import compile_prompt_to_md
 from ..journal import Node
 
+
 def prompt_shape(prompt: dict[str, Any]) -> dict[str, Any]:
     """Return field names and approximate sizes without storing full prompt text."""
     shape = {}
@@ -59,12 +60,35 @@ class ContextBuilder:
         prompt["Instructions"] |= self.agent._prompt_environment
         return prompt
 
+    def _current_selection(self) -> dict[str, Any] | None:
+        context = (
+            self.agent.generation_context()
+            if hasattr(self.agent, "generation_context")
+            else {}
+        )
+        selection: dict[str, Any] = {}
+        reason = getattr(self.agent, "_last_selection_reason", None)
+        if reason:
+            selection["Selection reason"] = reason
+        for source, label in [
+            ("round_item_index", "Round item"),
+            ("round_item_count", "Round item count"),
+            ("scheduled_step", "Scheduled step"),
+            ("speculative", "Speculative prefetch"),
+        ]:
+            value = context.get(source)
+            if value is not None:
+                selection[label] = value
+        return selection or None
+
     def _ordered_prompt(self, prompt: dict[str, Any]) -> dict[str, Any]:
         order = [
             "Introduction",
             "Task Description",
             "Data and Evaluation Summary",
+            "Current Selection",
             "Tree Records",
+            "Tool Observations",
             "Instructions",
         ]
         return {
@@ -81,11 +105,16 @@ class ContextBuilder:
             stage="draft",
             pending_same_round_nodes=self.agent.pending_round_nodes_for(None),
         )
+        current_selection = self._current_selection()
+        if current_selection is not None:
+            prompt["Current Selection"] = current_selection
         prompt["Instructions"] |= {
             "Solution sketch guideline": [
                 "Use Tree Records as factual experiment history. Do not duplicate an already tried draft.",
                 "If sibling draft records are present, use their plan and code as factual context; if reusing any component, make the overall attempt substantively different.",
                 "For a root draft, implement the smallest complete run that tests the core idea and writes all required artifacts; later nodes can scale or refine the approach using observed results.",
+                "For a root draft that trains a model, use fewer than 3 training epochs.",
+                "Do not use test-time augmentation (TTA) or model ensembles in a root draft; save those for later improvement nodes.",
                 "Avoid exhaustive tuning, repeated full retraining, large ensembles, or long training schedules in a root draft.",
                 "Keep the frozen evaluator protocol unchanged.",
                 "The solution sketch should be 3-5 sentences.",
@@ -107,16 +136,20 @@ class ContextBuilder:
         prompt["Tree Records"] = self.agent.journal.generate_tree_records(
             stage="debug",
             selected_parent=parent_node,
+            pending_same_round_nodes=self.agent.pending_round_nodes_for(parent_node),
         )
+        current_selection = self._current_selection()
+        if current_selection is not None:
+            prompt["Current Selection"] = current_selection
         prompt["Instructions"] |= {
             "Bugfix improvement sketch guideline": [
                 "You should write a brief natural language description (3-5 sentences) of how the issue in the previous implementation can be fixed.",
                 "Preserve the proposed method as much as possible; this is a code/debug step, not a new modeling strategy step.",
                 "Don't suggest to do EDA.",
-                "Use the selected parent's full record in Tree Records, compact execution output, and resource facts to fix the observed bug; change training budget only if it is necessary for the fix and state that in the sketch.",
-                "Compare against the selected parent's sibling attempts in Tree Records; those are alternative attempts from the same parent as the selected buggy node.",
-                "Do not treat this debug node as a broad new modelling branch; fix the selected parent while learning from how the selected parent's siblings succeeded, failed, or differed.",
-                "If the execution output contains DependencyPolicyError, remove the unavailable import or package-manager call and replace it with Python standard library or allowed packages.",
+                "Use the selected parent's full record in Tree Records, especially Execution Summary, compact execution output, and resource facts, to fix the observed bug; change training budget only if it is necessary for the fix and state that in the sketch.",
+                "Compare against previous debug children of the selected parent and the selected parent's sibling attempts in Tree Records.",
+                "Do not treat this debug node as a broad new modelling branch; fix the selected parent while learning from how related debug and sibling attempts succeeded, failed, or differed.",
+                "If the execution summary or output contains DependencyPolicyError, remove the unavailable import or package-manager call and replace it with Python standard library or allowed packages.",
                 "If the error is due to missing packages (ImportError/ModuleNotFoundError), DO NOT attempt to install. Instead, replace the missing package with an alternative approach using available packages.",
             ],
         }
@@ -134,6 +167,9 @@ class ContextBuilder:
             selected_parent=parent_node,
             pending_same_round_nodes=self.agent.pending_round_nodes_for(parent_node),
         )
+        current_selection = self._current_selection()
+        if current_selection is not None:
+            prompt["Current Selection"] = current_selection
         prompt["Instructions"] |= {
             "Solution improvement sketch guideline": [
                 "The solution sketch should be a brief natural language description of how the previous solution can be improved.",

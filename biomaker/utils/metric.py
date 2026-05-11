@@ -19,7 +19,10 @@ class MetricValue(DataClassJsonMixin):
 
     def __post_init__(self):
         if self.value is not None:
-            assert isinstance(self.value, (float, int, np.number, np.floating))
+            if not isinstance(self.value, (float, int, np.number, np.floating)):
+                raise TypeError(
+                    f"MetricValue value must be numeric, got {type(self.value).__name__}"
+                )
             self.value = float(self.value)
 
     def __gt__(self, other) -> bool:

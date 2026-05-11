@@ -16,7 +16,12 @@ from ..interpreter import ExecutionResult, Interpreter
 from ..journal import Node
 from .artifact_validation import normalize_working_outputs, validate_working_outputs
 from .config import Config
-from .evaluator_setup import clean_candidate_outputs
+from .evaluator_setup import clean_candidate_outputs, validate_submission_with_evaluator
+from .execution_record import (
+    attach_artifact_validation_result,
+    attach_evaluator_run_result,
+)
+from .experiment_contract import load_experiment_contract
 from .private_evaluation import evaluate_private_outputs
 
 logger = logging.getLogger("biomaker")
@@ -45,6 +50,11 @@ class FinalRetrainResult:
             ),
             "exc_type": None if self.exec_result is None else self.exec_result.exc_type,
             "exc_info": None if self.exec_result is None else self.exec_result.exc_info,
+            "execution": (
+                None
+                if self.exec_result is None
+                else self.exec_result.execution_record()
+            ),
             "private_metrics": self.private_metrics,
             "error": self.error,
         }
@@ -68,6 +78,93 @@ def _copy_input_for_retrain(source_input: Path, retrain_input: Path) -> None:
     shutil.copytree(source_input / "biomaker_splits", retrain_input / "biomaker_splits")
 
 
+def _score_answer_columns(
+    workspace_dir: Path,
+    train_df: pd.DataFrame,
+    score_visible_df: pd.DataFrame,
+) -> list[str]:
+    answer_columns = load_experiment_contract(workspace_dir).hidden_answer_columns(
+        "score_val"
+    )
+    if answer_columns:
+        return answer_columns
+
+    # Fallback: generated code sees score_val without answers, while train has them.
+    return [col for col in train_df.columns if col not in score_visible_df.columns]
+
+
+def _score_key_columns(
+    workspace_dir: Path,
+    score_visible_df: pd.DataFrame,
+    score_gt_df: pd.DataFrame,
+) -> list[str]:
+    keys = load_experiment_contract(workspace_dir).prediction.key_columns
+    if keys and all(
+        col in score_visible_df.columns and col in score_gt_df.columns for col in keys
+    ):
+        return keys
+
+    if "Id" in score_visible_df.columns and "Id" in score_gt_df.columns:
+        return ["Id"]
+
+    common = [
+        col
+        for col in score_visible_df.columns
+        if col in score_gt_df.columns and col != "path"
+    ]
+    if common:
+        return [common[0]]
+    raise ValueError("Could not infer key columns for score-validation label merge.")
+
+
+def _merge_visible_score_with_hidden_labels(
+    workspace_dir: Path,
+    train_df: pd.DataFrame,
+    score_gt_df: pd.DataFrame,
+) -> pd.DataFrame:
+    contract = load_experiment_contract(workspace_dir)
+    score_visible_path = contract.split_path("score_val")
+    if score_visible_path is None:
+        score_visible_path = (
+            workspace_dir / "input" / "biomaker_splits" / "score_val.csv"
+        )
+    if not score_visible_path.is_file():
+        raise FileNotFoundError(f"Missing visible score split: {score_visible_path}")
+
+    score_visible_df = pd.read_csv(score_visible_path)
+    answer_columns = _score_answer_columns(workspace_dir, train_df, score_visible_df)
+    key_columns = _score_key_columns(workspace_dir, score_visible_df, score_gt_df)
+
+    missing_answers = [col for col in answer_columns if col not in score_gt_df.columns]
+    if missing_answers:
+        raise ValueError(
+            f"Hidden score labels are missing answer columns: {missing_answers}"
+        )
+
+    label_source = score_gt_df[key_columns + answer_columns].copy()
+    if label_source.duplicated(key_columns).any():
+        raise ValueError(f"Hidden score labels contain duplicate keys: {key_columns}")
+
+    score_labeled = score_visible_df.merge(
+        label_source,
+        on=key_columns,
+        how="left",
+        validate="one_to_one",
+    )
+    if score_labeled[answer_columns].isna().any().any():
+        raise ValueError("Hidden score label merge produced missing labels.")
+
+    missing_train_columns = [
+        col for col in train_df.columns if col not in score_labeled.columns
+    ]
+    if missing_train_columns:
+        raise ValueError(
+            "Visible score split cannot be reshaped to training schema; "
+            f"missing columns: {missing_train_columns}"
+        )
+    return score_labeled[list(train_df.columns)]
+
+
 def _write_retrain_training_table(
     workspace_dir: Path,
     private_dir: Path,
@@ -84,13 +181,18 @@ def _write_retrain_training_table(
 
     train_df = pd.read_csv(train_path)
     score_gt_df = pd.read_csv(score_gt_path)
-    retrain_train = pd.concat([train_df, score_gt_df], ignore_index=True, sort=False)
+    score_labeled_df = _merge_visible_score_with_hidden_labels(
+        workspace_dir, train_df, score_gt_df
+    )
+    retrain_train = pd.concat(
+        [train_df, score_labeled_df], ignore_index=True, sort=False
+    )
     train_path.with_suffix(".search.csv").write_text(
         train_path.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     retrain_train.to_csv(train_path, index=False)
-    return int(len(train_df)), int(len(score_gt_df)), int(len(retrain_train))
+    return int(len(train_df)), int(len(score_labeled_df)), int(len(retrain_train))
 
 
 def _copy_retrain_outputs_to_log(cfg: Config, retrain_workspace: Path) -> None:
@@ -110,7 +212,6 @@ def _copy_retrain_outputs_to_log(cfg: Config, retrain_workspace: Path) -> None:
     submission = working_dir / "submission.csv"
     if submission.is_file():
         shutil.copy2(submission, cfg.log_dir / "final_submission.csv")
-        shutil.copy2(submission, cfg.log_dir / "submission.csv")
 
     for name in ["pred_masks", "best_ckpt.pth"]:
         src = working_dir / name
@@ -215,12 +316,37 @@ def run_final_retrain(
             retrain_workspace, "final retrain"
         )
         if normalization_messages:
-            exec_result.term_out.append("\n" + "\n".join(normalization_messages))
+            exec_result.append_system_output(
+                "artifact_normalization",
+                "\n".join(normalization_messages),
+                details={"messages": normalization_messages},
+            )
         artifact_check = validate_working_outputs(retrain_workspace, "final retrain")
-        if artifact_check.messages:
-            exec_result.term_out.append("\n" + "\n".join(artifact_check.messages))
+        attach_artifact_validation_result(
+            exec_result,
+            artifact_check,
+            failure_reason="final retrain artifacts failed validation",
+        )
         if not artifact_check.ok:
             result.error = "Final retrain artifacts failed validation."
+            return result
+
+        submission_check = validate_submission_with_evaluator(
+            retrain_workspace, timeout=min(180, timeout)
+        )
+        attach_evaluator_run_result(
+            exec_result,
+            submission_check,
+            failure_phase="final_retrain_evaluator_validation",
+            failure_type="EvaluatorValidationError",
+            failure_message_prefix="FinalRetrainEvaluatorValidationError",
+            extra_details={"mode": "final_retrain_submission_validation"},
+        )
+        if not submission_check.ok:
+            result.error = (
+                "Final retrain submission failed frozen evaluator validation: "
+                + (submission_check.error or "unknown error")
+            )
             return result
 
         result.ok = True

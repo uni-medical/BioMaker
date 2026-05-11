@@ -41,9 +41,13 @@ def loads_json(s: str, cls: Type[G]) -> G:
 
     if isinstance(obj, Journal):
         id2nodes = {n.id: n for n in obj.nodes}
-        for child_id, parent_id in obj_dict["node2parent"].items():
-            id2nodes[child_id].parent = id2nodes[parent_id]
-            id2nodes[child_id].__post_init__()
+        for child_id, parent_id in obj_dict.get("node2parent", {}).items():
+            child = id2nodes.get(child_id)
+            parent = id2nodes.get(parent_id)
+            if child is None or parent is None:
+                continue
+            child.parent = parent
+            child.__post_init__()
     return obj
 
 

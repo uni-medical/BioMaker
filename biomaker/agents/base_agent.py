@@ -17,7 +17,7 @@ from ..utils.evaluator_setup import (
 from ..utils.environment import environment_manifest_text
 from ..utils.metric import MetricValue, WorstMetricValue
 from ..utils.response import (
-    extract_code,
+    extract_code_blocks,
     extract_text_up_to_code,
     truncate_text,
     wrap_code,
@@ -25,6 +25,13 @@ from ..utils.response import (
 
 logger = logging.getLogger("biomaker")
 ExecCallbackType = Callable[..., ExecutionResult]
+CODE_PROMPT_CHAR_BUDGET = 120_000
+CODE_PROMPT_SECTION_FALLBACKS = [
+    ("Tool Observations", 40_000),
+    ("Data and Evaluation Summary", 32_000),
+    ("Task Description", 32_000),
+    ("Tree Records", 64_000),
+]
 
 
 @dataclass(frozen=True)
@@ -42,10 +49,37 @@ def parse_factual_exec_result(
 ) -> None:
     """Parse factual execution/evaluator output into a node."""
     node.absorb_exec_result(exec_result)
-    node.evaluator_details = parse_external_validation_details(exec_result.term_out)
-    node.artifact_report = parse_artifact_report(exec_result.term_out)
+    evaluator_result = (
+        exec_result.evaluator_result
+        if isinstance(exec_result.evaluator_result, dict)
+        else None
+    )
+    external_metric = None
+    if evaluator_result is not None:
+        details = evaluator_result.get("details")
+        if not isinstance(details, dict):
+            details = {}
+        node.artifact_report = details.get("artifact_report")
+        score_details = {k: v for k, v in details.items() if k != "artifact_report"}
+        node.evaluator_details = {
+            "metric": evaluator_result.get("metric"),
+            "maximize": bool(evaluator_result.get("maximize", True)),
+            "details": score_details,
+        }
+        metric = evaluator_result.get("metric")
+        if evaluator_result.get("ok") and not isinstance(metric, bool):
+            try:
+                external_metric = (
+                    float(metric),
+                    bool(evaluator_result.get("maximize", True)),
+                )
+            except (TypeError, ValueError):
+                external_metric = None
+    else:
+        node.evaluator_details = parse_external_validation_details(exec_result.term_out)
+        node.artifact_report = parse_artifact_report(exec_result.term_out)
+        external_metric = parse_external_validation(exec_result.term_out)
 
-    external_metric = parse_external_validation(exec_result.term_out)
     node.analysis = ""
     node.is_buggy = node.exc_type is not None or external_metric is None
     if node.is_buggy:
@@ -105,8 +139,14 @@ class BaseAgent:
         based only on completed nodes already present in the journal.
         """
         search_cfg = self.acfg.search
+        draft_batch_size = max(
+            1,
+            int(getattr(self.cfg.exec, "max_draft_generated_backlog", 1)),
+        )
         if len(self.journal.draft_nodes) < search_cfg.max_children_per_node:
             current = len(self.journal.draft_nodes)
+            missing = search_cfg.max_children_per_node - current
+            count = min(missing, draft_batch_size)
             return [
                 RoundTask(
                     parent=None,
@@ -115,7 +155,7 @@ class BaseAgent:
                         f"({current + idx + 1}/{search_cfg.max_children_per_node})"
                     ),
                 )
-                for idx in range(search_cfg.max_children_per_node - current)
+                for idx in range(count)
             ]
 
         tasks: list[RoundTask] = []
@@ -237,11 +277,64 @@ class BaseAgent:
     def _prompt_resp_fmt(self):
         return {
             "Response format": (
-                "Your response should be a brief outline/sketch of your proposed solution in natural language (3-5 sentences), "
-                "followed by a single markdown code block (wrapped in ```) which implements this solution and writes the required prediction artifacts. "
-                "There should be no additional headings or text in your response. Just natural language text followed by a newline and then the markdown code block. "
+                "Your response must start with a brief outline/sketch of your proposed solution in natural language (3-5 sentences), "
+                "followed by exactly one markdown Python code block whose opening fence is exactly ```python. "
+                "The code block must implement this solution and write the required prediction artifacts. "
+                "There should be no additional headings, extra code blocks, or text after the code block. "
+                "Historical code blocks in the prompt are context only; do not copy their fences into the final answer except for the single final ```python block. "
             )
         }
+
+    def _compiled_prompt_chars(self, prompt: dict[str, Any]) -> int:
+        return len(compile_prompt_to_md(prompt))
+
+    def _budget_code_prompt(
+        self, prompt: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Apply a last-resort prompt budget while preserving full context when possible."""
+        if self._compiled_prompt_chars(prompt) <= CODE_PROMPT_CHAR_BUDGET:
+            return prompt, []
+
+        budgeted = dict(prompt)
+        notes = [
+            (
+                f"Compiled prompt exceeded {CODE_PROMPT_CHAR_BUDGET} chars; "
+                "BioMaker applied last-resort section caps."
+            )
+        ]
+        for key, section_cap in CODE_PROMPT_SECTION_FALLBACKS:
+            if self._compiled_prompt_chars(budgeted) <= CODE_PROMPT_CHAR_BUDGET:
+                break
+            if key not in budgeted:
+                continue
+            section_text = compile_prompt_to_md(budgeted[key]).strip()
+            if len(section_text) <= section_cap:
+                continue
+            budgeted[key] = truncate_text(
+                section_text,
+                max_chars=section_cap,
+                marker=f"{key} trimmed by prompt budget",
+            )
+            notes.append(f"{key} capped at {section_cap} chars.")
+
+        if (
+            self._compiled_prompt_chars(budgeted) > CODE_PROMPT_CHAR_BUDGET
+            and "Tree Records" in budgeted
+        ):
+            overflow = self._compiled_prompt_chars(budgeted) - CODE_PROMPT_CHAR_BUDGET
+            tree_text = compile_prompt_to_md(budgeted["Tree Records"]).strip()
+            target = max(12_000, len(tree_text) - overflow - 2_000)
+            if target < len(tree_text):
+                budgeted["Tree Records"] = truncate_text(
+                    tree_text,
+                    max_chars=target,
+                    marker="Tree Records trimmed by final prompt budget",
+                )
+                notes.append(f"Tree Records final cap applied at {target} chars.")
+
+        if notes:
+            budgeted["Prompt Budget Notes"] = notes
+        return budgeted, notes
 
     def _prompt_capture(self, prompt: dict, metadata: dict | None) -> dict[str, Any]:
         sections = []
@@ -285,31 +378,63 @@ class BaseAgent:
     def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str, dict[str, Any]]:
         """Generate a natural language plan + code in the same LLM call and split them apart."""
         completion_text = None
-        prompt_capture: dict[str, Any] = self._prompt_capture(prompt, None)
-        for _ in range(retries):
+        query_prompt, budget_notes = self._budget_code_prompt(prompt)
+        if budget_notes:
+            append_event(
+                self.cfg.log_dir,
+                "prompt_budget_applied",
+                notes=budget_notes,
+                compiled_chars=self._compiled_prompt_chars(query_prompt),
+            )
+        prompt_capture: dict[str, Any] = self._prompt_capture(query_prompt, None)
+        last_reason = "no attempt made"
+        for attempt in range(1, retries + 1):
             completion_text, metadata = cast(
                 tuple[str, dict[str, Any]],
                 query(
-                    system_message=prompt,
+                    system_message=query_prompt,
                     user_message=None,
                     model=self.acfg.code.model,
                     temperature=self.acfg.code.temp,
                     return_metadata=True,
                 ),
             )
-            prompt_capture = self._prompt_capture(prompt, metadata)
+            prompt_capture = self._prompt_capture(query_prompt, metadata)
 
             completion_text = cast(str, completion_text)
-            code = extract_code(completion_text)
+            code_blocks = extract_code_blocks(completion_text)
             nl_text = extract_text_up_to_code(completion_text)
 
-            if code and nl_text:
-                # merge all code blocks into a single string
-                return nl_text, code, prompt_capture
+            if len(code_blocks) == 1:
+                return (
+                    nl_text or "No separate natural-language plan was returned.",
+                    code_blocks[0],
+                    prompt_capture,
+                )
 
-            print("Plan + code extraction failed, retrying...")
-        print("Final plan + code extraction attempt failed, giving up...")
-        return "", completion_text, prompt_capture  # type: ignore
+            if not code_blocks:
+                last_reason = "no valid Python code block"
+            else:
+                last_reason = f"{len(code_blocks)} valid Python code blocks"
+
+            append_event(
+                self.cfg.log_dir,
+                "plan_code_extraction_retry",
+                attempt=attempt,
+                reason=last_reason,
+                response_chars=len(completion_text),
+            )
+            logger.warning(
+                "Plan + code extraction failed on attempt %d/%d: %s",
+                attempt,
+                retries,
+                last_reason,
+            )
+        raise RuntimeError(
+            "Plan + code extraction failed after "
+            f"{retries} attempts ({last_reason}). Last response length: "
+            f"{len(completion_text or '')} chars."
+        )
 
     def wrap_execution_output(self, node: Node) -> str:
         """Return the execution output in the form shown to debug prompts."""
@@ -331,7 +456,6 @@ class BaseAgent:
         self,
         prompt: dict,
         max_chars: int | None = None,
-        essentials_first: bool = False,
     ) -> None:
         if not self.acfg.data_summary:
             return

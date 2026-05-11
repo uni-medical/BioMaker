@@ -57,7 +57,7 @@ agent:
   enable_web_search: True
   web_search_topk: 2
   enable_node_tools: True
-  max_node_tool_calls: 20
+  max_node_tool_calls: 4
 
   # hyperparameters for the tree search
   search:
@@ -88,6 +88,9 @@ exec:
   # Number of generated nodes that may execute concurrently. Use 1 for shared GPU-heavy runs.
   # Even with 1 worker, BioMaker overlaps node execution with generation of later same-round nodes.
   parallel_workers: 2
+  # Number of same-round node-generation/API calls that may run concurrently.
+  # Keep this modest to respect model API rate limits and preserve useful search feedback.
+  generation_workers: 2
   # Maximum generated-but-not-yet-running nodes to keep queued for known useful non-draft tasks.
   # A value near topk_improve + num_bugs keeps the LLM ahead without generating too far past feedback.
   max_generated_backlog: 3

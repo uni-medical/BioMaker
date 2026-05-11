@@ -8,6 +8,7 @@ import shutil
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, RLock, Thread
 
@@ -18,7 +19,8 @@ from rich.tree import Tree
 
 from . import backend
 from .agent import BioMakerWorkflow, RoundNode, WorkflowAgent
-from .agents.base_agent import RoundTask, parse_factual_exec_result
+from .agents.base_agent import RoundTask
+from .agents.proposal_agent import ProposalAgent
 from .interpreter import Interpreter
 from .journal import Journal, Node
 from .journal2report import journal2report
@@ -35,11 +37,17 @@ from .utils.config import (
     save_run,
     sync_node_working_to_run_workspace,
 )
+from .utils.exp_guide import write_exp_guide
+from .utils.experiment_contract import load_experiment_contract
 from .utils.events import append_event
 from .utils.evaluator_setup import (
     clean_candidate_outputs,
     prepare_evaluator,
     score_candidate_with_evaluator,
+)
+from .utils.execution_record import (
+    attach_artifact_validation_result,
+    attach_evaluator_run_result,
 )
 from .utils.final_retrain import run_final_retrain
 from .utils.input_cache import prepare_input_cache
@@ -68,9 +76,23 @@ logger.setLevel(logging.INFO)  # set default level
 def _interpreter_kwargs(cfg):
     kwargs = dict(OmegaConf.to_container(cfg.exec))  # type: ignore
     kwargs.pop("parallel_workers", None)
+    kwargs.pop("generation_workers", None)
     kwargs.pop("max_generated_backlog", None)
     kwargs.pop("max_draft_generated_backlog", None)
     return kwargs
+
+
+def _best_committed_node(nodes: list[Node]) -> Node | None:
+    candidates = [
+        node
+        for node in nodes
+        if node.step is not None and node.is_buggy is False and node.metric is not None
+    ]
+    return (
+        sorted(candidates, key=lambda node: node.metric, reverse=True)[0]
+        if candidates
+        else None
+    )
 
 
 def journal_to_rich_tree(
@@ -89,16 +111,7 @@ def journal_to_rich_tree(
 
     display_nodes = journal.nodes if nodes is None else nodes
     completed_nodes = [node for node in display_nodes if node.step is not None]
-    display_good_nodes = [
-        node
-        for node in display_nodes
-        if node.is_buggy is False and node.metric is not None
-    ]
-    best_node = (
-        sorted(display_good_nodes, key=lambda node: node.metric, reverse=True)[0]
-        if display_good_nodes
-        else None
-    )
+    best_node = _best_committed_node(display_nodes)
     new_node = completed_nodes[-1] if mark_new and completed_nodes else None
     children_by_parent: dict[Node | None, list[Node]] = {}
     display_node_set = set(display_nodes)
@@ -171,6 +184,122 @@ def _metric_payload(node: Node) -> dict:
     }
 
 
+def _pending_round_node_count(round_nodes_by_round: dict) -> int:
+    return sum(
+        1
+        for round_nodes in round_nodes_by_round.values()
+        for round_node in round_nodes
+        if getattr(round_node.node, "step", None) is None
+    )
+
+
+def _cached_speculative_node_count(
+    speculative_cache_by_round: dict,
+    *,
+    exclude_key: tuple[str, str] | None = None,
+    exclude_keys: set[tuple[str, str]] | None = None,
+) -> int:
+    excluded = set(exclude_keys or set())
+    if exclude_key is not None:
+        excluded.add(exclude_key)
+    count = 0
+    for cache in speculative_cache_by_round.values():
+        if not isinstance(cache, dict):
+            continue
+        for key, cached in cache.items():
+            if key in excluded:
+                continue
+            node = cached.get("node") if isinstance(cached, dict) else None
+            if node is not None and getattr(node, "step", None) is None:
+                count += 1
+    return count
+
+
+def _remaining_schedule_budget(
+    *,
+    total_steps: int,
+    committed_steps: int,
+    round_nodes_by_round: dict,
+    generating_nodes: list[Node],
+    speculative_cache_by_round: dict,
+) -> int:
+    """Return how many more nodes may be generated without exceeding the run plan."""
+    live_count = (
+        _pending_round_node_count(round_nodes_by_round)
+        + len([node for node in generating_nodes if node.step is None])
+        + _cached_speculative_node_count(speculative_cache_by_round)
+    )
+    return total_steps - committed_steps - live_count
+
+
+@dataclass
+class SchedulerState:
+    """Mutable scheduler bookkeeping kept together to avoid split counter semantics."""
+
+    future_to_round_node: dict = field(default_factory=dict)
+    round_nodes_by_round: dict[int, list[RoundNode]] = field(default_factory=dict)
+    raw_exec_results: dict = field(default_factory=dict)
+    parsed_node_ids: set[str] = field(default_factory=set)
+    result_appended_node_ids: set[str] = field(default_factory=set)
+    generation_future_to_meta: dict = field(default_factory=dict)
+    scheduled_keys_by_round: dict[int, set[tuple[str, str]]] = field(
+        default_factory=dict
+    )
+    speculative_cache_by_round: dict[int, dict[tuple[str, str], dict]] = field(
+        default_factory=dict
+    )
+    speculative_keys_by_round: dict[int, set[tuple[str, str]]] = field(
+        default_factory=dict
+    )
+    generating_nodes: list[Node] = field(default_factory=list)
+    appended_node_ids_by_round: dict[int, list[str]] = field(default_factory=dict)
+    pending_execution_queue: list[RoundNode] = field(default_factory=list)
+    round_start_step_by_round: dict[int, int] = field(default_factory=dict)
+    round_item_count_by_round: dict[int, int] = field(default_factory=dict)
+    best_node_before_by_round: dict[int, Node | None] = field(default_factory=dict)
+
+    def live_nodes(self) -> list[Node]:
+        nodes = [
+            round_node.node
+            for round_nodes in self.round_nodes_by_round.values()
+            for round_node in round_nodes
+        ]
+        return [node for node in nodes if node.step is None] + self.generating_nodes
+
+    def cached_speculative_nodes(
+        self,
+        *,
+        exclude_key: tuple[str, str] | None = None,
+        exclude_keys: set[tuple[str, str]] | None = None,
+    ) -> list[Node]:
+        excluded = set(exclude_keys or set())
+        if exclude_key is not None:
+            excluded.add(exclude_key)
+        nodes: list[Node] = []
+        for cache in self.speculative_cache_by_round.values():
+            for key, cached in cache.items():
+                if key in excluded:
+                    continue
+                node = cached.get("node")
+                if node is not None and node.step is None:
+                    nodes.append(node)
+        return nodes
+
+    def generated_count(self) -> int:
+        return sum(
+            len(round_nodes) for round_nodes in self.round_nodes_by_round.values()
+        ) + _cached_speculative_node_count(self.speculative_cache_by_round)
+
+    def remaining_budget(self, total_steps: int, committed_steps: int) -> int:
+        return _remaining_schedule_budget(
+            total_steps=total_steps,
+            committed_steps=committed_steps,
+            round_nodes_by_round=self.round_nodes_by_round,
+            generating_nodes=self.generating_nodes,
+            speculative_cache_by_round=self.speculative_cache_by_round,
+        )
+
+
 def _count_csv_rows(path: Path | None) -> int | None:
     if path is None or not path.is_file():
         return None
@@ -213,27 +342,29 @@ def _compact_task_description(task_desc, max_chars: int = 900) -> str:
 def _run_overview_text(
     task_desc, split_protocol, workspace_dir: Path, private_dir: Path
 ) -> tuple[str, dict]:
-    plan = split_protocol.split_plan
-    agent_visible = plan.get("agent_visible", {})
-    train_rel = agent_visible.get("train")
-    score_rel = agent_visible.get("score_val")
-    test_rel = agent_visible.get("test")
-
-    train_rows = _count_csv_rows(_input_relative_path(workspace_dir, train_rel))
-    score_rows = _count_csv_rows(_input_relative_path(workspace_dir, score_rel))
-    test_rows = _count_csv_rows(_input_relative_path(workspace_dir, test_rel))
+    contract = load_experiment_contract(workspace_dir, hidden_answers_dir=private_dir)
+    train_ref = (
+        contract.splits["train"].public_ref if "train" in contract.splits else None
+    )
+    score_ref = (
+        contract.splits["score_val"].public_ref
+        if "score_val" in contract.splits
+        else None
+    )
+    test_ref = contract.splits["test"].public_ref if "test" in contract.splits else None
+    train_rows = _count_csv_rows(contract.split_path("train"))
+    score_rows = _count_csv_rows(contract.split_path("score_val"))
+    test_rows = _count_csv_rows(contract.split_path("test"))
 
     private_sources = []
     private_test_rows = None
-    private_gt = plan.get("private_gt", {})
-    if isinstance(private_gt, dict):
-        test_gt = private_gt.get("test")
-        if isinstance(test_gt, dict):
-            source = str(test_gt.get("file") or "test.csv")
-            private_sources.append(source)
-            private_rows = _count_csv_rows(private_dir / source)
-            if private_rows is not None:
-                private_test_rows = private_rows
+    test_answers = contract.hidden_answers.get("test")
+    if test_answers is not None:
+        source = test_answers.path.name
+        private_sources.append(source)
+        private_rows = _count_csv_rows(private_dir / source)
+        if private_rows is not None:
+            private_test_rows = private_rows
     if private_test_rows is None:
         private_test_rows = test_rows
 
@@ -242,9 +373,9 @@ def _run_overview_text(
         "node_selection_val_rows": score_rows,
         "agent_test_rows": test_rows,
         "private_test_rows": private_test_rows,
-        "train_path": train_rel,
-        "node_selection_val_path": score_rel,
-        "agent_test_path": test_rel,
+        "train_path": train_ref,
+        "node_selection_val_path": score_ref,
+        "agent_test_path": test_ref,
         "private_sources": private_sources,
     }
 
@@ -254,17 +385,17 @@ def _run_overview_text(
         lines.append("Task description:")
         lines.extend(f"  {line}" for line in task_summary.splitlines())
     lines.append("Data split:")
-    if train_rel:
+    if train_ref:
         lines.append(
-            f"- Training rows visible to generated code: {train_rows if train_rows is not None else 'unknown'} (`./input/{train_rel}`)."
+            f"- Training rows visible to generated code: {train_rows if train_rows is not None else 'unknown'} (`{train_ref}`)."
         )
-    if score_rel:
+    if score_ref:
         lines.append(
-            f"- Node-selection validation rows, not for generated-code training: {score_rows if score_rows is not None else 'unknown'} (`./input/{score_rel}`; labels hidden from generated code)."
+            f"- Node-selection validation rows, not for generated-code training: {score_rows if score_rows is not None else 'unknown'} (`{score_ref}`; labels hidden from generated code)."
         )
-    if test_rel:
+    if test_ref:
         lines.append(
-            f"- Test input rows visible only for prediction: {test_rows if test_rows is not None else 'unknown'} (`./input/{test_rel}`)."
+            f"- Test input rows visible only for prediction: {test_rows if test_rows is not None else 'unknown'} (`{test_ref}`)."
         )
     if private_sources:
         source_text = ", ".join(f"`{source}`" for source in private_sources)
@@ -386,6 +517,7 @@ def _compact_private_summary_entry(entry: dict | None) -> dict | None:
 
 def _private_metrics_summary(history: list) -> dict:
     entries = [entry for entry in history if isinstance(entry, dict)]
+    eligible_entries = [entry for entry in entries if entry.get("is_buggy") is not True]
 
     def better_by_val(entry: dict):
         value, maximize = _entry_val_metric(entry)
@@ -399,9 +531,11 @@ def _private_metrics_summary(history: list) -> dict:
             return None
         return value if maximize else -value
 
-    val_candidates = [entry for entry in entries if better_by_val(entry) is not None]
+    val_candidates = [
+        entry for entry in eligible_entries if better_by_val(entry) is not None
+    ]
     test_candidates = [
-        entry for entry in entries if better_by_private_test(entry) is not None
+        entry for entry in eligible_entries if better_by_private_test(entry) is not None
     ]
     val_best = (
         max(val_candidates, key=lambda entry: better_by_val(entry))
@@ -421,6 +555,7 @@ def _private_metrics_summary(history: list) -> dict:
             and val_best.get("node_id") == private_test_best.get("node_id")
         ),
         "history_count": len(entries),
+        "eligible_history_count": len(eligible_entries),
     }
 
 
@@ -466,6 +601,7 @@ def run():
         steps=cfg.agent.steps,
         per_node_timeout_seconds=cfg.exec.timeout,
         parallel_workers=cfg.exec.parallel_workers,
+        generation_workers=cfg.exec.generation_workers,
         total_time_limit_seconds=cfg.agent.total_time_limit,
     )
 
@@ -500,7 +636,6 @@ def run():
     append_event(cfg.log_dir, "run_overview", **overview_payload)
     logger.info("Split protocol:\n%s", split_protocol.prompt_text)
 
-    input_cache_prompt = None
     if cfg.input_cache.enabled:
         logger.info("Preparing deterministic input cache ...")
         input_cache_result = prepare_input_cache(
@@ -511,7 +646,6 @@ def run():
             ),
             decode_arrays=cfg.input_cache.decode_arrays,
         )
-        input_cache_prompt = input_cache_result.prompt_text
         logger.info(
             "Input cache prepared at %s (%d files, %d decoded arrays, %d errors, reused=%s)",
             input_cache_result.path,
@@ -536,22 +670,27 @@ def run():
         **_interpreter_kwargs(cfg),
     )
     agent_task_desc = copy.deepcopy(task_desc)
-    evaluator_task_desc = copy.deepcopy(task_desc)
-    if isinstance(evaluator_task_desc, dict):
-        evaluator_task_desc["Data split protocol"] = split_protocol.prompt_text
-    else:
-        evaluator_task_desc = {
-            "Task description": evaluator_task_desc,
-            "Data split protocol": split_protocol.prompt_text,
-        }
-    if input_cache_prompt:
-        evaluator_task_desc["Input cache protocol"] = input_cache_prompt
+
+    def refresh_exp_guide(stage: str, prediction_spec_data: dict | None = None) -> None:
+        exp_guide_path = write_exp_guide(
+            cfg.workspace_dir,
+            prediction_spec=prediction_spec_data,
+        )
+        shutil.copy2(exp_guide_path, cfg.log_dir / exp_guide_path.name)
+        append_event(
+            cfg.log_dir,
+            "exp_guide_written",
+            path=exp_guide_path,
+            stage=stage,
+        )
+
+    refresh_exp_guide("before_evaluator")
 
     logger.info("Preparing frozen evaluator ...")
     prepared_evaluator = prepare_evaluator(
         workspace_dir=cfg.workspace_dir,
         log_dir=cfg.log_dir,
-        task_desc=evaluator_task_desc,
+        task_desc=task_desc,
         model=cfg.agent.feedback.model,
         temperature=0.0,
         timeout=min(180, cfg.exec.timeout),
@@ -582,6 +721,10 @@ def run():
                 metric_value = metrics[0]
         if metric_value is not None:
             metric_name = str(metric_value)
+    refresh_exp_guide(
+        "after_evaluator",
+        prediction_spec if isinstance(prediction_spec, dict) else None,
+    )
     manifest_path = write_run_manifest(
         cfg,
         agent_task_desc,
@@ -636,32 +779,32 @@ def run():
                 execution_workspace, str(agent_task_desc)
             )
             if normalization_messages:
-                res.term_out.append("\n" + "\n".join(normalization_messages))
+                res.append_system_output(
+                    "artifact_normalization",
+                    "\n".join(normalization_messages),
+                    details={"messages": normalization_messages},
+                )
             artifact_check = validate_working_outputs(
                 execution_workspace, str(agent_task_desc)
             )
-            if artifact_check.messages:
-                res.term_out.append("\n" + "\n".join(artifact_check.messages))
-            if not artifact_check.ok:
-                res.exc_type = "ArtifactValidationError"
-                res.exc_info = {"reason": "generated artifacts failed validation"}
+            attach_artifact_validation_result(
+                res,
+                artifact_check,
+                failure_reason="generated artifacts failed validation",
+            )
         if res.exc_type is None:
             evaluator_result = score_candidate_with_evaluator(
                 execution_workspace,
                 timeout=min(180, cfg.exec.timeout),
                 hidden_score_path=cfg.log_dir / "private_gt" / "score_val.csv",
             )
-            if evaluator_result.output:
-                res.term_out.append("\n" + evaluator_result.output)
-            if evaluator_result.ok:
-                res.term_out.append("\n" + evaluator_result.log_line())
-            else:
-                res.exc_type = "EvaluatorValidationError"
-                res.exc_info = {"reason": evaluator_result.error}
-                res.term_out.append(
-                    "\nEvaluatorValidationError: "
-                    + (evaluator_result.error or "external evaluator failed")
-                )
+            attach_evaluator_run_result(
+                res,
+                evaluator_result,
+                failure_phase="evaluator_scoring",
+                failure_type="EvaluatorValidationError",
+                failure_message_prefix="EvaluatorValidationError",
+            )
         res.exec_time = time.monotonic() - node_start_time
         append_event(
             cfg.log_dir,
@@ -712,32 +855,35 @@ def run():
     timeout_seconds = OmegaConf.select(cfg, "agent.total_time_limit", default=None)
     total_timer = Timer(timeout_seconds=timeout_seconds)
 
-    logger.info(f"Starting BioMaker workflow")
+    logger.info("Starting BioMaker workflow")
     logger.info(f"Workflow:\n{agent.workflow_status}")
     total_timer.reset()
     # Continue to the next step only when both the step limit and time limit are not reached
     global_step = 0
     round_index = 0
     end_with_exception = False
-    parallel_workers = max(1, int(cfg.exec.parallel_workers))
+    parallel_workers = int(cfg.exec.parallel_workers)
+    generation_workers = int(cfg.exec.generation_workers)
     workflow_agent: WorkflowAgent = agent.workflow[0]
     proposal_agent = agent.proposal_agent
-    future_to_round_node: dict = {}
-    round_nodes_by_round: dict[int, list[RoundNode]] = {}
-    raw_exec_results = {}
-    parsed_node_ids: set[str] = set()
-    result_appended_node_ids: set[str] = set()
-    generation_future_to_meta: dict = {}
-    scheduled_keys_by_round: dict[int, set[tuple[str, str]]] = {}
-    speculative_cache_by_round: dict[int, dict[tuple[str, str], dict]] = {}
-    speculative_keys_by_round: dict[int, set[tuple[str, str]]] = {}
-    generating_nodes: list[Node] = []
-    appended_node_ids_by_round: dict[int, list[str]] = {}
-    pending_execution_queue: list[RoundNode] = []
-    round_start_step_by_round: dict[int, int] = {}
-    round_item_count_by_round: dict[int, int] = {}
-    max_generated_backlog = max(0, int(cfg.exec.max_generated_backlog))
-    max_draft_generated_backlog = max(0, int(cfg.exec.max_draft_generated_backlog))
+    scheduler = SchedulerState()
+    future_to_round_node = scheduler.future_to_round_node
+    round_nodes_by_round = scheduler.round_nodes_by_round
+    raw_exec_results = scheduler.raw_exec_results
+    parsed_node_ids = scheduler.parsed_node_ids
+    result_appended_node_ids = scheduler.result_appended_node_ids
+    generation_future_to_meta = scheduler.generation_future_to_meta
+    scheduled_keys_by_round = scheduler.scheduled_keys_by_round
+    speculative_cache_by_round = scheduler.speculative_cache_by_round
+    speculative_keys_by_round = scheduler.speculative_keys_by_round
+    generating_nodes = scheduler.generating_nodes
+    appended_node_ids_by_round = scheduler.appended_node_ids_by_round
+    pending_execution_queue = scheduler.pending_execution_queue
+    round_start_step_by_round = scheduler.round_start_step_by_round
+    round_item_count_by_round = scheduler.round_item_count_by_round
+    best_node_before_by_round = scheduler.best_node_before_by_round
+    max_generated_backlog = int(cfg.exec.max_generated_backlog)
+    max_draft_generated_backlog = int(cfg.exec.max_draft_generated_backlog)
     live_tree_refresh_seconds = 1
     live_tree_lock = RLock()
     live_tree_stop = Event()
@@ -752,29 +898,34 @@ def run():
     live_tree_display_started = False
 
     def live_nodes() -> list[Node]:
-        nodes = []
-        for round_nodes in round_nodes_by_round.values():
-            nodes.extend(round_node.node for round_node in round_nodes)
-        return [node for node in nodes if node.step is None] + generating_nodes
+        return scheduler.live_nodes()
 
-    def cached_speculative_nodes() -> list[Node]:
-        nodes: list[Node] = []
-        for cache in speculative_cache_by_round.values():
-            for cached in cache.values():
-                node = cached.get("node")
-                if node is not None and node.step is None:
-                    nodes.append(node)
-        return nodes
+    def cached_speculative_nodes(
+        exclude_key: tuple[str, str] | None = None,
+        exclude_keys: set[tuple[str, str]] | None = None,
+    ) -> list[Node]:
+        return scheduler.cached_speculative_nodes(
+            exclude_key=exclude_key,
+            exclude_keys=exclude_keys,
+        )
 
     def live_display_nodes() -> list[Node]:
         return [*live_nodes(), *cached_speculative_nodes()]
 
-    def live_backlog_count(next_task: RoundTask | None = None) -> int:
+    def live_backlog_count(
+        next_task: RoundTask | None = None,
+        exclude_prefetch_keys: set[tuple[str, str]] | None = None,
+    ) -> int:
+        excluded_prefetch_key = task_key(next_task) if next_task is not None else None
         nodes = [
             node
             for node in [
                 *generating_nodes,
                 *(rn.node for rn in pending_execution_queue),
+                *cached_speculative_nodes(
+                    exclude_key=excluded_prefetch_key,
+                    exclude_keys=exclude_prefetch_keys,
+                ),
             ]
             if node.step is None
         ]
@@ -783,11 +934,10 @@ def run():
         return len(nodes)
 
     def live_progress_line() -> str:
-        generated = sum(
-            len(round_nodes) for round_nodes in round_nodes_by_round.values()
-        )
+        generated = scheduler.generated_count()
         executed = len(raw_exec_results)
         live = live_nodes()
+        prefetched = len(cached_speculative_nodes())
         generating = sum(1 for node in live if node.tag == "generating")
         running = sum(1 for node in live if node.tag == "running")
         queued = sum(
@@ -795,16 +945,7 @@ def run():
             for round_node in pending_execution_queue
             if round_node.node.step is None and round_node.node.tag == "generated"
         )
-        best_candidates = [
-            node
-            for node in [*journal.nodes, *live_display_nodes()]
-            if node.is_buggy is False and node.metric is not None
-        ]
-        best = (
-            sorted(best_candidates, key=lambda node: node.metric, reverse=True)[0]
-            if best_candidates
-            else None
-        )
+        best = _best_committed_node(journal.nodes)
         best_text = (
             f"{metric_name}={best.metric.value:.3f}"
             if best is not None and best.metric is not None
@@ -813,7 +954,8 @@ def run():
         return (
             f"Progress: generated {generated}/{total_steps} · "
             f"executed {executed}/{total_steps} · "
-            f"live generating {generating}, running {running}, queued {queued} · "
+            f"live generating {generating}, running {running}, "
+            f"queued {queued}, prefetched {prefetched} · "
             f"best {best_text}"
         )
 
@@ -840,7 +982,7 @@ def run():
     def live_tree_ticker() -> None:
         while not live_tree_stop.wait(live_tree_refresh_seconds):
             try:
-                if live_nodes() and (
+                if live_display_nodes() and (
                     time.monotonic() - last_live_tree_log_at
                     >= live_tree_refresh_seconds
                 ):
@@ -877,26 +1019,24 @@ def run():
 
     def active_speculative_keys(round_index: int) -> set[tuple[str, str]]:
         keys = set(speculative_keys_by_round.get(round_index, set()))
+        keys.update(speculative_cache_by_round.get(round_index, {}).keys())
         for meta in generation_future_to_meta.values():
             if meta.get("speculative") and meta.get("round_index") == round_index:
                 keys.add(task_key(meta["task"]))
         return keys
 
     def remaining_schedule_budget() -> int:
-        live_count = sum(
-            1
-            for round_nodes in round_nodes_by_round.values()
-            for round_node in round_nodes
-            if round_node.node.step is None
-        )
-        return total_steps - global_step - live_count - len(generating_nodes)
+        return scheduler.remaining_budget(total_steps, global_step)
 
-    def generation_backlog_full(next_task: RoundTask | None = None) -> bool:
+    def generation_backlog_full(
+        next_task: RoundTask | None = None,
+        exclude_prefetch_keys: set[tuple[str, str]] | None = None,
+    ) -> bool:
         if next_task is not None and task_stage(next_task) == "draft":
             limit = max_draft_generated_backlog
         else:
             limit = max_generated_backlog
-        backlog = live_backlog_count(next_task)
+        backlog = live_backlog_count(next_task, exclude_prefetch_keys)
         if limit <= 0:
             return backlog > 0
         return backlog >= limit
@@ -933,7 +1073,7 @@ def run():
             )
             changed = True
         if changed:
-            refresh_live_tree(log_tree=False)
+            refresh_live_tree(log_tree=True)
 
     def submit_generation_task(
         generation_executor: ThreadPoolExecutor,
@@ -941,6 +1081,7 @@ def run():
         task_round_index: int,
         item_index: int,
         item_count: int,
+        journal_snapshot: list[Node],
         scheduled_step: int | None = None,
         speculative: bool = False,
     ) -> bool:
@@ -990,12 +1131,34 @@ def run():
                 seen_pending_ids.add(node.id)
         for round_node in round_nodes_by_round.get(task_round_index, []):
             node = round_node.node
-            if node.id in seen_pending_ids or node.step is not None:
+            if node.id in seen_pending_ids:
                 continue
             pending_context.append(node)
             seen_pending_ids.add(node.id)
+        frozen_inputs = copy.deepcopy(
+            {
+                "task_parent": task.parent,
+                "pending_context": pending_context,
+                "journal_snapshot": journal_snapshot,
+            }
+        )
+        worker_task = RoundTask(
+            parent=frozen_inputs["task_parent"],
+            selection_reason=task.selection_reason,
+        )
+        worker_pending_context = frozen_inputs["pending_context"]
+        worker_journal_snapshot = frozen_inputs["journal_snapshot"]
+        snapshot_node_ids = [node.id for node in journal_snapshot]
+        pending_node_ids = [node.id for node in pending_context]
         future = generation_executor.submit(
-            generate_node_in_worker, task, pending_context
+            generate_node_in_worker,
+            worker_task,
+            worker_pending_context,
+            worker_journal_snapshot,
+            item_index,
+            item_count,
+            scheduled_step,
+            speculative,
         )
         generation_future_to_meta[future] = {
             "task": task,
@@ -1005,15 +1168,47 @@ def run():
             "item_count": item_count,
             "scheduled_step": scheduled_step,
             "speculative": speculative,
+            "snapshot_node_ids": snapshot_node_ids,
+            "pending_node_ids": pending_node_ids,
         }
         return True
 
-    def generate_node_in_worker(task: RoundTask, pending_context: list[Node]) -> Node:
-        proposal_agent.set_pending_round_nodes(pending_context)
+    def generate_node_in_worker(
+        task: RoundTask,
+        pending_context: list[Node],
+        journal_snapshot: list[Node],
+        item_index: int,
+        item_count: int,
+        scheduled_step: int | None,
+        speculative: bool,
+    ) -> Node:
+        worker_agent = ProposalAgent(
+            task_desc=agent_task_desc,
+            cfg=cfg,
+            journal=Journal(nodes=list(journal_snapshot)),
+        )
+        worker_agent.data_summary = proposal_agent.data_summary
+        worker_agent.set_generation_context(
+            pending_round_nodes=pending_context,
+            round_item_index=item_index,
+            round_item_count=item_count,
+            scheduled_step=scheduled_step,
+            speculative=speculative,
+        )
         try:
-            return proposal_agent.generate_node(task)
+            return worker_agent.generate_node(task)
         finally:
-            proposal_agent.clear_pending_round_nodes()
+            worker_agent.clear_generation_context()
+
+    def reattach_generated_node_to_live_parent(
+        node: Node, live_parent: Node | None
+    ) -> None:
+        """Move a worker-generated node from the private prompt graph to the live tree."""
+        if node.parent is not None:
+            node.parent.children.discard(node)
+        node.parent = live_parent
+        if live_parent is not None:
+            live_parent.children.add(node)
 
     def handle_finished_generations(
         executor: ThreadPoolExecutor,
@@ -1064,8 +1259,8 @@ def run():
                 refresh_live_tree(log_tree=True)
                 changed = True
                 continue
-            if node.parent is not None:
-                node.parent.children.discard(node)
+            task = meta["task"]
+            reattach_generated_node_to_live_parent(node, task.parent)
             node.id = placeholder.id
             node.ctime = placeholder.ctime
             node.agent_name = workflow_agent.name
@@ -1076,14 +1271,32 @@ def run():
             node.mark_status("generated")
             if placeholder in generating_nodes:
                 generating_nodes.remove(placeholder)
-
-            task = meta["task"]
             if meta["speculative"]:
                 key = task_key(task)
-                speculative_keys_by_round.setdefault(
-                    meta["round_index"], set()
-                ).discard(key)
-                scheduled_keys_by_round.setdefault(meta["round_index"], set()).add(key)
+                node.mark_status("prefetched")
+                speculative_cache_by_round.setdefault(meta["round_index"], {})[key] = {
+                    "node": node,
+                    "original_selection_reason": task.selection_reason,
+                    "snapshot_node_ids": meta.get("snapshot_node_ids", []),
+                    "pending_node_ids": meta.get("pending_node_ids", []),
+                }
+                speculative_keys_by_round.setdefault(meta["round_index"], set()).add(
+                    key
+                )
+                append_event(
+                    cfg.log_dir,
+                    "speculative_prefetched",
+                    round_index=meta["round_index"],
+                    round_item_index=meta["item_index"],
+                    round_item_count=meta["item_count"],
+                    scheduled_step=meta.get("scheduled_step"),
+                    node_id=node.id,
+                    stage=node.node_status,
+                    parent_id=node.parent.id if node.parent is not None else None,
+                    selection_reason=task.selection_reason,
+                )
+                changed = True
+                continue
 
             round_node = RoundNode(
                 workflow_agent=workflow_agent,
@@ -1124,7 +1337,7 @@ def run():
             )
             changed = True
         if changed:
-            refresh_live_tree(log_tree=False)
+            refresh_live_tree(log_tree=True)
             submit_ready_nodes(executor)
 
     def invalidate_speculative_cache(
@@ -1132,12 +1345,14 @@ def run():
         valid_keys: set[tuple[str, str]],
     ) -> None:
         cache = speculative_cache_by_round.setdefault(round_index, {})
+        changed = False
         for key in list(cache):
             if key in valid_keys:
                 continue
             cached = cache.pop(key)
             node = cached["node"]
             speculative_keys_by_round.setdefault(round_index, set()).discard(key)
+            changed = True
             append_event(
                 cfg.log_dir,
                 "speculative_invalidated",
@@ -1147,6 +1362,8 @@ def run():
                 parent_id=node.parent.id if node.parent is not None else None,
                 reason="not selected by official round task selection",
             )
+        if changed:
+            refresh_live_tree(log_tree=True)
 
     def adopt_speculative_node(
         executor: ThreadPoolExecutor,
@@ -1165,6 +1382,26 @@ def run():
             return False
         speculative_keys_by_round.setdefault(task_round_index, set()).discard(key)
         node = cached["node"]
+        expected_snapshot_ids = [
+            committed_node.id
+            for committed_node in journal.nodes
+            if node_round_index(committed_node) < task_round_index
+        ]
+        cached_snapshot_ids = list(cached.get("snapshot_node_ids") or [])
+        if cached_snapshot_ids != expected_snapshot_ids:
+            append_event(
+                cfg.log_dir,
+                "speculative_invalidated",
+                round_index=task_round_index,
+                node_id=node.id,
+                stage=node.node_status,
+                parent_id=node.parent.id if node.parent is not None else None,
+                reason="prompt_snapshot_stale",
+                cached_snapshot_node_ids=cached_snapshot_ids,
+                expected_snapshot_node_ids=expected_snapshot_ids,
+            )
+            refresh_live_tree(log_tree=True)
+            return False
         original_reason = cached.get("original_selection_reason")
         if original_reason and original_reason != task.selection_reason:
             node.selection_reason = (
@@ -1217,13 +1454,12 @@ def run():
             stage=node.node_status,
             parent_id=node.parent.id if node.parent is not None else None,
         )
-        refresh_live_tree(log_tree=False)
+        refresh_live_tree(log_tree=True)
         submit_ready_nodes(executor)
         return True
 
     def handle_scheduler_events(
         executor: ThreadPoolExecutor,
-        append_round_index: int | None = None,
         block: bool = False,
     ) -> None:
         futures = [*generation_future_to_meta, *future_to_round_node]
@@ -1231,38 +1467,29 @@ def run():
         if block and futures and not done:
             wait(futures, return_when=FIRST_COMPLETED)
         handle_finished_generations(executor, block=False)
-        handle_finished_futures(
-            block=False,
-            executor=executor,
-            append_round_index=append_round_index,
-        )
+        handle_finished_futures(block=False, executor=executor)
         submit_ready_nodes(executor)
 
     def wait_for_scheduler_capacity(
         executor: ThreadPoolExecutor,
         next_task: RoundTask | None = None,
-        append_round_index: int | None = None,
+        exclude_prefetch_keys: set[tuple[str, str]] | None = None,
     ) -> None:
-        while generation_future_to_meta or generation_backlog_full(next_task):
-            handle_scheduler_events(
-                executor, append_round_index=append_round_index, block=False
-            )
-            if not generation_future_to_meta and not generation_backlog_full(next_task):
+        while generation_backlog_full(next_task, exclude_prefetch_keys):
+            handle_scheduler_events(executor, block=False)
+            if not generation_backlog_full(next_task, exclude_prefetch_keys):
                 return
             futures = [*generation_future_to_meta, *future_to_round_node]
             if futures:
                 wait(futures, timeout=0.5, return_when=FIRST_COMPLETED)
             else:
-                time.sleep(0.05)
+                return
 
     def drain_generation(
         executor: ThreadPoolExecutor,
-        append_round_index: int | None = None,
     ) -> None:
         while generation_future_to_meta:
-            handle_scheduler_events(
-                executor, append_round_index=append_round_index, block=True
-            )
+            handle_scheduler_events(executor, block=True)
 
     def in_flight_child_count(parent: Node) -> int:
         return sum(
@@ -1354,25 +1581,16 @@ def run():
         agent.parse_round_result(
             round_node,
             raw_exec_results[round_node.node.id],
-            best_node_before=None,
+            best_node_before=best_node_before_by_round.get(round_node.round_index),
         )
         parsed_node_ids.add(round_node.node.id)
         round_node.node.mark_status("completed")
         append_result_for_round_node(round_node)
-        refresh_live_tree(log_tree=False)
-
-    def preview_exec_result(round_node: RoundNode, exec_result) -> None:
-        node = round_node.node
-        if node.id in parsed_node_ids:
-            return
-        parse_factual_exec_result(node, exec_result, record_context=False)
-        node.mark_status("completed")
-        refresh_live_tree(log_tree=False)
+        refresh_live_tree(log_tree=True)
 
     def handle_finished_futures(
         block: bool = False,
         executor: ThreadPoolExecutor | None = None,
-        append_round_index: int | None = None,
     ) -> None:
         futures = list(future_to_round_node)
         if not futures:
@@ -1386,19 +1604,11 @@ def run():
             exec_result = future.result()
             raw_exec_results.setdefault(round_node.node.id, exec_result)
             round_node.node.mark_status("completed")
-            preview_exec_result(round_node, exec_result)
             finished_round_nodes.append(round_node)
         if executor is not None:
             submit_ready_nodes(executor)
         for round_node in finished_round_nodes:
-            can_append_result = (
-                append_round_index is None
-                or round_node.round_index <= append_round_index
-            )
-            if can_append_result:
-                parse_round_node_if_ready(round_node)
-            if round_node.node.id not in parsed_node_ids:
-                refresh_live_tree(log_tree=False)
+            parse_round_node_if_ready(round_node)
 
     def append_result_for_round_node(round_node: RoundNode) -> None:
         nonlocal global_step
@@ -1411,8 +1621,19 @@ def run():
         appended_node_ids_by_round.setdefault(round_node.round_index, []).append(
             node.id
         )
+        sync_node_working_to_run_workspace(
+            cfg,
+            solution_workspace,
+            target_name="working_latest",
+        )
         sync_node_working_to_run_workspace(cfg, solution_workspace)
         best_node = journal.get_best_node(only_good=True)
+        if node is best_node:
+            sync_node_working_to_run_workspace(
+                cfg,
+                solution_workspace,
+                target_name="working_best",
+            )
         private_metrics = None
         private_error = None
         try:
@@ -1465,7 +1686,7 @@ def run():
 
     live_tree_thread = Thread(target=live_tree_ticker, daemon=True)
     live_tree_thread.start()
-    generation_executor = ThreadPoolExecutor(max_workers=1)
+    generation_executor = ThreadPoolExecutor(max_workers=generation_workers)
     executor = ThreadPoolExecutor(max_workers=parallel_workers)
     try:
         while global_step < total_steps and not total_timer.is_timeout():
@@ -1481,16 +1702,23 @@ def run():
             try:
                 tasks = select_tasks_visible_before_round(round_index)
                 existing_keys = scheduled_keys_by_round.setdefault(round_index, set())
-                filtered_tasks = []
+                candidate_tasks = []
                 for task in tasks:
                     key = task_key(task)
                     if task.parent is not None and key in existing_keys:
                         continue
-                    filtered_tasks.append(task)
-                budget = max(0, remaining_schedule_budget())
+                    candidate_tasks.append(task)
+                candidate_official_keys = {
+                    task_key(task)
+                    for task in candidate_tasks
+                    if task.parent is not None
+                }
+                invalidate_speculative_cache(round_index, candidate_official_keys)
+                adoptable_keys = set(speculative_cache_by_round.get(round_index, {}))
+                budget = max(0, remaining_schedule_budget()) + len(adoptable_keys)
                 existing_round_count = len(round_nodes_by_round.get(round_index, []))
                 remaining_round_slots = max(0, len(tasks) - existing_round_count)
-                filtered_tasks = filtered_tasks[
+                filtered_tasks = candidate_tasks[
                     : min(budget, workflow_agent.steps_left, remaining_round_slots)
                 ]
                 valid_official_keys = {
@@ -1502,6 +1730,9 @@ def run():
                 )
                 round_start_step_by_round[round_index] = global_step
                 round_item_count_by_round[round_index] = item_count
+                best_node_before_by_round[round_index] = journal.get_best_node(
+                    only_good=True
+                )
                 append_event(
                     cfg.log_dir,
                     "round_started",
@@ -1509,15 +1740,26 @@ def run():
                     round_start_step=global_step,
                     planned_items=item_count,
                     parallel_workers=parallel_workers,
+                    generation_workers=generation_workers,
                 )
                 for round_node in list(round_nodes_by_round.get(round_index, [])):
                     parse_round_node_if_ready(round_node)
 
-                for task in filtered_tasks:
+                existing_round_count = len(round_nodes_by_round.get(round_index, []))
+                round_journal_snapshot = [
+                    node
+                    for node in journal.nodes
+                    if node_round_index(node) < round_index
+                ]
+                for task_offset, task in enumerate(filtered_tasks, start=1):
+                    if task.parent is None:
+                        drain_generation(executor)
                     wait_for_scheduler_capacity(
-                        executor, task, append_round_index=round_index
+                        executor,
+                        task,
+                        exclude_prefetch_keys=valid_official_keys,
                     )
-                    item_index = len(round_nodes_by_round.get(round_index, [])) + 1
+                    item_index = existing_round_count + task_offset
                     scheduled_step = (
                         round_start_step_by_round.get(round_index, global_step)
                         + item_index
@@ -1538,13 +1780,12 @@ def run():
                             round_index,
                             item_index,
                             item_count,
+                            round_journal_snapshot,
                             scheduled_step=scheduled_step,
                             speculative=False,
                         )
-                    handle_scheduler_events(
-                        executor, append_round_index=round_index, block=False
-                    )
-                drain_generation(executor, append_round_index=round_index)
+                    handle_scheduler_events(executor, block=False)
+                drain_generation(executor)
 
                 for round_node in list(round_nodes_by_round.get(round_index, [])):
                     parse_round_node_if_ready(round_node)
@@ -1568,9 +1809,7 @@ def run():
                             or total_timer.is_timeout()
                         ):
                             break
-                        wait_for_scheduler_capacity(
-                            executor, task, append_round_index=round_index
-                        )
+                        wait_for_scheduler_capacity(executor, task)
                         if (
                             round_ready_to_commit(round_index)
                             or total_timer.is_timeout()
@@ -1594,6 +1833,7 @@ def run():
                             next_round_index,
                             item_index,
                             item_count,
+                            list(journal.nodes),
                             scheduled_step=scheduled_step,
                             speculative=True,
                         )
@@ -1601,7 +1841,6 @@ def run():
                             break
                     handle_scheduler_events(
                         executor,
-                        append_round_index=round_index,
                         block=not round_ready_to_commit(round_index),
                     )
 
@@ -1625,6 +1864,11 @@ def run():
         live_tree_thread.join(timeout=2)
         with live_tree_lock:
             if live_tree_display_started:
+                display_journal = save_live_tree(live_display_nodes())
+                live_tree_display.update(
+                    live_tree_view(display_journal),
+                    refresh=True,
+                )
                 live_tree_display.stop()
         generation_executor.shutdown(wait=True)
         executor.shutdown(wait=True)

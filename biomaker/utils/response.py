@@ -38,6 +38,7 @@ PROTECTED_STATUS_PREFIXES = STATUS_PREFIXES
 TRACEBACK_HEADER = "Traceback (most recent call last):"
 ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
+LOCAL_PATH_RE = re.compile(r"(?P<path>(?:/home|/mnt|/tmp|/var|/Users)[^\s'\"`),;]+)")
 
 
 def wrap_code(code: str, lang="python") -> str:
@@ -75,6 +76,11 @@ def truncate_text(text: str, max_chars: int = 6000, marker: str = "truncated") -
         f"{text[-tail_chars:]}"
     )
     return truncated_text[:max_chars]
+
+
+def redact_local_paths(text: str) -> str:
+    """Remove host-specific absolute paths from prompt-facing text."""
+    return LOCAL_PATH_RE.sub("<local_path>", str(text or ""))
 
 
 def trim_execution_output(text: str, max_chars: int = 5000) -> str:
@@ -160,7 +166,10 @@ def format_prompt_execution_output(
     text: str, *, is_buggy: bool, max_chars: int = 4000
 ) -> str:
     """Return the execution evidence useful as context for future nodes."""
-    cleaned = strip_execution_status_lines(trim_execution_output(text, max_chars=max_chars))
+    cleaned = strip_execution_status_lines(
+        trim_execution_output(text, max_chars=max_chars)
+    )
+    cleaned = redact_local_paths(cleaned)
     if is_buggy:
         return _extract_failure_evidence(cleaned, max_chars=max_chars)
     return "Execution completed successfully. Detailed stdout is omitted from tree context."
@@ -322,35 +331,41 @@ def _bounded_lines(lines: list[str], head: int, tail: int) -> list[str]:
     return lines[:head] + lines[-tail:]
 
 
+PYTHON_FENCE_LANGS = {"", "python", "py", "python3"}
+
+
+def extract_code_blocks(text):
+    """Extract valid Python code blocks from a model response."""
+    parsed_codes = []
+    fence_re = re.compile(
+        r"```[ \t]*(?P<lang>[A-Za-z0-9_+-]*)[ \t]*\r?\n"
+        r"(?P<code>.*?)\r?\n?[ \t]*```",
+        re.DOTALL | re.IGNORECASE,
+    )
+    for match in fence_re.finditer(text):
+        lang = (match.group("lang") or "").strip().lower()
+        if lang not in PYTHON_FENCE_LANGS:
+            continue
+        parsed_codes.append(match.group("code"))
+
+    # When the entire response is Python code and no markdown fence was used.
+    if len(parsed_codes) == 0 and is_valid_python_script(text):
+        parsed_codes.append(text)
+
+    return [format_code(c) for c in parsed_codes if is_valid_python_script(c)]
+
+
 def extract_code(text):
     """Extract python code blocks from the text."""
-    parsed_codes = []
-
-    # When code is in a text or python block
-    matches = re.findall(r"```(python)?\n*(.*?)\n*```", text, re.DOTALL)
-    for match in matches:
-        code_block = match[1]
-        parsed_codes.append(code_block)
-
-    # When the entire text is code or backticks of the code block is missing
-    if len(parsed_codes) == 0:
-        matches = re.findall(r"^(```(python)?)?\n?(.*?)\n?(```)?$", text, re.DOTALL)
-        if matches:
-            code_block = matches[0][2]
-            parsed_codes.append(code_block)
-
-    # validate the parsed codes
-    valid_code_blocks = [
-        format_code(c) for c in parsed_codes if is_valid_python_script(c)
-    ]
-    return format_code("\n\n".join(valid_code_blocks))
+    return format_code("\n\n".join(extract_code_blocks(text)))
 
 
 def extract_text_up_to_code(s):
     """Extract (presumed) natural language text up to the start of the first code block."""
-    if "```" not in s:
+    match = re.search(r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*(?:\r?\n|$)", s)
+    if match is None:
         return ""
-    return s[: s.find("```")].strip()
+    return s[: match.start()].strip()
 
 
 def format_code(code) -> str:

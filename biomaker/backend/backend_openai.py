@@ -133,10 +133,11 @@ def query(
             output = choice.message.content
         else:
             first_call = tool_calls[0]
-            assert first_call.function.name == func_spec.name, (
-                f"Function name mismatch: expected {func_spec.name}, "
-                f"got {first_call.function.name}"
-            )
+            if first_call.function.name != func_spec.name:
+                raise RuntimeError(
+                    f"Function name mismatch: expected {func_spec.name}, "
+                    f"got {first_call.function.name}"
+                )
             try:
                 output = json.loads(first_call.function.arguments)
             except json.JSONDecodeError as e:

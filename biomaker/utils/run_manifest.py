@@ -41,6 +41,7 @@ def _selected_cfg(cfg: Config) -> dict[str, Any]:
         "agent_steps": cfg.agent.steps,
         "total_time_limit_seconds": cfg.agent.total_time_limit,
         "per_node_timeout_seconds": cfg.exec.timeout,
+        "generation_workers": cfg.exec.generation_workers,
         "main_model": cfg.agent.code.model,
         "feedback_model": cfg.agent.feedback.model,
         "enable_node_tools": cfg.agent.enable_node_tools,

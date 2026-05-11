@@ -20,9 +20,14 @@ from .interpreter import ExecutionResult
 from .utils.metric import MetricValue
 from .utils.response import (
     format_prompt_execution_output,
+    redact_local_paths,
     trim_execution_output,
     truncate_text,
 )
+
+TREE_RECORD_MAX_CHARS = 24000
+TREE_RECORD_SELECTED_CODE_MAX_CHARS = 8000
+TREE_RECORD_NON_SELECTED_CODE_MAX_CHARS = 1200
 
 
 @dataclass(eq=False)
@@ -54,6 +59,7 @@ class Node(DataClassJsonMixin):
     _term_out: list[str] = field(default=None, kw_only=True)  # type: ignore
     exec_time: float = field(default=None, kw_only=True)  # type: ignore
     resource_usage: dict | None = field(default=None, kw_only=True)
+    execution: dict | None = field(default=None, kw_only=True)
     artifact_report: dict | None = field(default=None, kw_only=True)
     evaluator_details: dict | None = field(default=None, kw_only=True)
     exc_type: str | None = field(default=None, kw_only=True)
@@ -94,6 +100,7 @@ class Node(DataClassJsonMixin):
         self._term_out = exec_result.term_out
         self.exec_time = exec_result.exec_time
         self.resource_usage = exec_result.resource_usage
+        self.execution = exec_result.execution_record()
         self.exc_type = exec_result.exc_type
         self.exc_info = exec_result.exc_info
         self.exc_stack = exec_result.exc_stack
@@ -183,7 +190,7 @@ class Node(DataClassJsonMixin):
     @property
     def term_out(self) -> str:
         """Get the terminal output of the code execution after semantic trimming."""
-        return trim_execution_output("".join(self._term_out))
+        return trim_execution_output("".join(self._term_out or []))
 
     @property
     def is_leaf(self) -> bool:
@@ -224,8 +231,7 @@ class Journal(DataClassJsonMixin):
 
     def append(self, node: Node) -> None:
         """Append a new node to the journal."""
-        scheduled_step = node.scheduled_step
-        node.step = scheduled_step if isinstance(scheduled_step, int) else len(self.nodes)
+        node.step = len(self.nodes)
         self.nodes.append(node)
 
     def pop(self) -> Optional["Node"]:
@@ -415,6 +421,7 @@ class Journal(DataClassJsonMixin):
         stage: Literal["draft", "debug", "improve"],
         selected_parent: Node | None = None,
         pending_same_round_nodes: list[Node] | None = None,
+        max_chars: int = TREE_RECORD_MAX_CHARS,
     ) -> str:
         """Return the single prompt section that describes tree context.
 
@@ -422,6 +429,7 @@ class Journal(DataClassJsonMixin):
         the ordered lineage and sibling sections so the selected parent is not
         repeated as a full record in multiple places.
         """
+        sep = "\n\n---\n\n"
         parts = [
             "Overall tree\n"
             + _format_current_target(stage, selected_parent)
@@ -429,22 +437,50 @@ class Journal(DataClassJsonMixin):
             + self.generate_tree_index(),
         ]
 
+        def append_budgeted(part: str) -> bool:
+            current = sep.join(parts)
+            remaining = max_chars - len(current) - len(sep)
+            if remaining <= 0:
+                return False
+            if len(part) <= remaining:
+                parts.append(part)
+                return True
+            if remaining > 240:
+                parts.append(
+                    truncate_text(
+                        part,
+                        max_chars=remaining,
+                        marker="tree record prompt budget reached",
+                    )
+                )
+            return False
+
         lineage = _lineage_from_root(selected_parent) if selected_parent else []
         if lineage:
-            parts.append(_tree_record_lineage_intro(stage, selected_parent))
-            parts.extend(
-                _format_detail_record(
-                    node,
-                    (
-                        "root-to-parent lineage; selected parent"
-                        if node is selected_parent
-                        else "root-to-parent lineage ancestor"
-                    ),
+            if not append_budgeted(_tree_record_lineage_intro(stage, selected_parent)):
+                return truncate_text(
+                    sep.join(parts),
+                    max_chars=max_chars,
+                    marker="tree record prompt budget reached",
                 )
-                for node in lineage
-            )
+            for node in lineage:
+                if not append_budgeted(
+                    _format_detail_record(
+                        node,
+                        (
+                            "root-to-parent lineage; selected parent"
+                            if node is selected_parent
+                            else "root-to-parent lineage ancestor"
+                        ),
+                    )
+                ):
+                    return truncate_text(
+                        sep.join(parts),
+                        max_chars=max_chars,
+                        marker="tree record prompt budget reached",
+                    )
         else:
-            parts.append(_tree_record_lineage_intro(stage, selected_parent))
+            append_budgeted(_tree_record_lineage_intro(stage, selected_parent))
 
         sibling_nodes = [
             node
@@ -458,30 +494,83 @@ class Journal(DataClassJsonMixin):
         completed_sibling_nodes = [
             node for node in sibling_nodes if node.step is not None
         ]
-        pending_sibling_nodes = [
-            node for node in sibling_nodes if node.step is None
-        ]
+        pending_sibling_nodes = [node for node in sibling_nodes if node.step is None]
+
+        debug_child_nodes = []
+        if stage == "debug" and selected_parent is not None:
+            debug_child_nodes = [
+                node
+                for node in sorted(selected_parent.children, key=_node_context_sort_key)
+                if node in self.nodes and node.step is not None
+            ]
+        if debug_child_nodes:
+            if not append_budgeted(_tree_record_debug_child_intro()):
+                return truncate_text(
+                    sep.join(parts),
+                    max_chars=max_chars,
+                    marker="tree record prompt budget reached",
+                )
+            for node in debug_child_nodes:
+                if not append_budgeted(
+                    _format_detail_record(
+                        node,
+                        "previous debug child of the selected buggy parent",
+                    )
+                ):
+                    return truncate_text(
+                        sep.join(parts),
+                        max_chars=max_chars,
+                        marker="tree record prompt budget reached",
+                    )
 
         if completed_sibling_nodes:
-            parts.append(_tree_record_sibling_intro(stage, selected_parent))
-            parts.extend(
-                _format_detail_record(node, _tree_record_sibling_reason(stage))
-                for node in sorted(completed_sibling_nodes, key=_node_context_sort_key)
-            )
+            if not append_budgeted(_tree_record_sibling_intro(stage, selected_parent)):
+                return truncate_text(
+                    sep.join(parts),
+                    max_chars=max_chars,
+                    marker="tree record prompt budget reached",
+                )
+            for node in sorted(completed_sibling_nodes, key=_node_context_sort_key):
+                if not append_budgeted(
+                    _format_detail_record(node, _tree_record_sibling_reason(stage))
+                ):
+                    return truncate_text(
+                        sep.join(parts),
+                        max_chars=max_chars,
+                        marker="tree record prompt budget reached",
+                    )
         else:
-            parts.append(
+            append_budgeted(
                 _tree_record_sibling_intro(stage, selected_parent)
                 + "\nNo completed sibling records were available when this prompt was built."
             )
 
         if pending_sibling_nodes:
-            parts.append(_tree_record_pending_sibling_intro(stage, selected_parent))
-            parts.extend(
-                _format_detail_record(node, _tree_record_pending_sibling_reason(stage))
-                for node in sorted(pending_sibling_nodes, key=_node_context_sort_key)
-            )
+            if not append_budgeted(
+                _tree_record_pending_sibling_intro(stage, selected_parent)
+            ):
+                return truncate_text(
+                    sep.join(parts),
+                    max_chars=max_chars,
+                    marker="tree record prompt budget reached",
+                )
+            for node in sorted(pending_sibling_nodes, key=_node_context_sort_key):
+                if not append_budgeted(
+                    _format_detail_record(
+                        node, _tree_record_pending_sibling_reason(stage)
+                    )
+                ):
+                    return truncate_text(
+                        sep.join(parts),
+                        max_chars=max_chars,
+                        marker="tree record prompt budget reached",
+                    )
 
-        return "\n\n---\n\n".join(parts)
+        return truncate_text(
+            sep.join(parts),
+            max_chars=max_chars,
+            marker="tree record prompt budget reached",
+        )
 
     def _avoid_summary(self, max_items: int = 4) -> str:
         failures = []
@@ -693,7 +782,8 @@ def _tree_record_siblings(
     if stage == "debug":
         if selected_parent.parent is None:
             return [
-                node for node in sorted(list(draft_nodes), key=_node_sort_step)
+                node
+                for node in sorted(list(draft_nodes), key=_node_sort_step)
                 if node is not selected_parent
             ]
         return [
@@ -743,9 +833,7 @@ def _tree_record_sibling_intro(
     title = _tree_record_sibling_title(stage)
     if stage == "debug":
         if selected_parent is None:
-            instruction = (
-                "There is no selected parent, so no buggy-parent sibling context is available."
-            )
+            instruction = "There is no selected parent, so no buggy-parent sibling context is available."
         else:
             instruction = (
                 "These records are siblings of the buggy parent: they were generated "
@@ -766,6 +854,15 @@ def _tree_record_sibling_intro(
             "make the overall attempt substantively different."
         )
     return f"{title}\n{instruction}"
+
+
+def _tree_record_debug_child_intro() -> str:
+    return (
+        "Previous Debug Children of the Selected Buggy Parent\n"
+        "These are earlier child nodes generated to fix the same selected buggy "
+        "parent. Use their concrete failures or successes to avoid repeating a "
+        "failed repair and to preserve any working fix components."
+    )
 
 
 def _tree_record_pending_sibling_intro(
@@ -805,14 +902,13 @@ def _tree_record_sibling_reason(stage: Literal["draft", "debug", "improve"]) -> 
         )
     if stage == "improve":
         return (
-            "existing child of the selected parent; sibling of the new improve "
-            "node"
+            "existing child of the selected parent; sibling of the new improve " "node"
         )
     return "existing root draft; sibling of the new draft node"
 
 
 def _tree_record_pending_sibling_reason(
-    stage: Literal["draft", "debug", "improve"]
+    stage: Literal["draft", "debug", "improve"],
 ) -> str:
     if stage == "debug":
         return "same-round sibling of the buggy parent; generated but not scored yet"
@@ -990,8 +1086,7 @@ def _format_artifact_facts(
         )
         dtype_text = ",".join(sorted(dtypes)) if dtypes else "n/a"
         lines.append(
-            "prediction_columns: "
-            f"dtypes={dtype_text}, nulls={nulls}{range_text}"
+            "prediction_columns: " f"dtypes={dtype_text}, nulls={nulls}{range_text}"
         )
 
     if warnings:
@@ -1030,6 +1125,96 @@ def _format_evaluator_details(details: dict | None) -> str:
     return ", ".join(parts)
 
 
+def _execution_dict(n: Node) -> dict:
+    return n.execution if isinstance(n.execution, dict) else {}
+
+
+def _candidate_execution_text(n: Node) -> str:
+    execution = _execution_dict(n)
+    candidate = execution.get("candidate")
+    if isinstance(candidate, dict):
+        output = candidate.get("output")
+        if isinstance(output, str) and output.strip():
+            return output
+        stdout = str(candidate.get("stdout") or "")
+        stderr = str(candidate.get("stderr") or "")
+        if stdout or stderr:
+            return stdout + stderr
+    return "".join(n._term_out or [])
+
+
+def _format_failure(failure: object) -> str:
+    if not isinstance(failure, dict):
+        return "none"
+    phase = failure.get("phase") or "unknown"
+    failure_type = failure.get("type") or "unknown"
+    info = failure.get("info")
+    return redact_local_paths(
+        truncate_text(
+            f"{phase}: {failure_type}; info={json_dumps_compact(info)}",
+            max_chars=700,
+            marker="failure details trimmed",
+        )
+    )
+
+
+def _format_execution_summary(n: Node, *, not_executed: bool) -> str:
+    if not_executed:
+        return "execution_status: not_executed"
+
+    execution = _execution_dict(n)
+    lines = [
+        "execution_status: " + ("bug" if n.is_buggy is True else "success"),
+        f"failure: {_format_failure(execution.get('final_failure'))}",
+    ]
+
+    candidate = execution.get("candidate")
+    if isinstance(candidate, dict):
+        returncode = candidate.get("returncode")
+        if returncode is not None:
+            lines.append(f"candidate_returncode: {returncode}")
+        candidate_failure = candidate.get("failure")
+        if candidate_failure:
+            lines.append(f"candidate_failure: {_format_failure(candidate_failure)}")
+
+    artifact_validation = execution.get("artifact_validation")
+    if isinstance(artifact_validation, dict):
+        lines.append(f"artifact_validation_ok: {artifact_validation.get('ok')}")
+        messages = artifact_validation.get("messages")
+        if messages:
+            lines.append(
+                "artifact_validation_messages: "
+                + redact_local_paths(
+                    truncate_text(
+                        str(messages),
+                        max_chars=800,
+                        marker="artifact validation messages trimmed",
+                    )
+                )
+            )
+
+    evaluator = execution.get("evaluator")
+    if isinstance(evaluator, dict):
+        lines.append(
+            "evaluator: "
+            f"ok={evaluator.get('ok')}, "
+            f"metric={evaluator.get('metric')}, "
+            f"maximize={evaluator.get('maximize')}"
+        )
+        if evaluator.get("error"):
+            lines.append(
+                "evaluator_error: "
+                + redact_local_paths(
+                    truncate_text(
+                        str(evaluator.get("error")),
+                        max_chars=500,
+                        marker="evaluator error trimmed",
+                    )
+                )
+            )
+    return "\n".join(lines)
+
+
 def _format_node_header(n: Node) -> str:
     metric = n.metric.value if n.metric is not None else None
     metric_text = "n/a" if metric is None else f"{float(metric):.4f}"
@@ -1060,8 +1245,15 @@ def _format_memory_node(n: Node) -> str:
     )
 
 
-def _format_detail_record(n: Node, reason: str) -> str:
+def _format_detail_record(
+    n: Node,
+    reason: str,
+    *,
+    selected_code_max_chars: int = TREE_RECORD_SELECTED_CODE_MAX_CHARS,
+    non_selected_code_max_chars: int = TREE_RECORD_NON_SELECTED_CODE_MAX_CHARS,
+) -> str:
     not_executed = n.step is None or n._term_out is None
+    include_full_code = "selected parent" in reason
     include_output_check = bool(
         n.is_buggy
         or (
@@ -1073,7 +1265,7 @@ def _format_detail_record(n: Node, reason: str) -> str:
         )
     )
     artifact_facts = (
-        _format_artifact_facts(n.artifact_report, include_raw_report=True)
+        _format_artifact_facts(n.artifact_report, include_raw_report=False)
         if include_output_check
         else ""
     )
@@ -1081,11 +1273,15 @@ def _format_detail_record(n: Node, reason: str) -> str:
         json_dumps_compact(n.resource_usage) if n.resource_usage is not None else "n/a"
     )
     evaluator_details = _format_evaluator_details(n.evaluator_details)
-    exception_info = {
-        "exc_type": n.exc_type,
-        "exc_info": n.exc_info,
-        "exc_stack": n.exc_stack,
-    }
+    exception_info = redact_local_paths(
+        json_dumps_compact(
+            {
+                "exc_type": n.exc_type,
+                "exc_info": n.exc_info,
+                "exc_stack": n.exc_stack,
+            }
+        )
+    )
     if not_executed:
         result_text = (
             "generated_not_scored_yet"
@@ -1112,9 +1308,10 @@ def _format_detail_record(n: Node, reason: str) -> str:
         "Not executed yet. Execution output is unknown."
         if not_executed
         else format_prompt_execution_output(
-            "".join(n._term_out or []), is_buggy=bool(n.is_buggy)
+            _candidate_execution_text(n), is_buggy=bool(n.is_buggy)
         )
     )
+    execution_summary = _format_execution_summary(n, not_executed=not_executed)
     include_execution_output = bool(not_executed or n.is_buggy is True)
     output_check_block = (
         f"\n\nOutput Check:\n{artifact_facts}" if artifact_facts.strip() else ""
@@ -1124,6 +1321,19 @@ def _format_detail_record(n: Node, reason: str) -> str:
         if include_execution_output
         else ""
     )
+    code_text = n.code or ""
+    if include_full_code:
+        code_text = truncate_text(
+            code_text,
+            max_chars=selected_code_max_chars,
+            marker="selected parent code trimmed to prompt budget",
+        )
+    else:
+        code_text = truncate_text(
+            code_text,
+            max_chars=non_selected_code_max_chars,
+            marker="non-selected node code trimmed",
+        )
     return (
         f"Node {n.id[:8]} · {step_title} · {n.node_status} · parent {parent_id}\n"
         f"step: {step_value}\n"
@@ -1138,9 +1348,10 @@ def _format_detail_record(n: Node, reason: str) -> str:
         f"delta_vs_parent: {_format_delta(n.delta_vs_parent)}\n"
         f"execution_time: {exec_time}\n"
         f"resource_usage: {resource_usage}\n"
-        f"exception: {json_dumps_compact(exception_info)}"
+        f"exception: {exception_info}\n"
+        f"Execution Summary:\n{execution_summary}"
         f"{output_check_block}\n\n"
         f"Plan:\n{n.plan or ''}\n\n"
-        f"Code:\n```python\n{n.code or ''}\n```"
+        f"Code:\n```python\n{code_text}\n```"
         f"{execution_output_block}"
     )

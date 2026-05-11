@@ -104,6 +104,7 @@ class AgentConfig:
 class ExecConfig:
     timeout: int
     parallel_workers: int
+    generation_workers: int
     max_generated_backlog: int
     max_draft_generated_backlog: int
     agent_file_name: str
@@ -178,6 +179,20 @@ def _load_cfg(
     if use_cli_args:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_cli())
     return cfg
+
+
+def _validate_exec_config(cfg: Config) -> None:
+    exec_cfg = cfg.exec
+    positive_int_fields = ("timeout", "parallel_workers", "generation_workers")
+    non_negative_int_fields = ("max_generated_backlog", "max_draft_generated_backlog")
+    for name in positive_int_fields:
+        value = getattr(exec_cfg, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"exec.{name} must be an integer >= 1, got {value!r}.")
+    for name in non_negative_int_fields:
+        value = getattr(exec_cfg, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"exec.{name} must be an integer >= 0, got {value!r}.")
 
 
 def load_cfg(path: Path = Path(__file__).parent / "config.yaml") -> Config:
@@ -271,6 +286,7 @@ def prep_cfg(cfg: Config):
     # validate the config
     cfg_schema: Config = OmegaConf.structured(Config)
     cfg = OmegaConf.merge(cfg_schema, cfg)
+    _validate_exec_config(cfg)
 
     if cfg.agent.enable_web_search and not os.getenv("SERPER_API_KEY"):
         logger.warning(
@@ -390,20 +406,40 @@ def prepare_node_workspace(cfg: Config, node) -> Path:
     return node_dir
 
 
-def sync_node_working_to_run_workspace(cfg: Config, node_workspace: Path) -> None:
-    """Mirror one node's working outputs to the run-level working directory."""
-    src = node_workspace / "working"
-    dst = cfg.workspace_dir / "working"
-    if not src.is_dir():
-        return
+def _replace_tree(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        if not dst.is_symlink() and dst.is_dir():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst, symlinks=True)
 
 
+def sync_node_working_to_run_workspace(
+    cfg: Config,
+    node_workspace: Path,
+    *,
+    target_name: str = "working",
+) -> None:
+    """Mirror one node's working outputs to a run-level working directory."""
+    src = node_workspace / "working"
+    dst = cfg.workspace_dir / target_name
+    if not src.is_dir():
+        return
+    _replace_tree(src, dst)
+
+
 def _copy_submission_artifacts(
-    submission_path: Path, workspace_dir: Path, log_dir: Path
+    submission_path: Path,
+    workspace_dir: Path,
+    log_dir: Path,
+    *,
+    working_dir: Path | None = None,
 ):
+    working_dir = workspace_dir / "working" if working_dir is None else working_dir
     with open(submission_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         path_columns = [
@@ -424,10 +460,11 @@ def _copy_submission_artifacts(
                 else:
                     normalized = Path(str(rel_path).removeprefix("./"))
                     if normalized.parts and normalized.parts[0] == "working":
-                        src = workspace_dir / normalized
+                        rel_inside_working = Path(*normalized.parts[1:])
+                        src = working_dir / rel_inside_working
                         dst = log_dir / normalized
                     else:
-                        src = workspace_dir / "working" / normalized
+                        src = working_dir / normalized
                         dst = log_dir / normalized
 
                 if not src.is_file():
@@ -521,6 +558,7 @@ def _copy_node_artifacts(cfg: Config, node) -> None:
         "outcome": node.outcome,
         "exec_time": node.exec_time,
         "resource_usage": node.resource_usage,
+        "execution": node.execution,
         "evaluator_details": node.evaluator_details,
         "exc_type": node.exc_type,
         "exc_info": node.exc_info,
@@ -577,6 +615,40 @@ def _copy_node_artifacts(cfg: Config, node) -> None:
             dst_dir,
             file_columns=prediction_file_columns or None,
         )
+
+
+def _copy_run_working_dir(cfg: Config, source_name: str, log_name: str) -> Path | None:
+    src = Path(cfg.workspace_dir) / source_name
+    if not src.is_dir():
+        return None
+    dst = Path(cfg.log_dir) / log_name
+    _replace_tree(src, dst)
+    return src
+
+
+def _copy_best_working_outputs(cfg: Config) -> None:
+    """Persist best-node working artifacts under explicit and legacy paths."""
+    working_dir = _copy_run_working_dir(cfg, "working_best", "working_best")
+    if working_dir is None:
+        return
+
+    submission_path = working_dir / "submission.csv"
+    if submission_path.is_file():
+        shutil.copy2(submission_path, cfg.log_dir / "submission.csv")
+        _copy_submission_artifacts(
+            submission_path,
+            cfg.workspace_dir,
+            cfg.log_dir,
+            working_dir=working_dir,
+        )
+
+    pred_masks_dir = working_dir / "pred_masks"
+    if pred_masks_dir.is_dir():
+        _replace_tree(pred_masks_dir, cfg.log_dir / "pred_masks")
+
+    ckpt_path = working_dir / "best_ckpt.pth"
+    if ckpt_path.is_file():
+        shutil.copy2(ckpt_path, cfg.log_dir / "best_ckpt.pth")
 
 
 def _artifact_alignment_value(report: dict | None, key: str):
@@ -695,25 +767,9 @@ def save_run(cfg: Config, journal, solution_tree: Tree = None):
     if latest_node is not None:
         _copy_node_artifacts(cfg, latest_node)
 
-    if latest_node is not None and latest_node is best_node:
-        # Copy artifacts only when the latest candidate is the best runnable node.
-        # This keeps best_solution.py, submission.csv, masks, and private_latest aligned.
-        working_dir = Path(cfg.workspace_dir) / "working"
-        submission_path = working_dir / "submission.csv"
-        if submission_path.is_file():
-            shutil.copy2(submission_path, cfg.log_dir / "submission.csv")
-            _copy_submission_artifacts(submission_path, cfg.workspace_dir, cfg.log_dir)
-
-        pred_masks_dir = working_dir / "pred_masks"
-        if pred_masks_dir.is_dir():
-            log_pred_masks_dir = cfg.log_dir / "pred_masks"
-            if log_pred_masks_dir.exists():
-                shutil.rmtree(log_pred_masks_dir)
-            shutil.copytree(pred_masks_dir, log_pred_masks_dir)
-
-        ckpt_path = Path(cfg.workspace_dir) / "working/best_ckpt.pth"
-        if ckpt_path.is_file():
-            shutil.copy2(ckpt_path, cfg.log_dir / "best_ckpt.pth")
+    _copy_run_working_dir(cfg, "working_latest", "working_latest")
+    if best_node is not None:
+        _copy_best_working_outputs(cfg)
 
     if solution_tree is not None:
         # save the solution tree
