@@ -25,12 +25,11 @@ from ..utils.response import (
 
 logger = logging.getLogger("biomaker")
 ExecCallbackType = Callable[..., ExecutionResult]
-CODE_PROMPT_CHAR_BUDGET = 120_000
+CODE_PROMPT_CHAR_BUDGET = 4_000_000
 CODE_PROMPT_SECTION_FALLBACKS = [
     ("Tool Observations", 40_000),
     ("Data and Evaluation Summary", 32_000),
     ("Task Description", 32_000),
-    ("Tree Records", 64_000),
 ]
 
 
@@ -38,6 +37,7 @@ CODE_PROMPT_SECTION_FALLBACKS = [
 class RoundTask:
     parent: Node | None
     selection_reason: str
+    draft_plan: str | None = None
 
 
 def parse_factual_exec_result(
@@ -139,14 +139,13 @@ class BaseAgent:
         based only on completed nodes already present in the journal.
         """
         search_cfg = self.acfg.search
-        draft_batch_size = max(
-            1,
-            int(getattr(self.cfg.exec, "max_draft_generated_backlog", 1)),
-        )
+
+        def journal_child_count(node: Node) -> int:
+            return sum(1 for child in self.journal.nodes if child.parent is node)
+
         if len(self.journal.draft_nodes) < search_cfg.max_children_per_node:
             current = len(self.journal.draft_nodes)
             missing = search_cfg.max_children_per_node - current
-            count = min(missing, draft_batch_size)
             return [
                 RoundTask(
                     parent=None,
@@ -155,7 +154,7 @@ class BaseAgent:
                         f"({current + idx + 1}/{search_cfg.max_children_per_node})"
                     ),
                 )
-                for idx in range(count)
+                for idx in range(missing)
             ]
 
         tasks: list[RoundTask] = []
@@ -164,7 +163,7 @@ class BaseAgent:
             for n in self.journal.good_nodes
             if (
                 n.metric is not None
-                and len(n.children) < search_cfg.max_children_per_node
+                and journal_child_count(n) < search_cfg.max_children_per_node
             )
         ]
         if improve_candidates:
@@ -195,7 +194,7 @@ class BaseAgent:
             for n in self.journal.buggy_nodes
             if (
                 n.debug_depth < search_cfg.max_debug_depth
-                and len(n.children) < search_cfg.num_bugs
+                and journal_child_count(n) == 0
             )
         ]
         for selected_bug in sorted(
@@ -212,16 +211,6 @@ class BaseAgent:
                     ),
                 )
             )
-
-        if not tasks:
-            return [
-                RoundTask(
-                    parent=None,
-                    selection_reason=(
-                        "no successful expandable node remains after bootstrap drafts"
-                    ),
-                )
-            ]
 
         return tasks
 
@@ -264,11 +253,6 @@ class BaseAgent:
                 "The implementation should include a predict() function, "
                 "allowing users to seamlessly reuse the code to make predictions on new data. "
                 "The prediction function should be well-documented, especially the function signature."
-            )
-
-        if self.acfg.k_fold_validation > 1:
-            impl_guideline.append(
-                f"The evaluation should be based on {self.acfg.k_fold_validation}-fold cross-validation but only if that's an appropriate evaluation for the task at hand."
             )
 
         return {"Implementation guideline": impl_guideline}
@@ -316,21 +300,6 @@ class BaseAgent:
                 marker=f"{key} trimmed by prompt budget",
             )
             notes.append(f"{key} capped at {section_cap} chars.")
-
-        if (
-            self._compiled_prompt_chars(budgeted) > CODE_PROMPT_CHAR_BUDGET
-            and "Tree Records" in budgeted
-        ):
-            overflow = self._compiled_prompt_chars(budgeted) - CODE_PROMPT_CHAR_BUDGET
-            tree_text = compile_prompt_to_md(budgeted["Tree Records"]).strip()
-            target = max(12_000, len(tree_text) - overflow - 2_000)
-            if target < len(tree_text):
-                budgeted["Tree Records"] = truncate_text(
-                    tree_text,
-                    max_chars=target,
-                    marker="Tree Records trimmed by final prompt budget",
-                )
-                notes.append(f"Tree Records final cap applied at {target} chars.")
 
         if notes:
             budgeted["Prompt Budget Notes"] = notes

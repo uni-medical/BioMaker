@@ -109,8 +109,17 @@ def _split_path_from_plan(
     raw = agent_visible.get(name)
     if isinstance(raw, str) and raw.strip():
         candidate = Path(raw.removeprefix("./"))
-        path = candidate if candidate.is_absolute() else workspace_dir / candidate
-        return path, None
+        if candidate.is_absolute():
+            return candidate, None
+        candidates = [
+            workspace_dir / candidate,
+            workspace_dir / "input" / candidate,
+            split_dir / candidate,
+        ]
+        for path in candidates:
+            if path.is_file():
+                return path, None
+        return candidates[0], None
     path = split_dir / default_file
     if path.is_file() or legacy_file is None:
         return path, None

@@ -74,7 +74,7 @@ class ContextBuilder:
             ("round_item_index", "Round item"),
             ("round_item_count", "Round item count"),
             ("scheduled_step", "Scheduled step"),
-            ("speculative", "Speculative prefetch"),
+            ("draft_plan", "Assigned draft plan"),
         ]:
             value = context.get(source)
             if value is not None:
@@ -111,6 +111,7 @@ class ContextBuilder:
         prompt["Instructions"] |= {
             "Solution sketch guideline": [
                 "Use Tree Records as factual experiment history. Do not duplicate an already tried draft.",
+                "Implement the assigned draft plan in Current Selection. Do not switch to a different root strategy unless the assigned plan is impossible under the evaluator contract.",
                 "If sibling draft records are present, use their plan and code as factual context; if reusing any component, make the overall attempt substantively different.",
                 "For a root draft, implement the smallest complete run that tests the core idea and writes all required artifacts; later nodes can scale or refine the approach using observed results.",
                 "For a root draft that trains a model, use fewer than 3 training epochs.",
@@ -136,7 +137,9 @@ class ContextBuilder:
         prompt["Tree Records"] = self.agent.journal.generate_tree_records(
             stage="debug",
             selected_parent=parent_node,
-            pending_same_round_nodes=self.agent.pending_round_nodes_for(parent_node),
+            pending_same_round_nodes=self.agent.pending_round_nodes_for(
+                parent_node.parent
+            ),
         )
         current_selection = self._current_selection()
         if current_selection is not None:
@@ -147,8 +150,8 @@ class ContextBuilder:
                 "Preserve the proposed method as much as possible; this is a code/debug step, not a new modeling strategy step.",
                 "Don't suggest to do EDA.",
                 "Use the selected parent's full record in Tree Records, especially Execution Summary, compact execution output, and resource facts, to fix the observed bug; change training budget only if it is necessary for the fix and state that in the sketch.",
-                "Compare against previous debug children of the selected parent and the selected parent's sibling attempts in Tree Records.",
-                "Do not treat this debug node as a broad new modelling branch; fix the selected parent while learning from how related debug and sibling attempts succeeded, failed, or differed.",
+                "Compare against the selected parent's sibling attempts in Tree Records.",
+                "Do not treat this debug node as a broad new modelling branch; fix the selected parent while learning from how related sibling attempts succeeded, failed, or differed.",
                 "If the execution summary or output contains DependencyPolicyError, remove the unavailable import or package-manager call and replace it with Python standard library or allowed packages.",
                 "If the error is due to missing packages (ImportError/ModuleNotFoundError), DO NOT attempt to install. Instead, replace the missing package with an alternative approach using available packages.",
             ],

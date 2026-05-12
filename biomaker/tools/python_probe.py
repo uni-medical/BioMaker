@@ -122,6 +122,9 @@ import sys as __biomaker_sys
 from pathlib import Path as __BioMakerPath
 
 __biomaker_cwd = __BioMakerPath({cwd_text!r}).resolve()
+__biomaker_allowed_lexical_roots = [
+    __biomaker_cwd / "input",
+]
 __biomaker_allowed_roots = [
     (__biomaker_cwd / "input").resolve(),
 ]
@@ -150,13 +153,24 @@ def __biomaker_is_relative_to(path, root):
 
 def __biomaker_path_allowed(file):
     try:
-        path = __BioMakerPath(file)
+        file_path = __biomaker_os.fspath(file)
+        lexical = __BioMakerPath(__biomaker_os.path.abspath(file_path))
+        path = __BioMakerPath(file_path)
     except Exception:
         return True
     try:
         resolved = path.resolve()
     except Exception:
         resolved = path.absolute()
+    if __biomaker_is_relative_to(lexical, __biomaker_cwd):
+        return (
+            any(
+                __biomaker_is_relative_to(lexical, root)
+                for root in __biomaker_allowed_lexical_roots
+            )
+            or lexical in __biomaker_allowed_files
+            or resolved in __biomaker_allowed_files
+        )
     if __biomaker_is_relative_to(resolved, __biomaker_cwd):
         return (
             any(__biomaker_is_relative_to(resolved, root) for root in __biomaker_allowed_roots)

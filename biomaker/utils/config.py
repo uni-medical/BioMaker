@@ -73,7 +73,6 @@ class StageConfig:
 class SearchConfig:
     max_debug_depth: int
     max_children_per_node: int
-    num_bugs: int
     topk_improve: int
 
 
@@ -82,7 +81,6 @@ class AgentConfig:
     steps: int
     total_time_limit: int  # total time limit for all steps (second)
 
-    k_fold_validation: int
     search: SearchConfig
 
     expose_prediction: bool
@@ -104,9 +102,6 @@ class AgentConfig:
 class ExecConfig:
     timeout: int
     parallel_workers: int
-    generation_workers: int
-    max_generated_backlog: int
-    max_draft_generated_backlog: int
     agent_file_name: str
     format_tb_ipython: bool
     enforce_environment: bool
@@ -183,16 +178,11 @@ def _load_cfg(
 
 def _validate_exec_config(cfg: Config) -> None:
     exec_cfg = cfg.exec
-    positive_int_fields = ("timeout", "parallel_workers", "generation_workers")
-    non_negative_int_fields = ("max_generated_backlog", "max_draft_generated_backlog")
+    positive_int_fields = ("timeout", "parallel_workers")
     for name in positive_int_fields:
         value = getattr(exec_cfg, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"exec.{name} must be an integer >= 1, got {value!r}.")
-    for name in non_negative_int_fields:
-        value = getattr(exec_cfg, name)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"exec.{name} must be an integer >= 0, got {value!r}.")
 
 
 def load_cfg(path: Path = Path(__file__).parent / "config.yaml") -> Config:

@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import Event, RLock, Thread
 
 from omegaconf import OmegaConf
-from rich.console import Console, Group
+from rich.console import Console
 from rich.live import Live
 from rich.tree import Tree
 
@@ -76,9 +76,6 @@ logger.setLevel(logging.INFO)  # set default level
 def _interpreter_kwargs(cfg):
     kwargs = dict(OmegaConf.to_container(cfg.exec))  # type: ignore
     kwargs.pop("parallel_workers", None)
-    kwargs.pop("generation_workers", None)
-    kwargs.pop("max_generated_backlog", None)
-    kwargs.pop("max_draft_generated_backlog", None)
     return kwargs
 
 
@@ -193,41 +190,16 @@ def _pending_round_node_count(round_nodes_by_round: dict) -> int:
     )
 
 
-def _cached_speculative_node_count(
-    speculative_cache_by_round: dict,
-    *,
-    exclude_key: tuple[str, str] | None = None,
-    exclude_keys: set[tuple[str, str]] | None = None,
-) -> int:
-    excluded = set(exclude_keys or set())
-    if exclude_key is not None:
-        excluded.add(exclude_key)
-    count = 0
-    for cache in speculative_cache_by_round.values():
-        if not isinstance(cache, dict):
-            continue
-        for key, cached in cache.items():
-            if key in excluded:
-                continue
-            node = cached.get("node") if isinstance(cached, dict) else None
-            if node is not None and getattr(node, "step", None) is None:
-                count += 1
-    return count
-
-
 def _remaining_schedule_budget(
     *,
     total_steps: int,
     committed_steps: int,
     round_nodes_by_round: dict,
     generating_nodes: list[Node],
-    speculative_cache_by_round: dict,
 ) -> int:
     """Return how many more nodes may be generated without exceeding the run plan."""
-    live_count = (
-        _pending_round_node_count(round_nodes_by_round)
-        + len([node for node in generating_nodes if node.step is None])
-        + _cached_speculative_node_count(speculative_cache_by_round)
+    live_count = _pending_round_node_count(round_nodes_by_round) + len(
+        [node for node in generating_nodes if node.step is None]
     )
     return total_steps - committed_steps - live_count
 
@@ -242,15 +214,6 @@ class SchedulerState:
     parsed_node_ids: set[str] = field(default_factory=set)
     result_appended_node_ids: set[str] = field(default_factory=set)
     generation_future_to_meta: dict = field(default_factory=dict)
-    scheduled_keys_by_round: dict[int, set[tuple[str, str]]] = field(
-        default_factory=dict
-    )
-    speculative_cache_by_round: dict[int, dict[tuple[str, str], dict]] = field(
-        default_factory=dict
-    )
-    speculative_keys_by_round: dict[int, set[tuple[str, str]]] = field(
-        default_factory=dict
-    )
     generating_nodes: list[Node] = field(default_factory=list)
     appended_node_ids_by_round: dict[int, list[str]] = field(default_factory=dict)
     pending_execution_queue: list[RoundNode] = field(default_factory=list)
@@ -266,29 +229,10 @@ class SchedulerState:
         ]
         return [node for node in nodes if node.step is None] + self.generating_nodes
 
-    def cached_speculative_nodes(
-        self,
-        *,
-        exclude_key: tuple[str, str] | None = None,
-        exclude_keys: set[tuple[str, str]] | None = None,
-    ) -> list[Node]:
-        excluded = set(exclude_keys or set())
-        if exclude_key is not None:
-            excluded.add(exclude_key)
-        nodes: list[Node] = []
-        for cache in self.speculative_cache_by_round.values():
-            for key, cached in cache.items():
-                if key in excluded:
-                    continue
-                node = cached.get("node")
-                if node is not None and node.step is None:
-                    nodes.append(node)
-        return nodes
-
     def generated_count(self) -> int:
         return sum(
             len(round_nodes) for round_nodes in self.round_nodes_by_round.values()
-        ) + _cached_speculative_node_count(self.speculative_cache_by_round)
+        )
 
     def remaining_budget(self, total_steps: int, committed_steps: int) -> int:
         return _remaining_schedule_budget(
@@ -296,8 +240,63 @@ class SchedulerState:
             committed_steps=committed_steps,
             round_nodes_by_round=self.round_nodes_by_round,
             generating_nodes=self.generating_nodes,
-            speculative_cache_by_round=self.speculative_cache_by_round,
         )
+
+
+def _clone_node_view(node: Node) -> Node:
+    clone = copy.copy(node)
+    clone.parent = None
+    clone.children = set()
+    return clone
+
+
+def _unique_nodes(nodes: list[Node | None]) -> list[Node]:
+    result: list[Node] = []
+    seen: set[int] = set()
+    for node in nodes:
+        if node is None:
+            continue
+        object_id = id(node)
+        if object_id in seen:
+            continue
+        seen.add(object_id)
+        result.append(node)
+    return result
+
+
+def _freeze_generation_inputs(
+    *,
+    task_parent: Node | None,
+    pending_context: list[Node],
+    journal_snapshot: list[Node],
+) -> tuple[Node | None, list[Node], list[Node]]:
+    """Freeze the minimal node view shown to a generation worker."""
+
+    official_nodes = _unique_nodes(journal_snapshot)
+    official_map = {id(node): _clone_node_view(node) for node in official_nodes}
+    for node in official_nodes:
+        clone = official_map[id(node)]
+        if node.parent is not None and id(node.parent) in official_map:
+            parent = official_map[id(node.parent)]
+            clone.parent = parent
+            parent.children.add(clone)
+
+    pending_sources = _unique_nodes(pending_context)
+    pending_nodes = [
+        official_map.get(id(node)) or _clone_node_view(node) for node in pending_sources
+    ]
+    for source, clone in zip(pending_sources, pending_nodes):
+        if source.parent is not None:
+            clone.parent = official_map.get(id(source.parent))
+
+    parent_clone = None
+    if task_parent is not None:
+        parent_clone = official_map.get(id(task_parent))
+    return (
+        parent_clone,
+        pending_nodes,
+        [official_map[id(node)] for node in journal_snapshot],
+    )
 
 
 def _count_csv_rows(path: Path | None) -> int | None:
@@ -601,7 +600,6 @@ def run():
         steps=cfg.agent.steps,
         per_node_timeout_seconds=cfg.exec.timeout,
         parallel_workers=cfg.exec.parallel_workers,
-        generation_workers=cfg.exec.generation_workers,
         total_time_limit_seconds=cfg.agent.total_time_limit,
     )
 
@@ -863,7 +861,6 @@ def run():
     round_index = 0
     end_with_exception = False
     parallel_workers = int(cfg.exec.parallel_workers)
-    generation_workers = int(cfg.exec.generation_workers)
     workflow_agent: WorkflowAgent = agent.workflow[0]
     proposal_agent = agent.proposal_agent
     scheduler = SchedulerState()
@@ -873,17 +870,12 @@ def run():
     parsed_node_ids = scheduler.parsed_node_ids
     result_appended_node_ids = scheduler.result_appended_node_ids
     generation_future_to_meta = scheduler.generation_future_to_meta
-    scheduled_keys_by_round = scheduler.scheduled_keys_by_round
-    speculative_cache_by_round = scheduler.speculative_cache_by_round
-    speculative_keys_by_round = scheduler.speculative_keys_by_round
     generating_nodes = scheduler.generating_nodes
     appended_node_ids_by_round = scheduler.appended_node_ids_by_round
     pending_execution_queue = scheduler.pending_execution_queue
     round_start_step_by_round = scheduler.round_start_step_by_round
     round_item_count_by_round = scheduler.round_item_count_by_round
     best_node_before_by_round = scheduler.best_node_before_by_round
-    max_generated_backlog = int(cfg.exec.max_generated_backlog)
-    max_draft_generated_backlog = int(cfg.exec.max_draft_generated_backlog)
     live_tree_refresh_seconds = 1
     live_tree_lock = RLock()
     live_tree_stop = Event()
@@ -900,70 +892,11 @@ def run():
     def live_nodes() -> list[Node]:
         return scheduler.live_nodes()
 
-    def cached_speculative_nodes(
-        exclude_key: tuple[str, str] | None = None,
-        exclude_keys: set[tuple[str, str]] | None = None,
-    ) -> list[Node]:
-        return scheduler.cached_speculative_nodes(
-            exclude_key=exclude_key,
-            exclude_keys=exclude_keys,
-        )
-
     def live_display_nodes() -> list[Node]:
-        return [*live_nodes(), *cached_speculative_nodes()]
-
-    def live_backlog_count(
-        next_task: RoundTask | None = None,
-        exclude_prefetch_keys: set[tuple[str, str]] | None = None,
-    ) -> int:
-        excluded_prefetch_key = task_key(next_task) if next_task is not None else None
-        nodes = [
-            node
-            for node in [
-                *generating_nodes,
-                *(rn.node for rn in pending_execution_queue),
-                *cached_speculative_nodes(
-                    exclude_key=excluded_prefetch_key,
-                    exclude_keys=exclude_prefetch_keys,
-                ),
-            ]
-            if node.step is None
-        ]
-        if next_task is not None and task_stage(next_task) == "draft":
-            nodes = [node for node in nodes if node.parent is None]
-        return len(nodes)
-
-    def live_progress_line() -> str:
-        generated = scheduler.generated_count()
-        executed = len(raw_exec_results)
-        live = live_nodes()
-        prefetched = len(cached_speculative_nodes())
-        generating = sum(1 for node in live if node.tag == "generating")
-        running = sum(1 for node in live if node.tag == "running")
-        queued = sum(
-            1
-            for round_node in pending_execution_queue
-            if round_node.node.step is None and round_node.node.tag == "generated"
-        )
-        best = _best_committed_node(journal.nodes)
-        best_text = (
-            f"{metric_name}={best.metric.value:.3f}"
-            if best is not None and best.metric is not None
-            else "n/a"
-        )
-        return (
-            f"Progress: generated {generated}/{total_steps} · "
-            f"executed {executed}/{total_steps} · "
-            f"live generating {generating}, running {running}, "
-            f"queued {queued}, prefetched {prefetched} · "
-            f"best {best_text}"
-        )
+        return live_nodes()
 
     def live_tree_view(display_journal: Journal):
-        return Group(
-            live_progress_line(),
-            journal_to_rich_tree(display_journal),
-        )
+        return journal_to_rich_tree(display_journal)
 
     def refresh_live_tree(log_tree: bool = True) -> None:
         nonlocal last_live_tree_log_at, live_tree_display_started
@@ -990,56 +923,8 @@ def run():
             except Exception as exc:
                 logger.debug("Live tree refresh failed: %s", exc)
 
-    def task_stage(task: RoundTask) -> str:
-        if task.parent is None:
-            return "draft"
-        return "debug" if task.parent.is_buggy else "improve"
-
-    def task_key(task: RoundTask) -> tuple[str, str]:
-        parent_id = "root" if task.parent is None else task.parent.id
-        return (task_stage(task), parent_id)
-
-    def node_round_index(node: Node) -> int:
-        value = node.round_index
-        return int(value) if isinstance(value, int) else 0
-
-    def select_tasks_visible_before_round(task_round_index: int) -> list[RoundTask]:
-        """Select parents using only nodes from earlier official rounds."""
-        original_journal = proposal_agent.journal
-        visible_nodes = [
-            node
-            for node in original_journal.nodes
-            if node_round_index(node) < task_round_index
-        ]
-        proposal_agent.journal = Journal(nodes=visible_nodes)
-        try:
-            return proposal_agent.select_round_tasks()
-        finally:
-            proposal_agent.journal = original_journal
-
-    def active_speculative_keys(round_index: int) -> set[tuple[str, str]]:
-        keys = set(speculative_keys_by_round.get(round_index, set()))
-        keys.update(speculative_cache_by_round.get(round_index, {}).keys())
-        for meta in generation_future_to_meta.values():
-            if meta.get("speculative") and meta.get("round_index") == round_index:
-                keys.add(task_key(meta["task"]))
-        return keys
-
     def remaining_schedule_budget() -> int:
         return scheduler.remaining_budget(total_steps, global_step)
-
-    def generation_backlog_full(
-        next_task: RoundTask | None = None,
-        exclude_prefetch_keys: set[tuple[str, str]] | None = None,
-    ) -> bool:
-        if next_task is not None and task_stage(next_task) == "draft":
-            limit = max_draft_generated_backlog
-        else:
-            limit = max_generated_backlog
-        backlog = live_backlog_count(next_task, exclude_prefetch_keys)
-        if limit <= 0:
-            return backlog > 0
-        return backlog >= limit
 
     def submit_ready_nodes(executor: ThreadPoolExecutor) -> None:
         changed = False
@@ -1083,7 +968,6 @@ def run():
         item_count: int,
         journal_snapshot: list[Node],
         scheduled_step: int | None = None,
-        speculative: bool = False,
     ) -> bool:
         if remaining_schedule_budget() <= 0:
             return False
@@ -1109,19 +993,12 @@ def run():
             round_item_index=item_index,
             round_item_count=item_count,
             scheduled_step=scheduled_step,
-            speculative=speculative,
             placeholder_id=placeholder.id,
             stage=placeholder.node_status,
             parent_id=placeholder.parent.id if placeholder.parent is not None else None,
             selection_reason=task.selection_reason,
         )
         refresh_live_tree()
-        if task.parent is not None:
-            key = task_key(task)
-            if speculative:
-                speculative_keys_by_round.setdefault(task_round_index, set()).add(key)
-            else:
-                scheduled_keys_by_round.setdefault(task_round_index, set()).add(key)
 
         pending_context = []
         seen_pending_ids = {placeholder.id}
@@ -1135,21 +1012,18 @@ def run():
                 continue
             pending_context.append(node)
             seen_pending_ids.add(node.id)
-        frozen_inputs = copy.deepcopy(
-            {
-                "task_parent": task.parent,
-                "pending_context": pending_context,
-                "journal_snapshot": journal_snapshot,
-            }
+        frozen_task_parent, worker_pending_context, worker_journal_snapshot = (
+            _freeze_generation_inputs(
+                task_parent=task.parent,
+                pending_context=pending_context,
+                journal_snapshot=journal_snapshot,
+            )
         )
         worker_task = RoundTask(
-            parent=frozen_inputs["task_parent"],
+            parent=frozen_task_parent,
             selection_reason=task.selection_reason,
+            draft_plan=task.draft_plan,
         )
-        worker_pending_context = frozen_inputs["pending_context"]
-        worker_journal_snapshot = frozen_inputs["journal_snapshot"]
-        snapshot_node_ids = [node.id for node in journal_snapshot]
-        pending_node_ids = [node.id for node in pending_context]
         future = generation_executor.submit(
             generate_node_in_worker,
             worker_task,
@@ -1158,7 +1032,6 @@ def run():
             item_index,
             item_count,
             scheduled_step,
-            speculative,
         )
         generation_future_to_meta[future] = {
             "task": task,
@@ -1167,9 +1040,6 @@ def run():
             "item_index": item_index,
             "item_count": item_count,
             "scheduled_step": scheduled_step,
-            "speculative": speculative,
-            "snapshot_node_ids": snapshot_node_ids,
-            "pending_node_ids": pending_node_ids,
         }
         return True
 
@@ -1180,7 +1050,6 @@ def run():
         item_index: int,
         item_count: int,
         scheduled_step: int | None,
-        speculative: bool,
     ) -> Node:
         worker_agent = ProposalAgent(
             task_desc=agent_task_desc,
@@ -1193,7 +1062,7 @@ def run():
             round_item_index=item_index,
             round_item_count=item_count,
             scheduled_step=scheduled_step,
-            speculative=speculative,
+            draft_plan=task.draft_plan,
         )
         try:
             return worker_agent.generate_node(task)
@@ -1227,15 +1096,6 @@ def run():
             try:
                 node = future.result()
             except Exception as exc:
-                task = meta["task"]
-                if task.parent is not None:
-                    key = task_key(task)
-                    speculative_keys_by_round.setdefault(
-                        meta["round_index"], set()
-                    ).discard(key)
-                    scheduled_keys_by_round.setdefault(
-                        meta["round_index"], set()
-                    ).discard(key)
                 if placeholder in generating_nodes:
                     generating_nodes.remove(placeholder)
                 append_event(
@@ -1245,7 +1105,6 @@ def run():
                     round_item_index=meta["item_index"],
                     round_item_count=meta["item_count"],
                     scheduled_step=meta.get("scheduled_step"),
-                    speculative=meta["speculative"],
                     placeholder_id=placeholder.id,
                     stage=placeholder.node_status,
                     parent_id=(
@@ -1264,6 +1123,7 @@ def run():
             node.id = placeholder.id
             node.ctime = placeholder.ctime
             node.agent_name = workflow_agent.name
+            node.selection_reason = task.selection_reason
             node.assign_schedule(
                 round_index=meta["round_index"],
                 scheduled_step=meta.get("scheduled_step"),
@@ -1271,33 +1131,6 @@ def run():
             node.mark_status("generated")
             if placeholder in generating_nodes:
                 generating_nodes.remove(placeholder)
-            if meta["speculative"]:
-                key = task_key(task)
-                node.mark_status("prefetched")
-                speculative_cache_by_round.setdefault(meta["round_index"], {})[key] = {
-                    "node": node,
-                    "original_selection_reason": task.selection_reason,
-                    "snapshot_node_ids": meta.get("snapshot_node_ids", []),
-                    "pending_node_ids": meta.get("pending_node_ids", []),
-                }
-                speculative_keys_by_round.setdefault(meta["round_index"], set()).add(
-                    key
-                )
-                append_event(
-                    cfg.log_dir,
-                    "speculative_prefetched",
-                    round_index=meta["round_index"],
-                    round_item_index=meta["item_index"],
-                    round_item_count=meta["item_count"],
-                    scheduled_step=meta.get("scheduled_step"),
-                    node_id=node.id,
-                    stage=node.node_status,
-                    parent_id=node.parent.id if node.parent is not None else None,
-                    selection_reason=task.selection_reason,
-                )
-                changed = True
-                continue
-
             round_node = RoundNode(
                 workflow_agent=workflow_agent,
                 node=node,
@@ -1306,10 +1139,6 @@ def run():
                 round_item_count=meta["item_count"],
             )
             round_nodes_by_round.setdefault(meta["round_index"], []).append(round_node)
-            if task.parent is not None:
-                scheduled_keys_by_round.setdefault(meta["round_index"], set()).add(
-                    task_key(task)
-                )
             append_event(
                 cfg.log_dir,
                 "node_generation_finished",
@@ -1317,7 +1146,6 @@ def run():
                 round_item_index=meta["item_index"],
                 round_item_count=meta["item_count"],
                 scheduled_step=meta.get("scheduled_step"),
-                speculative=meta["speculative"],
                 node_id=node.id,
                 stage=node.node_status,
                 parent_id=node.parent.id if node.parent is not None else None,
@@ -1330,7 +1158,6 @@ def run():
                 round_item_index=meta["item_index"],
                 round_item_count=meta["item_count"],
                 scheduled_step=meta.get("scheduled_step"),
-                speculative=meta["speculative"],
                 node_id=node.id,
                 stage=node.node_status,
                 parent_id=node.parent.id if node.parent is not None else None,
@@ -1339,124 +1166,6 @@ def run():
         if changed:
             refresh_live_tree(log_tree=True)
             submit_ready_nodes(executor)
-
-    def invalidate_speculative_cache(
-        round_index: int,
-        valid_keys: set[tuple[str, str]],
-    ) -> None:
-        cache = speculative_cache_by_round.setdefault(round_index, {})
-        changed = False
-        for key in list(cache):
-            if key in valid_keys:
-                continue
-            cached = cache.pop(key)
-            node = cached["node"]
-            speculative_keys_by_round.setdefault(round_index, set()).discard(key)
-            changed = True
-            append_event(
-                cfg.log_dir,
-                "speculative_invalidated",
-                round_index=round_index,
-                node_id=node.id,
-                stage=node.node_status,
-                parent_id=node.parent.id if node.parent is not None else None,
-                reason="not selected by official round task selection",
-            )
-        if changed:
-            refresh_live_tree(log_tree=True)
-
-    def adopt_speculative_node(
-        executor: ThreadPoolExecutor,
-        task: RoundTask,
-        task_round_index: int,
-        item_index: int,
-        item_count: int,
-        scheduled_step: int | None = None,
-    ) -> bool:
-        if task.parent is None:
-            return False
-        key = task_key(task)
-        cache = speculative_cache_by_round.setdefault(task_round_index, {})
-        cached = cache.pop(key, None)
-        if cached is None:
-            return False
-        speculative_keys_by_round.setdefault(task_round_index, set()).discard(key)
-        node = cached["node"]
-        expected_snapshot_ids = [
-            committed_node.id
-            for committed_node in journal.nodes
-            if node_round_index(committed_node) < task_round_index
-        ]
-        cached_snapshot_ids = list(cached.get("snapshot_node_ids") or [])
-        if cached_snapshot_ids != expected_snapshot_ids:
-            append_event(
-                cfg.log_dir,
-                "speculative_invalidated",
-                round_index=task_round_index,
-                node_id=node.id,
-                stage=node.node_status,
-                parent_id=node.parent.id if node.parent is not None else None,
-                reason="prompt_snapshot_stale",
-                cached_snapshot_node_ids=cached_snapshot_ids,
-                expected_snapshot_node_ids=expected_snapshot_ids,
-            )
-            refresh_live_tree(log_tree=True)
-            return False
-        original_reason = cached.get("original_selection_reason")
-        if original_reason and original_reason != task.selection_reason:
-            node.selection_reason = (
-                f"{task.selection_reason}\n"
-                f"Adopted prefetched candidate originally generated because: "
-                f"{original_reason}"
-            )
-        else:
-            node.selection_reason = task.selection_reason
-        node.assign_schedule(
-            round_index=task_round_index,
-            scheduled_step=(
-                scheduled_step if scheduled_step is not None else node.scheduled_step
-            ),
-        )
-        node.mark_status("generated")
-        round_node = RoundNode(
-            workflow_agent=workflow_agent,
-            node=node,
-            round_index=task_round_index,
-            round_item_index=item_index,
-            round_item_count=item_count,
-        )
-        round_nodes_by_round.setdefault(task_round_index, []).append(round_node)
-        scheduled_keys_by_round.setdefault(task_round_index, set()).add(key)
-        append_event(
-            cfg.log_dir,
-            "speculative_adopted",
-            round_index=task_round_index,
-            round_item_index=item_index,
-            round_item_count=item_count,
-            scheduled_step=scheduled_step,
-            node_id=node.id,
-            stage=node.node_status,
-            parent_id=node.parent.id if node.parent is not None else None,
-            official_selection_reason=task.selection_reason,
-            original_selection_reason=original_reason,
-        )
-        pending_execution_queue.append(round_node)
-        append_event(
-            cfg.log_dir,
-            "node_queued_for_execution",
-            round_index=task_round_index,
-            round_item_index=item_index,
-            round_item_count=item_count,
-            scheduled_step=scheduled_step,
-            speculative=False,
-            prefetched=True,
-            node_id=node.id,
-            stage=node.node_status,
-            parent_id=node.parent.id if node.parent is not None else None,
-        )
-        refresh_live_tree(log_tree=True)
-        submit_ready_nodes(executor)
-        return True
 
     def handle_scheduler_events(
         executor: ThreadPoolExecutor,
@@ -1469,109 +1178,6 @@ def run():
         handle_finished_generations(executor, block=False)
         handle_finished_futures(block=False, executor=executor)
         submit_ready_nodes(executor)
-
-    def wait_for_scheduler_capacity(
-        executor: ThreadPoolExecutor,
-        next_task: RoundTask | None = None,
-        exclude_prefetch_keys: set[tuple[str, str]] | None = None,
-    ) -> None:
-        while generation_backlog_full(next_task, exclude_prefetch_keys):
-            handle_scheduler_events(executor, block=False)
-            if not generation_backlog_full(next_task, exclude_prefetch_keys):
-                return
-            futures = [*generation_future_to_meta, *future_to_round_node]
-            if futures:
-                wait(futures, timeout=0.5, return_when=FIRST_COMPLETED)
-            else:
-                return
-
-    def drain_generation(
-        executor: ThreadPoolExecutor,
-    ) -> None:
-        while generation_future_to_meta:
-            handle_scheduler_events(executor, block=True)
-
-    def in_flight_child_count(parent: Node) -> int:
-        return sum(
-            1 for node in live_nodes() if node.parent is parent and node.step is None
-        )
-
-    def guaranteed_next_round_tasks(
-        current_round_index: int, next_round_index: int
-    ) -> list[RoundTask]:
-        search_cfg = cfg.agent.search
-        current_nodes = round_nodes_by_round.get(current_round_index, [])
-        unknown_nodes = [rn.node for rn in current_nodes if rn.node.step is None]
-        pending_drafts = sum(1 for node in unknown_nodes if node.parent is None)
-        if len(journal.draft_nodes) + pending_drafts < search_cfg.max_children_per_node:
-            return []
-
-        unavailable_keys = set(
-            scheduled_keys_by_round.setdefault(next_round_index, set())
-        ) | active_speculative_keys(next_round_index)
-        improve_candidates = [
-            node
-            for node in proposal_agent.journal.good_nodes
-            if (
-                node_round_index(node) <= current_round_index
-                and node.metric is not None
-                and len(node.children) + in_flight_child_count(node)
-                < search_cfg.max_children_per_node
-            )
-        ]
-        unknown_candidate_count = len(unknown_nodes)
-        guaranteed_improve_count = max(
-            0, search_cfg.topk_improve - unknown_candidate_count
-        )
-        tasks: list[RoundTask] = []
-        if guaranteed_improve_count > 0 and improve_candidates:
-            ranked = sorted(
-                improve_candidates,
-                key=lambda node: (
-                    node.metric,
-                    -(node.step if node.step is not None else 10**9),
-                ),
-                reverse=True,
-            )
-            guaranteed_nodes = {node.id for node in ranked[:guaranteed_improve_count]}
-            for selected in ranked[: search_cfg.topk_improve]:
-                task = RoundTask(
-                    parent=selected,
-                    selection_reason=(
-                        "speculative next-round global frontier improve for node "
-                        f"{selected.id[:8]}; cannot be displaced by "
-                        f"{unknown_candidate_count} unfinished current-round node(s)"
-                    ),
-                )
-                if (
-                    selected.id in guaranteed_nodes
-                    and task_key(task) not in unavailable_keys
-                ):
-                    tasks.append(task)
-
-        debuggable_nodes = [
-            node
-            for node in proposal_agent.journal.buggy_nodes
-            if (
-                node_round_index(node) <= current_round_index
-                and node.debug_depth < search_cfg.max_debug_depth
-                and len(node.children) + in_flight_child_count(node)
-                < search_cfg.num_bugs
-            )
-        ]
-        for buggy_node in sorted(
-            debuggable_nodes,
-            key=lambda node: node.step if node.step is not None else 10**9,
-        ):
-            task = RoundTask(
-                parent=buggy_node,
-                selection_reason=(
-                    "speculative guaranteed next-round debug for completed buggy node"
-                ),
-            )
-            if task_key(task) not in unavailable_keys:
-                tasks.append(task)
-        return tasks
 
     def parse_round_node_if_ready(round_node: RoundNode) -> None:
         if round_node.node.id in parsed_node_ids:
@@ -1678,20 +1284,35 @@ def run():
         )
         global_step += 1
 
+    def official_generation_pending(current_round_index: int) -> bool:
+        return any(
+            meta.get("round_index") == current_round_index
+            for meta in generation_future_to_meta.values()
+        )
+
     def round_ready_to_commit(current_round_index: int) -> bool:
+        if official_generation_pending(current_round_index):
+            return False
         nodes = round_nodes_by_round.get(current_round_index, [])
         return bool(nodes) and all(
             round_node.node.id in parsed_node_ids for round_node in nodes
         )
 
+    def round_has_scheduled_work(current_round_index: int) -> bool:
+        if round_nodes_by_round.get(current_round_index):
+            return True
+        return any(
+            meta.get("round_index") == current_round_index
+            for meta in generation_future_to_meta.values()
+        )
+
     live_tree_thread = Thread(target=live_tree_ticker, daemon=True)
     live_tree_thread.start()
-    generation_executor = ThreadPoolExecutor(max_workers=generation_workers)
+    generation_executor = ThreadPoolExecutor(max_workers=max(1, total_steps))
     executor = ThreadPoolExecutor(max_workers=parallel_workers)
     try:
         while global_step < total_steps and not total_timer.is_timeout():
-            if generation_future_to_meta:
-                drain_generation(executor)
+            handle_scheduler_events(executor, block=False)
             round_index += 1
             logger.info(
                 "BioMaker workflow round %d starting at step %d / %d",
@@ -1700,34 +1321,10 @@ def run():
                 total_steps,
             )
             try:
-                tasks = select_tasks_visible_before_round(round_index)
-                existing_keys = scheduled_keys_by_round.setdefault(round_index, set())
-                candidate_tasks = []
-                for task in tasks:
-                    key = task_key(task)
-                    if task.parent is not None and key in existing_keys:
-                        continue
-                    candidate_tasks.append(task)
-                candidate_official_keys = {
-                    task_key(task)
-                    for task in candidate_tasks
-                    if task.parent is not None
-                }
-                invalidate_speculative_cache(round_index, candidate_official_keys)
-                adoptable_keys = set(speculative_cache_by_round.get(round_index, {}))
-                budget = max(0, remaining_schedule_budget()) + len(adoptable_keys)
-                existing_round_count = len(round_nodes_by_round.get(round_index, []))
-                remaining_round_slots = max(0, len(tasks) - existing_round_count)
-                filtered_tasks = candidate_tasks[
-                    : min(budget, workflow_agent.steps_left, remaining_round_slots)
-                ]
-                valid_official_keys = {
-                    task_key(task) for task in filtered_tasks if task.parent is not None
-                }
-                invalidate_speculative_cache(round_index, valid_official_keys)
-                item_count = len(round_nodes_by_round.get(round_index, [])) + len(
-                    filtered_tasks
-                )
+                tasks = proposal_agent.select_round_tasks()
+                budget = max(0, remaining_schedule_budget())
+                filtered_tasks = tasks[: min(budget, workflow_agent.steps_left)]
+                item_count = len(filtered_tasks)
                 round_start_step_by_round[round_index] = global_step
                 round_item_count_by_round[round_index] = item_count
                 best_node_before_by_round[round_index] = journal.get_best_node(
@@ -1740,57 +1337,28 @@ def run():
                     round_start_step=global_step,
                     planned_items=item_count,
                     parallel_workers=parallel_workers,
-                    generation_workers=generation_workers,
                 )
-                for round_node in list(round_nodes_by_round.get(round_index, [])):
-                    parse_round_node_if_ready(round_node)
 
-                existing_round_count = len(round_nodes_by_round.get(round_index, []))
-                round_journal_snapshot = [
-                    node
-                    for node in journal.nodes
-                    if node_round_index(node) < round_index
-                ]
+                round_journal_snapshot = list(journal.nodes)
                 for task_offset, task in enumerate(filtered_tasks, start=1):
-                    if task.parent is None:
-                        drain_generation(executor)
-                    wait_for_scheduler_capacity(
-                        executor,
-                        task,
-                        exclude_prefetch_keys=valid_official_keys,
-                    )
-                    item_index = existing_round_count + task_offset
+                    item_index = task_offset
                     scheduled_step = (
                         round_start_step_by_round.get(round_index, global_step)
                         + item_index
                         - 1
                     )
-                    adopted = adopt_speculative_node(
-                        executor,
+                    submit_generation_task(
+                        generation_executor,
                         task,
                         round_index,
                         item_index,
                         item_count,
+                        round_journal_snapshot,
                         scheduled_step=scheduled_step,
                     )
-                    if not adopted:
-                        submit_generation_task(
-                            generation_executor,
-                            task,
-                            round_index,
-                            item_index,
-                            item_count,
-                            round_journal_snapshot,
-                            scheduled_step=scheduled_step,
-                            speculative=False,
-                        )
-                    handle_scheduler_events(executor, block=False)
-                drain_generation(executor)
+                handle_scheduler_events(executor, block=False)
 
-                for round_node in list(round_nodes_by_round.get(round_index, [])):
-                    parse_round_node_if_ready(round_node)
-
-                if not round_nodes_by_round.get(round_index):
+                if not round_has_scheduled_work(round_index):
                     logger.info("No round tasks selected; stopping the run.")
                     break
 
@@ -1799,46 +1367,6 @@ def run():
                     and not total_timer.is_timeout()
                 ):
                     submit_ready_nodes(executor)
-                    next_round_index = round_index + 1
-                    guaranteed_tasks = guaranteed_next_round_tasks(
-                        round_index, next_round_index
-                    )
-                    for task in guaranteed_tasks:
-                        if (
-                            round_ready_to_commit(round_index)
-                            or total_timer.is_timeout()
-                        ):
-                            break
-                        wait_for_scheduler_capacity(executor, task)
-                        if (
-                            round_ready_to_commit(round_index)
-                            or total_timer.is_timeout()
-                        ):
-                            break
-                        item_index = len(active_speculative_keys(next_round_index)) + 1
-                        item_count = max(
-                            item_index,
-                            cfg.agent.search.topk_improve + len(guaranteed_tasks),
-                        )
-                        next_round_start_step = round_start_step_by_round.get(
-                            round_index, global_step
-                        ) + round_item_count_by_round.get(
-                            round_index,
-                            len(round_nodes_by_round.get(round_index, [])),
-                        )
-                        scheduled_step = next_round_start_step + item_index - 1
-                        submitted = submit_generation_task(
-                            generation_executor,
-                            task,
-                            next_round_index,
-                            item_index,
-                            item_count,
-                            list(journal.nodes),
-                            scheduled_step=scheduled_step,
-                            speculative=True,
-                        )
-                        if not submitted:
-                            break
                     handle_scheduler_events(
                         executor,
                         block=not round_ready_to_commit(round_index),

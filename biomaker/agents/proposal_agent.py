@@ -123,6 +123,35 @@ tool_request_func_spec = FunctionSpec(
     description="Request optional tool observations before writing the final candidate code.",
 )
 
+draft_plan_batch_func_spec = FunctionSpec(
+    name="create_draft_plan_batch",
+    json_schema={
+        "type": "object",
+        "properties": {
+            "plans": {
+                "type": "array",
+                "description": "Diverse textual root-draft plans.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Short distinct strategy name.",
+                        },
+                        "plan": {
+                            "type": "string",
+                            "description": "Concrete 3-5 sentence textual plan for one root draft. Do not include code.",
+                        },
+                    },
+                    "required": ["name", "plan"],
+                },
+            }
+        },
+        "required": ["plans"],
+    },
+    description="Create a batch of textual root-draft plans before code generation.",
+)
+
 
 class ProposalAgent(BaseAgent):
     def __init__(
@@ -151,7 +180,7 @@ class ProposalAgent(BaseAgent):
         round_item_index: int | None = None,
         round_item_count: int | None = None,
         scheduled_step: int | None = None,
-        speculative: bool = False,
+        draft_plan: str | None = None,
     ) -> None:
         """Set generation-local prompt context for the current worker thread."""
         self._generation_context.value = {
@@ -159,7 +188,7 @@ class ProposalAgent(BaseAgent):
             "round_item_index": round_item_index,
             "round_item_count": round_item_count,
             "scheduled_step": scheduled_step,
-            "speculative": speculative,
+            "draft_plan": draft_plan,
         }
 
     def clear_generation_context(self) -> None:
@@ -586,6 +615,129 @@ class ProposalAgent(BaseAgent):
             + "\n\n".join(self._format_tool_record(record) for record in selected)
         )
 
+    def generate_draft_plan_batch(self, count: int) -> list[str]:
+        """Generate textual bootstrap plans for root drafts."""
+        count = max(0, int(count))
+        if count == 0:
+            return []
+        if self.data_summary is None:
+            self.update_data_summary()
+        prompt = {
+            "Introduction": (
+                f"Analyze the task description, data/evaluator facts, and any "
+                f"existing root-draft plan summaries. Create {count} concise textual "
+                "root-draft plans for BioMaker. These plans will later be assigned "
+                "to separate parallel code-generation workers."
+            ),
+            "Task Description": self.context_builder._task_description_value(),
+            "Data and Evaluation Summary": self.get_data_summary(),
+            "Existing Root Draft Plan Summaries": self._root_draft_plan_summaries(),
+            "Planning requirements": [
+                "Return exactly the requested number of plans when possible.",
+                "Each plan must be a text-only strategy description, not code or pseudocode.",
+                "Base each plan on the provided task, split, input, and evaluator facts.",
+                "Let the task/data/evaluator facts determine the strategy; do not satisfy arbitrary category quotas.",
+                "Make plans substantively different in their task-relevant idea or evidence path, not by forcing arbitrary categories.",
+                "Avoid duplicating existing root draft plans.",
+                "Use the provided data/evaluator facts instead of asking for more exploration.",
+            ],
+        }
+        try:
+            response = query(
+                system_message=prompt,
+                user_message=None,
+                func_spec=draft_plan_batch_func_spec,
+                model=self.acfg.code.model,
+                temperature=max(float(self.acfg.code.temp or 0.0), 0.7),
+            )
+        except Exception as exc:
+            logger.warning("Draft plan batch generation failed: %s", exc)
+            response = {}
+        plan_items = response.get("plans", []) if isinstance(response, dict) else []
+        plans: list[str] = []
+        for item in plan_items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            plan = str(item.get("plan") or "").strip()
+            text = f"{name}: {plan}" if name else plan
+            if text and text not in plans:
+                plans.append(text)
+            if len(plans) >= count:
+                break
+        while len(plans) < count:
+            plans.append(
+                f"Generated plan {len(plans) + 1}: use the task description, "
+                "agent-visible training split, and frozen evaluator facts to define "
+                "one complete root-draft strategy that can later be implemented as a "
+                "single runnable candidate."
+            )
+        append_event(
+            self.cfg.log_dir,
+            "draft_plan_batch_generated",
+            requested=count,
+            returned=len(plans),
+            plan_previews=[truncate_text(plan, max_chars=240) for plan in plans],
+        )
+        return plans
+
+    def _root_draft_plan_summaries(self) -> str:
+        drafts = sorted(
+            self.journal.draft_nodes,
+            key=lambda node: (
+                node.step is None,
+                node.step if node.step is not None else 10**9,
+                node.ctime,
+            ),
+        )
+        if not drafts:
+            return "No existing root draft plans."
+
+        lines = [
+            "Existing root draft plans and outcomes. Code is intentionally omitted."
+        ]
+        for node in drafts:
+            if node.is_buggy is True:
+                result = "bug"
+            elif node.is_buggy is False:
+                result = "success"
+            else:
+                result = "not_scored"
+            metric = (
+                "n/a"
+                if node.metric is None or node.metric.value is None
+                else f"{float(node.metric.value):.4f}"
+            )
+            step = "not_scored" if node.step is None else str(node.step)
+            lines.append(
+                "\n".join(
+                    [
+                        f"- step: {step}",
+                        f"  id: {node.id[:8]}",
+                        f"  result: {result}",
+                        f"  validation_metric: {metric}",
+                        f"  plan: {node.plan or ''}",
+                    ]
+                )
+            )
+        return "\n".join(lines)
+
+    def select_round_tasks(self) -> list[RoundTask]:
+        tasks = super().select_round_tasks()
+        if not tasks or any(task.parent is not None for task in tasks):
+            return tasks
+        plans = self.generate_draft_plan_batch(len(tasks))
+        return [
+            RoundTask(
+                parent=task.parent,
+                selection_reason=(
+                    f"bootstrap root draft plan {idx}/{len(tasks)}: {plans[idx - 1]}"
+                ),
+                draft_plan=plans[idx - 1],
+            )
+            for idx, task in enumerate(tasks, start=1)
+        ]
+
     def attach_node_tool_observations(self, stage: str, prompt: dict[str, Any]) -> None:
         records: list[dict[str, Any]] = []
         seen_requests: set[tuple[str, str, str]] = set()
@@ -736,7 +888,10 @@ class ProposalAgent(BaseAgent):
         return result_node
 
     def step(self, exec_callback: ExecCallbackType):
-        task = self.select_round_tasks()[0]
+        tasks = self.select_round_tasks()
+        if not tasks:
+            raise RuntimeError("No proposal task is available.")
+        task = tasks[0]
         result_node = self.generate_node(task)
 
         self.parse_exec_result(

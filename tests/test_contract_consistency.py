@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import csv
 import io
 import importlib.util
@@ -9,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 from rich.console import Console
@@ -19,7 +19,7 @@ from biomaker.interpreter import ExecutionResult, Interpreter
 from biomaker.journal import Journal, Node
 from biomaker.tools.python_probe import python_probe
 from biomaker.run import (
-    _cached_speculative_node_count,
+    _freeze_generation_inputs,
     _private_metrics_summary,
     _remaining_schedule_budget,
     _run_overview_text,
@@ -43,6 +43,7 @@ from biomaker.utils.execution_record import (
     attach_evaluator_run_result,
 )
 from biomaker.utils.experiment_contract import load_experiment_contract
+from biomaker.utils.exp_guide import build_exp_guide
 from biomaker.utils.prediction_contract import load_prediction_contract
 from biomaker.utils.private_evaluation import evaluate_private_outputs
 from biomaker.utils.response import extract_code_blocks
@@ -87,21 +88,9 @@ class ContractConsistencyTests(unittest.TestCase):
         self.assertIn("1: 0.990", rendered)
         self.assertNotIn("0.990 (best)", rendered)
 
-    def test_live_tree_shows_prefetched_status(self) -> None:
-        node = Node(code="print('prefetched')")
-        node.scheduled_step = 2
-        node.mark_status("prefetched")
-
-        rendered = self._render_live_tree([node])
-
-        self.assertIn("2: prefetched", rendered)
-
-    def test_speculative_cache_counts_against_schedule_budget(self) -> None:
+    def test_pending_generation_counts_against_schedule_budget(self) -> None:
         official_pending = Node(code="print('official')")
         generating = Node(code="", plan="generating")
-        prefetched = Node(code="print('prefetched')")
-        completed_prefetch = Node(code="print('done')")
-        completed_prefetch.step = 3
 
         budget = _remaining_schedule_budget(
             total_steps=5,
@@ -110,15 +99,9 @@ class ContractConsistencyTests(unittest.TestCase):
                 1: [SimpleNamespace(node=official_pending)],
             },
             generating_nodes=[generating],
-            speculative_cache_by_round={
-                2: {
-                    ("improve", "a"): {"node": prefetched},
-                    ("improve", "b"): {"node": completed_prefetch},
-                }
-            },
         )
 
-        self.assertEqual(budget, 1)
+        self.assertEqual(budget, 2)
 
     def test_tree_root_exposes_pre_node_setup_sections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,31 +140,47 @@ class ContractConsistencyTests(unittest.TestCase):
             self.assertIn("Split Plan", section_names)
             self.assertIn("Pre-node setup", tree["summaries"][0]["plan"])
 
-    def test_adoptable_prefetch_can_be_excluded_from_backlog_count(self) -> None:
-        adoptable = Node(code="print('adopt')")
-        other = Node(code="print('other')")
-        cache = {
-            2: {
-                ("improve", "target"): {"node": adoptable},
-                ("debug", "bug"): {"node": other},
-            }
-        }
+    def test_generation_freeze_excludes_non_journal_children(self) -> None:
+        parent = Node(code="print('official')")
+        pending = Node(code="print('pending')", parent=parent)
+        invisible = Node(code="print('not in journal')", parent=parent)
 
-        self.assertEqual(_cached_speculative_node_count(cache), 2)
-        self.assertEqual(
-            _cached_speculative_node_count(cache, exclude_key=("improve", "target")),
-            1,
+        frozen_parent, frozen_pending, frozen_journal = _freeze_generation_inputs(
+            task_parent=parent,
+            pending_context=[pending],
+            journal_snapshot=[parent],
         )
-        self.assertEqual(
-            _cached_speculative_node_count(
-                cache,
-                exclude_keys={
-                    ("improve", "target"),
-                    ("debug", "bug"),
-                },
+
+        self.assertIs(frozen_parent, frozen_journal[0])
+        self.assertEqual(frozen_parent.id, parent.id)
+        self.assertEqual([node.id for node in frozen_pending], [pending.id])
+        self.assertIs(frozen_pending[0].parent, frozen_parent)
+        self.assertNotIn(frozen_pending[0], frozen_parent.children)
+        self.assertNotIn(invisible.id, {child.id for child in frozen_parent.children})
+
+    def test_task_selection_ignores_children_outside_journal(self) -> None:
+        cfg = SimpleNamespace(
+            agent=SimpleNamespace(
+                search=SimpleNamespace(
+                    max_debug_depth=2,
+                    max_children_per_node=1,
+                    topk_improve=1,
+                )
             ),
-            0,
+            exec=SimpleNamespace(
+                include_medical_packages=True,
+            ),
         )
+        parent = Node(code="print('official')")
+        parent.step = 0
+        parent.is_buggy = False
+        parent.metric = MetricValue(0.8, maximize=True)
+        _child_not_in_journal = Node(code="print('not in journal')", parent=parent)
+
+        tasks = BaseAgent("task", cfg, Journal(nodes=[parent])).select_round_tasks()  # type: ignore[arg-type]
+
+        self.assertEqual(len(tasks), 1)
+        self.assertIs(tasks[0].parent, parent)
 
     def test_round_best_node_before_is_fixed_snapshot(self) -> None:
         snapshot_best = Node(code="print('old best')")
@@ -391,7 +390,7 @@ class ContractConsistencyTests(unittest.TestCase):
         self.assertFalse(result.evaluator_result["ok"])
         self.assertIn("bad submission", result.system_outputs[-1]["message"])
 
-    def test_debug_tree_records_include_previous_debug_children(self) -> None:
+    def test_debug_tree_records_do_not_include_children_of_selected_bug(self) -> None:
         buggy_parent = Node(code="raise RuntimeError('bug')", plan="buggy parent")
         buggy_parent.step = 0
         buggy_parent.is_buggy = True
@@ -415,9 +414,83 @@ class ContractConsistencyTests(unittest.TestCase):
             selected_parent=buggy_parent,
         )
 
-        self.assertIn("Previous Debug Children of the Selected Buggy Parent", records)
-        self.assertIn("previous debug repair", records)
-        self.assertIn("ValueError: still broken", records)
+        self.assertNotIn("previous debug repair", records)
+        self.assertNotIn("ValueError: still broken", records)
+
+    def test_task_selection_debugs_each_buggy_node_once(self) -> None:
+        cfg = SimpleNamespace(
+            agent=SimpleNamespace(
+                search=SimpleNamespace(
+                    max_debug_depth=2,
+                    max_children_per_node=1,
+                    topk_improve=1,
+                )
+            ),
+            exec=SimpleNamespace(
+                include_medical_packages=True,
+            ),
+        )
+        buggy_parent = Node(code="raise RuntimeError('bug')")
+        buggy_parent.step = 0
+        buggy_parent.is_buggy = True
+        existing_debug = Node(code="print('debug')", parent=buggy_parent)
+        existing_debug.step = 1
+        existing_debug.is_buggy = True
+
+        tasks = BaseAgent(
+            "task",
+            cfg,
+            Journal(nodes=[buggy_parent, existing_debug]),
+        ).select_round_tasks()  # type: ignore[arg-type]
+
+        self.assertFalse(any(task.parent is buggy_parent for task in tasks))
+
+    def test_debug_prompt_pending_context_uses_buggy_parent_siblings(self) -> None:
+        cfg = SimpleNamespace(
+            workspace_dir=Path("."),
+            log_dir=Path("."),
+            exec=SimpleNamespace(include_medical_packages=True),
+            agent=SimpleNamespace(
+                data_summary=False,
+                expose_prediction=False,
+                enable_node_tools=False,
+                max_node_tool_calls=4,
+                enable_monai_knowledge_base=False,
+                enable_web_search=False,
+                web_search_topk=2,
+                code=SimpleNamespace(model="test-model", temp=0.0),
+                knowledge_base=SimpleNamespace(model="test-model", temp=0.0),
+            ),
+        )
+        root = Node(code="print('root')", plan="root")
+        root.step = 0
+        root.is_buggy = False
+        root.metric = MetricValue(0.7, maximize=True)
+        buggy_parent = Node(
+            code="raise RuntimeError('bug')", plan="buggy parent", parent=root
+        )
+        buggy_parent.step = 1
+        buggy_parent.is_buggy = True
+        sibling_pending = Node(
+            code="print('pending parent sibling')",
+            plan="pending parent sibling",
+            parent=root,
+        )
+        debug_pending = Node(
+            code="print('pending debug child')",
+            plan="pending debug child",
+            parent=buggy_parent,
+        )
+        agent = ProposalAgent("task", cfg, Journal(nodes=[root, buggy_parent]))  # type: ignore[arg-type]
+        agent.set_generation_context(
+            pending_round_nodes=[sibling_pending, debug_pending]
+        )
+
+        prompt = agent.context_builder.build_debug(buggy_parent)
+        records = prompt["Tree Records"]
+
+        self.assertIn("pending parent sibling", records)
+        self.assertNotIn("pending debug child", records)
 
     def test_journal_commit_step_is_monotonic_not_planned_slot(self) -> None:
         first = Node(code="print('first')")
@@ -438,18 +511,12 @@ class ContractConsistencyTests(unittest.TestCase):
         valid_exec = SimpleNamespace(
             timeout=1200,
             parallel_workers=2,
-            generation_workers=2,
-            max_generated_backlog=3,
-            max_draft_generated_backlog=2,
         )
         _validate_exec_config(SimpleNamespace(exec=valid_exec))
 
         invalid_exec = SimpleNamespace(
             timeout=1200,
             parallel_workers=0,
-            generation_workers=2,
-            max_generated_backlog=3,
-            max_draft_generated_backlog=2,
         )
         with self.assertRaises(ValueError):
             _validate_exec_config(SimpleNamespace(exec=invalid_exec))
@@ -532,12 +599,10 @@ class ContractConsistencyTests(unittest.TestCase):
                 search=SimpleNamespace(
                     max_debug_depth=2,
                     max_children_per_node=5,
-                    num_bugs=1,
                     topk_improve=3,
                 )
             ),
             exec=SimpleNamespace(
-                max_draft_generated_backlog=2,
                 include_medical_packages=True,
             ),
         )
@@ -546,7 +611,7 @@ class ContractConsistencyTests(unittest.TestCase):
 
         initial_tasks = agent.select_round_tasks()
 
-        self.assertEqual(len(initial_tasks), 2)
+        self.assertEqual(len(initial_tasks), 5)
         self.assertTrue(all(task.parent is None for task in initial_tasks))
 
         failed_draft = Node(code="raise RuntimeError('x')")
@@ -557,7 +622,7 @@ class ContractConsistencyTests(unittest.TestCase):
 
         followup_tasks = agent.select_round_tasks()
 
-        self.assertEqual(len(followup_tasks), 2)
+        self.assertEqual(len(followup_tasks), 4)
         self.assertTrue(all(task.parent is None for task in followup_tasks))
         self.assertTrue(
             all(
@@ -588,20 +653,181 @@ class ContractConsistencyTests(unittest.TestCase):
             any(task.parent is failed_draft for task in post_bootstrap_tasks)
         )
 
-    def test_tree_records_have_total_budget_and_selected_code_cap(self) -> None:
-        selected = Node(code="x = 1\n" * 10000, plan="long selected parent")
-        selected.step = 0
-        selected.is_buggy = False
-        journal = Journal(nodes=[selected])
+    def test_bootstrap_drafts_receive_diverse_plan_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = SimpleNamespace(
+                workspace_dir=Path(tmp),
+                log_dir=Path(tmp) / "logs",
+                exec=SimpleNamespace(include_medical_packages=True),
+                agent=SimpleNamespace(
+                    search=SimpleNamespace(
+                        max_debug_depth=2,
+                        max_children_per_node=3,
+                        topk_improve=1,
+                    ),
+                    data_summary=True,
+                    expose_prediction=False,
+                    enable_node_tools=False,
+                    max_node_tool_calls=4,
+                    enable_monai_knowledge_base=False,
+                    enable_web_search=False,
+                    web_search_topk=2,
+                    code=SimpleNamespace(model="test-model", temp=0.7),
+                    knowledge_base=SimpleNamespace(model="test-model", temp=0.0),
+                ),
+            )
+            agent = ProposalAgent("task", cfg, Journal())  # type: ignore[arg-type]
+            agent.data_summary = "data summary"
 
-        records = journal.generate_tree_records(
-            stage="improve",
-            selected_parent=selected,
-            max_chars=12000,
+            with patch(
+                "biomaker.agents.proposal_agent.query",
+                return_value={
+                    "plans": [
+                        {"name": "image evidence", "plan": "Use the image inputs."},
+                        {"name": "split aware", "plan": "Use the split facts."},
+                        {"name": "metric aligned", "plan": "Optimize for the metric."},
+                    ]
+                },
+            ):
+                tasks = agent.select_round_tasks()
+
+            self.assertEqual(len(tasks), 3)
+            self.assertEqual(
+                [task.draft_plan for task in tasks],
+                [
+                    "image evidence: Use the image inputs.",
+                    "split aware: Use the split facts.",
+                    "metric aligned: Optimize for the metric.",
+                ],
+            )
+            self.assertTrue(
+                all(
+                    "bootstrap root draft plan" in task.selection_reason
+                    for task in tasks
+                )
+            )
+
+    def test_draft_plan_batch_prompt_is_text_only_and_no_code_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = SimpleNamespace(
+                workspace_dir=Path(tmp),
+                log_dir=Path(tmp) / "logs",
+                exec=SimpleNamespace(include_medical_packages=True),
+                agent=SimpleNamespace(
+                    search=SimpleNamespace(
+                        max_debug_depth=2,
+                        max_children_per_node=3,
+                        topk_improve=1,
+                    ),
+                    data_summary=True,
+                    expose_prediction=False,
+                    enable_node_tools=False,
+                    max_node_tool_calls=4,
+                    enable_monai_knowledge_base=False,
+                    enable_web_search=False,
+                    web_search_topk=2,
+                    code=SimpleNamespace(model="test-model", temp=0.7),
+                    knowledge_base=SimpleNamespace(model="test-model", temp=0.0),
+                ),
+            )
+            existing = Node(
+                code="SECRET_CODE_SHOULD_NOT_REACH_PLANNER",
+                plan="Use already observed task-relevant image evidence.",
+            )
+            existing.step = 0
+            existing.is_buggy = False
+            existing.metric = MetricValue(0.7, maximize=True)
+            agent = ProposalAgent("task", cfg, Journal(nodes=[existing]))  # type: ignore[arg-type]
+            agent.data_summary = "data summary"
+
+            with patch(
+                "biomaker.agents.proposal_agent.query",
+                return_value={
+                    "plans": [
+                        {"name": "next", "plan": "Use task facts for the next plan."}
+                    ]
+                },
+            ) as query_mock:
+                plans = agent.generate_draft_plan_batch(1)
+
+            prompt = query_mock.call_args.kwargs["system_message"]
+            prompt_text = json.dumps(prompt, ensure_ascii=False, default=str)
+
+        self.assertEqual(plans, ["next: Use task facts for the next plan."])
+        self.assertIn("Existing Root Draft Plan Summaries", prompt)
+        self.assertIn("Use already observed task-relevant image evidence.", prompt_text)
+        self.assertNotIn("SECRET_CODE_SHOULD_NOT_REACH_PLANNER", prompt_text)
+        self.assertNotIn("simple robust baseline", prompt_text)
+        self.assertNotIn("fallback strategy", prompt_text)
+        self.assertNotIn("learned-model", prompt_text)
+
+    def test_draft_prompt_includes_assigned_plan(self) -> None:
+        cfg = SimpleNamespace(
+            workspace_dir=Path("."),
+            log_dir=Path("."),
+            exec=SimpleNamespace(include_medical_packages=True),
+            agent=SimpleNamespace(
+                data_summary=False,
+                expose_prediction=False,
+                enable_node_tools=False,
+                max_node_tool_calls=4,
+                enable_monai_knowledge_base=False,
+                enable_web_search=False,
+                web_search_topk=2,
+                code=SimpleNamespace(model="test-model", temp=0.0),
+                knowledge_base=SimpleNamespace(model="test-model", temp=0.0),
+            ),
+        )
+        agent = ProposalAgent("task", cfg, Journal())  # type: ignore[arg-type]
+        agent.set_generation_context(
+            pending_round_nodes=[],
+            draft_plan="Train a small CNN with strict evaluator outputs.",
         )
 
-        self.assertLessEqual(len(records), 12000)
-        self.assertIn("selected parent code trimmed to prompt budget", records)
+        prompt = agent.context_builder.build_draft()
+
+        self.assertEqual(
+            prompt["Current Selection"]["Assigned draft plan"],
+            "Train a small CNN with strict evaluator outputs.",
+        )
+
+    def test_task_selection_stops_when_no_frontier_remains(self) -> None:
+        cfg = SimpleNamespace(
+            agent=SimpleNamespace(
+                search=SimpleNamespace(
+                    max_debug_depth=0,
+                    max_children_per_node=1,
+                    topk_improve=1,
+                )
+            ),
+            exec=SimpleNamespace(
+                include_medical_packages=True,
+            ),
+        )
+        failed_draft = Node(code="raise RuntimeError('x')")
+        failed_draft.step = 0
+        failed_draft.is_buggy = True
+
+        tasks = BaseAgent("task", cfg, Journal(nodes=[failed_draft])).select_round_tasks()  # type: ignore[arg-type]
+
+        self.assertEqual(tasks, [])
+
+    def test_tree_records_keep_full_node_code(self) -> None:
+        selected_code = "x = 1\n" * 10000
+        sibling_code = "y = 2\n" * 10000
+        selected = Node(code=selected_code, plan="long selected parent")
+        selected.step = 0
+        selected.is_buggy = False
+        sibling = Node(code=sibling_code, plan="long sibling draft")
+        sibling.step = 1
+        sibling.is_buggy = False
+        journal = Journal(nodes=[selected, sibling])
+
+        records = journal.generate_tree_records(stage="draft")
+
+        self.assertGreater(len(records), 12000)
+        self.assertIn(selected_code, records)
+        self.assertIn(sibling_code, records)
 
     def test_code_extraction_accepts_common_python_fence_variants(self) -> None:
         for fence in ("```python", "```Python", "``` py", "```python3"):
@@ -619,7 +845,6 @@ class ContractConsistencyTests(unittest.TestCase):
                 max_node_tool_calls=4,
                 data_summary=False,
                 expose_prediction=False,
-                k_fold_validation=1,
                 enable_monai_knowledge_base=False,
                 enable_web_search=False,
                 web_search_topk=2,
@@ -655,6 +880,37 @@ class ContractConsistencyTests(unittest.TestCase):
 
             result = python_probe(
                 "from pathlib import Path\nPath('exp_guide.json').read_text()",
+                cwd=workspace,
+            )
+
+        self.assertIn("PermissionError", result)
+
+    def test_inspect_api_can_read_symlinked_input_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            dataset = root / "dataset"
+            (workspace / "input").mkdir(parents=True)
+            dataset.mkdir()
+            (dataset / "train.csv").write_text("case_id,label\n0,1\n", encoding="utf-8")
+            (workspace / "input" / "train.csv").symlink_to(dataset / "train.csv")
+
+            result = python_probe(
+                "from pathlib import Path\nprint(Path('input/train.csv').read_text())",
+                cwd=workspace,
+            )
+
+        self.assertIn("exit_code=0", result)
+        self.assertIn("case_id,label", result)
+
+    def test_inspect_api_blocks_parent_escape_from_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "input").mkdir()
+            (workspace / "exp_guide.json").write_text("secret", encoding="utf-8")
+
+            result = python_probe(
+                "from pathlib import Path\nPath('input/../exp_guide.json').read_text()",
                 cwd=workspace,
             )
 
@@ -800,6 +1056,71 @@ class ContractConsistencyTests(unittest.TestCase):
             )
             self.assertEqual(contract.prediction.key_columns, ["case_id"])
             self.assertEqual(contract.metric.primary_metric, "accuracy")
+
+    def test_experiment_contract_resolves_split_plan_paths_under_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            split_dir = workspace / "input" / "biomaker_splits"
+            _write_csv(
+                split_dir / "agent_train.csv",
+                [{"Id": "train_1", "class": 0, "path": "input/public/train/1.png"}],
+            )
+            _write_csv(
+                split_dir / "score_val.csv",
+                [{"Id": "val_1", "path": "input/public/val/1.png"}],
+            )
+            _write_csv(
+                split_dir / "agent_test.csv",
+                [{"Id": "test_1", "path": "input/public/test/1.png"}],
+            )
+            _write_json(
+                split_dir / "split_plan.json",
+                {
+                    "agent_visible": {
+                        "train": "biomaker_splits/agent_train.csv",
+                        "score_val": "biomaker_splits/score_val.csv",
+                        "test": "biomaker_splits/agent_test.csv",
+                    },
+                    "hidden_answers": {
+                        "score_val": {
+                            "file": "score_val.csv",
+                            "answer_columns": ["class"],
+                        },
+                        "test": {"file": "test.csv", "answer_columns": ["class"]},
+                    },
+                },
+            )
+            _write_json(
+                workspace / "evaluator_prediction_spec.json",
+                {
+                    "validation_artifact": "./working/validation_predictions.csv",
+                    "test_submission": "./working/submission.csv",
+                    "key_columns": ["Id"],
+                    "prediction_columns": ["prob_0", "prob_1"],
+                    "primary_metric": "accuracy",
+                    "score_split": "./input/biomaker_splits/score_val.csv",
+                },
+            )
+
+            contract = load_experiment_contract(workspace)
+            guide = build_exp_guide(workspace)
+
+        self.assertEqual(
+            contract.split_path("train"),
+            split_dir / "agent_train.csv",
+        )
+        self.assertEqual(
+            contract.splits["train"].public_ref,
+            "./input/biomaker_splits/agent_train.csv",
+        )
+        self.assertEqual(
+            guide["splits"]["train"]["columns"],
+            ["Id", "class", "path"],
+        )
+        self.assertEqual(
+            guide["samples"]["train"]["first_row"]["class"],
+            0,
+        )
 
     def test_run_overview_uses_contract_split_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
