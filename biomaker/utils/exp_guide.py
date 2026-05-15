@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from .experiment_contract import load_experiment_contract
 EXP_GUIDE_VERSION = 1
 EXP_GUIDE_FILENAME = "exp_guide.json"
 MEDICAL_IMAGE_SUFFIXES = {".nii", ".nii.gz", ".nrrd", ".mha", ".mhd"}
+MAX_CACHE_PROFILE_ROWS_PER_GROUP = 200
 
 
 def _compound_suffix(path: Path) -> str:
@@ -66,6 +68,50 @@ def _csv_profile(
         "rows": rows,
         "columns": columns,
     }, df
+
+
+def _safe_read_csv(path: Path) -> pd.DataFrame | None:
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return None
+
+
+def _visible_label_profile(
+    df: pd.DataFrame | None,
+    *,
+    answer_columns: set[str],
+    key_columns: set[str],
+) -> dict[str, Any] | None:
+    """Summarize labels that are already visible in the training split."""
+    if df is None or df.empty:
+        return None
+    profiles: dict[str, Any] = {}
+    for column in df.columns:
+        column_name = str(column)
+        lower = column_name.lower()
+        if column_name in key_columns:
+            continue
+        if "path" in lower or "file" in lower:
+            continue
+        series = df[column].dropna()
+        if series.empty:
+            continue
+        should_include = (
+            column_name in answer_columns
+            or lower in {"label", "class", "target", "y"}
+            or lower.startswith("label")
+            or lower.startswith("class")
+        )
+        if not should_include:
+            continue
+        counts = series.astype(str).value_counts(dropna=False)
+        profiles[column_name] = {
+            "rows": int(len(series)),
+            "unique_count": int(counts.shape[0]),
+            "counts": {str(index): int(value) for index, value in counts.items()},
+        }
+    return profiles or None
 
 
 def _path_observation(path_value: Any, input_dir: Path) -> dict[str, Any] | None:
@@ -175,7 +221,118 @@ def _cache_guide(input_dir: Path) -> dict[str, Any] | None:
                 }
         except Exception as exc:
             result["index_read_error"] = str(exc)
+        profiles = _cache_array_profiles(files_csv, input_dir)
+        if profiles:
+            result["array_profiles"] = profiles
     return result
+
+
+def _resolve_cache_path(value: Any, input_dir: Path) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    path = Path(text)
+    if path.is_absolute():
+        return path
+    if text.startswith("./input/"):
+        return input_dir.parent / text[2:]
+    if path.parts and path.parts[0] == "input":
+        return input_dir.parent / path
+    return input_dir / path
+
+
+def _shape_summary(shapes: list[list[int]]) -> dict[str, Any]:
+    ranks = sorted({len(shape) for shape in shapes})
+    max_rank = max(ranks) if ranks else 0
+    dim_ranges = []
+    for dim_index in range(max_rank):
+        values = [shape[dim_index] for shape in shapes if len(shape) > dim_index]
+        if not values:
+            continue
+        dim_ranges.append(
+            {
+                "min": int(min(values)),
+                "median": int(statistics.median(values)),
+                "max": int(max(values)),
+            }
+        )
+    examples: list[list[int]] = []
+    for shape in shapes:
+        if shape not in examples:
+            examples.append(shape)
+        if len(examples) >= 3:
+            break
+    return {"ranks": ranks, "dim_ranges": dim_ranges, "examples": examples}
+
+
+def _cache_array_profiles(files_csv: Path, input_dir: Path) -> dict[str, Any] | None:
+    try:
+        rows = pd.read_csv(files_csv)
+    except Exception:
+        return None
+    required = {"split", "column", "cache_metadata_path", "status"}
+    if not required.issubset(set(map(str, rows.columns))):
+        return None
+
+    profiles: dict[str, Any] = {}
+    for (split_name, column), group in rows.groupby(["split", "column"], dropna=False):
+        shapes: list[list[int]] = []
+        dtypes: dict[str, int] = {}
+        readers: dict[str, int] = {}
+        spacings: list[list[float]] = []
+        size_mb: list[float] = []
+        decoded_group = group[group["status"].astype(str) == "decoded"]
+        decoded_total = int(len(decoded_group))
+        profiled_rows = 0
+        for _, row in decoded_group.head(MAX_CACHE_PROFILE_ROWS_PER_GROUP).iterrows():
+            metadata_path = _resolve_cache_path(row.get("cache_metadata_path"), input_dir)
+            if metadata_path is None or not metadata_path.is_file():
+                continue
+            metadata = _read_json_dict(metadata_path)
+            if not metadata:
+                continue
+            profiled_rows += 1
+            shape = metadata.get("array_shape")
+            if isinstance(shape, list) and all(
+                isinstance(item, (int, float)) for item in shape
+            ):
+                shapes.append([int(item) for item in shape])
+            dtype = metadata.get("array_dtype")
+            if dtype:
+                dtypes[str(dtype)] = dtypes.get(str(dtype), 0) + 1
+            reader = metadata.get("reader")
+            if reader:
+                readers[str(reader)] = readers.get(str(reader), 0) + 1
+            spacing = metadata.get("spacing")
+            if isinstance(spacing, list) and spacing not in spacings:
+                spacings.append(spacing)
+            try:
+                size = float(metadata.get("size_bytes", 0)) / (1024 * 1024)
+            except Exception:
+                size = 0.0
+            if size > 0:
+                size_mb.append(size)
+        if profiled_rows == 0:
+            continue
+        entry: dict[str, Any] = {
+            "decoded_rows": decoded_total,
+            "profiled_rows": profiled_rows,
+            "dtypes": dtypes,
+        }
+        if shapes:
+            entry["shape_summary"] = _shape_summary(shapes)
+        if readers:
+            entry["readers"] = readers
+        if spacings:
+            entry["spacing_examples"] = spacings[:3]
+        if size_mb:
+            entry["size_mb"] = {
+                "min": round(float(min(size_mb)), 1),
+                "median": round(float(statistics.median(size_mb)), 1),
+                "max": round(float(max(size_mb)), 1),
+            }
+        profiles[f"{split_name}.{column}"] = entry
+    return profiles or None
 
 
 def build_exp_guide(
@@ -193,6 +350,13 @@ def build_exp_guide(
 
     split_guide: dict[str, Any] = {}
     samples: dict[str, Any] = {}
+    split_profiles: dict[str, Any] = {}
+    answer_columns = {
+        column
+        for hidden in contract.hidden_answers.values()
+        for column in hidden.answer_columns
+    }
+    key_columns = set(prediction_contract.key_columns)
     for split_name in ["train", "score_val", "test"]:
         split = contract.splits.get(split_name)
         if split is None:
@@ -207,6 +371,15 @@ def build_exp_guide(
         sample = _sample_profile(df, input_dir)
         if sample is not None:
             samples[split_name] = sample
+        if split_name == "train":
+            full_df = _safe_read_csv(split.path)
+            label_profile = _visible_label_profile(
+                full_df,
+                answer_columns=answer_columns,
+                key_columns=key_columns,
+            )
+            if label_profile:
+                split_profiles[split_name] = {"visible_labels": label_profile}
 
     hidden_answers = {
         split: hidden.answer_columns
@@ -262,6 +435,7 @@ def build_exp_guide(
             "hidden_answers_outside_agent_workspace": True,
         },
         "samples": samples,
+        "split_profiles": split_profiles,
         "cache": _cache_guide(input_dir),
     }
 
@@ -294,6 +468,7 @@ def _guide_view(guide: dict[str, Any], *, include_samples: bool) -> dict[str, An
     }
     if include_samples:
         view["samples"] = guide.get("samples", {})
+        view["split_profiles"] = guide.get("split_profiles", {})
     return view
 
 

@@ -59,11 +59,14 @@ def _append_splits(lines: list[str], guide: dict[str, Any]) -> None:
     if not splits:
         return
     lines.extend(["", "Agent-visible split files:"])
+    split_columns: dict[str, set[str]] = {}
     for split_name in ["train", "score_val", "test"]:
         split = _as_dict(splits.get(split_name))
         if not split:
             continue
-        columns = ", ".join(map(str, split.get("columns") or []))
+        column_values = [str(column) for column in split.get("columns") or []]
+        split_columns[split_name] = set(column_values)
+        columns = ", ".join(column_values)
         rows = split.get("rows", "unknown")
         path = split.get("path", "unknown")
         label = split.get("role") or split_name
@@ -72,6 +75,40 @@ def _append_splits(lines: list[str], guide: dict[str, Any]) -> None:
             lines.append(f"- {label}: `{path}` could not be read: {read_error}")
         else:
             lines.append(f"- {label}: `{path}`; rows={rows}; columns=[{columns}]")
+    train_columns = split_columns.get("train", set())
+    for split_name in ["score_val", "test"]:
+        columns = split_columns.get(split_name)
+        if not columns:
+            continue
+        missing_from_split = sorted(train_columns - columns)
+        path_like = [
+            column
+            for column in missing_from_split
+            if "path" in column.lower() or "file" in column.lower()
+        ]
+        if path_like:
+            label = _as_dict(splits.get(split_name)).get("role") or split_name
+            lines.append(
+                f"- {label} does not include training-only file column(s): "
+                f"{path_like}; generated code must handle this split separately."
+            )
+
+
+def _append_split_profiles(lines: list[str], guide: dict[str, Any]) -> None:
+    profiles = _as_dict(guide.get("split_profiles"))
+    train_profile = _as_dict(profiles.get("train"))
+    visible_labels = _as_dict(train_profile.get("visible_labels"))
+    if not visible_labels:
+        return
+    lines.extend(["", "Visible training-label profile:"])
+    for column, profile in visible_labels.items():
+        profile = _as_dict(profile)
+        counts = _as_dict(profile.get("counts"))
+        counts_text = ", ".join(f"{key}: {value}" for key, value in counts.items())
+        lines.append(
+            f"- `{column}`: rows={profile.get('rows', 'unknown')}; "
+            f"unique={profile.get('unique_count', 'unknown')}; counts={{ {counts_text} }}"
+        )
 
 
 def _append_hidden_answers(lines: list[str], guide: dict[str, Any]) -> None:
@@ -215,6 +252,73 @@ def _append_cache(lines: list[str], guide: dict[str, Any]) -> None:
     lines.append(
         "- Original files remain available; the cache is only an optional faster loading path."
     )
+    array_profiles = _as_dict(cache.get("array_profiles"))
+    if not array_profiles:
+        return
+    lines.extend(["", "Cached array profile:"])
+    max_rank = 0
+    max_size_mb = 0.0
+    rank3_volume_like = False
+    for name in sorted(array_profiles):
+        profile = _as_dict(array_profiles.get(name))
+        shape_summary = _as_dict(profile.get("shape_summary"))
+        ranks = shape_summary.get("ranks") or []
+        if ranks:
+            try:
+                max_rank = max(max_rank, max(int(rank) for rank in ranks))
+            except Exception:
+                pass
+        dim_ranges = shape_summary.get("dim_ranges") or []
+        examples = shape_summary.get("examples") or []
+        dtypes = _as_dict(profile.get("dtypes"))
+        readers = _as_dict(profile.get("readers"))
+        size_mb = _as_dict(profile.get("size_mb"))
+        if size_mb.get("max") is not None:
+            try:
+                max_size_mb = max(max_size_mb, float(size_mb["max"]))
+            except Exception:
+                pass
+        if ranks == [3]:
+            examples_look_channel_free = all(
+                isinstance(example, list)
+                and len(example) == 3
+                and min(int(dim) for dim in example) > 4
+                for example in examples
+            )
+            if "SimpleITK" in readers or examples_look_channel_free:
+                rank3_volume_like = True
+        dim_text = "; ".join(
+            f"d{idx}=min/med/max {dim.get('min')}/{dim.get('median')}/{dim.get('max')}"
+            for idx, dim in enumerate(dim_ranges[:4])
+            if isinstance(dim, dict)
+        )
+        size_text = ""
+        if size_mb:
+            size_text = (
+                f"; size_mb=min/med/max "
+                f"{size_mb.get('min')}/{size_mb.get('median')}/{size_mb.get('max')}"
+            )
+        lines.append(
+            f"- `{name}`: decoded_rows={profile.get('decoded_rows', 'unknown')}; "
+            f"profiled_rows={profile.get('profiled_rows', 'unknown')}; "
+            f"readers={readers}; dtypes={dtypes}; ranks={ranks}; "
+            f"{dim_text}; examples={examples}{size_text}"
+        )
+    cautions = []
+    if max_rank >= 3 and max_size_mb >= 50:
+        cautions.append(
+            "large 3D arrays are present; root drafts should cap slices/patches/epochs "
+            "and avoid exhaustive full-volume processing."
+        )
+    if rank3_volume_like:
+        cautions.append(
+            "rank-3 array groups without an obvious small channel axis are present; "
+            "do not treat them as HWC/RGB images by default, and explicitly adapt "
+            "channels when using 2D pretrained image models."
+        )
+    if cautions:
+        lines.extend(["", "Data-shape cautions:"])
+        lines.extend(f"- {caution}" for caution in cautions)
 
 
 def _render_exp_guide_summary(guide: dict[str, Any], base_path: Path) -> str:
@@ -227,6 +331,7 @@ def _render_exp_guide_summary(guide: dict[str, Any], base_path: Path) -> str:
     ]
     _append_artifacts(lines, guide)
     _append_splits(lines, guide)
+    _append_split_profiles(lines, guide)
     _append_hidden_answers(lines, guide)
     _append_samples(lines, guide)
     _append_cache(lines, guide)

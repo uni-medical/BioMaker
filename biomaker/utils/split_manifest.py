@@ -163,6 +163,8 @@ def _validate_sample_universe(
         return
     seen: set[str] = set()
     counts = {"train": 0, "score_val": 0, "test": 0}
+    duplicate_sample_id_errors = 0
+    missing_source_path_errors = 0
     for index, item in enumerate(samples):
         if not isinstance(item, dict):
             errors.append(f"sample_universe[{index}] must be an object.")
@@ -172,7 +174,11 @@ def _validate_sample_universe(
         if not sample_id:
             errors.append(f"sample_universe[{index}] is missing sample_id.")
         elif sample_id in seen:
-            errors.append(f"sample_universe has duplicate sample_id: {sample_id}")
+            duplicate_sample_id_errors += 1
+            if duplicate_sample_id_errors <= 20:
+                errors.append(
+                    f"sample_universe has duplicate sample_id: {sample_id}"
+                )
         else:
             seen.add(sample_id)
         split = str(item.get("split") or "").strip()
@@ -195,10 +201,22 @@ def _validate_sample_universe(
                 if path.parts and path.parts[0] == "input" and len(path.parts) > 1:
                     candidates.append(source_input_dir / Path(*path.parts[1:]))
             if not any(candidate.exists() for candidate in candidates):
-                errors.append(
-                    f"sample_universe[{index}] source path does not exist: {raw_path}"
-                )
+                missing_source_path_errors += 1
+                if missing_source_path_errors <= 20:
+                    errors.append(
+                        f"sample_universe[{index}] source path does not exist: {raw_path}"
+                    )
                 break
+    if duplicate_sample_id_errors > 20:
+        errors.append(
+            "sample_universe has additional duplicate sample_id errors: "
+            f"{duplicate_sample_id_errors - 20}"
+        )
+    if missing_source_path_errors > 20:
+        errors.append(
+            "sample_universe has additional missing source path errors: "
+            f"{missing_source_path_errors - 20}"
+        )
     if manifest.get("row_representation", "one_row_per_sample") == "one_row_per_sample":
         for split_name, expected in counts.items():
             df = frames.get(split_name)

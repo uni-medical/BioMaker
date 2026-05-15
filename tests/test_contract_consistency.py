@@ -36,6 +36,7 @@ from biomaker.utils.artifact_validation import (
     normalize_working_outputs,
     validate_working_outputs,
 )
+from biomaker.utils import agentic_data_planner
 from biomaker.utils.environment import allowed_package_specs, validate_code_environment
 from biomaker.utils.evaluator_setup import EvaluatorRunResult
 from biomaker.utils.execution_record import (
@@ -520,6 +521,62 @@ class ContractConsistencyTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             _validate_exec_config(SimpleNamespace(exec=invalid_exec))
+
+    def test_split_builder_retries_response_without_code_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            task_file = root / "task.md"
+            task_file.write_text("Build a tiny split.", encoding="utf-8")
+            output_dir = root / "package"
+            query_failures = []
+
+            def fake_query_builder(*args, previous_failure=None, **kwargs):
+                query_failures.append(previous_failure)
+                if len(query_failures) == 1:
+                    return (
+                        "",
+                        "This explains the split but forgot the code fence.",
+                        {"prompt_tokens": 10, "completion_tokens": 5},
+                    )
+                return (
+                    "print('ok')",
+                    "```python\nprint('ok')\n```",
+                    {"prompt_tokens": 11, "completion_tokens": 6},
+                )
+
+            def fake_run(*args, **kwargs):
+                return SimpleNamespace(returncode=0, stdout="ok")
+
+            def fake_verify(output_dir, **kwargs):
+                (output_dir / "biomaker_splits").mkdir(parents=True, exist_ok=True)
+                return {"ok": True, "row_counts": {}}
+
+            with (
+                patch.object(
+                    agentic_data_planner, "_query_builder", side_effect=fake_query_builder
+                ),
+                patch.object(agentic_data_planner.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    agentic_data_planner,
+                    "verify_split_package",
+                    side_effect=fake_verify,
+                ),
+            ):
+                result = agentic_data_planner.run_agentic_split_builder_probe(
+                    input_dir,
+                    task_file,
+                    output_dir,
+                    max_attempts=2,
+                    debug_artifacts=True,
+                )
+
+            self.assertTrue(result.verifier["ok"])
+            self.assertEqual(len(query_failures), 2)
+            self.assertIsNone(query_failures[0])
+            self.assertIn("valid Python code block", query_failures[1]["errors"][0])
+            self.assertTrue((output_dir / "_debug" / "response_1.txt").is_file())
 
     def test_working_latest_and_best_artifacts_are_separate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

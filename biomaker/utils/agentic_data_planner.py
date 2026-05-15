@@ -43,7 +43,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 2
+SPLIT_BUILDER_CACHE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -308,6 +308,76 @@ def _builder_system_prompt() -> str:
     )
 
 
+def _compact_error_list(errors: Any, *, limit: int = 40) -> dict[str, Any]:
+    if not isinstance(errors, list):
+        return {"items": []}
+    items = [str(error) for error in errors]
+    duplicate_sample_id_count = sum(
+        1 for error in items if error.startswith("sample_universe has duplicate sample_id:")
+    )
+    compact = {
+        "count": len(items),
+        "items": items[:limit],
+    }
+    if len(items) > limit:
+        compact["omitted_count"] = len(items) - limit
+    if duplicate_sample_id_count:
+        compact["duplicate_sample_id_errors"] = duplicate_sample_id_count
+    return compact
+
+
+def _compact_split_manifest_for_prompt(manifest: Any) -> dict[str, Any]:
+    if not isinstance(manifest, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for key in (
+        "manifest_version",
+        "sample_unit",
+        "key_columns",
+        "task_heads",
+        "visibility",
+        "prediction_contract",
+        "metric_contract",
+        "hidden_answers",
+    ):
+        if key in manifest:
+            compact[key] = manifest[key]
+    sample_universe = manifest.get("sample_universe")
+    if isinstance(sample_universe, list):
+        compact["sample_universe_summary"] = {
+            "count": len(sample_universe),
+            "first_items": sample_universe[:3],
+            "last_items": sample_universe[-3:] if len(sample_universe) > 3 else [],
+        }
+    elif sample_universe is not None:
+        compact["sample_universe_summary"] = str(type(sample_universe).__name__)
+    return compact
+
+
+def _manifest_summary_for_verifier(manifest: Any) -> dict[str, Any]:
+    summary = _compact_split_manifest_for_prompt(manifest)
+    if isinstance(manifest, dict):
+        summary["present_fields"] = sorted(map(str, manifest.keys()))
+    return summary
+
+
+def _compact_builder_failure_for_prompt(failure: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {
+        "ok": failure.get("ok"),
+        "builder_returncode": failure.get("builder_returncode"),
+        "errors": _compact_error_list(failure.get("errors")),
+        "warnings": _compact_error_list(failure.get("warnings"), limit=20),
+    }
+    for key in ("row_counts", "hidden_answers", "private_gt"):
+        if key in failure:
+            compact[key] = failure[key]
+    if "split_manifest" in failure:
+        compact["split_manifest"] = _compact_split_manifest_for_prompt(
+            failure.get("split_manifest")
+        )
+    return compact
+
+
 def _builder_user_prompt(
     task_text: str,
     facts: dict[str, Any],
@@ -333,11 +403,15 @@ def _builder_user_prompt(
             "sample_unit: what one prediction row represents, for example image, volume, patient, slide, study, encounter, window, or row.",
             "key_columns: public columns that uniquely align score/test predictions with private truth; use [] only when row order is the explicit contract.",
             "task_heads: list of task heads, each either a string or object with type such as classification, multilabel, segmentation_2d, detection, regression, survival, or segmentation_3d.",
-            "sample_universe: list of objects with sample_id, split (train/score_val/test/dropped), source_paths, and reason for every dropped sample. If one CSV row is not one sample, set row_representation to a short explanation instead of one_row_per_sample.",
             "visibility: object listing agent_visible, evaluator_only, and forbidden columns/files.",
             "prediction_contract: object describing required candidate output files/columns and probability/file-path semantics.",
             "metric_contract: object with primary_metric and maximize.",
             "hidden_answers: object mirroring private_gt/private_gt.json answer_columns.",
+        ],
+        "Optional split_manifest.json Fields": [
+            "row_representation: short explanation when one CSV row is not one prediction sample.",
+            "dropped_samples: compact list of excluded samples with reasons, only when samples are intentionally dropped.",
+            "sample_universe_summary: compact counts or source-file summary when useful; do not enumerate every sample.",
         ],
         "Builder Interface": [
             "Return one Python script.",
@@ -351,6 +425,7 @@ def _builder_user_prompt(
             "If an answer is stored as a file path, hide that path from public score/test files and retain it in hidden answers.",
             "If a column is computed from the answer, hide it from public score/test files too.",
             "Make your semantic assumptions explicit in split_manifest.json; do not leave task type, key columns, sample unit, or class/mask/box schema implicit.",
+            "The public and private CSV files are the source of truth for row-level membership; do not create a per-sample sample_universe list for ordinary row-based datasets.",
             "Do not create modeling code; only prepare split files.",
             "Keep the implementation short and direct.",
         ],
@@ -360,7 +435,9 @@ def _builder_user_prompt(
         prompt["Previous Builder Script"] = previous_script
     if previous_failure is not None:
         prompt["Previous Verification Failure"] = json.dumps(
-            previous_failure, indent=2, ensure_ascii=False
+            _compact_builder_failure_for_prompt(previous_failure),
+            indent=2,
+            ensure_ascii=False,
         )
     if previous_stdout:
         prompt["Previous Builder Output"] = previous_stdout[-4000:]
@@ -392,10 +469,6 @@ def _query_builder(
     )
     raw_response = str(response)
     code = extract_code(raw_response)
-    if not code.strip():
-        raise RuntimeError(
-            "Builder response did not contain a valid Python code block."
-        )
     return code, raw_response, metadata
 
 
@@ -688,7 +761,7 @@ def verify_split_package(
         "row_counts": row_counts,
         "hidden_answers": manifest,
         "private_gt": manifest,
-        "split_manifest": split_manifest,
+        "split_manifest": _manifest_summary_for_verifier(split_manifest),
     }
 
 
@@ -792,6 +865,44 @@ def run_agentic_split_builder_probe(
             previous_failure=previous_failure,
             previous_stdout=previous_stdout,
         )
+        if not code.strip():
+            verifier = {
+                "ok": False,
+                "errors": [
+                    "Builder response did not contain a valid Python code block.",
+                    "Return a brief explanation followed by exactly one fenced Python code block, for example ```python ... ```.",
+                ],
+                "builder_returncode": None,
+            }
+            attempts.append(
+                {
+                    "attempt": attempt_index,
+                    "ok": False,
+                    "verifier": verifier,
+                    "stdout_tail": raw_response[-4000:],
+                    "prompt_tokens": metadata.get("prompt_tokens"),
+                    "completion_tokens": metadata.get("completion_tokens"),
+                }
+            )
+            if debug_artifacts:
+                debug_dir = output_dir / "_debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                (debug_dir / f"response_{attempt_index}.txt").write_text(
+                    raw_response, encoding="utf-8"
+                )
+                (debug_dir / f"stdout_{attempt_index}.txt").write_text(
+                    raw_response, encoding="utf-8"
+                )
+                (debug_dir / f"verifier_{attempt_index}.json").write_text(
+                    json.dumps(verifier, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            final_verifier = verifier
+            previous_script = None
+            previous_failure = verifier
+            previous_stdout = raw_response
+            continue
+
         builder_path = output_dir / f"_builder_attempt_{attempt_index}.py"
         builder_path.write_text(code, encoding="utf-8")
 
@@ -868,7 +979,10 @@ def run_agentic_split_builder_probe(
     if not final_verifier.get("ok"):
         raise RuntimeError(
             "Agentic split builder failed: "
-            + json.dumps(final_verifier, ensure_ascii=False)
+            + json.dumps(
+                _compact_builder_failure_for_prompt(final_verifier),
+                ensure_ascii=False,
+            )
             + "\nLast builder output:\n"
             + str(previous_stdout or "")[-4000:]
         )
