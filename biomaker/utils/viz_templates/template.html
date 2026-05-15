@@ -166,6 +166,8 @@
         font-weight: 500;
       }
       code {
+        font-family:
+          "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
         font-size: 12px;
         line-height: 1.45;
         white-space: pre;
@@ -175,10 +177,13 @@
       }
       .code-with-lines code {
         display: block;
+        line-height: 1.35;
+        white-space: normal;
       }
       .code-line {
         display: grid;
-        grid-template-columns: 4.5ch minmax(0, 1fr);
+        grid-template-columns: max-content minmax(0, 1fr);
+        line-height: inherit;
         min-width: max-content;
       }
       .line-number {
@@ -188,9 +193,12 @@
         padding: 0 8px 0 6px;
         text-align: right;
         user-select: none;
+        white-space: nowrap;
+        width: 5.5ch;
       }
       .line-content {
         padding-left: 10px;
+        line-height: inherit;
         white-space: pre;
       }
       .best-pill {

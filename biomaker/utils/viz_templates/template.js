@@ -69,12 +69,11 @@ const renderCodeBlock = (code) => {
         language: "python",
         ignoreIllegals: true,
       }).value;
-      return `
-        <span class="code-line">
-          <span class="line-number">${index + 1}</span>
-          <span class="line-content">${highlighted || "&nbsp;"}</span>
-        </span>
-      `;
+      return `<span class="code-line"><span class="line-number">${
+        index + 1
+      }</span><span class="line-content">${
+        highlighted || "&nbsp;"
+      }</span></span>`;
     })
     .join("");
   return `<pre class="code-with-lines"><code class="language-python">${rows}</code></pre>`;
