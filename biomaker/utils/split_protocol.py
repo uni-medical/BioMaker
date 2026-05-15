@@ -347,6 +347,175 @@ def _copy_generated_public_assets(package_dir: Path, input_dir: Path) -> None:
     )
 
 
+_AGENT_VISIBLE_SPLIT_FILES = (
+    "agent_train.csv",
+    "score_val.csv",
+    "agent_test.csv",
+)
+
+_SAFE_TOP_LEVEL_INFO_FILES = {
+    "data_description.txt",
+    "description.txt",
+    "readme",
+    "readme.md",
+    "readme.txt",
+    "license",
+    "license.md",
+    "license.txt",
+}
+
+
+def _existing_input_reference(value: Any, input_dir: Path) -> tuple[str, Path] | None:
+    workspace_rel = _workspace_relative_input_path(value, input_dir)
+    if workspace_rel is None:
+        return None
+    rel = Path(workspace_rel)
+    if not rel.parts or rel.parts[0] != "input":
+        return None
+    source = input_dir / Path(*rel.parts[1:])
+    if not source.exists() and not source.is_symlink():
+        return None
+    return workspace_rel, source
+
+
+def _copy_or_link_visible_path(
+    source: Path, destination: Path, input_dir: Path
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        return
+    resolved_source = source.resolve()
+    input_root = input_dir.resolve()
+    source_inside_input = False
+    try:
+        resolved_source.relative_to(input_root)
+        source_inside_input = True
+    except ValueError:
+        source_inside_input = False
+
+    if source.is_dir():
+        if source_inside_input:
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            destination.symlink_to(resolved_source)
+        return
+
+    if source_inside_input:
+        shutil.copy2(resolved_source, destination)
+    else:
+        destination.symlink_to(resolved_source)
+
+
+def _can_expose_directory(source_dir: Path, referenced_names: set[str]) -> bool:
+    if not source_dir.is_dir() or not referenced_names:
+        return False
+    child_names: set[str] = set()
+    try:
+        children = list(source_dir.iterdir())
+    except OSError:
+        return False
+    for child in children:
+        if child.is_dir():
+            return False
+        if child.is_file() or child.is_symlink():
+            child_names.add(child.name)
+            continue
+        return False
+    return child_names == referenced_names
+
+
+def _copy_or_link_visible_references(
+    visible_paths: dict[str, Path], temp_input: Path, input_dir: Path
+) -> int:
+    grouped: dict[Path, dict[str, Path]] = {}
+    for workspace_rel, source in visible_paths.items():
+        rel = Path(workspace_rel)
+        grouped.setdefault(Path(*rel.parts[1:-1]), {})[rel.name] = source
+
+    materialized = 0
+    for rel_parent, entries in sorted(grouped.items(), key=lambda item: str(item[0])):
+        source_parents = {source.parent.resolve() for source in entries.values()}
+        source_parent = next(iter(entries.values())).parent
+        destination_parent = temp_input / rel_parent
+        if len(source_parents) == 1 and _can_expose_directory(
+            source_parent, set(entries)
+        ):
+            _copy_or_link_visible_path(source_parent, destination_parent, input_dir)
+            materialized += len(entries)
+            continue
+
+        for filename, source in sorted(entries.items()):
+            _copy_or_link_visible_path(source, destination_parent / filename, input_dir)
+            materialized += 1
+    return materialized
+
+
+def sanitize_agent_visible_input(
+    input_dir: Path | str, split_dir: Path | str
+) -> dict[str, Any]:
+    """Replace workspace input with only files the generated code is allowed to see.
+
+    The split builder needs the original dataset view, but code nodes should only see
+    the public split tables and files those tables explicitly reference. This prevents
+    root dataset CSVs, metadata tables, and hidden score/test masks from remaining
+    reachable through the initial dataset symlink.
+    """
+    input_dir = Path(input_dir).resolve()
+    split_dir = Path(split_dir).resolve()
+    if not split_dir.is_dir():
+        raise FileNotFoundError(f"split directory does not exist: {split_dir}")
+
+    visible_paths: dict[str, Path] = {}
+    for filename in _AGENT_VISIBLE_SPLIT_FILES:
+        csv_path = split_dir / filename
+        if not csv_path.is_file():
+            continue
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception:
+            continue
+        for column in df.columns:
+            if df[column].dtype != object:
+                continue
+            for value in df[column].dropna().tolist():
+                reference = _existing_input_reference(value, input_dir)
+                if reference is None:
+                    continue
+                workspace_rel, source = reference
+                visible_paths.setdefault(workspace_rel, source)
+
+    safe_info_files = []
+    for child in sorted(input_dir.iterdir()):
+        if not child.is_file():
+            continue
+        if child.name.lower() in _SAFE_TOP_LEVEL_INFO_FILES:
+            safe_info_files.append(child)
+
+    temp_input = input_dir.parent / f".{input_dir.name}.agent_visible"
+    _remove_path(temp_input)
+    temp_input.mkdir(parents=True, exist_ok=True)
+
+    shutil.copytree(split_dir, temp_input / "biomaker_splits", symlinks=True)
+    for source in safe_info_files:
+        _copy_or_link_visible_path(source, temp_input / source.name, input_dir)
+    materialized_files = _copy_or_link_visible_references(
+        visible_paths, temp_input, input_dir
+    )
+
+    _remove_path(input_dir)
+    temp_input.rename(input_dir)
+    return {
+        "split_files": [
+            name
+            for name in _AGENT_VISIBLE_SPLIT_FILES
+            if (input_dir / "biomaker_splits" / name).is_file()
+        ],
+        "referenced_files": len(visible_paths),
+        "materialized_files": materialized_files,
+        "info_files": [path.name for path in safe_info_files],
+    }
+
+
 def _copy_split_package_from_cache(
     cache_entry: Path, split_dir: Path, private_dir: Path, input_dir: Path
 ) -> dict[str, Any] | None:
@@ -492,6 +661,7 @@ def prepare_split_protocol(
     _normalize_split_paths_in_dir(split_dir, input_dir)
     _make_private_paths_evaluator_visible(private_dir, input_dir)
     _hide_private_file_answers(input_dir, private_dir)
+    agent_visible_input = sanitize_agent_visible_input(input_dir, split_dir)
 
     hidden_answers_plan = (
         result_verifier.get("hidden_answers")
@@ -522,6 +692,7 @@ def prepare_split_protocol(
         "row_counts": result_verifier.get("row_counts", {}),
         "warnings": result_verifier.get("warnings", []),
         "cache_reused": cache_reused,
+        "agent_visible_input": agent_visible_input,
     }
     split_manifest = result_verifier.get("split_manifest")
     if isinstance(split_manifest, dict):

@@ -13,7 +13,6 @@ from pathlib import Path
 from threading import Event, RLock, Thread
 
 from omegaconf import OmegaConf
-from rich.console import Console
 from rich.live import Live
 from rich.tree import Tree
 
@@ -30,6 +29,7 @@ from .utils.artifact_validation import (
 )
 from .utils import tree_export
 from .utils.config import (
+    SHARED_CONSOLE,
     load_cfg,
     load_task_desc,
     prep_agent_workspace,
@@ -50,7 +50,6 @@ from .utils.execution_record import (
     attach_evaluator_run_result,
 )
 from .utils.final_retrain import run_final_retrain
-from .utils.input_cache import prepare_input_cache
 from .utils.private_evaluation import evaluate_private_outputs
 from .utils.run_manifest import write_run_manifest
 from .utils.split_protocol import prepare_split_protocol
@@ -605,7 +604,7 @@ def run():
 
     task_desc = load_task_desc(cfg)
 
-    logger.info("Preparing agent workspace (copying and extracting files) ...")
+    logger.info("Preparing agent workspace ...")
     prep_agent_workspace(cfg)
     append_event(cfg.log_dir, "workspace_prepared", workspace_dir=cfg.workspace_dir)
     private_dir = cfg.log_dir / "private_gt"
@@ -615,7 +614,7 @@ def run():
         task_desc=task_desc,
         model=cfg.agent.feedback.model,
         temperature=0.0,
-        attempts=3,
+        attempts=cfg.split_builder.attempts,
         cache_root=cfg.resource_dir / "split_builder",
     )
     append_event(
@@ -633,35 +632,6 @@ def run():
     logger.info("%s", overview_text)
     append_event(cfg.log_dir, "run_overview", **overview_payload)
     logger.info("Split protocol:\n%s", split_protocol.prompt_text)
-
-    if cfg.input_cache.enabled:
-        logger.info("Preparing deterministic input cache ...")
-        input_cache_result = prepare_input_cache(
-            cfg.workspace_dir / "input",
-            split_protocol.split_plan,
-            shared_root=(
-                cfg.resource_dir / "input_cache" if cfg.input_cache.reuse else None
-            ),
-            decode_arrays=cfg.input_cache.decode_arrays,
-        )
-        logger.info(
-            "Input cache prepared at %s (%d files, %d decoded arrays, %d errors, reused=%s)",
-            input_cache_result.path,
-            input_cache_result.files_total,
-            input_cache_result.arrays_decoded,
-            input_cache_result.errors,
-            input_cache_result.reused,
-        )
-        append_event(
-            cfg.log_dir,
-            "input_cache_prepared",
-            path=str(input_cache_result.path),
-            fingerprint=input_cache_result.fingerprint,
-            files_total=input_cache_result.files_total,
-            arrays_decoded=input_cache_result.arrays_decoded,
-            errors=input_cache_result.errors,
-            reused=input_cache_result.reused,
-        )
 
     interpreter = Interpreter(
         cfg.workspace_dir,
@@ -880,9 +850,8 @@ def run():
     live_tree_lock = RLock()
     live_tree_stop = Event()
     last_live_tree_log_at = 0.0
-    live_tree_console = Console(file=sys.stderr, stderr=True)
     live_tree_display = Live(
-        console=live_tree_console,
+        console=SHARED_CONSOLE,
         refresh_per_second=1,
         transient=False,
         vertical_overflow="visible",

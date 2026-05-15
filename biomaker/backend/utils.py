@@ -45,7 +45,13 @@ def compile_prompt_to_md(prompt: PromptType, _header_depth: int = 1) -> str:
     if isinstance(prompt, str):
         return prompt.strip() + "\n"
     elif isinstance(prompt, list):
-        return "\n".join([f"- {s.strip()}" for s in prompt] + ["\n"])
+        items = []
+        for value in prompt:
+            text = compile_prompt_to_md(value, _header_depth=_header_depth).strip()
+            if "\n" in text:
+                text = "\n  ".join(text.splitlines())
+            items.append(f"- {text}")
+        return "\n".join(items + ["\n"])
     elif not isinstance(prompt, dict):
         return str(prompt).strip() + "\n"
 

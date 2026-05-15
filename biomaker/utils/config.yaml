@@ -22,15 +22,14 @@ exp_name: null # a random experiment name will be generated if not provided
 
 model_for_all_agents: null # optional CLI override for all model roles
 
-# Deterministic agent-visible input cache. This is an I/O cache, not modeling preprocessing.
-input_cache:
-  enabled: True
-  decode_arrays: True
-  reuse: True
-
 # Reuse smoke-tested frozen evaluators when the task/split/evaluator prompt is unchanged.
 evaluator_cache:
   enabled: True
+
+# Agentic split builder retry budget. Each failed package is verified and the
+# verifier errors are fed back to the builder before retrying.
+split_builder:
+  attempts: 5
 
 # After the search selects the best node, rerun that code once with the hidden
 # score-validation labels merged into the training table. This is a final-only

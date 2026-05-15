@@ -622,20 +622,29 @@ class ProposalAgent(BaseAgent):
             return []
         if self.data_summary is None:
             self.update_data_summary()
+        root_draft_context = self.context_builder.build_draft()
+        shared_instructions = dict(root_draft_context.get("Instructions") or {})
+        shared_instructions.pop("Response format", None)
         prompt = {
             "Introduction": (
-                f"Analyze the task description, data/evaluator facts, and any "
-                f"existing root-draft plan summaries. Create {count} concise textual "
-                "root-draft plans for BioMaker. These plans will later be assigned "
-                "to separate parallel code-generation workers."
+                f"Analyze the same task, data/evaluator, environment, and root-draft "
+                f"constraints shown to code-generation workers. Create {count} concise "
+                "textual root-draft plans for BioMaker. These plans will later be "
+                "assigned to separate parallel code-generation workers."
             ),
-            "Task Description": self.context_builder._task_description_value(),
-            "Data and Evaluation Summary": self.get_data_summary(),
+            "Task Description": root_draft_context.get("Task Description"),
+            "Data and Evaluation Summary": root_draft_context.get(
+                "Data and Evaluation Summary"
+            ),
+            "Shared Root-Draft Constraints": shared_instructions,
             "Existing Root Draft Plan Summaries": self._root_draft_plan_summaries(),
             "Planning requirements": [
                 "Return exactly the requested number of plans when possible.",
                 "Each plan must be a text-only strategy description, not code or pseudocode.",
                 "Base each plan on the provided task, split, input, and evaluator facts.",
+                "Each plan must be implementable using only the Environment contract's allowed packages plus the Python standard library.",
+                "Do not propose unavailable frameworks, package installation, or approaches that require imports outside the allowed package list.",
+                "Do not use score_val for training, calibration, model selection, threshold tuning, debugging, or metric reporting; plans may only generate score_val predictions for BioMaker's external evaluator.",
                 "Let the task/data/evaluator facts determine the strategy; do not satisfy arbitrary category quotas.",
                 "Make plans substantively different in their task-relevant idea or evidence path, not by forcing arbitrary categories.",
                 "Avoid duplicating existing root draft plans.",

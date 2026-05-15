@@ -39,11 +39,10 @@ TABLE_SUFFIXES = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".jsonl"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 GENERATED_DIR_NAMES = {
     "biomaker_splits",
-    "biomaker_cache",
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 3
+SPLIT_BUILDER_CACHE_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -396,7 +395,7 @@ def _builder_user_prompt(
             "private_gt/test.csv: private test rows with hidden answers retained when private answers exist.",
             'private_gt/private_gt.json: hidden-answer index with keys score_val and test. Each entry must contain answer_columns, for example {"score_val":{"answer_columns":["label"]},"test":{"answer_columns":["label"]}}.',
             "split_manifest.json: structured data contract for the prepared task.",
-            "public/: optional generated agent-visible files such as anonymized images or copied inputs; CSV paths may reference this directory.",
+            "public/: optional generated agent-visible files only when a derived/converted/anonymized public artifact is truly needed; CSV paths may reference this directory.",
         ],
         "Required split_manifest.json Fields": [
             "manifest_version: integer 1.",
@@ -426,6 +425,8 @@ def _builder_user_prompt(
             "If a column is computed from the answer, hide it from public score/test files too.",
             "Make your semantic assumptions explicit in split_manifest.json; do not leave task type, key columns, sample unit, or class/mask/box schema implicit.",
             "The public and private CSV files are the source of truth for row-level membership; do not create a per-sample sample_universe list for ordinary row-based datasets.",
+            "Prefer references to existing files under --input-dir in split CSVs; do not copy existing input files or directories into public/ just to make paths convenient.",
+            "Only write public/ for genuinely derived, converted, or anonymized files that do not already exist under --input-dir.",
             "Do not create modeling code; only prepare split files.",
             "Keep the implementation short and direct.",
         ],
@@ -592,6 +593,68 @@ def _check_source_coverage(
         )
 
 
+def _file_digest(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _check_generated_public_does_not_copy_inputs(
+    output_dir: Path, source_input_dir: Path | None, errors: list[str]
+) -> None:
+    if source_input_dir is None:
+        return
+    public_dir = output_dir / "public"
+    if not public_dir.is_dir():
+        return
+    source_by_size: dict[int, list[Path]] = {}
+    for source_path in source_input_dir.rglob("*"):
+        if not source_path.is_file() or _inside_generated_dir(source_path):
+            continue
+        try:
+            size = source_path.stat().st_size
+        except OSError:
+            continue
+        source_by_size.setdefault(size, []).append(source_path)
+
+    copied: list[str] = []
+    source_digest_cache: dict[Path, str | None] = {}
+    for public_path in public_dir.rglob("*"):
+        if not public_path.is_file():
+            continue
+        try:
+            candidates = source_by_size.get(public_path.stat().st_size, [])
+        except OSError:
+            continue
+        if not candidates:
+            continue
+        public_digest = _file_digest(public_path)
+        if public_digest is None:
+            continue
+        for source_path in candidates:
+            if source_path not in source_digest_cache:
+                source_digest_cache[source_path] = _file_digest(source_path)
+            if source_digest_cache[source_path] != public_digest:
+                continue
+            copied.append(
+                f"public/{public_path.relative_to(public_dir)} duplicates source input `{_relative(source_path, source_input_dir)}`"
+            )
+            break
+        if len(copied) >= 5:
+            break
+    if copied:
+        errors.append(
+            "public/ must contain only genuinely derived, converted, or anonymized files; "
+            "do not copy existing --input-dir files into public/. Examples: "
+            + "; ".join(copied)
+        )
+
+
 def verify_split_package(
     output_dir: Path,
     source_input_dir: Path | None = None,
@@ -741,6 +804,7 @@ def verify_split_package(
         _check_referenced_paths(df, name, output_dir, source_input_dir, errors)
     if facts is not None:
         _check_source_coverage(facts, row_counts, errors)
+    _check_generated_public_does_not_copy_inputs(output_dir, source_input_dir, errors)
     if not split_manifest:
         split_manifest = legacy_manifest(
             output_dir, private_gt=manifest, row_counts=row_counts

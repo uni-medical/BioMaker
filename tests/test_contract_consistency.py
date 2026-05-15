@@ -13,6 +13,7 @@ from unittest.mock import patch
 import numpy as np
 from rich.console import Console
 
+from biomaker.backend import compile_prompt_to_md
 from biomaker.agents.base_agent import BaseAgent, parse_factual_exec_result
 from biomaker.agents.proposal_agent import ProposalAgent
 from biomaker.interpreter import ExecutionResult, Interpreter
@@ -71,6 +72,23 @@ class ContractConsistencyTests(unittest.TestCase):
         console = Console(file=output, force_terminal=False, width=100)
         console.print(journal_to_rich_tree(SimpleNamespace(nodes=nodes)))
         return output.getvalue()
+
+    def test_prompt_compiler_handles_structured_numeric_lists(self) -> None:
+        prompt = {
+            "Experiment Guide": {
+                "array_profile": {
+                    "shape": [224, 224, 3],
+                    "examples": [[224, 224, 3]],
+                    "counts": {"0": 2, "1": 3},
+                }
+            }
+        }
+
+        rendered = compile_prompt_to_md(prompt)
+
+        self.assertIn("- 224", rendered)
+        self.assertIn("## array_profile", rendered)
+        self.assertIn("### shape", rendered)
 
     def test_live_tree_best_uses_only_committed_nodes(self) -> None:
         committed = Node(code="print('committed')")

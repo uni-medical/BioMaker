@@ -32,10 +32,13 @@ except OverflowError:
     csv.field_size_limit(2**31 - 1)
 
 
+SHARED_CONSOLE = Console(file=sys.stderr, stderr=True)
+
+
 class RichLogHandler(RichHandler):
     def __init__(self, *args, **kwargs):
+        kwargs.setdefault("console", SHARED_CONSOLE)
         super().__init__(*args, **kwargs)
-        self.console = Console(file=sys.stderr, stderr=True)
 
     def emit(self, record):
         # Check if the message is a Rich object
@@ -109,15 +112,13 @@ class ExecConfig:
 
 
 @dataclass
-class InputCacheConfig:
+class EvaluatorCacheConfig:
     enabled: bool
-    decode_arrays: bool
-    reuse: bool
 
 
 @dataclass
-class EvaluatorCacheConfig:
-    enabled: bool
+class SplitBuilderConfig:
+    attempts: int
 
 
 @dataclass
@@ -144,8 +145,8 @@ class Config(Hashable):
     exp_name: str
 
     exec: ExecConfig
-    input_cache: InputCacheConfig
     evaluator_cache: EvaluatorCacheConfig
+    split_builder: SplitBuilderConfig
     final_retrain: FinalRetrainConfig
     generate_report: bool
     report: StageConfig
@@ -183,6 +184,13 @@ def _validate_exec_config(cfg: Config) -> None:
         value = getattr(exec_cfg, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"exec.{name} must be an integer >= 1, got {value!r}.")
+    split_builder_cfg = getattr(cfg, "split_builder", None)
+    if split_builder_cfg is not None:
+        attempts = split_builder_cfg.attempts
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+            raise ValueError(
+                f"split_builder.attempts must be an integer >= 1, got {attempts!r}."
+            )
 
 
 def load_cfg(path: Path = Path(__file__).parent / "config.yaml") -> Config:
@@ -352,7 +360,6 @@ def prep_agent_workspace(cfg: Config):
     use_symlinks = (not cfg.copy_data) and (not cfg.preprocess_data)
     generated_input_names = {
         "biomaker_splits",
-        "biomaker_cache",
         "private_gt",
         "_split_builder",
     }

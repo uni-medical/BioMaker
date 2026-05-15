@@ -179,6 +179,7 @@ def _evaluator_prompt(
             "test_submission must be exactly './working/submission.csv'.",
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
             "The candidate validation artifact must contain predictions for rows in the Experiment guide's score validation split, usually ./input/biomaker_splits/score_val.csv and sometimes legacy ./input/biomaker_splits/agent_val.csv.",
+            "When resolving file paths from split CSVs or hidden truth, values starting with `input/` or `./input/` are already workspace-relative paths; do not prepend `./input` a second time.",
             "The candidate validation artifact must follow the same public prediction contract as the test submission: key_columns plus prediction_columns only. Do not require candidates to output validation ground-truth columns such as label, class, target, or true_class. score_val() must load hidden score labels from os.environ['BIOMAKER_SCORE_VAL_PATH'] and align them to the validation artifact by key columns.",
             "When reading candidate artifacts, validate the required columns and then restrict the dataframe to key_columns plus prediction_columns before merging with ground truth. Extra candidate columns such as class, label, target, or true_class must not collide with ground-truth columns or change scoring.",
             "For tabular score_val(), use this safe merge pattern: copy the hidden ground-truth label column to a private column named `y_true_private`, build `truth_view = hidden_answers[key_columns + ['y_true_private']]`, build `pred_view = predictions[key_columns + prediction_columns]`, convert every key column in both views to string before merging, merge those restricted views only, and read labels with dataframe/series indexing such as `merged['y_true_private']` or `row['y_true_private']`. Never rely on tuple attribute access for helper columns, and never read `merged['class']`, `merged['label']`, `merged['target']`, or candidate-supplied label-like columns after merge.",
@@ -950,7 +951,14 @@ def _manifest_key_columns(manifest: dict[str, Any]) -> list[str]:
 def _manifest_primary_metric(manifest: dict[str, Any]) -> str | None:
     metric_contract = manifest.get("metric_contract")
     if isinstance(metric_contract, dict) and metric_contract.get("primary_metric"):
-        return str(metric_contract["primary_metric"])
+        metric = metric_contract["primary_metric"]
+        if isinstance(metric, dict):
+            for key in ("name", "metric", "id"):
+                value = metric.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return None
+        return str(metric)
     return None
 
 
@@ -1505,16 +1513,35 @@ def _infer_fixed_segmentation_spec(
         raw_image_column = columns_plan.get("path") or columns_plan.get("image")
         if isinstance(raw_image_column, str):
             image_column = raw_image_column
-    if image_column not in set(map(str, score_df.columns)) | set(
-        map(str, test_df.columns)
+    public_columns = set(map(str, score_df.columns)) | set(map(str, test_df.columns))
+    public_frames = [score_df, test_df]
+    if image_column not in public_columns or not any(
+        image_column in frame.columns and _looks_like_file_values(frame[image_column])
+        for frame in public_frames
     ):
-        for column in list(score_df.columns) + list(test_df.columns):
-            name = str(column).lower()
-            if ("image" in name or "path" in name or "file" in name) and str(
-                column
-            ) != answer_column:
-                image_column = str(column)
-                break
+        image_column = None
+        candidates: list[tuple[int, int, str]] = []
+        seen_columns: set[str] = set()
+        for order, column in enumerate(list(score_df.columns) + list(test_df.columns)):
+            column = str(column)
+            if column in seen_columns:
+                continue
+            seen_columns.add(column)
+            if column == answer_column or column in key_columns:
+                continue
+            name = column.lower()
+            if not any(token in name for token in ("image", "path", "file")):
+                continue
+            if not any(
+                column in frame.columns and _looks_like_file_values(frame[column])
+                for frame in public_frames
+            ):
+                continue
+            priority = 0 if ("path" in name or "file" in name) else 1
+            candidates.append((priority, order, column))
+        if candidates:
+            candidates.sort()
+            image_column = candidates[0][2]
 
     primary_metric = str(
         _manifest_primary_metric(split_manifest)

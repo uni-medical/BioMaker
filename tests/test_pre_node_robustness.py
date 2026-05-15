@@ -28,6 +28,7 @@ from biomaker.utils.agentic_data_planner import (
 from biomaker.utils.split_protocol import (
     _make_private_paths_evaluator_visible,
     _normalize_split_paths_in_dir,
+    sanitize_agent_visible_input,
 )
 
 
@@ -273,11 +274,60 @@ class PreNodeRobustnessTests(unittest.TestCase):
             self.assertIsNotNone(spec)
             self.assertEqual(spec["task_type"], "segmentation_3d")
 
-    def test_malformed_split_and_cache_are_reported_without_crashing(self) -> None:
+    def test_fixed_segmentation_accepts_structured_metric_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            split_dir = workspace / "input" / "biomaker_splits"
+            hidden = root / "logs" / "run" / "private_gt" / "score_val.csv"
+            _write_csv(
+                split_dir / "agent_train.csv",
+                [{"image_id": "train", "image_path": "input/public/train.png"}],
+            )
+            _write_csv(
+                split_dir / "score_val.csv",
+                [{"image_id": "val", "image_path": "input/public/val.png"}],
+            )
+            _write_csv(
+                split_dir / "agent_test.csv",
+                [{"image_id": "test", "image_path": "input/public/test.png"}],
+            )
+            _write_csv(
+                hidden,
+                [{"image_id": "val", "mask_path": "private_gt/val_mask.png"}],
+            )
+            _write_json(
+                split_dir / "split_manifest.json",
+                {
+                    "manifest_version": 1,
+                    "sample_unit": "image",
+                    "key_columns": ["image_id"],
+                    "task_heads": [{"type": "segmentation_2d"}],
+                    "metric_contract": {
+                        "primary_metric": {"name": "AJI", "maximize": True}
+                    },
+                    "hidden_answers": {"score_val": {"answer_columns": ["mask_path"]}},
+                },
+            )
+            _write_json(
+                split_dir / "split_plan.json",
+                {
+                    "hidden_answers": {"score_val": {"answer_columns": ["mask_path"]}},
+                    "columns": {"path": "image_path", "mask": "mask_path"},
+                },
+            )
+
+            spec = _infer_fixed_segmentation_spec(workspace, hidden)
+
+            self.assertIsNotNone(spec)
+            self.assertEqual(spec["primary_metric"], "AJI")
+            self.assertEqual(spec["key_columns"], ["image_id"])
+            self.assertEqual(spec["image_column"], "image_path")
+
+    def test_malformed_split_is_reported_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "workspace"
             split_dir = workspace / "input" / "biomaker_splits"
-            cache_dir = workspace / "input" / "biomaker_cache"
             split_dir.mkdir(parents=True)
             (split_dir / "agent_train.csv").write_text(
                 'Id,class,path\n1,0,"unterminated\n', encoding="utf-8"
@@ -292,36 +342,12 @@ class PreNodeRobustnessTests(unittest.TestCase):
                     "task_type": "binary",
                 },
             )
-            _write_json(
-                cache_dir / "manifest.json",
-                {
-                    "files_total": 2,
-                    "arrays_decoded": 1,
-                    "errors": 1,
-                    "decode_arrays": True,
-                },
-            )
-            _write_csv(
-                cache_dir / "files.csv",
-                [
-                    {
-                        "original_path": "input/images/a.png",
-                        "cache_array_path": "input/biomaker_cache/a.npy",
-                        "status": "decoded",
-                        "sha256": "abc",
-                    }
-                ],
-            )
 
             guide = build_exp_guide(workspace)
             self.assertIn("read_error", guide["splits"]["train"])
-            self.assertEqual(
-                guide["cache"]["path_mapping"]["cache_array_column"],
-                "cache_array_path",
-            )
+            self.assertNotIn("cache", guide)
             text = data_and_evaluation_summary(workspace)
             self.assertIn("could not be read", text)
-            self.assertIn("cache_array_path", text)
 
     def test_agentic_split_verifier_catches_source_undercoverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -351,6 +377,38 @@ class PreNodeRobustnessTests(unittest.TestCase):
             )
             self.assertFalse(verifier["ok"])
             self.assertIn("cover only part", "\n".join(verifier["errors"]))
+
+    def test_agentic_split_verifier_rejects_public_copied_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            output = root / "package"
+            _write_png(source / "images" / "case.png", value=7)
+            _write_png(output / "public" / "images" / "case.png", value=7)
+            _write_csv(
+                output / "biomaker_splits" / "agent_train.csv",
+                [{"case_id": "train", "image": "public/images/case.png", "label": 0}],
+            )
+            _write_csv(
+                output / "biomaker_splits" / "score_val.csv",
+                [{"case_id": "val", "image": "public/images/case.png"}],
+            )
+            _write_csv(
+                output / "private_gt" / "score_val.csv",
+                [{"case_id": "val", "image": "public/images/case.png", "label": 1}],
+            )
+            _write_json(
+                output / "private_gt" / "private_gt.json",
+                {"score_val": {"answer_columns": ["label"]}},
+            )
+
+            verifier = verify_split_package(output, source_input_dir=source)
+
+            self.assertFalse(verifier["ok"])
+            self.assertIn(
+                "do not copy existing --input-dir files into public/",
+                "\n".join(verifier["errors"]),
+            )
 
     def test_split_manifest_sample_universe_is_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -550,6 +608,106 @@ class PreNodeRobustnessTests(unittest.TestCase):
             self.assertEqual(private_row["image"], "input/PNGImages/case.png")
             self.assertTrue(Path(private_row["mask"]).is_absolute())
             self.assertTrue(Path(private_row["mask"]).exists())
+
+    def test_agent_visible_input_sanitizer_removes_source_label_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            workspace = root / "workspace"
+            input_dir = workspace / "input"
+            split_dir = input_dir / "biomaker_splits"
+            input_dir.mkdir(parents=True)
+            _write_png(dataset / "train_png" / "1.png", value=1)
+            _write_png(dataset / "val_png" / "1.png", value=2)
+            _write_png(dataset / "test_png" / "1.png", value=3)
+            _write_csv(dataset / "train.csv", [{"Id": "train_1", "class": 0}])
+            _write_csv(dataset / "val.csv", [{"Id": "val_1", "class": 1}])
+            _write_csv(dataset / "test.csv", [{"Id": "test_1", "class": 1}])
+            (dataset / "data_description.txt").write_text(
+                "classification task\n", encoding="utf-8"
+            )
+            for child in dataset.iterdir():
+                os.symlink(child.resolve(), input_dir / child.name)
+
+            _write_csv(
+                split_dir / "agent_train.csv",
+                [{"Id": "train_1", "class": 0, "path": "input/train_png/1.png"}],
+            )
+            _write_csv(
+                split_dir / "score_val.csv",
+                [{"Id": "val_1", "path": "input/val_png/1.png"}],
+            )
+            _write_csv(
+                split_dir / "agent_test.csv",
+                [{"Id": "test_1", "path": "input/test_png/1.png"}],
+            )
+
+            summary = sanitize_agent_visible_input(input_dir, split_dir)
+
+            self.assertEqual(summary["referenced_files"], 3)
+            self.assertTrue(
+                (input_dir / "biomaker_splits" / "agent_train.csv").is_file()
+            )
+            self.assertTrue((input_dir / "train_png" / "1.png").is_file())
+            self.assertTrue((input_dir / "val_png" / "1.png").is_file())
+            self.assertTrue((input_dir / "test_png" / "1.png").is_file())
+            self.assertTrue((input_dir / "train_png").is_symlink())
+            self.assertTrue((input_dir / "data_description.txt").is_file())
+            self.assertFalse((input_dir / "train.csv").exists())
+            self.assertFalse((input_dir / "val.csv").exists())
+            self.assertFalse((input_dir / "test.csv").exists())
+
+    def test_agent_visible_input_sanitizer_keeps_only_referenced_masks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            workspace = root / "workspace"
+            input_dir = workspace / "input"
+            split_dir = input_dir / "biomaker_splits"
+            input_dir.mkdir(parents=True)
+            _write_png(dataset / "DATA" / "train.png", value=1)
+            _write_png(dataset / "DATA" / "val.png", value=2)
+            _write_png(dataset / "DATA" / "test.png", value=3)
+            _write_png(dataset / "MASK" / "train.png", value=4)
+            _write_png(dataset / "MASK" / "val.png", value=5)
+            _write_png(dataset / "MASK" / "test.png", value=6)
+            _write_csv(
+                dataset / "metadata.csv",
+                [
+                    {"Id": "train", "mask_path": "MASK/train.png"},
+                    {"Id": "val", "mask_path": "MASK/val.png"},
+                    {"Id": "test", "mask_path": "MASK/test.png"},
+                ],
+            )
+            for child in dataset.iterdir():
+                os.symlink(child.resolve(), input_dir / child.name)
+
+            _write_csv(
+                split_dir / "agent_train.csv",
+                [
+                    {
+                        "Id": "train",
+                        "image_path": "input/DATA/train.png",
+                        "mask_path": "input/MASK/train.png",
+                    }
+                ],
+            )
+            _write_csv(
+                split_dir / "score_val.csv",
+                [{"Id": "val", "image_path": "input/DATA/val.png"}],
+            )
+            _write_csv(
+                split_dir / "agent_test.csv",
+                [{"Id": "test", "image_path": "input/DATA/test.png"}],
+            )
+
+            sanitize_agent_visible_input(input_dir, split_dir)
+
+            self.assertTrue((input_dir / "MASK" / "train.png").is_file())
+            self.assertFalse((input_dir / "MASK").is_symlink())
+            self.assertFalse((input_dir / "MASK" / "val.png").exists())
+            self.assertFalse((input_dir / "MASK" / "test.png").exists())
+            self.assertFalse((input_dir / "metadata.csv").exists())
 
     def test_local_current_runs_and_experiments_pre_node_contracts(self) -> None:
         repo = Path(__file__).resolve().parents[1]

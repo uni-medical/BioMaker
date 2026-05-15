@@ -33,7 +33,6 @@ excluded_dirs = {
     "working",
     "node_workspaces",
     "biomaker_splits",
-    "biomaker_cache",
     "_split_builder",
 }
 excluded_files = {"evaluator_prediction_spec.json", "exp_guide.json"}
@@ -220,106 +219,6 @@ def _append_samples(lines: list[str], guide: dict[str, Any]) -> None:
             )
 
 
-def _append_cache(lines: list[str], guide: dict[str, Any]) -> None:
-    cache = _as_dict(guide.get("cache"))
-    if not cache:
-        return
-    lines.extend(
-        [
-            "",
-            "Input cache:",
-            "- `./input/biomaker_cache/files.csv`: "
-            f"files={cache.get('files_total', 'unknown')}, "
-            f"decoded_arrays={cache.get('arrays_decoded', 'unknown')}, "
-            f"errors={cache.get('errors', 'unknown')}.",
-        ]
-    )
-    if cache.get("index_columns"):
-        lines.append(f"- cache index columns: {cache['index_columns']}")
-    mapping = _as_dict(cache.get("path_mapping"))
-    if mapping:
-        source_col = mapping.get("source_path_column", "original_path")
-        cache_col = mapping.get("cache_array_column", "cache_array_path")
-        lines.append(
-            f"- Match dataset path values to `{source_col}`; use `{cache_col}` "
-            "when it is non-empty, otherwise read the original file path."
-        )
-        if mapping.get("usable_status"):
-            lines.append(
-                f"- Cached arrays are usable for rows whose `status` is "
-                f"`{mapping['usable_status']}`."
-            )
-    lines.append(
-        "- Original files remain available; the cache is only an optional faster loading path."
-    )
-    array_profiles = _as_dict(cache.get("array_profiles"))
-    if not array_profiles:
-        return
-    lines.extend(["", "Cached array profile:"])
-    max_rank = 0
-    max_size_mb = 0.0
-    rank3_volume_like = False
-    for name in sorted(array_profiles):
-        profile = _as_dict(array_profiles.get(name))
-        shape_summary = _as_dict(profile.get("shape_summary"))
-        ranks = shape_summary.get("ranks") or []
-        if ranks:
-            try:
-                max_rank = max(max_rank, max(int(rank) for rank in ranks))
-            except Exception:
-                pass
-        dim_ranges = shape_summary.get("dim_ranges") or []
-        examples = shape_summary.get("examples") or []
-        dtypes = _as_dict(profile.get("dtypes"))
-        readers = _as_dict(profile.get("readers"))
-        size_mb = _as_dict(profile.get("size_mb"))
-        if size_mb.get("max") is not None:
-            try:
-                max_size_mb = max(max_size_mb, float(size_mb["max"]))
-            except Exception:
-                pass
-        if ranks == [3]:
-            examples_look_channel_free = all(
-                isinstance(example, list)
-                and len(example) == 3
-                and min(int(dim) for dim in example) > 4
-                for example in examples
-            )
-            if "SimpleITK" in readers or examples_look_channel_free:
-                rank3_volume_like = True
-        dim_text = "; ".join(
-            f"d{idx}=min/med/max {dim.get('min')}/{dim.get('median')}/{dim.get('max')}"
-            for idx, dim in enumerate(dim_ranges[:4])
-            if isinstance(dim, dict)
-        )
-        size_text = ""
-        if size_mb:
-            size_text = (
-                f"; size_mb=min/med/max "
-                f"{size_mb.get('min')}/{size_mb.get('median')}/{size_mb.get('max')}"
-            )
-        lines.append(
-            f"- `{name}`: decoded_rows={profile.get('decoded_rows', 'unknown')}; "
-            f"profiled_rows={profile.get('profiled_rows', 'unknown')}; "
-            f"readers={readers}; dtypes={dtypes}; ranks={ranks}; "
-            f"{dim_text}; examples={examples}{size_text}"
-        )
-    cautions = []
-    if max_rank >= 3 and max_size_mb >= 50:
-        cautions.append(
-            "large 3D arrays are present; root drafts should cap slices/patches/epochs "
-            "and avoid exhaustive full-volume processing."
-        )
-    if rank3_volume_like:
-        cautions.append(
-            "rank-3 array groups without an obvious small channel axis are present; "
-            "do not treat them as HWC/RGB images by default, and explicitly adapt "
-            "channels when using 2D pretrained image models."
-        )
-    if cautions:
-        lines.extend(["", "Data-shape cautions:"])
-        lines.extend(f"- {caution}" for caution in cautions)
-
 
 def _render_exp_guide_summary(guide: dict[str, Any], base_path: Path) -> str:
     lines = [
@@ -334,7 +233,6 @@ def _render_exp_guide_summary(guide: dict[str, Any], base_path: Path) -> str:
     _append_split_profiles(lines, guide)
     _append_hidden_answers(lines, guide)
     _append_samples(lines, guide)
-    _append_cache(lines, guide)
     _append_input_tree(lines, base_path / "input")
     return "\n".join(lines)
 
