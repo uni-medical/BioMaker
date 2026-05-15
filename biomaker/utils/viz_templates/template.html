@@ -170,6 +170,29 @@
         line-height: 1.45;
         white-space: pre;
       }
+      .code-with-lines {
+        padding: 0;
+      }
+      .code-with-lines code {
+        display: block;
+      }
+      .code-line {
+        display: grid;
+        grid-template-columns: 4.5ch minmax(0, 1fr);
+        min-width: max-content;
+      }
+      .line-number {
+        background-color: #1a1d24;
+        border-right: 1px solid #3a404b;
+        color: #7f8797;
+        padding: 0 8px 0 6px;
+        text-align: right;
+        user-select: none;
+      }
+      .line-content {
+        padding-left: 10px;
+        white-space: pre;
+      }
       .best-pill {
         display: inline-block;
         color: #201b09;
@@ -212,7 +235,7 @@
       </details>
       <details>
         <summary>Code</summary>
-        <pre><code id="code" class="language-python"></code></pre>
+        <div id="code"></div>
       </details>
       <details>
         <summary>Execution Output</summary>

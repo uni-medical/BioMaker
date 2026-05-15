@@ -59,6 +59,27 @@ const promptTokenText = (stats) => {
   return "n/a";
 };
 
+const renderCodeBlock = (code) => {
+  const text = String(code || "");
+  if (!text) return '<p class="muted">No code recorded for this node.</p>';
+  const lines = text.replace(/\n$/, "").split("\n");
+  const rows = lines
+    .map((line, index) => {
+      const highlighted = hljs.highlight(line || " ", {
+        language: "python",
+        ignoreIllegals: true,
+      }).value;
+      return `
+        <span class="code-line">
+          <span class="line-number">${index + 1}</span>
+          <span class="line-content">${highlighted || "&nbsp;"}</span>
+        </span>
+      `;
+    })
+    .join("");
+  return `<pre class="code-with-lines"><code class="language-python">${rows}</code></pre>`;
+};
+
 const renderPromptSections = (sections) => {
   if (!Array.isArray(sections) || sections.length === 0) {
     return '<p class="muted">No prompt sections were saved for this node.</p>';
@@ -175,7 +196,7 @@ const renderDetailRecordBody = (record) => {
       </details>
       <details class="prompt-section">
         <summary>Code</summary>
-        <pre><code class="language-python">${escapeHtml(parsed.code)}</code></pre>
+        ${renderCodeBlock(parsed.code)}
       </details>
       ${
         parsed.output
@@ -303,16 +324,13 @@ const setNodeDetails = (treeInd) => {
         ${metricLine("output tokens", formatNumber(stats.output_tokens))}
       </div>
       ${summary.is_best ? '<p class="best-pill">best node</p>' : ""}
-      ${summary.error ? `<h3>Error</h3><pre>${escapeHtml(summary.error)}</pre>` : ""}
     `;
   }
 
   const codeElm = document.getElementById("code");
   if (codeElm) {
     const code = treeStructData.code[treeInd] || "";
-    codeElm.innerHTML = code
-      ? hljs.highlight(code, { language: "python" }).value
-      : "";
+    codeElm.innerHTML = renderCodeBlock(code);
   }
 
   const outputElm = document.getElementById("output");

@@ -231,6 +231,12 @@ class BaseAgent:
 
     @property
     def _prompt_impl_guideline(self):
+        per_node_timeout = getattr(getattr(self.cfg, "exec", None), "timeout", None)
+        timeout_text = (
+            f"{per_node_timeout} seconds"
+            if per_node_timeout is not None
+            else "the configured per-node timeout"
+        )
         impl_guideline = [
             "The code should **implement the proposed solution** and write final validation predictions in the format required by `./evaluator.py`.",
             "The code should be a single-file python program that is self-contained and can be executed as-is.",
@@ -241,7 +247,7 @@ class BaseAgent:
             "You may use pretrained model weights from installed libraries when useful, including downloading those weights at runtime. Do not install packages or modify the uv environment.",
             "Use observed validation metric, runtime, and resource history when deciding training budget; if you change the budget, make it an explicit part of the proposed experiment.",
             "When relevant, consider reducing execution time and improving GPU utilization while preserving validation quality.",
-            "The per-node execution timeout is a hard safety limit, not a target budget. Choose the experiment scale from the task, data, observed validation metric, runtime, and resource history.",
+            f"The per-node execution timeout is {timeout_text}. This is a hard safety limit, not a target budget. Choose the experiment scale from the task, data, observed validation metric, runtime, and resource history so the full script is likely to finish well before the timeout.",
             'All the provided input data is stored in "./input" directory.',
             "When building data loading code, base it on the actual existing data files rather than relying entirely on the annotation file.",
             "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` for score-validation predictions and `./working/submission.csv`.",
