@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/BioMaker_logo.png" alt="BioMaker" width="720">
+</p>
+
 # Introduction
 **BioMaker** is an agentic development system for biomedical image analysis.
 
