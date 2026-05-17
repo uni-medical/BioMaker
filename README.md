@@ -24,8 +24,8 @@ We recommend using `uv` to manage the environment and dependencies.
 
 2. **Clone the repository**:
      ```bash
-     git clone https://github.com/uni-medical/CREA
-     cd CREA
+     git clone https://github.com/uni-medical/BioMaker
+     cd BioMaker
      ```
 
 3. **Create and sync a Python 3.11 environment**:
