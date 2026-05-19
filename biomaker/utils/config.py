@@ -124,7 +124,6 @@ class SplitBuilderConfig:
 @dataclass
 class FinalRetrainConfig:
     enabled: bool
-    timeout: int | None
 
 
 @dataclass

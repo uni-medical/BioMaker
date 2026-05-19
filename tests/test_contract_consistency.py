@@ -21,6 +21,7 @@ from biomaker.journal import Journal, Node
 from biomaker.tools.python_probe import python_probe
 from biomaker.run import (
     _freeze_generation_inputs,
+    _final_retrain_timeout_seconds,
     _private_metrics_summary,
     _remaining_schedule_budget,
     _run_overview_text,
@@ -539,6 +540,11 @@ class ContractConsistencyTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             _validate_exec_config(SimpleNamespace(exec=invalid_exec))
+
+    def test_final_retrain_timeout_is_one_and_half_node_timeout(self) -> None:
+        cfg = SimpleNamespace(exec=SimpleNamespace(timeout=601))
+
+        self.assertEqual(_final_retrain_timeout_seconds(cfg), 902)
 
     def test_split_builder_retries_response_without_code_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

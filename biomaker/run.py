@@ -441,6 +441,10 @@ def _append_private_metrics_entry(cfg, entry: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _final_retrain_timeout_seconds(cfg: Config) -> int:
+    return (cfg.exec.timeout * 3 + 1) // 2
+
+
 def _finite_number(value) -> float | None:
     if isinstance(value, bool):
         return None
@@ -1371,7 +1375,7 @@ def run():
         executor.shutdown(wait=True)
     best_node = journal.get_best_node(only_good=True)
     if cfg.final_retrain.enabled and best_node is not None and not end_with_exception:
-        retrain_timeout = cfg.final_retrain.timeout or cfg.exec.timeout
+        retrain_timeout = _final_retrain_timeout_seconds(cfg)
         append_event(
             cfg.log_dir,
             "final_retrain_started",

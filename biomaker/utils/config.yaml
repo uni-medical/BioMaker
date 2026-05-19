@@ -36,8 +36,6 @@ split_builder:
 # retrain and does not affect node selection.
 final_retrain:
   enabled: True
-  # Null uses exec.timeout.
-  timeout: null
 
 # agent hyperparams
 agent:
