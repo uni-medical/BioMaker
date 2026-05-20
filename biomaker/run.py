@@ -29,6 +29,7 @@ from .utils.artifact_validation import (
 )
 from .utils import tree_export
 from .utils.config import (
+    Config,
     SHARED_CONSOLE,
     load_cfg,
     load_task_desc,
