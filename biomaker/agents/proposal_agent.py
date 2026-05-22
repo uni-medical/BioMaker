@@ -106,11 +106,11 @@ tool_request_func_spec = FunctionSpec(
                             "description": "Brief reason this information is needed.",
                         },
                         "query": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "Search query for search_docs or web_search. Do not include local sample values, file paths, experiment metrics, or private task text.",
                         },
                         "code": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "Short read-only Python snippet for inspect_api.",
                         },
                     },
@@ -453,7 +453,22 @@ class ProposalAgent(BaseAgent):
         requests = response.get("requests", [])
         if not isinstance(requests, list):
             return []
-        return [request for request in requests if isinstance(request, dict)]
+        normalized_requests = []
+        for request in requests:
+            if not isinstance(request, dict):
+                continue
+            tool = str(request.get("tool") or "").strip()
+            if tool not in {"inspect_api", "search_docs", "web_search"}:
+                continue
+            normalized_requests.append(
+                {
+                    "tool": tool,
+                    "reason": str(request.get("reason") or "").strip(),
+                    "query": str(request.get("query") or "").strip(),
+                    "code": str(request.get("code") or "").strip(),
+                }
+            )
+        return normalized_requests
 
     def _execute_node_tool(
         self, request: dict[str, Any], prompt: dict[str, Any] | None = None

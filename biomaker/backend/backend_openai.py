@@ -116,7 +116,12 @@ def query(
     )
     req_time = time.time() - t0
 
-    choice = completion.choices[0]
+    choices = getattr(completion, "choices", None)
+    if not choices:
+        raise RuntimeError(
+            "OpenAI completion failed after retries; no completion choices were returned."
+        )
+    choice = choices[0]
 
     if func_spec is None:
         output = choice.message.content

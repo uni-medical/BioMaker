@@ -13,6 +13,8 @@ from unittest.mock import patch
 import numpy as np
 from rich.console import Console
 
+import biomaker.backend.backend_openai as backend_openai
+import biomaker.agents.proposal_agent as proposal_agent
 from biomaker.backend import compile_prompt_to_md
 from biomaker.agents.base_agent import BaseAgent, parse_factual_exec_result
 from biomaker.agents.proposal_agent import ProposalAgent
@@ -90,6 +92,59 @@ class ContractConsistencyTests(unittest.TestCase):
         self.assertIn("- 224", rendered)
         self.assertIn("## array_profile", rendered)
         self.assertIn("### shape", rendered)
+
+    def test_openai_backend_rejects_failed_completion_sentinel(self) -> None:
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **kwargs: None)
+            )
+        )
+
+        with (
+            patch.object(backend_openai, "_setup_openai_client", return_value=None),
+            patch.object(backend_openai, "_client", fake_client),
+            patch.object(backend_openai, "backoff_create", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no completion choices"):
+                backend_openai.query("system", "user", model="test-model")
+
+    def test_node_tool_requests_normalize_nullable_optional_fields(self) -> None:
+        cfg = SimpleNamespace(
+            workspace_dir=Path("."),
+            log_dir=Path("."),
+            exec=SimpleNamespace(include_medical_packages=True),
+            agent=SimpleNamespace(
+                data_summary=False,
+                enable_node_tools=True,
+                max_node_tool_calls=4,
+                code=SimpleNamespace(model="test-model"),
+            ),
+        )
+        agent = ProposalAgent("task", cfg, Journal())  # type: ignore[arg-type]
+        agent.data_summary = "summary"
+
+        with patch.object(
+            proposal_agent,
+            "query",
+            return_value={
+                "requests": [
+                    {
+                        "tool": "inspect_api",
+                        "reason": None,
+                        "query": None,
+                        "code": None,
+                    },
+                    {"tool": "unknown", "reason": "ignored"},
+                    "not a request",
+                ]
+            },
+        ):
+            requests = agent._request_node_tools("draft", {})
+
+        self.assertEqual(
+            requests,
+            [{"tool": "inspect_api", "reason": "", "query": "", "code": ""}],
+        )
 
     def test_live_tree_best_uses_only_committed_nodes(self) -> None:
         committed = Node(code="print('committed')")
