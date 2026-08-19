@@ -78,7 +78,7 @@ Download command:
 ```
 uv run hf download blueyo0/organmnist3d --local-dir dataset/organmnist3d --repo-type dataset
 ```
-Then run the `quick_start.sh` to test (It may take 1-2 hours, and make sure your GPU memory is over 12 GB):
+Then run `quick_start.sh` to test. BioMaker adapts the model and training scale to the available hardware (CPU, Apple MPS, or CUDA GPU):
 ```
 bash quick_start.sh
 ```
