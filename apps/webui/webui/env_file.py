@@ -35,6 +35,9 @@ FILE_AUTHORITATIVE_ENV_KEYS = (*SECRET_ENV_KEYS, "OPENAI_BASE_URL")
 # Kept as a public alias for callers that used the original name.
 MANAGED_ENV_KEYS = EDITABLE_ENV_KEYS
 
+SECRET_MASK = "•" * 8
+VISIBLE_SECRET_PREFIXES = ("sk-", "sk_", "jina_", "jina-")
+
 
 def _assignment_pattern(key: str) -> re.Pattern[str]:
     return re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=")
@@ -70,7 +73,10 @@ def read_managed_values(path: Path) -> dict[str, str]:
 def mask_value(value: str) -> str:
     if not value:
         return ""
-    return "********"
+    prefix = next(
+        (prefix for prefix in VISIBLE_SECRET_PREFIXES if value.startswith(prefix)), ""
+    )
+    return f"{prefix}{SECRET_MASK}"
 
 
 def masked_env(path: Path) -> dict[str, dict[str, str | bool]]:

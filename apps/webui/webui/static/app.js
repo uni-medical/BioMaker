@@ -1,5 +1,11 @@
 "use strict";
 
+const PREFERRED_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
+const PREFERRED_MODEL = PREFERRED_MODELS[0];
+const MAX_MODEL_SUGGESTIONS = 8;
+let secretReadGeneration = 0;
+let modelDiscoveryGeneration = 0;
+
 const DEFAULT_OPTIONS = {
   model_for_all_agents: null,
   agent_steps: 35,
@@ -19,6 +25,7 @@ const state = {
   projects: [],
   runs: [],
   datasets: [],
+  models: [],
   env: {},
   envDefaults: {},
   selectedProjectId: null,
@@ -631,14 +638,16 @@ function renderEnvironmentFields() {
     input.value = "";
     input.type = "password";
     input.dataset.changed = "false";
-    $(field.status).textContent = state.env[key]?.configured ? "Configured" : "Not configured";
+    input.placeholder = state.env[key]?.masked || "";
+    $(field.status).textContent = state.env[key]?.configured ? "" : "Not configured";
     updateSecretToggle(key, false);
   }
   const currentModel = state.envDefaults.main_model
     || state.env.BIOMAKER_MAIN_MODEL?.value
     || state.env.OPENAI_MODEL?.value
     || "";
-  setModelOptions(currentModel ? [currentModel] : [], currentModel);
+  $("#settings-model").dataset.changed = "false";
+  setModelOptions([], currentModel);
   $("#settings-model-status").textContent = "";
   refreshIcons();
 }
@@ -652,11 +661,38 @@ async function openSettings() {
   discoverModels().catch(showModelError);
 }
 
-function setModelOptions(models, selected) {
-  const uniqueModels = [...new Set([selected, ...models].filter(Boolean))];
-  $("#settings-model-options").innerHTML = uniqueModels
+function renderModelOptions(query = "", selected = "") {
+  const normalizedQuery = query.trim().toLowerCase();
+  const suggestions = state.models
+    .map((model, index) => ({ model, index, lower: model.toLowerCase() }))
+    .filter(({ lower }) => !normalizedQuery || lower.includes(normalizedQuery))
+    .sort((left, right) => {
+      if (left.model === selected) return -1;
+      if (right.model === selected) return 1;
+      const leftPreferred = PREFERRED_MODELS.indexOf(left.model);
+      const rightPreferred = PREFERRED_MODELS.indexOf(right.model);
+      if (leftPreferred !== rightPreferred) {
+        if (leftPreferred < 0) return 1;
+        if (rightPreferred < 0) return -1;
+        return leftPreferred - rightPreferred;
+      }
+      if (normalizedQuery) {
+        const leftStarts = left.lower.startsWith(normalizedQuery);
+        const rightStarts = right.lower.startsWith(normalizedQuery);
+        if (leftStarts !== rightStarts) return leftStarts ? -1 : 1;
+      }
+      return left.index - right.index;
+    })
+    .slice(0, MAX_MODEL_SUGGESTIONS)
+    .map(({ model }) => model);
+  $("#settings-model-options").innerHTML = suggestions
     .map((model) => `<option value="${escapeHtml(model)}"></option>`)
     .join("");
+}
+
+function setModelOptions(models, selected, query = "") {
+  state.models = [...new Set(models.filter(Boolean))];
+  renderModelOptions(query, selected);
   $("#settings-model").value = selected || "";
 }
 
@@ -665,10 +701,22 @@ function showModelError(error) {
   $("#settings-model-status").textContent = error.message || String(error);
 }
 
+function invalidateModelDiscovery() {
+  modelDiscoveryGeneration += 1;
+  state.models = [];
+  $("#settings-model-options").innerHTML = "";
+  $("#settings-model-status").textContent = "";
+  $("#refresh-models-button").disabled = false;
+}
+
 async function discoverModels() {
   const button = $("#refresh-models-button");
   const status = $("#settings-model-status");
+  const modelInput = $("#settings-model");
+  const discoveryGeneration = ++modelDiscoveryGeneration;
   button.disabled = true;
+  state.models = [];
+  $("#settings-model-options").innerHTML = "";
   status.textContent = "Loading...";
   try {
     const apiKeyInput = $("#settings-api-key");
@@ -680,11 +728,21 @@ async function discoverModels() {
         api_key: apiKey || null,
       }),
     });
-    const selected = $("#settings-model").value || response.default_model || "";
-    setModelOptions(response.models || [], selected);
-    status.textContent = response.status === "ok" ? "" : (response.detail || "Models unavailable");
+    if (discoveryGeneration !== modelDiscoveryGeneration || !$("#settings-dialog").open) return;
+    const models = response.models || [];
+    const selected = modelInput.dataset.changed === "true"
+      ? modelInput.value
+      : response.default_model || (models.includes(PREFERRED_MODEL) ? PREFERRED_MODEL : "");
+    const query = modelInput.dataset.changed === "true" ? selected : "";
+    setModelOptions(models, selected, query);
+    status.textContent = response.status === "ok"
+      ? ""
+      : (response.detail || "Models unavailable");
+  } catch (error) {
+    if (discoveryGeneration !== modelDiscoveryGeneration || !$("#settings-dialog").open) return;
+    throw error;
   } finally {
-    button.disabled = false;
+    if (discoveryGeneration === modelDiscoveryGeneration) button.disabled = false;
   }
 }
 
@@ -707,21 +765,24 @@ async function toggleSecret(event) {
   if (!field) return;
   const input = $(field.input);
   if (input.type === "text") {
+    if (input.dataset.changed !== "true") input.value = "";
     input.type = "password";
     updateSecretToggle(key, false);
     refreshIcons();
     return;
   }
   if (!input.value && state.env[key]?.configured) {
+    const revealGeneration = secretReadGeneration;
     button.disabled = true;
     try {
       const response = await api("/api/env/reveal", {
         method: "POST",
         body: JSON.stringify({ key }),
       });
+      if (revealGeneration !== secretReadGeneration || !$("#settings-dialog").open) return;
       input.value = response.value || "";
     } finally {
-      button.disabled = false;
+      if (revealGeneration === secretReadGeneration) button.disabled = false;
     }
   }
   input.type = "text";
@@ -730,11 +791,15 @@ async function toggleSecret(event) {
 }
 
 function clearVisibleSecrets() {
+  secretReadGeneration += 1;
+  invalidateModelDiscovery();
   for (const [key, field] of Object.entries(SECRET_FIELDS)) {
     const input = $(field.input);
+    const button = $(`.secret-toggle[data-env-key="${key}"]`);
     input.value = "";
     input.type = "password";
     input.dataset.changed = "false";
+    if (button) button.disabled = false;
     updateSecretToggle(key, false);
   }
   refreshIcons();
@@ -770,26 +835,26 @@ async function saveEnvironment(event) {
   toast("Settings saved");
 }
 
-function renderDatasetDialog() {
-  const list = $("#dataset-list");
-  if (!state.datasets.length) {
-    list.innerHTML = emptyStateMarkup("folder-search", "No datasets found");
-    refreshIcons();
-    return;
-  }
-  list.innerHTML = state.datasets.map((dataset) => `
-    <button class="dataset-option" type="button" data-dataset-path="${escapeHtml(dataset.path)}">
-      <i data-lucide="folder" aria-hidden="true"></i>
-      <span>${escapeHtml(dataset.name)}<small>${escapeHtml(dataset.path)}</small></span>
-    </button>`).join("");
-  list.querySelectorAll("[data-dataset-path]").forEach((button) => {
-    button.addEventListener("click", () => {
-      $("#dataset-path").value = button.dataset.datasetPath;
-      state.dirty = true;
-      $("#dataset-dialog").close();
+async function chooseDatasetDirectory() {
+  const button = $("#browse-datasets-button");
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    const response = await api("/api/directories/select", {
+      method: "POST",
+      headers: { "X-BioMaker-UI": "directory-picker" },
     });
-  });
-  refreshIcons();
+    if (response.status === "cancelled") return;
+    if (response.status !== "selected" || !response.path) {
+      throw new Error("The system folder picker returned an invalid result.");
+    }
+    $("#dataset-path").value = response.path;
+    state.dirty = true;
+    updateNewTaskTitle();
+  } finally {
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+  }
 }
 
 async function refreshRuns(force = false) {
@@ -821,21 +886,25 @@ function bindEvents() {
   $("#settings-button").addEventListener("click", () => openSettings().catch(showError));
   $("#settings-form").addEventListener("submit", (event) => saveEnvironment(event).catch(showError));
   $("#settings-dialog").addEventListener("close", clearVisibleSecrets);
+  $("#settings-base-url").addEventListener("input", invalidateModelDiscovery);
   $("#refresh-models-button").addEventListener("click", () => discoverModels().catch(showModelError));
   $$(".secret-toggle").forEach((button) => {
     button.addEventListener("click", (event) => toggleSecret(event).catch(showError));
   });
-  for (const field of Object.values(SECRET_FIELDS)) {
-    $(field.input).addEventListener("input", (event) => { event.currentTarget.dataset.changed = "true"; });
+  for (const [key, field] of Object.entries(SECRET_FIELDS)) {
+    $(field.input).addEventListener("input", (event) => {
+      event.currentTarget.dataset.changed = "true";
+      if (key === "OPENAI_API_KEY") invalidateModelDiscovery();
+    });
   }
+  $("#settings-model").addEventListener("input", (event) => {
+    event.currentTarget.dataset.changed = "true";
+    renderModelOptions(event.currentTarget.value, event.currentTarget.value);
+  });
   $("#refresh-button").addEventListener("click", () => refreshRuns(true).catch(showError));
   $("#tree-refresh-button").addEventListener("click", () => renderTree(true));
   $("#console-refresh-button").addEventListener("click", () => loadConsole().catch(showError));
-  $("#browse-datasets-button").addEventListener("click", () => {
-    renderDatasetDialog();
-    $("#dataset-dialog").showModal();
-  });
-  $("#close-dataset-dialog").addEventListener("click", () => $("#dataset-dialog").close());
+  $("#browse-datasets-button").addEventListener("click", () => chooseDatasetDirectory().catch(showError));
   $("#run-history-select").addEventListener("change", (event) => selectRun(event.currentTarget.value).catch(showError));
   $$(".tab").forEach((tab) => {
     tab.addEventListener("click", () => setActiveTab(tab.dataset.tab));

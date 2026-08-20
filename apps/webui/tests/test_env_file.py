@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from webui.env_file import (
+    mask_value,
     masked_env,
     read_managed_values,
     subprocess_environment,
@@ -46,7 +47,7 @@ def test_env_update_preserves_unmanaged_lines_and_never_returns_secret(tmp_path)
     assert "new-secret-123456" not in json.dumps(masked)
     assert masked["OPENAI_API_KEY"] == {
         "configured": True,
-        "masked": "********",
+        "masked": "••••••••",
         "secret": True,
     }
     assert masked["OPENAI_BASE_URL"] == {
@@ -55,6 +56,22 @@ def test_env_update_preserves_unmanaged_lines_and_never_returns_secret(tmp_path)
         "value": "https://api.example.test/v1",
         "secret": False,
     }
+
+
+def test_secret_mask_preserves_only_known_prefixes():
+    black_dots = "•" * 8
+    assert mask_value("") == ""
+    assert mask_value("sk-secret-value") == f"sk-{black_dots}"
+    assert mask_value("sk_secret-value") == f"sk_{black_dots}"
+    assert mask_value("jina_secret-value") == f"jina_{black_dots}"
+    assert mask_value("jina-secret-value") == f"jina-{black_dots}"
+
+
+def test_secret_mask_hides_unknown_prefix_suffix_and_total_length():
+    black_dots = "•" * 8
+    assert mask_value("secret") == black_dots
+    assert mask_value("other-prefix-with-a-very-long-secret-value") == black_dots
+    assert mask_value("SK-uppercase-is-not-a-known-prefix") == black_dots
 
 
 def test_model_settings_are_editable_and_loaded_into_subprocess(tmp_path, monkeypatch):

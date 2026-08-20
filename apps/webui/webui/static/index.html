@@ -233,7 +233,7 @@
           <div class="field">
             <label for="settings-model">Model</label>
             <span class="model-input-row">
-              <input id="settings-model" type="text" list="settings-model-options" autocomplete="off" aria-describedby="settings-model-status" placeholder="Default">
+              <input id="settings-model" type="text" list="settings-model-options" autocomplete="off" aria-describedby="settings-model-status" placeholder="Search or enter model">
               <datalist id="settings-model-options"></datalist>
               <button id="refresh-models-button" class="icon-button" type="button" title="Refresh models" aria-label="Refresh models">
                 <span class="icon-fallback" aria-hidden="true">↻</span>
@@ -276,19 +276,6 @@
           <button id="save-env-button" class="button primary" value="default" type="submit">Save</button>
         </div>
       </form>
-    </dialog>
-
-    <dialog id="dataset-dialog" class="modal dataset-modal">
-      <div class="modal-shell">
-        <div class="modal-heading">
-          <h2>Choose dataset</h2>
-          <button id="close-dataset-dialog" class="icon-button" type="button" title="Close" aria-label="Close">
-            <span class="icon-fallback" aria-hidden="true">×</span>
-            <i data-lucide="x" aria-hidden="true"></i>
-          </button>
-        </div>
-        <div id="dataset-list" class="dataset-list"></div>
-      </div>
     </dialog>
 
     <div id="toast-region" class="toast-region" aria-live="polite"></div>

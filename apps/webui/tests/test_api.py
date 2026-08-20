@@ -252,6 +252,41 @@ def test_secret_bearing_settings_endpoints_require_loopback(settings):
         assert client.post("/api/models/discover", json={}).status_code == 403
 
 
+def test_native_directory_picker_is_loopback_only_and_accepts_no_body(
+    settings, tmp_path, monkeypatch
+):
+    selected = tmp_path / "selected dataset"
+    selected.mkdir()
+    calls = []
+
+    def fake_select_directory():
+        calls.append(True)
+        return {"status": "selected", "path": str(selected.resolve())}
+
+    monkeypatch.setattr(server, "select_directory", fake_select_directory)
+    app = create_app(settings, process_factory=ImmediateProcess)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        assert client.post("/api/directories/select").status_code == 403
+        response = client.post(
+            "/api/directories/select",
+            headers={"X-BioMaker-UI": "directory-picker"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "selected",
+            "path": str(selected.resolve()),
+        }
+        assert calls == [True]
+
+    with TestClient(app, client=("192.0.2.10", 50000)) as client:
+        response = client.post(
+            "/api/directories/select",
+            headers={"X-BioMaker-UI": "directory-picker"},
+        )
+        assert response.status_code == 403
+        assert calls == [True]
+
+
 def test_api_cancel_pending_and_stop_active_run(settings):
     dataset, template = prepare_workspace(settings)
     app = create_app(settings, process_factory=BlockingProcess)

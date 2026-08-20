@@ -900,6 +900,12 @@ textarea::placeholder {
   background: var(--surface);
 }
 
+.secret-input-row input::placeholder {
+  color: #343a36;
+  letter-spacing: 0.04em;
+  opacity: 1;
+}
+
 .field-status {
   min-height: 15px;
   color: var(--text-dim);

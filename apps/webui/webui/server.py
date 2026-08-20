@@ -21,6 +21,13 @@ from .artifacts import (
     resolve_artifact,
     tail_text,
 )
+from .directory_picker import (
+    DirectoryPickerBusy,
+    DirectoryPickerError,
+    DirectoryPickerTimeout,
+    DirectoryPickerUnsupported,
+    select_directory,
+)
 from .env_file import SECRET_ENV_KEYS, masked_env, read_env_values, update_env_file
 from .model_discovery import discover_models, normalize_base_url
 from .models import (
@@ -195,7 +202,16 @@ def _require_loopback(request: Request) -> None:
     if not is_loopback:
         raise HTTPException(
             status_code=403,
-            detail="Settings changes are available only from this computer.",
+            detail="This action is available only from this computer.",
+        )
+
+
+def _require_directory_picker_request(request: Request) -> None:
+    _require_loopback(request)
+    if request.headers.get("x-biomaker-ui") != "directory-picker":
+        raise HTTPException(
+            status_code=403,
+            detail="The system folder picker can be opened only from the BioMaker UI.",
         )
 
 
@@ -321,6 +337,20 @@ def create_app(
         result["default_model"] = defaults["main_model"]
         result["default_model_source"] = defaults["main_model_source"]
         return result
+
+    @app.post("/api/directories/select")
+    def directory_select(request: Request) -> dict[str, Any]:
+        _require_directory_picker_request(request)
+        try:
+            return select_directory()
+        except DirectoryPickerBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DirectoryPickerUnsupported as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except DirectoryPickerTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except DirectoryPickerError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.get("/api/task-templates")
     def task_templates() -> list[dict[str, Any]]:
