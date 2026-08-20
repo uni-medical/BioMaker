@@ -5,7 +5,7 @@
 # Introduction
 **BioMaker** is an agentic development system for biomedical image analysis.
 
-BioMaker uses a compact workflow: it optionally validates a user-provided solution file, then runs a single proposal agent loop that drafts code, debugs failed attempts, and improves successful solutions. The workflow can use a lightweight MONAI knowledge index and web search when extra biomedical implementation context is useful.
+BioMaker uses a collaborative multi-agent workflow: an Orchestrator coordinates a Data Analyzer, Researcher, Programmer, and Summarizer through shared Memory. Together, they analyze the data, retrieve implementation knowledge, generate and refine candidate solutions, and package the selected result. The workflow can use a lightweight MONAI knowledge index and web search when extra biomedical implementation context is useful.
 
 # Quick Start
 
@@ -61,14 +61,15 @@ The default run is intentionally simple:
 
 ```text
 prepare workspace and data
--> ProposalAgent loop
-   -> draft a solution when no good candidate exists
-   -> debug failed candidates
-   -> improve the best successful candidate
--> save journal, tree, best solution, and optional final report
+-> Orchestrator coordinates specialized agents through shared Memory
+   -> Data Analyzer profiles the dataset
+   -> Researcher retrieves relevant knowledge when needed
+   -> Programmer generates and refines executable candidates
+-> execute and evaluate candidates in the solution tree
+-> Summarizer packages the best-observed solution and optional final report
 ```
 
-The proposal loop is a lightweight solution tree search. BioMaker drafts a conservative baseline, debugs failed leaf nodes until a runnable solution exists, then mostly improves top-performing nodes. It can still create extra draft roots later to preserve diversity.
+The multi-agent workflow uses a lightweight solution tree search. BioMaker generates candidate solutions, debugs failed nodes, and refines promising ones based on execution results recorded in shared Memory. When the configured budget ends, the Summarizer packages the best-observed solution.
 
 Generated code runs under a strict dependency policy. BioMaker tells the model which installed packages are allowed, blocks package installation, and performs a preflight import check before execution. If code imports an unavailable package such as `cv2` or `albumentations`, the run fails fast with a policy error so the next debug step can replace it with an allowed package.
 
