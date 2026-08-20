@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    method_root: Path
+    workspace_root: Path
+    state_dir: Path
+    logs_root: Path
+    workspaces_root: Path
+    experiments_root: Path
+    datasets_root: Path
+    env_file: Path
+    uv_executable: str = "uv"
+    stop_grace_seconds: float = 8.0
+
+    @classmethod
+    def default(cls) -> Settings:
+        method_root = (
+            Path(
+                os.environ.get(
+                    "BIOMAKER_WEBUI_METHOD_ROOT",
+                    Path(__file__).resolve().parents[3],
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+        workspace_root = (
+            Path(os.environ.get("BIOMAKER_WEBUI_WORKSPACE_ROOT", method_root.parent))
+            .expanduser()
+            .resolve()
+        )
+        state_dir = (
+            Path(
+                os.environ.get(
+                    "BIOMAKER_WEBUI_STATE_DIR",
+                    Path(__file__).resolve().parents[1] / "state",
+                )
+            )
+            .expanduser()
+            .resolve()
+        )
+        return cls(
+            method_root=method_root,
+            workspace_root=workspace_root,
+            state_dir=state_dir,
+            logs_root=workspace_root / "logs",
+            workspaces_root=workspace_root / "workspaces",
+            experiments_root=workspace_root / "experiments",
+            datasets_root=workspace_root / "datasets",
+            env_file=method_root / ".env",
+            uv_executable=os.environ.get("BIOMAKER_WEBUI_UV", "uv"),
+        )
+
+    def ensure_directories(self) -> None:
+        for path in (
+            self.state_dir,
+            self.state_dir / "tasks",
+            self.state_dir / "console",
+            self.logs_root,
+            self.workspaces_root,
+        ):
+            path.mkdir(parents=True, exist_ok=True)

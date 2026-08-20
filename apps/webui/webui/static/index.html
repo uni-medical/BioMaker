@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>BioMaker</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script defer src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true">B</div>
+        <div>
+          <strong>BioMaker</strong>
+          <span>Local Workbench</span>
+        </div>
+      </div>
+      <div class="header-context">
+        <span id="header-project">No project selected</span>
+        <span class="header-divider" aria-hidden="true"></span>
+        <span id="queue-indicator" class="queue-indicator">Queue idle</span>
+      </div>
+      <div class="header-actions">
+        <button id="refresh-button" class="icon-button" type="button" title="Refresh" aria-label="Refresh">
+          <span class="icon-fallback" aria-hidden="true">↻</span>
+          <i data-lucide="refresh-cw" aria-hidden="true"></i>
+        </button>
+        <button id="settings-button" class="icon-button" type="button" title="Environment settings" aria-label="Environment settings">
+          <span class="icon-fallback" aria-hidden="true">⚙</span>
+          <i data-lucide="settings" aria-hidden="true"></i>
+        </button>
+      </div>
+    </header>
+
+    <main class="workbench">
+      <aside class="sidebar" aria-label="Projects and runs">
+        <section class="sidebar-section projects-section">
+          <div class="section-heading">
+            <h2>Projects</h2>
+            <button id="new-project-button" class="icon-button small" type="button" title="New project" aria-label="New project">
+              <span class="icon-fallback" aria-hidden="true">+</span>
+              <i data-lucide="plus" aria-hidden="true"></i>
+            </button>
+          </div>
+          <div id="project-list" class="nav-list" role="list"></div>
+        </section>
+
+        <section class="sidebar-section runs-section">
+          <div class="section-heading">
+            <h2>Runs</h2>
+            <span id="run-count" class="count-label">0</span>
+          </div>
+          <div id="run-list" class="nav-list run-list" role="list"></div>
+        </section>
+      </aside>
+
+      <section class="editor-pane" aria-label="Project editor">
+        <div class="pane-heading editor-heading">
+          <div>
+            <span class="eyebrow">PROJECT</span>
+            <h1 id="editor-title">New project</h1>
+          </div>
+          <div class="editor-actions">
+            <button id="delete-project-button" class="icon-button danger-ghost" type="button" title="Delete project" aria-label="Delete project" hidden>
+              <span class="icon-fallback" aria-hidden="true">×</span>
+              <i data-lucide="trash-2" aria-hidden="true"></i>
+            </button>
+            <button id="save-project-button" class="button secondary" type="button">
+              <i data-lucide="save" aria-hidden="true"></i>
+              Save
+            </button>
+          </div>
+        </div>
+
+        <form id="project-form" class="project-form" autocomplete="off">
+          <div class="field-grid two-columns">
+            <label class="field">
+              <span>Project name</span>
+              <input id="project-name" name="name" type="text" maxlength="120" required>
+            </label>
+            <label class="field">
+              <span>Task template</span>
+              <select id="task-template" name="task_template_path">
+                <option value="">Custom task</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field dataset-field">
+            <span>Dataset path</span>
+            <div class="input-action-row">
+              <input id="dataset-path" name="dataset_path" type="text" list="dataset-options" spellcheck="false" required>
+              <datalist id="dataset-options"></datalist>
+              <button id="browse-datasets-button" class="icon-button field-action" type="button" title="Choose dataset" aria-label="Choose dataset">
+                <span class="icon-fallback" aria-hidden="true">…</span>
+                <i data-lucide="folder-open" aria-hidden="true"></i>
+              </button>
+            </div>
+          </label>
+
+          <label class="field task-field">
+            <span>Task goal</span>
+            <textarea id="task-body" name="task_body" spellcheck="true" required></textarea>
+          </label>
+
+          <details class="advanced-panel">
+            <summary>
+              <span>Advanced run options</span>
+              <i data-lucide="chevron-down" aria-hidden="true"></i>
+            </summary>
+            <div class="advanced-fields">
+              <label class="field span-two">
+                <span>Model for all agents</span>
+                <input id="model-name" type="text" placeholder="Use .env defaults" maxlength="200">
+              </label>
+              <label class="field">
+                <span>Agent steps</span>
+                <input id="agent-steps" type="number" min="1" max="1000" step="1">
+              </label>
+              <label class="field">
+                <span>Node timeout (seconds)</span>
+                <input id="exec-timeout" type="number" min="1" max="86400" step="1">
+              </label>
+              <label class="field">
+                <span>Parallel workers</span>
+                <input id="parallel-workers" type="number" min="1" max="64" step="1">
+              </label>
+              <label class="field">
+                <span>Total time limit (seconds)</span>
+                <input id="total-time-limit" type="number" min="1" max="2592000" step="1">
+              </label>
+              <label class="toggle-field span-two">
+                <input id="final-retrain" type="checkbox">
+                <span class="toggle-control" aria-hidden="true"></span>
+                <span>Final retrain</span>
+              </label>
+            </div>
+          </details>
+        </form>
+
+        <div class="run-bar">
+          <label class="compact-field">
+            <span>Experiment name</span>
+            <input id="experiment-name" type="text" maxlength="80" placeholder="Generated automatically">
+          </label>
+          <button id="run-button" class="button primary run-button" type="button">
+            <i data-lucide="play" aria-hidden="true"></i>
+            Queue run
+          </button>
+        </div>
+      </section>
+
+      <section class="detail-pane" aria-label="Run details">
+        <div id="run-summary" class="run-summary">
+          <div>
+            <span class="eyebrow">RUN</span>
+            <strong id="selected-run-name">No run selected</strong>
+          </div>
+          <div id="selected-run-actions" class="run-actions"></div>
+        </div>
+        <div class="tab-bar" role="tablist" aria-label="Run views">
+          <button class="tab active" type="button" role="tab" data-tab="tree" aria-selected="true">
+            <i data-lucide="git-branch" aria-hidden="true"></i>
+            Tree Plot
+          </button>
+          <button class="tab" type="button" role="tab" data-tab="console" aria-selected="false">
+            <i data-lucide="terminal" aria-hidden="true"></i>
+            Console
+          </button>
+          <button class="tab" type="button" role="tab" data-tab="events" aria-selected="false">
+            <i data-lucide="activity" aria-hidden="true"></i>
+            Events
+          </button>
+          <button class="tab" type="button" role="tab" data-tab="artifacts" aria-selected="false">
+            <i data-lucide="files" aria-hidden="true"></i>
+            Artifacts
+          </button>
+        </div>
+
+        <div class="tab-content">
+          <section id="tree-panel" class="tab-panel active" role="tabpanel">
+            <div class="panel-toolbar">
+              <label class="check-label">
+                <input id="tree-auto-refresh" type="checkbox" checked>
+                <span>Auto-refresh</span>
+              </label>
+              <div class="panel-toolbar-actions">
+                <a id="tree-open-link" class="icon-button small" href="#" target="_blank" rel="noopener" title="Open tree plot" aria-label="Open tree plot" hidden>
+                  <span class="icon-fallback" aria-hidden="true">↗</span>
+                  <i data-lucide="external-link" aria-hidden="true"></i>
+                </a>
+                <button id="tree-refresh-button" class="icon-button small" type="button" title="Refresh tree plot" aria-label="Refresh tree plot">
+                  <span class="icon-fallback" aria-hidden="true">↻</span>
+                  <i data-lucide="refresh-cw" aria-hidden="true"></i>
+                </button>
+              </div>
+            </div>
+            <div id="tree-empty" class="empty-state">
+              <i data-lucide="git-branch" aria-hidden="true"></i>
+              <span>Select a run with a tree plot</span>
+            </div>
+            <iframe id="tree-frame" title="BioMaker tree plot" sandbox="allow-scripts allow-downloads" hidden></iframe>
+          </section>
+
+          <section id="console-panel" class="tab-panel" role="tabpanel">
+            <div class="panel-toolbar">
+              <label class="check-label">
+                <input id="console-follow" type="checkbox" checked>
+                <span>Follow output</span>
+              </label>
+              <button id="console-refresh-button" class="icon-button small" type="button" title="Refresh console" aria-label="Refresh console">
+                <span class="icon-fallback" aria-hidden="true">↻</span>
+                <i data-lucide="refresh-cw" aria-hidden="true"></i>
+              </button>
+            </div>
+            <pre id="console-output" class="console-output">Select a run to view console output.</pre>
+          </section>
+
+          <section id="events-panel" class="tab-panel" role="tabpanel">
+            <div id="events-list" class="events-list">
+              <div class="empty-state"><span>Select a run to view events</span></div>
+            </div>
+          </section>
+
+          <section id="artifacts-panel" class="tab-panel" role="tabpanel">
+            <div id="run-observation" class="observation-strip"></div>
+            <div id="artifact-list" class="artifact-list">
+              <div class="empty-state"><span>Select a run to view artifacts</span></div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="settings-dialog" class="modal">
+      <form method="dialog" class="modal-shell" id="settings-form">
+        <div class="modal-heading">
+          <div>
+            <span class="eyebrow">BIOMAKER/.ENV</span>
+            <h2>Environment settings</h2>
+          </div>
+          <button class="icon-button" value="cancel" type="submit" title="Close" aria-label="Close">
+            <span class="icon-fallback" aria-hidden="true">×</span>
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </div>
+        <div id="env-fields" class="env-fields"></div>
+        <div class="modal-actions">
+          <button class="button secondary" value="cancel" type="submit">Cancel</button>
+          <button id="save-env-button" class="button primary" value="default" type="submit">Save settings</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="dataset-dialog" class="modal dataset-modal">
+      <div class="modal-shell">
+        <div class="modal-heading">
+          <div>
+            <span class="eyebrow">WORKSPACE DATASETS</span>
+            <h2>Choose dataset</h2>
+          </div>
+          <button id="close-dataset-dialog" class="icon-button" type="button" title="Close" aria-label="Close">
+            <span class="icon-fallback" aria-hidden="true">×</span>
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </div>
+        <div id="dataset-list" class="dataset-list"></div>
+      </div>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  </body>
+</html>

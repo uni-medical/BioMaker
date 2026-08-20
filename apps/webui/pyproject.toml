@@ -1,0 +1,26 @@
+[project]
+name = "biomaker-webui"
+version = "0.1.0"
+description = "Local sidecar web interface for BioMaker"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "python-dotenv>=1.0,<2",
+    "uvicorn>=0.30,<1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27,<1",
+    "pytest>=8,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The workspace may set TMPDIR to a Windows mount under WSL; pytest's fd capture
+# cannot reliably truncate its temporary file there.
+addopts = "-q -s"
+pythonpath = ["."]
+
+[tool.uv]
+package = false
