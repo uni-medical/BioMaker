@@ -36,7 +36,33 @@ def _split_files(workspace_dir: Path) -> dict[str, str]:
     }
 
 
+def _monai_rag_index_provenance() -> dict[str, Any] | None:
+    manifest_path = (
+        Path(__file__).resolve().parent.parent
+        / "monai_rag"
+        / "monai_rag_db"
+        / "manifest.json"
+    )
+    manifest = _read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        return None
+    fields = (
+        "schema_version",
+        "version",
+        "document_versions",
+        "mode",
+        "embedding_model",
+        "record_count",
+        "dimension",
+        "embedding_dtype",
+        "chunks_sha256",
+        "embeddings_sha256",
+    )
+    return {field: manifest.get(field) for field in fields}
+
+
 def _selected_cfg(cfg: Config) -> dict[str, Any]:
+    knowledge_cfg = cfg.agent.knowledge_base
     return {
         "agent_steps": cfg.agent.steps,
         "total_time_limit_seconds": cfg.agent.total_time_limit,
@@ -45,6 +71,11 @@ def _selected_cfg(cfg: Config) -> dict[str, Any]:
         "feedback_model": cfg.agent.feedback.model,
         "enable_node_tools": cfg.agent.enable_node_tools,
         "enable_monai_knowledge_base": cfg.agent.enable_monai_knowledge_base,
+        "monai_rag_mode": getattr(knowledge_cfg, "retrieval_mode", "keyword"),
+        "monai_rag_embedding_model": getattr(
+            knowledge_cfg, "embedding_model", "text-embedding-3-large"
+        ),
+        "monai_rag_topk": getattr(knowledge_cfg, "topk", 5),
         "enable_web_search": cfg.agent.enable_web_search,
         "copy_data": cfg.copy_data,
         "preprocess_data": cfg.preprocess_data,
@@ -73,6 +104,7 @@ def write_run_manifest(
         "split_files": _split_files(Path(cfg.workspace_dir)),
         "prediction_spec": spec,
         "config": _selected_cfg(cfg),
+        "monai_rag_index": _monai_rag_index_provenance(),
         "environment": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),

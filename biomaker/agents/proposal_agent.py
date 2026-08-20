@@ -302,25 +302,53 @@ class ProposalAgent(BaseAgent):
             truncate_text(code, max_chars=max_chars, marker="code trimmed")
         )
 
-    def query_knowledge_base(self, query: str, topk: int = 3) -> str:
+    def query_knowledge_base(self, query: str, topk: int | None = None) -> str:
         result = ""
         if self.acfg.enable_monai_knowledge_base:
             if not self._is_monai_query(query):
                 logger.debug("Skipping MONAI RAG for non-MONAI query: %s", query)
                 return ""
-            logger.debug("Querying MONAI knowledge base with query: %s", query)
+            knowledge_cfg = self.acfg.knowledge_base
+            retrieval_mode = str(getattr(knowledge_cfg, "retrieval_mode", "keyword"))
+            embedding_model = str(
+                getattr(
+                    knowledge_cfg,
+                    "embedding_model",
+                    "text-embedding-3-large",
+                )
+            )
+            retrieval_topk = (
+                int(topk)
+                if topk is not None
+                else int(getattr(knowledge_cfg, "topk", 5))
+            )
+            logger.debug(
+                "Querying MONAI %s index (topk=%d) with query: %s",
+                retrieval_mode,
+                retrieval_topk,
+                query,
+            )
             try:
                 if self.knowledge_base is None:
                     from ..monai_rag.query_rag_db import MED_KNOWLEDGE_RAG
 
                     self.knowledge_base = MED_KNOWLEDGE_RAG(
-                        model=self.acfg.knowledge_base.model
+                        model=knowledge_cfg.model,
+                        mode=retrieval_mode,
+                        embedding_model=embedding_model,
                     )
                 result = self.knowledge_base.search(
-                    query, k=topk, enable_query2doc=self.acfg.enable_query2doc
+                    query,
+                    k=retrieval_topk,
+                    enable_query2doc=self.acfg.enable_query2doc,
                 )
             except Exception as e:
-                logger.warning(f"Failed to query knowledge base with error: {e}.")
+                logger.warning(
+                    "Failed to query the configured MONAI %s index: %s. "
+                    "No fallback retrieval mode was used.",
+                    retrieval_mode,
+                    e,
+                )
             logger.debug(f"Querying knowledge base get result:\n {result[:200]}")
         return result
 
@@ -501,7 +529,7 @@ class ProposalAgent(BaseAgent):
                     "`monai.transforms.RandRotate` when a MONAI documentation lookup is needed."
                 )
             query_text = self._augment_doc_query(query_text, prompt)
-            result = self.query_knowledge_base(query_text, topk=3)
+            result = self.query_knowledge_base(query_text)
             return result or "No local documentation result was returned."
         if tool == "web_search":
             if self._is_local_contract_query(query_text):

@@ -69,6 +69,10 @@ agent:
   knowledge_base:
     model: null
     temp: 0.0
+    # Retrieval backend for the local MONAI documentation index: embedding or keyword.
+    retrieval_mode: ${oc.env:BIOMAKER_RAG_MODE,keyword}
+    embedding_model: ${oc.env:BIOMAKER_EMBEDDING_MODEL,text-embedding-3-large}
+    topk: ${oc.decode:${oc.env:BIOMAKER_RAG_TOPK,5}}
 
   # LLM settings for evaluating program output / tracebacks. Null means read BIOMAKER_MAIN_MODEL from .env.
   feedback:

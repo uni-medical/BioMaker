@@ -38,16 +38,24 @@ Set up your private API key for OpenAI-compatible endpoints. Serper and Jina are
      ```bash
      export OPENAI_BASE_URL="<your base url>" # (e.g. https://api.openai.com/v1)
      export OPENAI_API_KEY="<your key>"
+     export BIOMAKER_EMBEDDING_BASE_URL="<your embedding base url>" # optional
+     export BIOMAKER_EMBEDDING_API_KEY="<your embedding key>"       # optional
      export SERPER_API_KEY="<your serper key>"
      export JINA_API_KEY="<your jina key>"
      ```
-If `SERPER_API_KEY` is missing, BioMaker warns and disables web search for that run. If `JINA_API_KEY` is missing, BioMaker warns and falls back to Serper snippets only.
+The embedding variables are only needed when the embedding endpoint differs from the main OpenAI-compatible endpoint. If `SERPER_API_KEY` is missing, BioMaker warns and disables web search for that run. If `JINA_API_KEY` is missing, BioMaker warns and falls back to Serper snippets only.
 
 5. **Set up the MONAI RAG index**
-BioMaker keeps the RAG index local instead of storing generated index files in git. Build it once before running tasks:
+BioMaker keeps the RAG index local instead of storing generated index files in git. The default `keyword` mode works locally without an embedding API. Build it once before running tasks:
      ```bash
      bash scripts/create_rag_db.sh
      ```
+
+     To use the paper-described embedding retrieval with `text-embedding-3-large`:
+     ```bash
+     BIOMAKER_RAG_MODE=embedding bash scripts/create_rag_db.sh
+     ```
+     At run time, select it with `BIOMAKER_RAG_MODE=embedding` (or `agent.knowledge_base.retrieval_mode=embedding`). Both modes share `chunks.jsonl`; embedding mode additionally requires matching vectors and a compatible embedding endpoint.
 
      Check whether the index is usable:
      ```bash

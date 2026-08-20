@@ -1,6 +1,7 @@
 """configuration and setup utils"""
 
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -73,6 +74,15 @@ class StageConfig:
 
 
 @dataclass
+class KnowledgeBaseConfig:
+    model: str | None = None
+    temp: float = 0.0
+    retrieval_mode: str = "keyword"
+    embedding_model: str = "text-embedding-3-large"
+    topk: int = 5
+
+
+@dataclass
 class SearchConfig:
     max_debug_depth: int
     max_children_per_node: int
@@ -98,7 +108,7 @@ class AgentConfig:
 
     code: StageConfig
     feedback: StageConfig
-    knowledge_base: StageConfig
+    knowledge_base: KnowledgeBaseConfig
 
 
 @dataclass
@@ -191,17 +201,60 @@ def _validate_exec_config(cfg: Config) -> None:
                 f"split_builder.attempts must be an integer >= 1, got {attempts!r}."
             )
 
+    agent_cfg = getattr(cfg, "agent", None)
+    knowledge_cfg = getattr(agent_cfg, "knowledge_base", None)
+    if knowledge_cfg is None:
+        return
+    retrieval_mode = str(knowledge_cfg.retrieval_mode).strip().lower()
+    if retrieval_mode not in {"keyword", "embedding"}:
+        raise ValueError(
+            "agent.knowledge_base.retrieval_mode must be 'keyword' or "
+            f"'embedding', got {knowledge_cfg.retrieval_mode!r}."
+        )
+    knowledge_cfg.retrieval_mode = retrieval_mode
+    if (
+        retrieval_mode == "embedding"
+        and not str(knowledge_cfg.embedding_model or "").strip()
+    ):
+        raise ValueError(
+            "agent.knowledge_base.embedding_model must be set when "
+            "retrieval_mode='embedding'."
+        )
+    if (
+        isinstance(knowledge_cfg.topk, bool)
+        or not isinstance(knowledge_cfg.topk, int)
+        or knowledge_cfg.topk < 1
+    ):
+        raise ValueError(
+            "agent.knowledge_base.topk must be an integer >= 1, "
+            f"got {knowledge_cfg.topk!r}."
+        )
+
 
 def load_cfg(path: Path = Path(__file__).parent / "config.yaml") -> Config:
     """Load config from .yaml file and CLI args, and set up logging directory."""
     return prep_cfg(_load_cfg(path))
 
 
-def _is_usable_rag_index(index_file: Path) -> tuple[bool, str | None]:
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _is_usable_rag_index(
+    index_file: Path,
+    *,
+    retrieval_mode: str = "keyword",
+    embedding_model: str | None = None,
+) -> tuple[bool, str | None]:
     if not index_file.is_file():
         return False, "missing"
     if index_file.stat().st_size <= 0:
         return False, "empty"
+    record_count = 0
     try:
         with open(index_file, encoding="utf-8") as f:
             for line in f:
@@ -209,11 +262,77 @@ def _is_usable_rag_index(index_file: Path) -> tuple[bool, str | None]:
                     continue
                 record = json.loads(line)
                 if not record.get("page_content"):
-                    return False, "first record has no page_content"
-                return True, None
+                    return False, f"record {record_count + 1} has no page_content"
+                record_count += 1
     except Exception as exc:
         return False, f"invalid JSONL: {exc}"
-    return False, "no non-empty records"
+    if record_count == 0:
+        return False, "no non-empty records"
+    if retrieval_mode == "keyword":
+        return True, None
+
+    index_dir = index_file.parent
+    embeddings_file = index_dir / "embeddings.npy"
+    manifest_file = index_dir / "manifest.json"
+    if not embeddings_file.is_file() or embeddings_file.stat().st_size <= 0:
+        return False, "embedding index embeddings.npy is missing or empty"
+    if not manifest_file.is_file() or manifest_file.stat().st_size <= 0:
+        return False, "embedding index manifest.json is missing or empty"
+
+    try:
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"invalid embedding manifest: {exc}"
+    if not isinstance(manifest, dict):
+        return False, "embedding manifest must be a JSON object"
+    if manifest.get("mode") != "embedding":
+        return False, f"embedding manifest mode is {manifest.get('mode')!r}"
+    if manifest.get("embedding_model") != embedding_model:
+        return False, (
+            "embedding manifest model does not match configured model "
+            f"({manifest.get('embedding_model')!r} != {embedding_model!r})"
+        )
+    if manifest.get("record_count") != record_count:
+        return False, (
+            "embedding manifest record_count does not match chunks.jsonl "
+            f"({manifest.get('record_count')!r} != {record_count})"
+        )
+    if manifest.get("chunks_sha256") != _sha256_file(index_file):
+        return False, "embedding manifest chunks_sha256 does not match chunks.jsonl"
+    if manifest.get("embeddings_sha256") != _sha256_file(embeddings_file):
+        return (
+            False,
+            "embedding manifest embeddings_sha256 does not match embeddings.npy",
+        )
+
+    try:
+        import numpy as np
+
+        embeddings = np.load(embeddings_file, mmap_mode="r", allow_pickle=False)
+    except Exception as exc:
+        return False, f"invalid embeddings.npy: {exc}"
+    dimension = manifest.get("dimension")
+    if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 1:
+        return False, f"embedding manifest has invalid dimension {dimension!r}"
+    expected_shape = (record_count, dimension)
+    if embeddings.ndim != 2 or embeddings.shape != expected_shape:
+        return False, (
+            "embedding matrix shape does not match manifest "
+            f"({embeddings.shape!r} != {expected_shape!r})"
+        )
+    if manifest.get("embedding_dtype") != str(embeddings.dtype):
+        return False, (
+            "embedding matrix dtype does not match manifest "
+            f"({str(embeddings.dtype)!r} != {manifest.get('embedding_dtype')!r})"
+        )
+    if (
+        not np.issubdtype(embeddings.dtype, np.floating)
+        or not np.isfinite(embeddings).all()
+    ):
+        return False, "embedding matrix must contain only finite floats"
+    if np.any(np.linalg.norm(embeddings, axis=1) <= 0):
+        return False, "embedding matrix contains zero-length vectors"
+    return True, None
 
 
 def prep_cfg(cfg: Config):
@@ -297,21 +416,28 @@ def prep_cfg(cfg: Config):
             "Serper search will still run, but page reading will use snippets only."
         )
 
-    rag_index = (
-        Path(__file__).resolve().parent.parent
-        / "monai_rag"
-        / "monai_rag_db"
-        / "chunks.jsonl"
-    )
-    rag_ok, rag_reason = _is_usable_rag_index(rag_index)
-    if cfg.agent.enable_monai_knowledge_base and not rag_ok:
-        logger.warning(
-            "MONAI knowledge base is enabled, but the local index is not usable "
-            f"({rag_reason}). "
-            "Run `bash scripts/create_rag_db.sh` from the repository root to build it. "
-            "Disabling MONAI RAG for this run."
+    if cfg.agent.enable_monai_knowledge_base:
+        rag_index = (
+            Path(__file__).resolve().parent.parent
+            / "monai_rag"
+            / "monai_rag_db"
+            / "chunks.jsonl"
         )
-        cfg.agent.enable_monai_knowledge_base = False
+        retrieval_mode = cfg.agent.knowledge_base.retrieval_mode
+        rag_ok, rag_reason = _is_usable_rag_index(
+            rag_index,
+            retrieval_mode=retrieval_mode,
+            embedding_model=cfg.agent.knowledge_base.embedding_model,
+        )
+        if not rag_ok:
+            logger.warning(
+                f"MONAI {retrieval_mode} retrieval is enabled, but its local index is "
+                f"not usable ({rag_reason}). Run `bash scripts/create_rag_db.sh` from "
+                "the repository root to rebuild the configured index. BioMaker will not "
+                "fall back to a different retrieval mode. "
+                "Disabling MONAI RAG for this run."
+            )
+            cfg.agent.enable_monai_knowledge_base = False
 
     return cast(Config, cfg)
 
