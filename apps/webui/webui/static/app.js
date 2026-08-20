@@ -9,23 +9,22 @@ const DEFAULT_OPTIONS = {
   final_retrain_enabled: true,
 };
 
-const ENV_KEYS = [
-  "OPENAI_API_KEY",
-  "OPENAI_BASE_URL",
-  "SERPER_API_KEY",
-  "JINA_API_KEY",
-];
+const SECRET_FIELDS = {
+  OPENAI_API_KEY: { input: "#settings-api-key", status: "#settings-api-key-status", label: "API key" },
+  SERPER_API_KEY: { input: "#settings-serper-key", status: "#settings-serper-key-status", label: "Serper key" },
+  JINA_API_KEY: { input: "#settings-jina-key", status: "#settings-jina-key-status", label: "Jina key" },
+};
 
 const state = {
   projects: [],
   runs: [],
-  templates: [],
   datasets: [],
   env: {},
+  envDefaults: {},
   selectedProjectId: null,
   selectedRunId: null,
   selectedRun: null,
-  activeTab: "tree",
+  activeTab: "events",
   dirty: false,
   polling: false,
   treeRunId: null,
@@ -49,6 +48,14 @@ function refreshIcons() {
     window.lucide.createIcons({ attrs: { "stroke-width": 1.8 } });
     document.body.classList.add("icons-ready");
   }
+}
+
+function emptyStateMarkup(icon, title) {
+  return `
+    <div class="empty-state rich-empty-state">
+      <div class="empty-icon"><i data-lucide="${escapeHtml(icon)}" aria-hidden="true"></i></div>
+      <strong>${escapeHtml(title)}</strong>
+    </div>`;
 }
 
 async function api(path, options = {}) {
@@ -110,6 +117,12 @@ function formatBytes(bytes) {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
+function formatEventName(value) {
+  return String(value || "Event")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
 function projectById(projectId) {
   return state.projects.find((project) => project.id === projectId) || null;
 }
@@ -118,19 +131,32 @@ function runById(runId) {
   return state.runs.find((run) => run.id === runId) || null;
 }
 
+function runsForProject(projectId) {
+  return state.runs.filter((run) => run.project_id === projectId);
+}
+
+function latestRunForProject(projectId) {
+  return runsForProject(projectId)[0] || null;
+}
+
+function autoTaskName(datasetPath, goal) {
+  const firstLine = String(goal || "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*#+\s*/, "").trim())
+    .find(Boolean);
+  if (firstLine) {
+    const firstSentence = firstLine.split(/(?<=[.!?。！？])\s+/)[0];
+    return firstSentence.length > 64 ? `${firstSentence.slice(0, 61).trimEnd()}...` : firstSentence;
+  }
+  const dataset = String(datasetPath || "").split(/[\\/]/).filter(Boolean).at(-1);
+  return dataset || "New task";
+}
+
 function isTerminal(status) {
   return ["succeeded", "failed", "cancelled", "stopped", "interrupted"].includes(status);
 }
 
-function renderTemplateOptions() {
-  const select = $("#task-template");
-  select.innerHTML = '<option value="">Custom task</option>';
-  for (const template of state.templates) {
-    const option = document.createElement("option");
-    option.value = template.path;
-    option.textContent = template.name;
-    select.append(option);
-  }
+function renderDatasetOptions() {
   const datalist = $("#dataset-options");
   datalist.innerHTML = state.datasets
     .map((dataset) => `<option value="${escapeHtml(dataset.path)}">${escapeHtml(dataset.name)}</option>`)
@@ -140,59 +166,58 @@ function renderTemplateOptions() {
 function renderProjects() {
   const list = $("#project-list");
   if (!state.projects.length) {
-    list.innerHTML = '<div class="empty-state"><span>No saved projects</span></div>';
+    list.innerHTML = emptyStateMarkup("folder-plus", "No tasks");
+    refreshIcons();
     return;
   }
   list.innerHTML = state.projects
     .map((project) => {
       const dataset = project.dataset_path.split(/[\\/]/).filter(Boolean).at(-1) || project.dataset_path;
+      const latestRun = latestRunForProject(project.id);
       return `
         <button class="nav-item ${project.id === state.selectedProjectId ? "active" : ""}" type="button" data-project-id="${escapeHtml(project.id)}">
           <span class="nav-item-main">
             <span class="nav-item-title">${escapeHtml(project.name)}</span>
             <span class="nav-item-meta">${escapeHtml(dataset)}</span>
           </span>
-          <i data-lucide="chevron-right" aria-hidden="true"></i>
+          ${latestRun ? `<span class="status-dot ${escapeHtml(latestRun.status)}" title="${escapeHtml(latestRun.status)}" role="img" aria-label="Latest run: ${escapeHtml(latestRun.status)}"></span>` : ""}
         </button>`;
     })
     .join("");
   list.querySelectorAll("[data-project-id]").forEach((button) => {
-    button.addEventListener("click", () => selectProject(button.dataset.projectId));
+    button.addEventListener("click", () => selectProject(button.dataset.projectId).catch(showError));
   });
   refreshIcons();
 }
 
 function renderRuns() {
-  const list = $("#run-list");
-  $("#run-count").textContent = String(state.runs.length);
   const queued = state.runs.filter((run) => run.status === "queued").length;
   const running = state.runs.filter((run) => ["running", "stopping"].includes(run.status)).length;
   const queueIndicator = $("#queue-indicator");
-  queueIndicator.textContent = running || queued ? `${running} running · ${queued} queued` : "Queue idle";
-  queueIndicator.classList.toggle("busy", Boolean(running || queued));
+  const queueParts = [];
+  if (running) queueParts.push(`${running} running`);
+  if (queued) queueParts.push(`${queued} queued`);
+  queueIndicator.textContent = queueParts.join(" · ");
+  queueIndicator.hidden = !queueParts.length;
+  queueIndicator.classList.toggle("busy", Boolean(queueParts.length));
+  renderProjects();
+  renderRunHistory();
+}
 
-  if (!state.runs.length) {
-    list.innerHTML = '<div class="empty-state"><span>No runs yet</span></div>';
-    return;
-  }
-  list.innerHTML = state.runs
+function renderRunHistory() {
+  const select = $("#run-history-select");
+  const title = $("#selected-run-name");
+  const runs = state.selectedProjectId ? runsForProject(state.selectedProjectId) : [];
+  select.innerHTML = runs
     .map((run) => {
       const name = run.actual_exp_name || run.requested_exp_name;
-      const project = projectById(run.project_id);
-      const projectName = project?.name || run.project_snapshot?.project_name || "Deleted project";
-      return `
-        <button class="nav-item ${run.id === state.selectedRunId ? "active" : ""}" type="button" data-run-id="${escapeHtml(run.id)}">
-          <span class="nav-item-main">
-            <span class="nav-item-title">${escapeHtml(name)}</span>
-            <span class="nav-item-meta">${escapeHtml(projectName)} · ${escapeHtml(formatDate(run.timestamps?.created_at, true))}</span>
-          </span>
-          <span class="status-dot ${escapeHtml(run.status)}" title="${escapeHtml(run.status)}"></span>
-        </button>`;
+      const label = `${name} · ${formatDate(run.timestamps?.created_at, true)}`;
+      return `<option value="${escapeHtml(run.id)}" ${run.id === state.selectedRunId ? "selected" : ""}>${escapeHtml(label)}</option>`;
     })
     .join("");
-  list.querySelectorAll("[data-run-id]").forEach((button) => {
-    button.addEventListener("click", () => selectRun(button.dataset.runId));
-  });
+  const hasHistory = runs.length > 1;
+  select.hidden = !hasHistory;
+  title.hidden = hasHistory || !state.selectedRun;
 }
 
 function emptyProject() {
@@ -212,27 +237,32 @@ function populateProjectForm(project) {
   $("#dataset-path").value = value.dataset_path || "";
   $("#task-template").value = value.task_template_path || "";
   $("#task-body").value = value.task_body || "";
-  $("#model-name").value = options.model_for_all_agents || "";
   $("#agent-steps").value = options.agent_steps;
   $("#exec-timeout").value = options.exec_timeout;
   $("#parallel-workers").value = options.exec_parallel_workers;
   $("#total-time-limit").value = options.agent_total_time_limit;
   $("#final-retrain").checked = options.final_retrain_enabled;
-  $("#experiment-name").value = "";
-  $("#editor-title").textContent = project?.name || "New project";
-  $("#header-project").textContent = project?.name || "New project";
-  $("#delete-project-button").hidden = !project;
+  $("#editor-title").textContent = project?.name || "New task";
+  $("#delete-project-button").hidden = true;
   state.dirty = false;
 }
 
+function updateNewTaskTitle() {
+  if (state.selectedProjectId) return;
+  $("#editor-title").textContent = autoTaskName($("#dataset-path").value, $("#task-body").value);
+}
+
 function collectProjectForm() {
+  const datasetPath = $("#dataset-path").value.trim();
+  const taskBody = $("#task-body").value.trim();
+  const existing = projectById(state.selectedProjectId);
   return {
-    name: $("#project-name").value.trim(),
-    dataset_path: $("#dataset-path").value.trim(),
-    task_template_path: $("#task-template").value || null,
-    task_body: $("#task-body").value.trim(),
+    name: existing?.name || autoTaskName(datasetPath, taskBody),
+    dataset_path: datasetPath,
+    task_template_path: existing?.task_template_path || null,
+    task_body: taskBody,
     advanced_defaults: {
-      model_for_all_agents: $("#model-name").value.trim() || null,
+      model_for_all_agents: null,
       agent_steps: Number($("#agent-steps").value),
       exec_timeout: Number($("#exec-timeout").value),
       exec_parallel_workers: Number($("#parallel-workers").value),
@@ -242,31 +272,43 @@ function collectProjectForm() {
   };
 }
 
-function selectProject(projectId) {
-  if (state.dirty && !window.confirm("Discard unsaved project changes?")) {
-    return;
-  }
+async function selectProject(projectId) {
   const project = projectById(projectId);
   if (!project) return;
+  if (projectId === state.selectedProjectId) {
+    renderProjects();
+    renderRunHistory();
+    return;
+  }
+  if (state.dirty && !window.confirm("Discard unsaved changes?")) {
+    return;
+  }
   state.selectedProjectId = projectId;
   populateProjectForm(project);
   renderProjects();
+  const latestRun = latestRunForProject(projectId);
+  state.selectedRunId = latestRun?.id || null;
+  await loadSelectedRun(true);
+  renderRuns();
 }
 
 function newProject() {
-  if (state.dirty && !window.confirm("Discard unsaved project changes?")) {
+  if (state.dirty && !window.confirm("Discard unsaved changes?")) {
     return;
   }
   state.selectedProjectId = null;
+  state.selectedRunId = null;
+  state.selectedRun = null;
   populateProjectForm(null);
   renderProjects();
-  $("#project-name").focus();
+  loadSelectedRun(true).catch(showError);
+  $("#dataset-path").focus();
 }
 
 async function saveProject({ quiet = false } = {}) {
   const payload = collectProjectForm();
-  if (!payload.name || !payload.dataset_path || !payload.task_body) {
-    throw new Error("Project name, dataset path, and task goal are required");
+  if (!payload.dataset_path || !payload.task_body) {
+    throw new Error("Dataset and goal are required");
   }
   const existing = state.selectedProjectId;
   const project = await api(existing ? `/api/projects/${existing}` : "/api/projects", {
@@ -280,22 +322,37 @@ async function saveProject({ quiet = false } = {}) {
   state.dirty = false;
   populateProjectForm(project);
   renderProjects();
-  if (!quiet) toast("Project saved");
+  if (!quiet) toast("Task saved");
   return project;
 }
 
-async function deleteProject() {
-  if (!state.selectedProjectId) return;
-  const project = projectById(state.selectedProjectId);
-  if (!window.confirm(`Delete project “${project?.name || ""}”? Run records will be kept.`)) {
+async function deleteProject(projectId = state.selectedProjectId) {
+  if (!projectId) return;
+  const project = projectById(projectId);
+  if (!project) return;
+  if (!window.confirm(`Delete task “${project?.name || ""}”? Runs will be kept.`)) {
     return;
   }
-  await api(`/api/projects/${state.selectedProjectId}`, { method: "DELETE" });
-  state.projects = state.projects.filter((item) => item.id !== state.selectedProjectId);
-  state.selectedProjectId = state.projects[0]?.id || null;
-  populateProjectForm(projectById(state.selectedProjectId));
-  renderProjects();
-  toast("Project deleted");
+  const deletedIndex = state.projects.findIndex((item) => item.id === projectId);
+  await api(`/api/projects/${projectId}`, { method: "DELETE" });
+  state.projects = state.projects.filter((item) => item.id !== projectId);
+
+  if (state.selectedProjectId !== projectId) {
+    renderRuns();
+    toast("Task deleted");
+    return;
+  }
+
+  state.dirty = false;
+  state.selectedProjectId = null;
+  const nextIndex = Math.min(Math.max(deletedIndex, 0), state.projects.length - 1);
+  const nextProject = state.projects[nextIndex] || null;
+  if (nextProject) {
+    await selectProject(nextProject.id);
+  } else {
+    newProject();
+  }
+  toast("Task deleted");
 }
 
 async function queueRun() {
@@ -303,26 +360,31 @@ async function queueRun() {
   button.disabled = true;
   try {
     const project = await saveProject({ quiet: true });
-    const requestedName = $("#experiment-name").value.trim();
     const run = await api("/api/runs", {
       method: "POST",
       body: JSON.stringify({
         project_id: project.id,
-        requested_exp_name: requestedName || null,
+        requested_exp_name: null,
       }),
     });
     state.runs.unshift(run);
     state.selectedRunId = run.id;
-    $("#experiment-name").value = "";
     renderRuns();
     await loadSelectedRun(true);
-    toast("Run added to queue");
+    toast("Run queued");
   } finally {
     button.disabled = false;
   }
 }
 
 async function selectRun(runId) {
+  const run = runById(runId);
+  const project = run ? projectById(run.project_id) : null;
+  if (project && project.id !== state.selectedProjectId) {
+    if (state.dirty && !window.confirm("Discard unsaved changes?")) return;
+    state.selectedProjectId = project.id;
+    populateProjectForm(project);
+  }
   state.selectedRunId = runId;
   state.treeRunId = null;
   state.lastTreeRefresh = 0;
@@ -332,8 +394,12 @@ async function selectRun(runId) {
 
 function renderRunSummary() {
   const run = state.selectedRun;
-  const name = run?.actual_exp_name || run?.requested_exp_name || "No run selected";
+  const summary = $("#run-summary");
+  summary.hidden = !run;
+  $(".detail-pane").classList.toggle("no-run", !run);
+  const name = run?.actual_exp_name || run?.requested_exp_name || "";
   $("#selected-run-name").textContent = name;
+  renderRunHistory();
   const actions = $("#selected-run-actions");
   if (!run) {
     actions.innerHTML = "";
@@ -349,8 +415,20 @@ function renderRunSummary() {
   }
   actions.innerHTML = `<span class="status-pill ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>${command}`;
   const actionButton = actions.querySelector("[data-run-action]");
-  if (actionButton) actionButton.addEventListener("click", runAction);
+  if (actionButton) actionButton.addEventListener("click", (event) => runAction(event).catch(showError));
   refreshIcons();
+}
+
+function clearSelectedRun() {
+  state.selectedRunId = null;
+  state.selectedRun = null;
+  state.treeRunId = null;
+  state.lastTreeRefresh = 0;
+  renderRunSummary();
+  renderTree();
+  renderArtifacts();
+  loadEvents();
+  loadConsole();
 }
 
 async function runAction(event) {
@@ -367,28 +445,28 @@ async function runAction(event) {
     state.treeRunId = null;
   }
   await refreshRuns(true);
-  toast(action === "requeue" ? "Run requeued" : `Run ${action} requested`);
+  toast(action === "requeue" ? "Run requeued" : `${action[0].toUpperCase()}${action.slice(1)} requested`);
 }
 
 async function loadSelectedRun(forceTree = false) {
-  if (!state.selectedRunId) {
-    state.selectedRun = null;
-    renderRunSummary();
-    renderTree();
-    renderArtifacts();
+  const requestedRunId = state.selectedRunId;
+  if (!requestedRunId) {
+    clearSelectedRun();
     return;
   }
+  let selectedRun;
   try {
-    state.selectedRun = await api(`/api/runs/${state.selectedRunId}`);
+    selectedRun = await api(`/api/runs/${requestedRunId}`);
   } catch (error) {
+    if (state.selectedRunId !== requestedRunId) return;
     if (error.message.includes("not found")) {
-      state.selectedRunId = null;
-      state.selectedRun = null;
-      renderRunSummary();
+      clearSelectedRun();
       return;
     }
     throw error;
   }
+  if (state.selectedRunId !== requestedRunId) return;
+  state.selectedRun = selectedRun;
   renderRunSummary();
   if (state.activeTab === "tree") renderTree(forceTree);
   if (state.activeTab === "console") await loadConsole();
@@ -404,12 +482,13 @@ function renderTree(force = false) {
   const hasTree = Boolean(run?.artifacts?.some((artifact) => artifact.name === "tree_plot.html"));
   if (!run || !hasTree) {
     frame.hidden = true;
+    frame.removeAttribute("src");
     openLink.hidden = true;
     openLink.removeAttribute("href");
     empty.hidden = false;
-    empty.querySelector("span").textContent = run
-      ? "Tree plot is not available yet"
-      : "Select a run with a tree plot";
+    empty.querySelector("strong").textContent = "No search data yet";
+    state.treeRunId = null;
+    state.lastTreeRefresh = 0;
     return;
   }
   empty.hidden = true;
@@ -431,24 +510,31 @@ function renderTree(force = false) {
 
 async function loadConsole() {
   const output = $("#console-output");
-  if (!state.selectedRunId) {
-    output.textContent = "Select a run to view console output.";
+  const requestedRunId = state.selectedRunId;
+  if (!requestedRunId) {
+    output.textContent = "No output yet.";
     return;
   }
-  output.textContent = await api(`/api/runs/${state.selectedRunId}/log?tail=1200`);
-  if (!output.textContent) output.textContent = "Console output is not available yet.";
+  const consoleText = await api(`/api/runs/${requestedRunId}/log?tail=1200`);
+  if (state.selectedRunId !== requestedRunId) return;
+  output.textContent = consoleText;
+  if (!output.textContent) output.textContent = "No output yet.";
   if ($("#console-follow").checked) output.scrollTop = output.scrollHeight;
 }
 
 async function loadEvents() {
   const list = $("#events-list");
-  if (!state.selectedRunId) {
-    list.innerHTML = '<div class="empty-state"><span>Select a run to view events</span></div>';
+  const requestedRunId = state.selectedRunId;
+  if (!requestedRunId) {
+    list.innerHTML = emptyStateMarkup("activity", "No activity yet");
+    refreshIcons();
     return;
   }
-  const response = await api(`/api/runs/${state.selectedRunId}/events?tail=200`);
+  const response = await api(`/api/runs/${requestedRunId}/events?tail=200`);
+  if (state.selectedRunId !== requestedRunId) return;
   if (!response.events.length) {
-    list.innerHTML = '<div class="empty-state"><span>No structured events yet</span></div>';
+    list.innerHTML = emptyStateMarkup("activity", "No activity yet");
+    refreshIcons();
     return;
   }
   list.innerHTML = response.events
@@ -462,7 +548,7 @@ async function loadEvents() {
       return `
         <article class="event-row">
           <span class="event-marker" aria-hidden="true"></span>
-          <span class="event-name">${escapeHtml(event.event || "event")}</span>
+          <span class="event-name">${escapeHtml(formatEventName(event.event))}</span>
           <time class="event-time">${escapeHtml(formatDate(event.ts))}</time>
           ${payloadText ? `<pre class="event-payload">${escapeHtml(payloadText)}</pre>` : ""}
         </article>`;
@@ -476,7 +562,8 @@ function renderArtifacts() {
   const run = state.selectedRun;
   if (!run) {
     observation.innerHTML = "";
-    list.innerHTML = '<div class="empty-state"><span>Select a run to view artifacts</span></div>';
+    list.innerHTML = emptyStateMarkup("files", "No files yet");
+    refreshIcons();
     return;
   }
   const observed = run.observed || {};
@@ -488,7 +575,8 @@ function renderArtifacts() {
     <span>Best metric <strong>${results.best_metric == null ? "—" : escapeHtml(Number(results.best_metric).toFixed(4))}</strong></span>
     <span>Last event <strong>${escapeHtml(lastEvent)}</strong></span>`;
   if (!run.artifacts?.length) {
-    list.innerHTML = '<div class="empty-state"><span>No artifacts yet</span></div>';
+    list.innerHTML = emptyStateMarkup("files", "No files yet");
+    refreshIcons();
     return;
   }
   list.innerHTML = run.artifacts
@@ -509,6 +597,7 @@ function setActiveTab(tabName) {
     const active = tab.dataset.tab === tabName;
     tab.classList.toggle("active", active);
     tab.setAttribute("aria-selected", String(active));
+    tab.tabIndex = active ? 0 : -1;
   });
   $$(".tab-panel").forEach((panel) => {
     panel.classList.toggle("active", panel.id === `${tabName}-panel`);
@@ -519,60 +608,173 @@ function setActiveTab(tabName) {
   if (tabName === "artifacts") renderArtifacts();
 }
 
+function handleTabKeydown(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = $$(".tab");
+  const currentIndex = tabs.indexOf(event.currentTarget);
+  if (currentIndex < 0) return;
+  event.preventDefault();
+  let nextIndex;
+  if (event.key === "Home") nextIndex = 0;
+  else if (event.key === "End") nextIndex = tabs.length - 1;
+  else if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % tabs.length;
+  else nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+  tabs[nextIndex].focus();
+  setActiveTab(tabs[nextIndex].dataset.tab);
+}
+
 function renderEnvironmentFields() {
-  $("#env-fields").innerHTML = ENV_KEYS.map((key) => {
-    const item = state.env[key] || { configured: false, masked: "" };
-    return `
-      <div class="env-row" data-env-key="${key}">
-        <label class="field">
-          <span>${key}</span>
-          <input type="${key.includes("KEY") ? "password" : "text"}" autocomplete="off" placeholder="${escapeHtml(item.configured ? "Leave blank to keep current value" : "Not configured")}">
-        </label>
-        <span class="env-status">${escapeHtml(item.masked || "not set")}</span>
-        <label class="clear-secret">
-          <input type="checkbox" ${item.configured ? "" : "disabled"}>
-          Clear
-        </label>
-      </div>`;
-  }).join("");
+  const baseUrl = state.env.OPENAI_BASE_URL?.value || "";
+  $("#settings-base-url").value = baseUrl;
+  for (const [key, field] of Object.entries(SECRET_FIELDS)) {
+    const input = $(field.input);
+    input.value = "";
+    input.type = "password";
+    input.dataset.changed = "false";
+    $(field.status).textContent = state.env[key]?.configured ? "Configured" : "Not configured";
+    updateSecretToggle(key, false);
+  }
+  const currentModel = state.envDefaults.main_model
+    || state.env.BIOMAKER_MAIN_MODEL?.value
+    || state.env.OPENAI_MODEL?.value
+    || "";
+  setModelOptions(currentModel ? [currentModel] : [], currentModel);
+  $("#settings-model-status").textContent = "";
+  refreshIcons();
 }
 
 async function openSettings() {
   const response = await api("/api/env");
   state.env = response.values;
+  state.envDefaults = response.defaults || {};
   renderEnvironmentFields();
   $("#settings-dialog").showModal();
+  discoverModels().catch(showModelError);
+}
+
+function setModelOptions(models, selected) {
+  const uniqueModels = [...new Set([selected, ...models].filter(Boolean))];
+  $("#settings-model-options").innerHTML = uniqueModels
+    .map((model) => `<option value="${escapeHtml(model)}"></option>`)
+    .join("");
+  $("#settings-model").value = selected || "";
+}
+
+function showModelError(error) {
+  console.error(error);
+  $("#settings-model-status").textContent = error.message || String(error);
+}
+
+async function discoverModels() {
+  const button = $("#refresh-models-button");
+  const status = $("#settings-model-status");
+  button.disabled = true;
+  status.textContent = "Loading...";
+  try {
+    const apiKeyInput = $("#settings-api-key");
+    const apiKey = apiKeyInput.dataset.changed === "true" ? apiKeyInput.value : null;
+    const response = await api("/api/models/discover", {
+      method: "POST",
+      body: JSON.stringify({
+        base_url: $("#settings-base-url").value.trim() || null,
+        api_key: apiKey || null,
+      }),
+    });
+    const selected = $("#settings-model").value || response.default_model || "";
+    setModelOptions(response.models || [], selected);
+    status.textContent = response.status === "ok" ? "" : (response.detail || "Models unavailable");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function updateSecretToggle(key, revealed) {
+  const field = SECRET_FIELDS[key];
+  if (!field) return;
+  const button = $(`.secret-toggle[data-env-key="${key}"]`);
+  if (!button) return;
+  const action = revealed ? "Hide" : "Show";
+  button.title = `${action} ${field.label}`;
+  button.setAttribute("aria-label", `${action} ${field.label}`);
+  button.setAttribute("aria-pressed", String(revealed));
+  button.innerHTML = `<span class="icon-fallback" aria-hidden="true">${action}</span><i data-lucide="${revealed ? "eye-off" : "eye"}" aria-hidden="true"></i>`;
+}
+
+async function toggleSecret(event) {
+  const button = event.currentTarget;
+  const key = button.dataset.envKey;
+  const field = SECRET_FIELDS[key];
+  if (!field) return;
+  const input = $(field.input);
+  if (input.type === "text") {
+    input.type = "password";
+    updateSecretToggle(key, false);
+    refreshIcons();
+    return;
+  }
+  if (!input.value && state.env[key]?.configured) {
+    button.disabled = true;
+    try {
+      const response = await api("/api/env/reveal", {
+        method: "POST",
+        body: JSON.stringify({ key }),
+      });
+      input.value = response.value || "";
+    } finally {
+      button.disabled = false;
+    }
+  }
+  input.type = "text";
+  updateSecretToggle(key, true);
+  refreshIcons();
+}
+
+function clearVisibleSecrets() {
+  for (const [key, field] of Object.entries(SECRET_FIELDS)) {
+    const input = $(field.input);
+    input.value = "";
+    input.type = "password";
+    input.dataset.changed = "false";
+    updateSecretToggle(key, false);
+  }
+  refreshIcons();
 }
 
 async function saveEnvironment(event) {
   event.preventDefault();
   if (event.submitter?.value === "cancel") {
+    clearVisibleSecrets();
     $("#settings-dialog").close();
     return;
   }
-  const updates = {};
-  $$(".env-row").forEach((row) => {
-    const key = row.dataset.envKey;
-    const input = row.querySelector("input:not([type=checkbox])");
-    const clear = row.querySelector("input[type=checkbox]");
-    if (clear.checked) updates[key] = null;
-    else if (input.value) updates[key] = input.value;
-  });
+  const model = $("#settings-model").value.trim();
+  const updates = {
+    OPENAI_BASE_URL: $("#settings-base-url").value.trim() || null,
+    BIOMAKER_MAIN_MODEL: model || null,
+    BIOMAKER_HELPER_MODEL: model || null,
+  };
+  for (const [key, field] of Object.entries(SECRET_FIELDS)) {
+    const input = $(field.input);
+    if (input.dataset.changed === "true") updates[key] = input.value.trim() || null;
+  }
   if (Object.keys(updates).length) {
     const response = await api("/api/env", {
       method: "PUT",
       body: JSON.stringify(updates),
     });
     state.env = response.values;
+    state.envDefaults = response.defaults || state.envDefaults;
   }
+  clearVisibleSecrets();
   $("#settings-dialog").close();
-  toast("Environment settings saved");
+  toast("Settings saved");
 }
 
 function renderDatasetDialog() {
   const list = $("#dataset-list");
   if (!state.datasets.length) {
-    list.innerHTML = '<div class="empty-state"><span>No workspace datasets found</span></div>';
+    list.innerHTML = emptyStateMarkup("folder-search", "No datasets found");
+    refreshIcons();
     return;
   }
   list.innerHTML = state.datasets.map((dataset) => `
@@ -590,23 +792,16 @@ function renderDatasetDialog() {
   refreshIcons();
 }
 
-function applyTemplate() {
-  const selected = state.templates.find((template) => template.path === $("#task-template").value);
-  if (!selected) return;
-  $("#task-body").value = selected.body;
-  if (selected.dataset_path) $("#dataset-path").value = selected.dataset_path;
-  if (!$("#project-name").value.trim()) $("#project-name").value = selected.name;
-  state.dirty = true;
-}
-
 async function refreshRuns(force = false) {
   if (state.polling) return;
   state.polling = true;
   try {
     state.runs = await api("/api/runs");
     renderRuns();
-    if (state.selectedRunId && (force || runById(state.selectedRunId))) {
+    if (state.selectedRunId) {
       await loadSelectedRun(force);
+    } else if (state.selectedRun) {
+      clearSelectedRun();
     }
   } finally {
     state.polling = false;
@@ -623,9 +818,16 @@ function bindEvents() {
   $("#save-project-button").addEventListener("click", () => saveProject().catch(showError));
   $("#delete-project-button").addEventListener("click", () => deleteProject().catch(showError));
   $("#run-button").addEventListener("click", () => queueRun().catch(showError));
-  $("#task-template").addEventListener("change", applyTemplate);
   $("#settings-button").addEventListener("click", () => openSettings().catch(showError));
   $("#settings-form").addEventListener("submit", (event) => saveEnvironment(event).catch(showError));
+  $("#settings-dialog").addEventListener("close", clearVisibleSecrets);
+  $("#refresh-models-button").addEventListener("click", () => discoverModels().catch(showModelError));
+  $$(".secret-toggle").forEach((button) => {
+    button.addEventListener("click", (event) => toggleSecret(event).catch(showError));
+  });
+  for (const field of Object.values(SECRET_FIELDS)) {
+    $(field.input).addEventListener("input", (event) => { event.currentTarget.dataset.changed = "true"; });
+  }
   $("#refresh-button").addEventListener("click", () => refreshRuns(true).catch(showError));
   $("#tree-refresh-button").addEventListener("click", () => renderTree(true));
   $("#console-refresh-button").addEventListener("click", () => loadConsole().catch(showError));
@@ -634,9 +836,16 @@ function bindEvents() {
     $("#dataset-dialog").showModal();
   });
   $("#close-dataset-dialog").addEventListener("click", () => $("#dataset-dialog").close());
-  $$(".tab").forEach((tab) => tab.addEventListener("click", () => setActiveTab(tab.dataset.tab)));
+  $("#run-history-select").addEventListener("change", (event) => selectRun(event.currentTarget.value).catch(showError));
+  $$(".tab").forEach((tab) => {
+    tab.addEventListener("click", () => setActiveTab(tab.dataset.tab));
+    tab.addEventListener("keydown", handleTabKeydown);
+  });
   $$("#project-form input, #project-form select, #project-form textarea").forEach((field) => {
-    field.addEventListener("input", () => { state.dirty = true; });
+    field.addEventListener("input", () => {
+      state.dirty = true;
+      updateNewTaskTitle();
+    });
   });
   window.addEventListener("beforeunload", (event) => {
     if (!state.dirty) return;
@@ -648,30 +857,24 @@ function bindEvents() {
 async function initialize() {
   bindEvents();
   refreshIcons();
-  const [projects, runs, templates, datasets, environment] = await Promise.all([
+  const [projects, runs, datasets, environment] = await Promise.all([
     api("/api/projects"),
     api("/api/runs"),
-    api("/api/task-templates"),
     api("/api/datasets"),
     api("/api/env"),
   ]);
   state.projects = projects;
   state.runs = runs;
-  state.templates = templates;
   state.datasets = datasets;
   state.env = environment.values;
-  renderTemplateOptions();
-  state.selectedProjectId = projects[0]?.id || null;
-  populateProjectForm(projectById(state.selectedProjectId));
-  renderProjects();
-  renderRuns();
-  if (runs[0]) {
-    state.selectedRunId = runs[0].id;
-    await loadSelectedRun(true);
-    renderRuns();
+  state.envDefaults = environment.defaults || {};
+  renderDatasetOptions();
+  const activeRun = runs.find((run) => ["running", "stopping", "queued"].includes(run.status));
+  const initialProject = projectById(activeRun?.project_id) || projects[0] || null;
+  if (initialProject) {
+    await selectProject(initialProject.id);
   } else {
-    renderRunSummary();
-    renderTree();
+    newProject();
   }
   window.setInterval(() => refreshRuns().catch(showError), 2000);
 }

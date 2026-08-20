@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -76,3 +76,26 @@ class EnvUpdate(BaseModel):
     OPENAI_BASE_URL: str | None = Field(default=None, max_length=20_000)
     SERPER_API_KEY: str | None = Field(default=None, max_length=20_000)
     JINA_API_KEY: str | None = Field(default=None, max_length=20_000)
+    BIOMAKER_MAIN_MODEL: str | None = Field(default=None, max_length=200)
+    BIOMAKER_HELPER_MODEL: str | None = Field(default=None, max_length=200)
+
+
+class EnvRevealRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: Literal["OPENAI_API_KEY", "SERPER_API_KEY", "JINA_API_KEY"]
+
+
+class ModelDiscoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str | None = Field(default=None, max_length=4096)
+    api_key: str | None = Field(default=None, max_length=20_000)
+
+    @field_validator("base_url", "api_key")
+    @classmethod
+    def normalize_optional(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None

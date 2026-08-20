@@ -8,12 +8,32 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-MANAGED_ENV_KEYS = (
+SECRET_ENV_KEYS = (
     "OPENAI_API_KEY",
-    "OPENAI_BASE_URL",
     "SERPER_API_KEY",
     "JINA_API_KEY",
 )
+
+PUBLIC_ENV_KEYS = (
+    "OPENAI_BASE_URL",
+    "BIOMAKER_MAIN_MODEL",
+    "BIOMAKER_HELPER_MODEL",
+    "OPENAI_MODEL",
+    "OPENAI_HELPER_MODEL",
+)
+
+EDITABLE_ENV_KEYS = (
+    *SECRET_ENV_KEYS,
+    "OPENAI_BASE_URL",
+    "BIOMAKER_MAIN_MODEL",
+    "BIOMAKER_HELPER_MODEL",
+)
+
+RUNTIME_ENV_KEYS = (*SECRET_ENV_KEYS, *PUBLIC_ENV_KEYS)
+FILE_AUTHORITATIVE_ENV_KEYS = (*SECRET_ENV_KEYS, "OPENAI_BASE_URL")
+
+# Kept as a public alias for callers that used the original name.
+MANAGED_ENV_KEYS = EDITABLE_ENV_KEYS
 
 
 def _assignment_pattern(key: str) -> re.Pattern[str]:
@@ -30,37 +50,53 @@ def _encode_value(value: str) -> str:
     return f'"{escaped}"'
 
 
-def read_managed_values(path: Path) -> dict[str, str]:
+def read_env_values(
+    path: Path, keys: tuple[str, ...] = RUNTIME_ENV_KEYS
+) -> dict[str, str]:
     if not path.is_file():
         return {}
     values = dotenv_values(path)
     return {
         key: str(values[key])
-        for key in MANAGED_ENV_KEYS
+        for key in keys
         if values.get(key) not in (None, "")
     }
+
+
+def read_managed_values(path: Path) -> dict[str, str]:
+    return read_env_values(path, EDITABLE_ENV_KEYS)
 
 
 def mask_value(value: str) -> str:
     if not value:
         return ""
-    suffix = value[-4:] if len(value) > 4 else ""
-    return f"********{suffix}"
+    return "********"
 
 
 def masked_env(path: Path) -> dict[str, dict[str, str | bool]]:
-    values = read_managed_values(path)
-    return {
-        key: {
-            "configured": key in values,
-            "masked": mask_value(values.get(key, "")),
-        }
-        for key in MANAGED_ENV_KEYS
-    }
+    values = read_env_values(path)
+    result: dict[str, dict[str, str | bool]] = {}
+    for key in (*EDITABLE_ENV_KEYS, "OPENAI_MODEL", "OPENAI_HELPER_MODEL"):
+        configured = key in values
+        if key in SECRET_ENV_KEYS:
+            result[key] = {
+                "configured": configured,
+                "masked": mask_value(values.get(key, "")),
+                "secret": True,
+            }
+        else:
+            value = values.get(key, "")
+            result[key] = {
+                "configured": configured,
+                "masked": value,
+                "value": value,
+                "secret": False,
+            }
+    return result
 
 
 def update_env_file(path: Path, updates: Mapping[str, str | None]) -> None:
-    unknown = set(updates) - set(MANAGED_ENV_KEYS)
+    unknown = set(updates) - set(EDITABLE_ENV_KEYS)
     if unknown:
         raise ValueError(f"Unsupported environment keys: {sorted(unknown)}")
     if not updates:
@@ -118,7 +154,7 @@ def update_env_file(path: Path, updates: Mapping[str, str | None]) -> None:
 
 def subprocess_environment(path: Path) -> dict[str, str]:
     environment = os.environ.copy()
-    for key in MANAGED_ENV_KEYS:
+    for key in FILE_AUTHORITATIVE_ENV_KEYS:
         environment.pop(key, None)
-    environment.update(read_managed_values(path))
+    environment.update(read_env_values(path))
     return environment

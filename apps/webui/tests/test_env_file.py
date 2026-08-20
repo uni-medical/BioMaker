@@ -6,7 +6,12 @@ import stat
 import tempfile
 from pathlib import Path
 
-from webui.env_file import masked_env, read_managed_values, update_env_file
+from webui.env_file import (
+    masked_env,
+    read_managed_values,
+    subprocess_environment,
+    update_env_file,
+)
 
 
 def test_env_update_preserves_unmanaged_lines_and_never_returns_secret(tmp_path):
@@ -41,8 +46,45 @@ def test_env_update_preserves_unmanaged_lines_and_never_returns_secret(tmp_path)
     assert "new-secret-123456" not in json.dumps(masked)
     assert masked["OPENAI_API_KEY"] == {
         "configured": True,
-        "masked": "********3456",
+        "masked": "********",
+        "secret": True,
     }
+    assert masked["OPENAI_BASE_URL"] == {
+        "configured": True,
+        "masked": "https://api.example.test/v1",
+        "value": "https://api.example.test/v1",
+        "secret": False,
+    }
+
+
+def test_model_settings_are_editable_and_loaded_into_subprocess(tmp_path, monkeypatch):
+    path = tmp_path / ".env"
+    path.write_text(
+        "BIOMAKER_MAIN_MODEL=main-from-file\n"
+        "BIOMAKER_HELPER_MODEL=helper-from-file\n"
+        "OPENAI_MODEL=fallback-from-file\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BIOMAKER_MAIN_MODEL", "inherited-main")
+    monkeypatch.setenv("OPENAI_MODEL", "inherited-fallback")
+
+    update_env_file(
+        path,
+        {
+            "BIOMAKER_MAIN_MODEL": "selected-model",
+            "BIOMAKER_HELPER_MODEL": "selected-model",
+        },
+    )
+
+    environment = subprocess_environment(path)
+    assert environment["BIOMAKER_MAIN_MODEL"] == "selected-model"
+    assert environment["BIOMAKER_HELPER_MODEL"] == "selected-model"
+    assert environment["OPENAI_MODEL"] == "fallback-from-file"
+
+    empty_path = tmp_path / "missing.env"
+    inherited_environment = subprocess_environment(empty_path)
+    assert inherited_environment["BIOMAKER_MAIN_MODEL"] == "inherited-main"
+    assert inherited_environment["OPENAI_MODEL"] == "inherited-fallback"
 
 
 def test_new_env_file_uses_private_permissions():

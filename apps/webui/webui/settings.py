@@ -45,6 +45,15 @@ class Settings:
             .expanduser()
             .resolve()
         )
+        env_file_override = os.environ.get("BIOMAKER_WEBUI_ENV_FILE")
+        env_file = (
+            Path(env_file_override).expanduser()
+            if env_file_override
+            else workspace_root / ".env"
+        )
+        if not env_file.is_absolute():
+            env_file = workspace_root / env_file
+        env_file = env_file.resolve()
         return cls(
             method_root=method_root,
             workspace_root=workspace_root,
@@ -53,7 +62,7 @@ class Settings:
             workspaces_root=workspace_root / "workspaces",
             experiments_root=workspace_root / "experiments",
             datasets_root=workspace_root / "datasets",
-            env_file=method_root / ".env",
+            env_file=env_file,
             uv_executable=os.environ.get("BIOMAKER_WEBUI_UV", "uv"),
         )
 

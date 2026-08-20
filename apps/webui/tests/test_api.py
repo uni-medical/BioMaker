@@ -7,6 +7,7 @@ import time
 
 from fastapi.testclient import TestClient
 
+import webui.server as server
 from webui.server import create_app
 
 
@@ -90,7 +91,7 @@ def prepare_workspace(settings):
 def test_project_env_run_and_artifact_api(settings):
     dataset, template = prepare_workspace(settings)
     app = create_app(settings, process_factory=ImmediateProcess)
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         assert client.get("/api/health").json()["status"] == "ok"
         templates = client.get("/api/task-templates").json()
         assert templates[0]["dataset_path"] == str(dataset.resolve())
@@ -105,10 +106,42 @@ def test_project_env_run_and_artifact_api(settings):
         assert client.get("/api/projects").json()[0]["id"] == project["id"]
 
         secret = "api-secret-value-9876"
-        response = client.put("/api/env", json={"OPENAI_API_KEY": secret})
+        response = client.put(
+            "/api/env",
+            json={
+                "OPENAI_API_KEY": secret,
+                "OPENAI_BASE_URL": "https://api.example.test/v1",
+                "BIOMAKER_MAIN_MODEL": "model-one",
+                "BIOMAKER_HELPER_MODEL": "model-one",
+            },
+        )
         assert response.status_code == 200
         assert secret not in response.text
-        assert secret not in client.get("/api/env").text
+        environment_response = client.get("/api/env")
+        assert secret not in environment_response.text
+        assert secret[-4:] not in environment_response.text
+        environment = environment_response.json()
+        assert environment["values"]["OPENAI_BASE_URL"]["value"] == (
+            "https://api.example.test/v1"
+        )
+        assert environment["values"]["BIOMAKER_MAIN_MODEL"]["value"] == "model-one"
+        assert environment["defaults"]["main_model"] == "model-one"
+        assert environment["source"] == {
+            "path": str(settings.env_file),
+            "exists": True,
+        }
+        reveal = client.post("/api/env/reveal", json={"key": "OPENAI_API_KEY"})
+        assert reveal.status_code == 200
+        assert reveal.json() == {
+            "key": "OPENAI_API_KEY",
+            "configured": True,
+            "value": secret,
+        }
+        assert reveal.headers["cache-control"] == "no-store"
+        assert (
+            client.post("/api/env/reveal", json={"key": "OPENAI_BASE_URL"}).status_code
+            == 422
+        )
         assert secret not in json.dumps(client.get("/api/health").json())
 
         response = client.post("/api/runs", json={"project_id": project["id"]})
@@ -139,6 +172,84 @@ def test_project_env_run_and_artifact_api(settings):
 
         assert client.delete(f"/api/projects/{project['id']}").status_code == 204
         assert client.get(f"/api/projects/{project['id']}").status_code == 404
+
+
+def test_model_discovery_uses_configured_or_supplied_credentials(settings, monkeypatch):
+    settings.env_file.write_text(
+        "OPENAI_BASE_URL=https://configured.example/v1\n"
+        "OPENAI_API_KEY=configured-secret\n"
+        "OPENAI_MODEL=fallback-model\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_discover(base_url, api_key):
+        calls.append((base_url, api_key))
+        return {
+            "status": "ok",
+            "models": ["fallback-model", "another-model"],
+            "base_url": base_url,
+            "detail": None,
+        }
+
+    monkeypatch.setattr(server, "discover_models", fake_discover)
+    app = create_app(settings, process_factory=ImmediateProcess)
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        configured = client.post("/api/models/discover", json={})
+        assert configured.status_code == 200
+        assert calls[-1] == (
+            "https://configured.example/v1",
+            "configured-secret",
+        )
+        assert configured.json()["default_model"] == "fallback-model"
+        assert configured.json()["default_model_source"] == "OPENAI_MODEL"
+        assert "configured-secret" not in configured.text
+
+        supplied = client.post(
+            "/api/models/discover",
+            json={
+                "base_url": "http://127.0.0.1:11434/v1",
+                "api_key": "temporary-key",
+            },
+        )
+        assert supplied.status_code == 200
+        assert calls[-1] == ("http://127.0.0.1:11434/v1", "temporary-key")
+        assert "temporary-key" not in supplied.text
+
+        changed_provider = client.post(
+            "/api/models/discover",
+            json={"base_url": "https://different.example/v1"},
+        )
+        assert changed_provider.status_code == 200
+        assert calls[-1] == ("https://different.example/v1", None)
+
+        marker = "VALIDATION_SECRET_MUST_NOT_APPEAR"
+        oversized_secret = marker + ("x" * 20_000)
+        for path, payload in (
+            ("/api/models/discover", {"api_key": oversized_secret}),
+            ("/api/env", {"OPENAI_API_KEY": oversized_secret}),
+        ):
+            if "models" in path:
+                response = client.post(path, json=payload)
+            else:
+                response = client.put(path, json=payload)
+            assert response.status_code == 422
+            assert marker not in response.text
+
+
+def test_secret_bearing_settings_endpoints_require_loopback(settings):
+    settings.env_file.write_text("OPENAI_API_KEY=do-not-return\n", encoding="utf-8")
+    app = create_app(settings, process_factory=ImmediateProcess)
+    with TestClient(app, client=("192.0.2.10", 50000)) as client:
+        environment = client.get("/api/env")
+        assert environment.status_code == 200
+        assert "do-not-return" not in environment.text
+        assert client.put("/api/env", json={"OPENAI_API_KEY": "new"}).status_code == 403
+        assert (
+            client.post("/api/env/reveal", json={"key": "OPENAI_API_KEY"}).status_code
+            == 403
+        )
+        assert client.post("/api/models/discover", json={}).status_code == 403
 
 
 def test_api_cancel_pending_and_stop_active_run(settings):

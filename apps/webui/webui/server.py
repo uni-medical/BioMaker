@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -9,6 +10,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -19,8 +21,15 @@ from .artifacts import (
     resolve_artifact,
     tail_text,
 )
-from .env_file import masked_env, update_env_file
-from .models import EnvUpdate, ProjectInput, RunCreate
+from .env_file import SECRET_ENV_KEYS, masked_env, read_env_values, update_env_file
+from .model_discovery import discover_models, normalize_base_url
+from .models import (
+    EnvRevealRequest,
+    EnvUpdate,
+    ModelDiscoveryRequest,
+    ProjectInput,
+    RunCreate,
+)
 from .registry import JsonRegistry, RegistryError
 from .runner import RunManager, utc_now
 from .settings import Settings
@@ -142,6 +151,63 @@ def _console_path(settings: Settings, run: dict[str, Any]) -> Path:
     return path
 
 
+def _model_defaults(values: dict[str, str]) -> dict[str, str]:
+    main_source = (
+        "BIOMAKER_MAIN_MODEL"
+        if values.get("BIOMAKER_MAIN_MODEL")
+        else "OPENAI_MODEL" if values.get("OPENAI_MODEL") else ""
+    )
+    helper_source = (
+        "BIOMAKER_HELPER_MODEL"
+        if values.get("BIOMAKER_HELPER_MODEL")
+        else "OPENAI_HELPER_MODEL" if values.get("OPENAI_HELPER_MODEL") else ""
+    )
+    return {
+        "main_model": values.get(main_source, ""),
+        "helper_model": values.get(helper_source, ""),
+        "main_model_source": main_source,
+        "helper_model_source": helper_source,
+        "openai_model": values.get("OPENAI_MODEL", ""),
+    }
+
+
+def _environment_response(settings: Settings) -> dict[str, Any]:
+    values = read_env_values(settings.env_file)
+    return {
+        "values": masked_env(settings.env_file),
+        "defaults": _model_defaults(values),
+        "source": {
+            "path": str(settings.env_file),
+            "exists": settings.env_file.is_file(),
+        },
+    }
+
+
+def _require_loopback(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    is_loopback = bool(address and address.is_loopback)
+    if address and address.version == 6 and address.ipv4_mapped:
+        is_loopback = address.ipv4_mapped.is_loopback
+    if not is_loopback:
+        raise HTTPException(
+            status_code=403,
+            detail="Settings changes are available only from this computer.",
+        )
+
+
+def _same_base_url(first: str | None, second: str | None) -> bool:
+    if not first or not second:
+        return False
+    try:
+        return normalize_base_url(first) == normalize_base_url(second)
+    except ValueError:
+        return False
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -183,6 +249,18 @@ def create_app(
     async def registry_error(_: Request, exc: RegistryError):
         return JSONResponse(status_code=500, content={"detail": str(exc)})
 
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(_: Request, exc: RequestValidationError):
+        safe_errors = [
+            {
+                "type": error.get("type", "value_error"),
+                "loc": error.get("loc", ()),
+                "msg": error.get("msg", "Invalid value"),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": safe_errors})
+
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
@@ -202,13 +280,47 @@ def create_app(
 
     @app.get("/api/env")
     def get_env() -> dict[str, Any]:
-        return {"values": masked_env(app_settings.env_file)}
+        return _environment_response(app_settings)
 
     @app.put("/api/env")
-    def put_env(payload: EnvUpdate) -> dict[str, Any]:
+    def put_env(request: Request, payload: EnvUpdate) -> dict[str, Any]:
+        _require_loopback(request)
         updates = {key: getattr(payload, key) for key in payload.model_fields_set}
         update_env_file(app_settings.env_file, updates)
-        return {"values": masked_env(app_settings.env_file)}
+        return _environment_response(app_settings)
+
+    @app.post("/api/env/reveal")
+    def reveal_env(request: Request, payload: EnvRevealRequest) -> dict[str, Any]:
+        _require_loopback(request)
+        values = read_env_values(app_settings.env_file, SECRET_ENV_KEYS)
+        value = values.get(payload.key)
+        return {
+            "key": payload.key,
+            "configured": value is not None,
+            "value": value,
+        }
+
+    @app.post("/api/models/discover")
+    def models_discover(
+        request: Request, payload: ModelDiscoveryRequest
+    ) -> dict[str, Any]:
+        _require_loopback(request)
+        values = read_env_values(app_settings.env_file)
+        configured_base_url = values.get("OPENAI_BASE_URL")
+        base_url = payload.base_url or configured_base_url
+        if payload.api_key:
+            api_key = payload.api_key
+        elif payload.base_url is None or _same_base_url(
+            payload.base_url, configured_base_url
+        ):
+            api_key = values.get("OPENAI_API_KEY")
+        else:
+            api_key = None
+        result = discover_models(base_url, api_key)
+        defaults = _model_defaults(values)
+        result["default_model"] = defaults["main_model"]
+        result["default_model_source"] = defaults["main_model_source"]
+        return result
 
     @app.get("/api/task-templates")
     def task_templates() -> list[dict[str, Any]]:

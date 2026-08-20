@@ -28,6 +28,6 @@ def settings(tmp_path: Path) -> Settings:
         workspaces_root=workspace_root / "workspaces",
         experiments_root=workspace_root / "experiments",
         datasets_root=workspace_root / "datasets",
-        env_file=method_root / ".env",
+        env_file=workspace_root / ".env",
         stop_grace_seconds=0.1,
     )
