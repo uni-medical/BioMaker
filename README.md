@@ -63,6 +63,15 @@ BioMaker keeps the RAG index local instead of storing generated index files in g
      ```
 If the index is missing, BioMaker warns and disables MONAI RAG for that run.
 
+## Web interface
+
+Start the local WebUI from the repository root:
+```bash
+cd apps/webui
+uv run python -m webui.server --host 127.0.0.1 --port 7860
+```
+Open <http://127.0.0.1:7860>, configure the endpoint and API key in Settings, then select a local dataset folder to create a task.
+
 ## Workflow
 
 The default run is intentionally simple:
