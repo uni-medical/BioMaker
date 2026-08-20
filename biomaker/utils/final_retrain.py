@@ -145,14 +145,21 @@ def _merge_visible_score_with_hidden_labels(
     if label_source.duplicated(key_columns).any():
         raise ValueError(f"Hidden score labels contain duplicate keys: {key_columns}")
 
+    merge_indicator = "__biomaker_score_label_merge"
     score_labeled = score_visible_df.merge(
         label_source,
         on=key_columns,
         how="left",
         validate="one_to_one",
+        indicator=merge_indicator,
     )
-    if score_labeled[answer_columns].isna().any().any():
-        raise ValueError("Hidden score label merge produced missing labels.")
+    unmatched_rows = score_labeled[merge_indicator] != "both"
+    if unmatched_rows.any():
+        raise ValueError(
+            "Hidden score label merge produced unmatched score rows: "
+            f"{int(unmatched_rows.sum())}"
+        )
+    score_labeled = score_labeled.drop(columns=[merge_indicator])
 
     missing_train_columns = [
         col for col in train_df.columns if col not in score_labeled.columns
