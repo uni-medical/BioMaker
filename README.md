@@ -34,15 +34,16 @@ We recommend using `uv` to manage the environment and dependencies.
      ```
 
 4. **Set up API keys**:
-Set up your private API key for OpenAI-compatible endpoints. Serper and Jina are optional but recommended for web search: Serper finds relevant pages, and Jina reads those pages into cleaner text.
-     ```bash
-     export OPENAI_BASE_URL="<your base url>" # (e.g. https://api.openai.com/v1)
-     export OPENAI_API_KEY="<your key>"
-     export BIOMAKER_EMBEDDING_BASE_URL="<your embedding base url>" # optional
-     export BIOMAKER_EMBEDDING_API_KEY="<your embedding key>"       # optional
-     export SERPER_API_KEY="<your serper key>"
-     export JINA_API_KEY="<your jina key>"
+Create `BioMaker/.env` in the repository root. BioMaker, its RAG tools, and the WebUI use this same file regardless of their launch directory. Serper and Jina are optional but recommended for web search: Serper finds relevant pages, and Jina reads those pages into cleaner text.
+     ```dotenv
+     OPENAI_BASE_URL="<your base url>" # (e.g. https://api.openai.com/v1)
+     OPENAI_API_KEY="<your key>"
+     BIOMAKER_EMBEDDING_BASE_URL="<your embedding base url>" # optional
+     BIOMAKER_EMBEDDING_API_KEY="<your embedding key>"       # optional
+     SERPER_API_KEY="<your serper key>"
+     JINA_API_KEY="<your jina key>"
      ```
+Set `BIOMAKER_ENV_FILE` to an absolute path, or a path relative to the repository root, to use a different file explicitly. Existing shell environment variables still take precedence when running the BioMaker CLI directly.
 The embedding variables are only needed when the embedding endpoint differs from the main OpenAI-compatible endpoint. If `SERPER_API_KEY` is missing, BioMaker warns and disables web search for that run. If `JINA_API_KEY` is missing, BioMaker warns and falls back to Serper snippets only.
 
 5. **Set up the MONAI RAG index**

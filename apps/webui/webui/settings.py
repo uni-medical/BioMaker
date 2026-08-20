@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .env_file import resolve_env_file
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -45,15 +47,7 @@ class Settings:
             .expanduser()
             .resolve()
         )
-        env_file_override = os.environ.get("BIOMAKER_WEBUI_ENV_FILE")
-        env_file = (
-            Path(env_file_override).expanduser()
-            if env_file_override
-            else workspace_root / ".env"
-        )
-        if not env_file.is_absolute():
-            env_file = workspace_root / env_file
-        env_file = env_file.resolve()
+        env_file = resolve_env_file(method_root)
         return cls(
             method_root=method_root,
             workspace_root=workspace_root,

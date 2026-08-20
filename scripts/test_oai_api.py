@@ -1,9 +1,10 @@
 import os
 
-from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()
+from biomaker.utils.env import load_local_env
+
+load_local_env()
 client = OpenAI()
 
 completion = client.chat.completions.create(

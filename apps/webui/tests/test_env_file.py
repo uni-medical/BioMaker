@@ -10,9 +10,27 @@ from webui.env_file import (
     mask_value,
     masked_env,
     read_managed_values,
+    resolve_env_file,
     subprocess_environment,
     update_env_file,
 )
+
+
+def test_env_file_resolution_is_independent_of_cwd(tmp_path, monkeypatch):
+    method_root = tmp_path / "BioMaker"
+    elsewhere = tmp_path / "elsewhere"
+    method_root.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.delenv("BIOMAKER_ENV_FILE", raising=False)
+    monkeypatch.delenv("BIOMAKER_WEBUI_ENV_FILE", raising=False)
+
+    assert resolve_env_file(method_root) == (method_root / ".env").resolve()
+
+    monkeypatch.setenv("BIOMAKER_ENV_FILE", "secrets/provider.env")
+    assert resolve_env_file(method_root) == (
+        method_root / "secrets" / "provider.env"
+    ).resolve()
 
 
 def test_env_update_preserves_unmanaged_lines_and_never_returns_secret(tmp_path):

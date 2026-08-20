@@ -77,6 +77,7 @@ def test_linux_uses_kdialog_fallback_and_treats_user_cancel_as_cancelled(
     requested = []
 
     monkeypatch.setattr(directory_picker.sys, "platform", "linux")
+    monkeypatch.setattr(directory_picker, "_is_wsl", lambda: False)
 
     def fake_which(name):
         requested.append(name)
@@ -100,6 +101,7 @@ def test_linux_uses_kdialog_fallback_and_treats_user_cancel_as_cancelled(
 
 def test_linux_picker_error_is_not_treated_as_cancel(monkeypatch):
     monkeypatch.setattr(directory_picker.sys, "platform", "linux")
+    monkeypatch.setattr(directory_picker, "_is_wsl", lambda: False)
     monkeypatch.setattr(directory_picker.shutil, "which", lambda _name: "/usr/bin/zenity")
     monkeypatch.setattr(
         directory_picker.subprocess,
@@ -111,6 +113,46 @@ def test_linux_picker_error_is_not_treated_as_cancel(monkeypatch):
 
     with pytest.raises(directory_picker.DirectoryPickerError, match="closed"):
         directory_picker.select_directory()
+
+
+def test_wsl_uses_windows_picker_and_converts_selected_path(tmp_path, monkeypatch):
+    captured = []
+    selected = "C:\\Users\\研究者\\数据集"
+    converted = tmp_path / "数据集"
+
+    monkeypatch.setattr(directory_picker.sys, "platform", "linux")
+    monkeypatch.setattr(directory_picker, "_is_wsl", lambda: True)
+
+    def fake_which(name):
+        return {
+            "powershell.exe": "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            "wslpath": "/usr/bin/wslpath",
+        }.get(name)
+
+    def fake_run(command, **kwargs):
+        captured.append((command, kwargs))
+        if command[0].endswith("powershell.exe"):
+            return subprocess.CompletedProcess(
+                command, 0, stdout=selected + "\r\n", stderr=""
+            )
+        assert command == ["/usr/bin/wslpath", "-u", selected]
+        return subprocess.CompletedProcess(
+            command, 0, stdout=str(converted) + "\n", stderr=""
+        )
+
+    monkeypatch.setattr(directory_picker.shutil, "which", fake_which)
+    monkeypatch.setattr(directory_picker.subprocess, "run", fake_run)
+
+    assert directory_picker.select_directory()["path"] == str(converted.resolve())
+    assert len(captured) == 2
+    assert captured[0][0][1:5] == [
+        "-NoProfile",
+        "-NonInteractive",
+        "-STA",
+        "-Command",
+    ]
+    assert "FolderBrowserDialog" in captured[0][0][5]
+    assert captured[1][1]["timeout"] == 10.0
 
 
 def test_windows_uses_fixed_powershell_dialog(monkeypatch):

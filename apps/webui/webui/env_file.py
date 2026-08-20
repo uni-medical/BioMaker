@@ -8,6 +8,9 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+ENV_FILE_VARIABLE = "BIOMAKER_ENV_FILE"
+LEGACY_ENV_FILE_VARIABLE = "BIOMAKER_WEBUI_ENV_FILE"
+
 SECRET_ENV_KEYS = (
     "OPENAI_API_KEY",
     "SERPER_API_KEY",
@@ -37,6 +40,19 @@ MANAGED_ENV_KEYS = EDITABLE_ENV_KEYS
 
 SECRET_MASK = "•" * 8
 VISIBLE_SECRET_PREFIXES = ("sk-", "sk_", "jina_", "jina-")
+
+
+def resolve_env_file(method_root: Path | str) -> Path:
+    """Resolve the shared BioMaker env-file contract for the WebUI runtime."""
+
+    root = Path(method_root).expanduser().resolve()
+    override = os.environ.get(ENV_FILE_VARIABLE) or os.environ.get(
+        LEGACY_ENV_FILE_VARIABLE
+    )
+    path = Path(override).expanduser() if override else root / ".env"
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
 
 
 def _assignment_pattern(key: str) -> re.Pattern[str]:

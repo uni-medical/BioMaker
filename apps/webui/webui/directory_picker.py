@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ntpath
+import os
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,19 @@ class DirectoryPickerBusy(DirectoryPickerError):
 _PICKER_LOCK = threading.Lock()
 
 
+def _is_wsl() -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        release = Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    normalized = release.lower()
+    return "microsoft" in normalized or "wsl" in normalized
+
+
 def _command_for_platform(platform: str) -> tuple[list[str], str]:
     if platform == "darwin":
         executable = shutil.which("osascript")
@@ -78,6 +92,18 @@ def _command_for_platform(platform: str) -> tuple[list[str], str]:
         )
 
     if platform.startswith("linux"):
+        if _is_wsl():
+            executable = shutil.which("powershell.exe")
+            converter = shutil.which("wslpath")
+            if executable and converter:
+                return [
+                    executable,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-STA",
+                    "-Command",
+                    _WINDOWS_SCRIPT,
+                ], "wsl-windows"
         executable = shutil.which("zenity")
         if executable:
             return [
@@ -105,12 +131,52 @@ def _command_for_platform(platform: str) -> tuple[list[str], str]:
 
 
 def _absolute_path(raw_path: str, picker_kind: str) -> str:
-    if picker_kind == "windows":
+    if picker_kind in {"windows", "wsl-windows"}:
         if not PureWindowsPath(raw_path).is_absolute():
             raise DirectoryPickerError(
                 "The system folder picker returned an invalid path."
             )
-        return ntpath.normpath(raw_path)
+        windows_path = ntpath.normpath(raw_path)
+        if picker_kind == "windows":
+            return windows_path
+
+        converter = shutil.which("wslpath")
+        if not converter:
+            raise DirectoryPickerUnsupported(
+                "The Windows folder path cannot be converted for WSL."
+            )
+        try:
+            completed = subprocess.run(
+                [converter, "-u", windows_path],
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+                check=False,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="strict",
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DirectoryPickerError(
+                "The selected Windows folder path could not be converted for WSL."
+            ) from exc
+        except UnicodeError as exc:
+            raise DirectoryPickerError(
+                "The converted WSL folder path could not be read."
+            ) from exc
+
+        converted = completed.stdout.rstrip("\r\n")
+        if completed.returncode != 0 or not converted:
+            raise DirectoryPickerError(
+                "The selected Windows folder path could not be converted for WSL."
+            )
+        path = Path(converted)
+        if not path.is_absolute():
+            raise DirectoryPickerError(
+                "The system folder picker returned an invalid WSL path."
+            )
+        return str(path.resolve())
 
     path = Path(raw_path)
     if not path.is_absolute():
