@@ -48,6 +48,7 @@ const state = {
 const refreshPolicy = window.BioMakerRefreshPolicy || {
   isActive: (status) => ["queued", "running", "stopping"].includes(status),
   isTerminal,
+  initialRun: (runs = []) => runs.find((run) => ["queued", "running", "stopping"].includes(run?.status)) || null,
   pollDelay: ({ hidden, hasActive, failures }) => {
     if (hidden) return null;
     if (failures) return Math.min(30000, 2000 * (2 ** (failures - 1)));
@@ -281,6 +282,28 @@ function renderDatasetOptions() {
   datalist.innerHTML = state.datasets
     .map((dataset) => `<option value="${escapeHtml(dataset.path)}">${escapeHtml(dataset.name)}</option>`)
     .join("");
+}
+
+function renderDatasetDialog() {
+  const list = $("#dataset-list");
+  if (!state.datasets.length) {
+    list.innerHTML = emptyStateMarkup("folder-search", "No datasets found");
+    refreshIcons();
+    return;
+  }
+  list.innerHTML = state.datasets.map((dataset) => `
+    <button class="dataset-option" type="button" data-dataset-path="${escapeHtml(dataset.path)}">
+      <i data-lucide="folder" aria-hidden="true"></i>
+      <span>${escapeHtml(dataset.name)}<small>${escapeHtml(dataset.path)}</small></span>
+    </button>`).join("");
+  list.querySelectorAll("[data-dataset-path]").forEach((button) => {
+    button.addEventListener("click", () => {
+      $("#dataset-path").value = button.dataset.datasetPath;
+      markProjectDirty();
+      $("#dataset-dialog").close();
+    });
+  });
+  refreshIcons();
 }
 
 function runDatasetPath(run) {
@@ -1381,27 +1404,6 @@ async function saveEnvironment(event) {
   toast("Settings saved");
 }
 
-async function chooseDatasetDirectory() {
-  const button = $("#browse-datasets-button");
-  button.disabled = true;
-  button.setAttribute("aria-busy", "true");
-  try {
-    const response = await api("/api/directories/select", {
-      method: "POST",
-      headers: { "X-BioMaker-UI": "directory-picker" },
-    });
-    if (response.status === "cancelled") return;
-    if (response.status !== "selected" || !response.path) {
-      throw new Error("The system folder picker returned an invalid result.");
-    }
-    $("#dataset-path").value = response.path;
-    markProjectDirty();
-  } finally {
-    button.disabled = false;
-    button.removeAttribute("aria-busy");
-  }
-}
-
 function setConnectionIndicator(message = "", kind = "") {
   const indicator = $("#connection-indicator");
   indicator.textContent = message;
@@ -1502,6 +1504,7 @@ function bindEvents() {
   $("#settings-form").addEventListener("submit", (event) => saveEnvironment(event).catch(showError));
   $("#settings-dialog").addEventListener("close", clearVisibleSecrets);
   $("#settings-dialog").addEventListener("keydown", trapDialogFocus);
+  $("#dataset-dialog").addEventListener("keydown", trapDialogFocus);
   $("#settings-base-url").addEventListener("input", invalidateModelDiscovery);
   $("#refresh-task-models-button").addEventListener("click", () => discoverModels("task").catch(showModelError));
   $("#refresh-models-button").addEventListener("click", () => {
@@ -1531,7 +1534,12 @@ function bindEvents() {
   });
   $("#run-focus-button").addEventListener("click", () => toggleTreeFocus());
   $("#console-refresh-button").addEventListener("click", () => loadConsole({ force: true }).catch(showError));
-  $("#browse-datasets-button").addEventListener("click", () => chooseDatasetDirectory().catch(showError));
+  $("#browse-datasets-button").addEventListener("click", () => {
+    renderDatasetDialog();
+    $("#dataset-dialog").showModal();
+    $("#dataset-list .dataset-option")?.focus();
+  });
+  $("#close-dataset-dialog").addEventListener("click", () => $("#dataset-dialog").close());
   $("#run-history-select").addEventListener("change", (event) => selectRun(event.currentTarget.value).catch(showError));
   $$(".mobile-view-button").forEach((button) => {
     button.addEventListener("click", () => setMobileView(button.dataset.mobileView));
@@ -1601,9 +1609,8 @@ async function initialize() {
   setMobileView("setup");
   populateProjectForm(null);
   renderRuns();
-  const activeRun = runs.find((run) => ["running", "stopping", "queued"].includes(run.status));
-  const initialRun = activeRun || runs[0] || null;
-  if (initialRun) await selectRun(initialRun.id);
+  const activeRun = refreshPolicy.initialRun(runs);
+  if (activeRun) await selectRun(activeRun.id);
   else await loadSelectedRun(true);
   if (activeRun) setMobileView("run");
   schedulePoll(nextPollDelay());

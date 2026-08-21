@@ -27,6 +27,10 @@
     return TERMINAL_STATUSES.has(String(status || ""));
   }
 
+  function initialRun(runs = []) {
+    return runs.find((run) => isActive(run?.status)) || null;
+  }
+
   function pollDelay({ hidden = false, hasActive = false, failures = 0 } = {}) {
     if (hidden) return null;
     if (failures > 0) {
@@ -55,6 +59,7 @@
     BACKOFF_DELAYS,
     isActive,
     isTerminal,
+    initialRun,
     pollDelay,
     treeDecision,
   });

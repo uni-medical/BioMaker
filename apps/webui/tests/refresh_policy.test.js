@@ -5,11 +5,21 @@ const assert = require("node:assert/strict");
 
 const {
   BACKOFF_DELAYS,
+  initialRun,
   isActive,
   isTerminal,
   pollDelay,
   treeDecision,
 } = require("../webui/static/refresh_policy.js");
+
+test("initialRun opens only active work and otherwise leaves a new experiment", () => {
+  const completed = { id: "completed", status: "succeeded" };
+  const queued = { id: "queued", status: "queued" };
+
+  assert.equal(initialRun([completed]), null);
+  assert.equal(initialRun([completed, queued]), queued);
+  assert.equal(initialRun([]), null);
+});
 
 test("status helpers distinguish active, terminal, and unknown runs", () => {
   for (const status of ["queued", "running", "stopping"]) {
