@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="/static/styles.css">
     <script defer src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
     <script defer src="/static/refresh_policy.js"></script>
+    <script defer src="/static/system_resources.js"></script>
     <script defer src="/static/queue_view.js"></script>
     <script defer src="/static/app.js"></script>
   </head>
@@ -18,6 +19,9 @@
         <strong>BioMaker</strong>
       </div>
       <div class="header-context">
+        <div id="system-resources" class="system-resources">
+          <button id="system-resource-summary" type="button" aria-controls="system-panel" aria-pressed="false">System · loading…</button>
+        </div>
         <span id="connection-indicator" class="connection-indicator" role="status" hidden></span>
       </div>
       <div class="header-actions">
@@ -148,7 +152,7 @@
         </div>
       </section>
 
-      <section class="detail-pane no-run" aria-label="Run details">
+      <section class="detail-pane no-run" aria-label="Details">
         <div id="run-summary" class="run-summary" hidden>
           <div class="run-title">
             <strong id="selected-run-name"></strong>
@@ -165,7 +169,7 @@
           </div>
           <div id="run-lifecycle-detail" class="run-lifecycle-detail" hidden></div>
         </div>
-        <div class="tab-bar" role="tablist" aria-label="Run views">
+        <div class="tab-bar" role="tablist" aria-label="Details">
           <button id="events-tab" class="tab active" type="button" role="tab" data-tab="events" aria-selected="true" aria-controls="events-panel" tabindex="0">
             <i data-lucide="activity" aria-hidden="true"></i>
             Activity
@@ -181,6 +185,10 @@
           <button id="artifacts-tab" class="tab" type="button" role="tab" data-tab="artifacts" aria-selected="false" aria-controls="artifacts-panel" tabindex="-1">
             <i data-lucide="files" aria-hidden="true"></i>
             Files
+          </button>
+          <button id="system-tab" class="tab system-tab" type="button" role="tab" data-tab="system" aria-selected="false" aria-controls="system-panel" tabindex="-1">
+            <i data-lucide="cpu" aria-hidden="true"></i>
+            System
           </button>
         </div>
 
@@ -240,6 +248,17 @@
             <div id="run-observation" class="observation-strip"></div>
             <div id="artifact-list" class="artifact-list">
               <div class="empty-state rich-empty-state"><div class="empty-icon"><i data-lucide="files" aria-hidden="true"></i></div><strong>No files yet</strong></div>
+            </div>
+          </section>
+
+          <section id="system-panel" class="tab-panel system-resource-panel" role="tabpanel" aria-labelledby="system-tab" tabindex="0">
+            <div class="system-resource-content">
+              <div class="system-resource-heading">
+                <strong>Whole-system resources</strong>
+                <span id="system-resource-freshness"></span>
+              </div>
+              <div id="system-resource-overview" class="system-resource-overview"></div>
+              <div id="system-resource-gpus" class="system-resource-gpus"></div>
             </div>
           </section>
         </div>

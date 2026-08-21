@@ -367,7 +367,25 @@ def test_reimported_unmanaged_terminal_event_updates_api_status(settings):
         assert updates["final_barrier"] is True
 
 
-def test_queue_api(settings):
+def test_queue_and_system_resources_api(settings, monkeypatch):
+    resource_snapshot = {
+        "sampled_at": "2026-08-21T08:09:10Z",
+        "stale": False,
+        "error": None,
+        "cpu": {"utilization_percent": 12.5},
+        "memory": {
+            "used_bytes": 2_000,
+            "total_bytes": 8_000,
+            "utilization_percent": 25.0,
+        },
+        "nvidia_gpus": [],
+        "apple_gpu": {
+            "source": "ioreg",
+            "utilization_percent": 97.0,
+            "shared_memory_used_bytes": 1_204_289_536,
+        },
+    }
+    monkeypatch.setattr(server, "get_system_resources", lambda: resource_snapshot)
     app = create_app(settings, process_factory=ImmediateProcess)
 
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
@@ -385,6 +403,11 @@ def test_queue_api(settings):
         assert resumed.status_code == 202
         assert resumed.json()["paused"] is False
         assert resumed.json()["reason"] is None
+
+        resources = client.get("/api/system/resources")
+        assert resources.status_code == 200
+        assert resources.json() == resource_snapshot
+        assert resources.headers["cache-control"] == "no-store"
 
         app.state.run_store.update_queue_control(
             {"paused": True, "reason": "first pause", "pause_generation": 1}

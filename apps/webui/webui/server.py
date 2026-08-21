@@ -46,6 +46,7 @@ from .run_catalog import list_log_runs, run_from_log_dir
 from .run_store import SQLiteRunStore
 from .runner import TERMINAL_STATUSES, RunManager
 from .settings import Settings
+from .system_resources import get_system_resources
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -292,6 +293,10 @@ def create_app(
             "workspace_root": str(app_settings.workspace_root),
             "method_root": str(app_settings.method_root),
         }
+
+    @app.get("/api/system/resources")
+    def system_resources() -> dict[str, Any]:
+        return get_system_resources()
 
     @app.get("/api/queue")
     def queue_state() -> dict[str, Any]:

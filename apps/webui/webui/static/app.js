@@ -2,6 +2,8 @@
 
 const PREFERRED_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
 const MAX_MODEL_SUGGESTIONS = 8;
+const SYSTEM_RESOURCE_POLL_INTERVAL_MS = 2000;
+const SYSTEM_RESOURCE_REQUEST_TIMEOUT_MS = 5000;
 let secretReadGeneration = 0;
 let modelDiscoveryGeneration = 0;
 
@@ -40,6 +42,11 @@ const state = {
   resources: null,
   queue: { paused: false, reason: null, pause_generation: 0 },
   queueEndpointAvailable: null,
+  systemResourceTimer: null,
+  systemResourcePolling: false,
+  systemResourceAbortController: null,
+  systemResourceEndpointAvailable: null,
+  systemResourceSnapshot: null,
   treeLoadToken: 0,
   treeLoadCancel: null,
   treeViewState: {},
@@ -64,6 +71,13 @@ const refreshPolicy = window.BioMakerRefreshPolicy || {
   },
 };
 
+const systemResourceView = window.BioMakerSystemResourceView || {
+  buildSummary: () => "System · unavailable",
+  formatBytes: () => "—",
+  formatMemoryUsage: () => "— / —",
+  formatPercent: () => "—",
+  markStale: () => null,
+};
 const queueView = window.BioMakerQueueView;
 
 function emptyResourceState() {
@@ -1257,6 +1271,9 @@ function renderArtifacts() {
 
 function setActiveTab(tabName) {
   state.activeTab = tabName;
+  const systemActive = tabName === "system";
+  $(".detail-pane").classList.toggle("system-view", systemActive);
+  $("#system-resource-summary").setAttribute("aria-pressed", String(systemActive));
   $$(".tab").forEach((tab) => {
     const active = tab.dataset.tab === tabName;
     tab.classList.toggle("active", active);
@@ -1273,6 +1290,11 @@ function setActiveTab(tabName) {
   if (tabName === "events" && state.updateSnapshot?.events?.available) loadEvents().catch(showError);
   if (tabName === "artifacts") renderArtifacts();
   if (tabName !== "tree" && $(".workbench").classList.contains("tree-focus")) toggleTreeFocus(false);
+}
+
+function openSystemResources() {
+  setActiveTab("system");
+  setMobileView("run", { focus: true });
 }
 
 function setMobileView(view, { focus = false } = {}) {
@@ -1574,6 +1596,148 @@ function setConnectionIndicator(message = "", kind = "") {
   indicator.hidden = !message;
 }
 
+function resourceMetric(label, value) {
+  const metric = document.createElement("div");
+  metric.className = "system-resource-metric";
+  const name = document.createElement("span");
+  name.textContent = label;
+  const reading = document.createElement("strong");
+  reading.textContent = value;
+  metric.append(name, reading);
+  return metric;
+}
+
+function renderSystemResources(snapshot) {
+  state.systemResourceSnapshot = snapshot;
+  const summary = $("#system-resource-summary");
+  summary.textContent = systemResourceView.buildSummary(snapshot);
+
+  const freshness = $("#system-resource-freshness");
+  const sampledAt = formatDate(snapshot?.sampled_at, true);
+  freshness.textContent = `${snapshot?.stale ? "Stale" : "Sampled"}${sampledAt ? ` ${sampledAt}` : ""}`;
+
+  const overview = $("#system-resource-overview");
+  overview.replaceChildren(
+    resourceMetric("CPU", systemResourceView.formatPercent(snapshot?.cpu?.utilization_percent)),
+    resourceMetric(
+      "RAM",
+      `${systemResourceView.formatPercent(snapshot?.memory?.utilization_percent)} · ${systemResourceView.formatMemoryUsage(snapshot?.memory?.used_bytes, snapshot?.memory?.total_bytes)}`,
+    ),
+  );
+
+  const gpuList = $("#system-resource-gpus");
+  gpuList.replaceChildren();
+  const gpus = Array.isArray(snapshot?.nvidia_gpus) ? snapshot.nvidia_gpus : [];
+  for (const gpu of gpus) {
+    const card = document.createElement("section");
+    card.className = "system-resource-gpu";
+    const name = document.createElement("strong");
+    name.textContent = `GPU ${gpu.index ?? "?"} · ${gpu.name || "NVIDIA GPU"}`;
+    const metrics = document.createElement("div");
+    metrics.className = "system-resource-gpu-metrics";
+    metrics.append(
+      resourceMetric("Utilization", systemResourceView.formatPercent(gpu.utilization_percent)),
+      resourceMetric("Memory", systemResourceView.formatMemoryUsage(gpu.memory_used_bytes, gpu.memory_total_bytes)),
+      resourceMetric(
+        "Temperature",
+        gpu.temperature_celsius != null && Number.isFinite(Number(gpu.temperature_celsius))
+          ? `${Math.round(Number(gpu.temperature_celsius))} °C`
+          : "—",
+      ),
+    );
+    card.append(name, metrics);
+    gpuList.append(card);
+  }
+  const appleGpu = snapshot?.apple_gpu;
+  if (!gpus.length && appleGpu) {
+    const apple = document.createElement("section");
+    apple.className = "system-resource-gpu";
+    const title = document.createElement("strong");
+    title.textContent = "Apple GPU";
+    const metrics = document.createElement("div");
+    metrics.className = "system-resource-gpu-metrics";
+    metrics.append(
+      resourceMetric("Utilization", systemResourceView.formatPercent(appleGpu?.utilization_percent)),
+      resourceMetric("Shared memory", systemResourceView.formatBytes(appleGpu?.shared_memory_used_bytes)),
+    );
+    apple.append(title, metrics);
+    gpuList.append(apple);
+  } else if (!gpus.length) {
+    const unavailable = document.createElement("p");
+    unavailable.className = "system-resource-gpu-empty";
+    unavailable.textContent = "No GPU metrics available.";
+    gpuList.append(unavailable);
+  }
+
+}
+
+function renderSystemResourceFailure(message) {
+  const staleSnapshot = systemResourceView.markStale(state.systemResourceSnapshot, message);
+  if (staleSnapshot) {
+    renderSystemResources(staleSnapshot);
+    return;
+  }
+  $("#system-resource-summary").textContent = "System · unavailable";
+  $("#system-resource-freshness").textContent = "Unavailable";
+  $("#system-resource-overview").replaceChildren();
+  $("#system-resource-gpus").replaceChildren();
+}
+
+function scheduleSystemResourcePoll(delay = SYSTEM_RESOURCE_POLL_INTERVAL_MS) {
+  if (state.systemResourceTimer) window.clearTimeout(state.systemResourceTimer);
+  state.systemResourceTimer = null;
+  if (document.hidden || state.systemResourceEndpointAvailable === false) return;
+  state.systemResourceTimer = window.setTimeout(() => {
+    state.systemResourceTimer = null;
+    pollSystemResources().catch((error) => console.error(error));
+  }, Math.max(0, delay));
+}
+
+async function pollSystemResources() {
+  if (state.systemResourcePolling || document.hidden || state.systemResourceEndpointAvailable === false) return;
+  if (state.systemResourceTimer) window.clearTimeout(state.systemResourceTimer);
+  state.systemResourceTimer = null;
+  state.systemResourcePolling = true;
+  const controller = new AbortController();
+  state.systemResourceAbortController = controller;
+  const timeout = window.setTimeout(
+    () => controller.abort(),
+    SYSTEM_RESOURCE_REQUEST_TIMEOUT_MS,
+  );
+  try {
+    const snapshot = await api("/api/system/resources", { signal: controller.signal });
+    state.systemResourceEndpointAvailable = true;
+    renderSystemResources(snapshot);
+  } catch (error) {
+    if ([404, 405].includes(error.status)) {
+      state.systemResourceEndpointAvailable = false;
+      renderSystemResourceFailure("System resource monitoring is unavailable on this server.");
+    } else {
+      renderSystemResourceFailure("System resource refresh failed; retrying.");
+    }
+  } finally {
+    window.clearTimeout(timeout);
+    if (state.systemResourceAbortController === controller) {
+      state.systemResourceAbortController = null;
+    }
+    state.systemResourcePolling = false;
+    scheduleSystemResourcePoll();
+  }
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    if (state.pollTimer) window.clearTimeout(state.pollTimer);
+    state.pollTimer = null;
+    if (state.systemResourceTimer) window.clearTimeout(state.systemResourceTimer);
+    state.systemResourceTimer = null;
+    state.systemResourceAbortController?.abort();
+    return;
+  }
+  schedulePoll(0);
+  scheduleSystemResourcePoll(0);
+}
+
 function nextPollDelay() {
   return refreshPolicy.pollDelay({
     hidden: document.hidden,
@@ -1732,6 +1896,7 @@ function bindEvents() {
     event.currentTarget.dataset.changed = "true";
     renderModelOptions("#settings-model-options", event.currentTarget.value, event.currentTarget.value);
   });
+  $("#system-resource-summary").addEventListener("click", openSystemResources);
   $("#refresh-button").addEventListener("click", () => refreshRuns(true).catch(showError));
   $("#tree-refresh-button").addEventListener("click", () => renderTree(true).catch(showError));
   $("#tree-auto-refresh").addEventListener("change", (event) => {
@@ -1758,15 +1923,11 @@ function bindEvents() {
     field.addEventListener("input", markProjectDirty);
     field.addEventListener("change", markProjectDirty);
   });
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
-      if (state.pollTimer) window.clearTimeout(state.pollTimer);
-      state.pollTimer = null;
-      return;
-    }
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("online", () => {
     schedulePoll(0);
+    if (state.systemResourceEndpointAvailable !== false) scheduleSystemResourcePoll(0);
   });
-  window.addEventListener("online", () => schedulePoll(0));
   window.addEventListener("offline", () => setConnectionIndicator("Offline · waiting for connection", "error"));
   window.addEventListener("message", (event) => {
     const frame = $("#tree-frame");
@@ -1820,6 +1981,7 @@ async function initialize() {
   else await loadSelectedRun(true);
   if (activeRun) setMobileView("run");
   schedulePoll(nextPollDelay());
+  scheduleSystemResourcePoll(0);
 }
 
 document.addEventListener("DOMContentLoaded", () => initialize().catch(showError));
