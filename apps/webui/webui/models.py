@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+WorkerSetting: TypeAlias = Literal["auto"] | Annotated[int, Field(ge=1, le=64)]
 
 
 class AdvancedOptions(BaseModel):
@@ -11,7 +13,7 @@ class AdvancedOptions(BaseModel):
     model_for_all_agents: str | None = Field(default=None, max_length=200)
     agent_steps: Annotated[int, Field(ge=1, le=1000)] = 35
     exec_timeout: Annotated[int, Field(ge=1, le=86400)] = 600
-    exec_parallel_workers: Annotated[int, Field(ge=1, le=64)] = 1
+    exec_parallel_workers: WorkerSetting = "auto"
     agent_total_time_limit: Annotated[int, Field(ge=1, le=2_592_000)] = 86400
     final_retrain_enabled: bool = True
 
@@ -30,7 +32,7 @@ class AdvancedOptionsPatch(BaseModel):
     model_for_all_agents: str | None = Field(default=None, max_length=200)
     agent_steps: Annotated[int | None, Field(ge=1, le=1000)] = None
     exec_timeout: Annotated[int | None, Field(ge=1, le=86400)] = None
-    exec_parallel_workers: Annotated[int | None, Field(ge=1, le=64)] = None
+    exec_parallel_workers: WorkerSetting | None = None
     agent_total_time_limit: Annotated[int | None, Field(ge=1, le=2_592_000)] = None
     final_retrain_enabled: bool | None = None
 
@@ -66,6 +68,12 @@ class RunCreate(BaseModel):
     experiment: ExperimentInput
     requested_exp_name: str | None = Field(default=None, max_length=80)
     options: AdvancedOptionsPatch | None = None
+
+
+class QueueResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pause_generation: Annotated[int, Field(ge=0)]
 
 
 class EnvUpdate(BaseModel):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -290,6 +291,7 @@ def run_final_retrain(
     private_dir: Path,
     *,
     timeout: int,
+    env_overrides: dict[str, str] | None = None,
 ) -> FinalRetrainResult:
     """Rerun the selected best node after adding score-validation labels to train."""
     result = FinalRetrainResult(
@@ -312,6 +314,7 @@ def run_final_retrain(
             agent_file_name=cfg.exec.agent_file_name,
             enforce_environment=cfg.exec.enforce_environment,
             include_medical_packages=cfg.exec.include_medical_packages,
+            environment=env_overrides,
         )
         exec_result = interpreter.run(best_node.code, reset_session=True)
         result.exec_result = exec_result
@@ -339,7 +342,9 @@ def run_final_retrain(
             return result
 
         submission_check = validate_submission_with_evaluator(
-            retrain_workspace, timeout=min(180, timeout)
+            retrain_workspace,
+            timeout=min(180, timeout),
+            env_overrides=env_overrides,
         )
         attach_evaluator_run_result(
             exec_result,
@@ -356,23 +361,37 @@ def run_final_retrain(
             )
             return result
 
-        result.ok = True
         _copy_retrain_outputs_to_log(cfg, retrain_workspace)
         try:
             result.private_metrics = evaluate_private_outputs(
-                retrain_workspace, private_dir
+                retrain_workspace,
+                private_dir,
+                env_overrides=env_overrides,
             )
         except Exception as exc:
             result.error = f"Private evaluation failed after final retrain: {exc}"
+            return result
+        result.ok = True
         return result
     except Exception as exc:
         logger.warning("Final retrain failed: %s", exc)
         result.error = str(exc)
         return result
     finally:
-        (cfg.log_dir / "final_retrain").mkdir(parents=True, exist_ok=True)
-        (cfg.log_dir / "final_retrain" / "completed_at.txt").write_text(
-            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            encoding="utf-8",
-        )
-        _write_result(cfg, result)
+        active_exception = sys.exc_info()[0] is not None
+        try:
+            (cfg.log_dir / "final_retrain").mkdir(parents=True, exist_ok=True)
+            (cfg.log_dir / "final_retrain" / "completed_at.txt").write_text(
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                encoding="utf-8",
+            )
+            _write_result(cfg, result)
+        except Exception as exc:
+            if not active_exception:
+                raise
+            try:
+                logger.warning(
+                    "Could not persist final retrain interruption details: %s", exc
+                )
+            except Exception:
+                pass

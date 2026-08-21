@@ -8,6 +8,8 @@
     <link rel="stylesheet" href="/static/styles.css">
     <script defer src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
     <script defer src="/static/refresh_policy.js"></script>
+    <script defer src="/static/system_resources.js"></script>
+    <script defer src="/static/queue_view.js"></script>
     <script defer src="/static/app.js"></script>
   </head>
   <body>
@@ -17,8 +19,18 @@
         <strong>BioMaker</strong>
       </div>
       <div class="header-context">
+        <details id="system-resources" class="system-resources">
+          <summary id="system-resource-summary" aria-label="System resource usage">System · loading…</summary>
+          <div class="system-resource-popover">
+            <div class="system-resource-heading">
+              <strong>System resources</strong>
+              <span id="system-resource-freshness"></span>
+            </div>
+            <div id="system-resource-overview" class="system-resource-overview"></div>
+            <div id="system-resource-gpus" class="system-resource-gpus"></div>
+          </div>
+        </details>
         <span id="connection-indicator" class="connection-indicator" role="status" hidden></span>
-        <span id="queue-indicator" class="queue-indicator" hidden></span>
       </div>
       <div class="header-actions">
         <button id="refresh-button" class="icon-button" type="button" title="Refresh" aria-label="Refresh">
@@ -40,6 +52,18 @@
 
     <main class="workbench">
       <aside class="sidebar" aria-label="Experiments">
+        <section id="queue-section" class="sidebar-section queue-section" aria-labelledby="queue-heading" hidden>
+          <div class="section-heading queue-heading-row">
+            <h2 id="queue-heading">Queue</h2>
+            <button id="resume-queue-button" class="queue-resume-action" type="button" hidden>
+              <i data-lucide="play" aria-hidden="true"></i>
+              <span>Resume</span>
+            </button>
+          </div>
+          <p id="queue-paused-reason" class="queue-paused-reason" role="status" hidden></p>
+          <div id="queue-list" class="queue-list" role="list"></div>
+        </section>
+
         <section class="sidebar-section projects-section">
           <div class="section-heading">
             <h2>Experiments</h2>
@@ -113,10 +137,6 @@
                 <input id="exec-timeout" type="number" min="1" max="86400" step="1">
               </label>
               <label class="field">
-                <span>Workers</span>
-                <input id="parallel-workers" type="number" min="1" max="64" step="1">
-              </label>
-              <label class="field">
                 <span>Time limit (s)</span>
                 <input id="total-time-limit" type="number" min="1" max="2592000" step="1">
               </label>
@@ -155,7 +175,7 @@
               <span id="run-action-label">Retry</span>
             </button>
           </div>
-          <div id="run-error-summary" class="run-error-summary" hidden></div>
+          <div id="run-lifecycle-detail" class="run-lifecycle-detail" hidden></div>
         </div>
         <div class="tab-bar" role="tablist" aria-label="Run views">
           <button id="events-tab" class="tab active" type="button" role="tab" data-tab="events" aria-selected="true" aria-controls="events-panel" tabindex="0">

@@ -62,6 +62,38 @@ def test_run_emits_failed_as_the_last_lifecycle_fact(tmp_path, monkeypatch):
     ]
 
 
+def test_manifest_failure_is_recorded_as_run_failed(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(log_dir=tmp_path)
+    events = []
+
+    monkeypatch.setattr(run_module, "load_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        run_module,
+        "write_run_manifest",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("manifest failed")),
+    )
+    monkeypatch.setattr(
+        run_module,
+        "_run",
+        lambda _cfg: pytest.fail("the workflow must not start without a manifest"),
+    )
+    monkeypatch.setattr(
+        run_module,
+        "append_event",
+        lambda _log_dir, event, **payload: events.append((event, payload)),
+    )
+
+    with pytest.raises(RuntimeError, match="manifest failed"):
+        run_module.run()
+
+    assert events == [
+        (
+            "run_failed",
+            {"exc_type": "RuntimeError", "error": "manifest failed"},
+        )
+    ]
+
+
 def test_run_emits_interrupted_for_keyboard_interrupt(tmp_path, monkeypatch):
     cfg = SimpleNamespace(log_dir=tmp_path)
     events = []

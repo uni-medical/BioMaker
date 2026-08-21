@@ -39,14 +39,30 @@ from .models import (
     EnvUpdate,
     ExperimentInput,
     ModelDiscoveryRequest,
+    QueueResumeRequest,
     RunCreate,
 )
-from .run_catalog import list_log_runs
-from .run_store import MemoryRunStore
+from .run_catalog import list_log_runs, run_from_log_dir
+from .run_store import SQLiteRunStore
 from .runner import TERMINAL_STATUSES, RunManager
 from .settings import Settings
+from .system_resources import get_system_resources
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+CANONICAL_STATUS = {
+    "queued": "queued",
+    "running": "running",
+    "stopping": "stopping",
+    "succeeded": "complete",
+    "complete": "complete",
+    "failed": "incomplete",
+    "cancelled": "incomplete",
+    "stopped": "incomplete",
+    "interrupted": "incomplete",
+    "incomplete": "incomplete",
+}
+CANONICAL_TERMINAL_STATUSES = {"complete", "incomplete"}
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -217,11 +233,12 @@ def create_app(
 ) -> FastAPI:
     app_settings = settings or Settings.default()
     app_settings.ensure_directories()
-    run_store = MemoryRunStore()
+    run_store = SQLiteRunStore(app_settings.state_dir / "runs.sqlite3")
     manager = RunManager(app_settings, run_store, process_factory=process_factory)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        manager.import_history(list_log_runs(app_settings))
         manager.start()
         yield
         manager.shutdown()
@@ -272,9 +289,26 @@ def create_app(
         return {
             "status": "ok",
             "queue": manager.summary(),
+            "run_ledger": run_store.database_path,
             "workspace_root": str(app_settings.workspace_root),
             "method_root": str(app_settings.method_root),
         }
+
+    @app.get("/api/system/resources")
+    def system_resources() -> dict[str, Any]:
+        return get_system_resources()
+
+    @app.get("/api/queue")
+    def queue_state() -> dict[str, Any]:
+        return run_store.get_queue_control()
+
+    @app.post("/api/queue/resume", status_code=status.HTTP_202_ACCEPTED)
+    def resume_queue(request: Request, payload: QueueResumeRequest) -> dict[str, Any]:
+        _require_loopback(request)
+        try:
+            return manager.resume_queue(payload.pause_generation)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/env")
     def get_env() -> dict[str, Any]:
@@ -340,56 +374,70 @@ def create_app(
 
     def session_run(record: dict[str, Any]) -> dict[str, Any]:
         result = dict(record)
-        result["source"] = "webui_session"
-        result["read_only"] = False
-        result["status_source"] = "session"
+        result.setdefault("source", "run_ledger")
+        result.setdefault("read_only", False)
+        result["status_source"] = "ledger"
         snapshot = result.get("project_snapshot") or {}
         dataset_path = str(snapshot.get("dataset_path") or "")
         result["dataset_path"] = dataset_path or None
         result["dataset_name"] = Path(dataset_path).name if dataset_path else None
-        status_value = str(result.get("status") or "unknown")
+        detailed_status = str(
+            result.get("detailed_status") or result.get("status") or "incomplete"
+        ).lower()
+        status_value = CANONICAL_STATUS.get(detailed_status, "incomplete")
         actions = []
-        if status_value == "queued":
+        if result["read_only"]:
+            actions = []
+        elif detailed_status == "queued":
             actions.append("cancel")
-        elif status_value in {"running", "stopping"}:
+        elif detailed_status == "running":
             actions.append("stop")
-        elif status_value in TERMINAL_STATUSES:
+        elif detailed_status in TERMINAL_STATUSES:
             actions.append("requeue")
+        result["detailed_status"] = detailed_status
+        result["status"] = status_value
+        if status_value == "incomplete" and not result.get("status_reason"):
+            result["status_reason"] = result.get("error") or {
+                "cancelled": "Cancelled before the run started.",
+                "stopped": "Stopped by the user.",
+                "interrupted": "The run was interrupted before completion.",
+                "failed": "The run failed before completion.",
+            }.get(detailed_status, "The run did not record successful completion.")
         result["allowed_actions"] = actions
         result["controllable"] = bool(actions)
         return result
 
     def all_runs() -> list[dict[str, Any]]:
-        discovered = list_log_runs(app_settings)
-        discovered_by_dir = {
-            str(Path(str(run["log_dir"])).resolve()): run
-            for run in discovered
-            if run.get("log_dir")
-        }
         merged: list[dict[str, Any]] = []
-        used_log_dirs: set[str] = set()
         for raw_session in run_store.list_records("runs"):
             current = session_run(raw_session)
             raw_log_dir = current.get("log_dir")
-            log_key = str(Path(str(raw_log_dir)).resolve()) if raw_log_dir else None
-            base = discovered_by_dir.get(log_key) if log_key else None
+            base = (
+                run_from_log_dir(app_settings, Path(str(raw_log_dir)))
+                if raw_log_dir
+                else None
+            )
             if base is not None:
-                combined = {**base, **current}
-                # Once the CLI has created a real log directory, its manifest
-                # and directory name are the canonical experiment metadata.
-                combined["progress"] = base.get("progress")
-                combined["project_snapshot"] = base.get("project_snapshot")
-                combined["dataset_path"] = base.get("dataset_path")
-                combined["dataset_name"] = base.get("dataset_name")
-                combined["actual_exp_name"] = base.get("actual_exp_name")
-                combined["options"] = base.get("options")
+                combined = dict(current)
+                # The ledger owns lifecycle state. Manifest/events enrich only
+                # immutable run metadata and observable progress.
+                for key in (
+                    "progress",
+                    "project_snapshot",
+                    "dataset_path",
+                    "dataset_name",
+                    "actual_exp_name",
+                    "options",
+                    "log_modified_at",
+                    "terminal_event",
+                ):
+                    if base.get(key) is not None:
+                        combined[key] = base[key]
+                if not combined.get("status_reason") and base.get("status_reason"):
+                    combined["status_reason"] = base["status_reason"]
                 merged.append(combined)
-                used_log_dirs.add(log_key)
             else:
                 merged.append(current)
-        merged.extend(
-            run for key, run in discovered_by_dir.items() if key not in used_log_dirs
-        )
         return sorted(
             merged,
             key=lambda item: (
@@ -439,7 +487,7 @@ def create_app(
             console_revision = None
 
         run_status = str(run.get("status") or "unknown")
-        terminal = run_status in TERMINAL_STATUSES
+        terminal = run_status in CANONICAL_TERMINAL_STATUSES
         return {
             "run_id": run_id,
             "status": run_status,
@@ -483,7 +531,7 @@ def create_app(
     def cancel_run(request: Request, run_id: str) -> dict[str, Any]:
         _require_loopback(request)
         try:
-            return manager.cancel(run_id)
+            return session_run(manager.cancel(run_id))
         except KeyError:
             if find_run(run_id) is not None:
                 raise HTTPException(
@@ -497,7 +545,7 @@ def create_app(
     def stop_run(request: Request, run_id: str) -> dict[str, Any]:
         _require_loopback(request)
         try:
-            return manager.stop(run_id)
+            return session_run(manager.stop(run_id))
         except KeyError:
             if find_run(run_id) is not None:
                 raise HTTPException(
@@ -511,7 +559,7 @@ def create_app(
     def requeue_run(request: Request, run_id: str) -> dict[str, Any]:
         _require_loopback(request)
         try:
-            return manager.requeue(run_id)
+            return session_run(manager.requeue(run_id))
         except KeyError:
             if find_run(run_id) is not None:
                 raise HTTPException(

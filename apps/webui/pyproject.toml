@@ -5,6 +5,7 @@ description = "Local sidecar web interface for BioMaker"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1",
+    "psutil>=6,<8",
     "python-dotenv>=1.0,<2",
     "uvicorn>=0.30,<1",
 ]

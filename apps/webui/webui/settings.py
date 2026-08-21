@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from .env_file import resolve_env_file
+
+_METHOD_PACKAGE_ROOT = Path(__file__).resolve().parents[3]
+if str(_METHOD_PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_METHOD_PACKAGE_ROOT))
+
+from biomaker.utils.queue_paths import resolve_queue_paths  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,30 +39,16 @@ class Settings:
             .expanduser()
             .resolve()
         )
-        workspace_root = (
-            Path(os.environ.get("BIOMAKER_WEBUI_WORKSPACE_ROOT", method_root.parent))
-            .expanduser()
-            .resolve()
-        )
-        state_dir = (
-            Path(
-                os.environ.get(
-                    "BIOMAKER_WEBUI_STATE_DIR",
-                    Path(__file__).resolve().parents[1] / "state",
-                )
-            )
-            .expanduser()
-            .resolve()
-        )
+        queue_paths = resolve_queue_paths(method_root)
         env_file = resolve_env_file(method_root)
         return cls(
             method_root=method_root,
-            workspace_root=workspace_root,
-            state_dir=state_dir,
-            logs_root=workspace_root / "logs",
-            workspaces_root=workspace_root / "workspaces",
-            experiments_root=workspace_root / "experiments",
-            datasets_root=workspace_root / "datasets",
+            workspace_root=queue_paths.workspace_root,
+            state_dir=queue_paths.state_dir,
+            logs_root=queue_paths.logs_root,
+            workspaces_root=queue_paths.workspaces_root,
+            experiments_root=queue_paths.experiments_root,
+            datasets_root=queue_paths.datasets_root,
             env_file=env_file,
             uv_executable=os.environ.get("BIOMAKER_WEBUI_UV", "uv"),
         )

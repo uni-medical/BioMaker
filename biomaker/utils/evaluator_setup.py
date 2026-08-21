@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from importlib import metadata as importlib_metadata
 import json
 import logging
 import math
@@ -14,21 +13,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from PIL import Image
-import numpy as np
 
 from .. import backend
 from .environment import environment_manifest_text, validate_code_environment
-from .events import append_event
 from .evaluator_templates import (
     _FIXED_CLASSIFICATION_EVALUATOR,
     _FIXED_SEGMENTATION_EVALUATOR,
 )
+from .events import append_event
 from .exp_guide import (
     build_exp_guide,
     evaluator_exp_guide_view,
@@ -39,6 +40,11 @@ from .metric_registry import (
     is_classification_metric_supported,
     is_segmentation_metric_supported,
     metric_maximize,
+)
+from .process_tree import (
+    ProcessTreeInspectionError,
+    ProcessTreeTracker,
+    drain_uncaptured_process_group,
 )
 from .response import extract_code, truncate_text
 
@@ -212,14 +218,65 @@ def _run_python(
     if env is not None:
         run_env = os.environ.copy()
         run_env.update(env)
-    return subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=workspace_dir,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=run_env,
-    )
+    command = [sys.executable, "-c", code]
+    popen_kwargs: dict[str, Any] = {
+        "cwd": workspace_dir,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": run_env,
+    }
+    if os.name == "posix":
+        popen_kwargs["process_group"] = 0
+    process = subprocess.Popen(command, **popen_kwargs)
+    try:
+        process_tree = ProcessTreeTracker.capture(process.pid)
+    except (OSError, ProcessLookupError, ProcessTreeInspectionError, ValueError):
+        drain_uncaptured_process_group(process)
+        raise RuntimeError("Could not capture evaluator process identity") from None
+
+    started_at = time.monotonic()
+    stdout = ""
+    stderr = ""
+    try:
+        while True:
+            process_tree.refresh_best_effort()
+            if process.poll() is not None:
+                # An evaluator descendant can keep the captured PIPEs open after
+                # the evaluator leader succeeds. Drain the PGID before collecting
+                # output so this cannot be misclassified as a timeout.
+                process_tree.terminate_and_wait(root_process=process)
+                stdout, stderr = process.communicate()
+                return subprocess.CompletedProcess(
+                    command,
+                    process.returncode,
+                    stdout,
+                    stderr,
+                )
+            remaining = timeout - (time.monotonic() - started_at)
+            if remaining <= 0:
+                process_tree.terminate_and_wait(root_process=process)
+                stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(
+                    command,
+                    timeout,
+                    output=stdout,
+                    stderr=stderr,
+                )
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=min(0.25, max(0.05, remaining))
+                )
+                return subprocess.CompletedProcess(
+                    command,
+                    process.returncode,
+                    stdout,
+                    stderr,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        process_tree.terminate_and_wait(root_process=process)
 
 
 def _uses_eval_or_exec(code: str) -> bool:
@@ -2008,6 +2065,7 @@ def score_candidate_with_evaluator(
     workspace_dir: Path | str,
     timeout: int = 120,
     hidden_score_path: Path | str | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> EvaluatorRunResult:
     """Run the frozen evaluator against the current ./working artifacts."""
     workspace_dir = Path(workspace_dir)
@@ -2021,11 +2079,14 @@ def score_candidate_with_evaluator(
         f"print('{_RESULT_PREFIX}' + json.dumps(payload, ensure_ascii=False, default=str))\n"
     )
     try:
+        evaluator_env = _hidden_score_env(workspace_dir, hidden_score_path)
+        if env_overrides:
+            evaluator_env.update(env_overrides)
         completed = _run_python(
             workspace_dir,
             code,
             timeout=timeout,
-            env=_hidden_score_env(workspace_dir, hidden_score_path),
+            env=evaluator_env,
         )
     except subprocess.TimeoutExpired as exc:
         output = _sanitize_private_paths(
@@ -2121,6 +2182,7 @@ def score_candidate_with_evaluator(
 def validate_submission_with_evaluator(
     workspace_dir: Path | str,
     timeout: int = 120,
+    env_overrides: dict[str, str] | None = None,
 ) -> EvaluatorRunResult:
     """Run only the frozen evaluator's public test-submission validation."""
     workspace_dir = Path(workspace_dir)
@@ -2133,7 +2195,12 @@ def validate_submission_with_evaluator(
         f"print('{_RESULT_PREFIX}' + json.dumps(payload, ensure_ascii=False, default=str))\n"
     )
     try:
-        completed = _run_python(workspace_dir, code, timeout=timeout)
+        completed = _run_python(
+            workspace_dir,
+            code,
+            timeout=timeout,
+            env=env_overrides,
+        )
     except subprocess.TimeoutExpired as exc:
         output = (exc.stdout or "") + (exc.stderr or "")
         return EvaluatorRunResult(

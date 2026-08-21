@@ -2,6 +2,7 @@
 
 const PREFERRED_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
 const MAX_MODEL_SUGGESTIONS = 8;
+const SYSTEM_RESOURCE_POLL_INTERVAL_MS = 2000;
 let secretReadGeneration = 0;
 let modelDiscoveryGeneration = 0;
 
@@ -9,7 +10,7 @@ const DEFAULT_OPTIONS = {
   model_for_all_agents: null,
   agent_steps: 35,
   exec_timeout: 600,
-  exec_parallel_workers: 1,
+  exec_parallel_workers: "auto",
   agent_total_time_limit: 86400,
   final_retrain_enabled: true,
 };
@@ -38,6 +39,12 @@ const state = {
   pollStopped: false,
   updateSnapshot: null,
   resources: null,
+  queue: { paused: false, reason: null, pause_generation: 0 },
+  queueEndpointAvailable: null,
+  systemResourceTimer: null,
+  systemResourcePolling: false,
+  systemResourceEndpointAvailable: null,
+  systemResourceSnapshot: null,
   treeLoadToken: 0,
   treeLoadCancel: null,
   treeViewState: {},
@@ -61,6 +68,15 @@ const refreshPolicy = window.BioMakerRefreshPolicy || {
     return autoUpdate ? "load" : "pending";
   },
 };
+
+const systemResourceView = window.BioMakerSystemResourceView || {
+  buildSummary: () => "System · unavailable",
+  formatBytes: () => "—",
+  formatMemoryUsage: () => "— / —",
+  formatPercent: () => "—",
+  markStale: () => null,
+};
+const queueView = window.BioMakerQueueView;
 
 function emptyResourceState() {
   return {
@@ -122,7 +138,9 @@ async function api(path, options = {}) {
     } catch (_) {
       // Keep the HTTP status as the fallback message.
     }
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   if (response.status === 204) {
     return null;
@@ -189,7 +207,15 @@ function autoTaskName(datasetPath, goal) {
 }
 
 function isTerminal(status) {
-  return ["succeeded", "failed", "cancelled", "stopped", "interrupted"].includes(status);
+  return ["complete", "incomplete"].includes(canonicalStatus(status));
+}
+
+function canonicalStatus(status) {
+  const value = String(status || "").trim().toLowerCase();
+  if (["succeeded", "success", "complete", "completed"].includes(value)) return "complete";
+  if (["queued", "running", "stopping"].includes(value)) return value;
+  if (["failed", "cancelled", "stopped", "interrupted", "incomplete"].includes(value)) return "incomplete";
+  return value || "incomplete";
 }
 
 function formatDuration(startValue, endValue = Date.now()) {
@@ -210,12 +236,22 @@ function executionLabel(status) {
     queued: "Queued",
     running: "Running",
     stopping: "Stopping",
-    succeeded: "Process completed",
-    failed: "Process failed",
-    cancelled: "Cancelled",
-    stopped: "Stopped",
-    interrupted: "Interrupted",
-  }[status] || String(status || "Unknown");
+    complete: "Complete",
+    incomplete: "Incomplete",
+  }[canonicalStatus(status)] || String(status || "Incomplete");
+}
+
+function sidebarStatusLabel(status) {
+  const normalized = canonicalStatus(status);
+  return normalized === "complete" ? null : executionLabel(normalized);
+}
+
+function computeWorkerLabel(value) {
+  if (value == null || String(value).toLowerCase() === "auto") return "Auto compute";
+  const workers = Number(value);
+  return Number.isFinite(workers)
+    ? `${workers} worker${workers === 1 ? "" : "s"}`
+    : "Auto compute";
 }
 
 function resultPresentation(run) {
@@ -246,7 +282,7 @@ function resultPresentation(run) {
     };
   }
   if (isTerminal(run?.status)) {
-    return { text: "No valid result", kind: run.status === "succeeded" ? "warning" : "neutral" };
+    return { text: "No valid result", kind: canonicalStatus(run.status) === "complete" ? "warning" : "neutral" };
   }
   return null;
 }
@@ -415,19 +451,23 @@ function renderProjects() {
       keepRuns.add(run.id);
       const logName = runLogDirectoryName(run);
       button.querySelector(".run-log-name").textContent = logName;
-      button.title = logName;
+      const statusLabel = sidebarStatusLabel(run.status);
+      button.title = statusLabel ? `${logName} — ${statusLabel}` : logName;
+      button.setAttribute("aria-label", statusLabel ? `${logName}, ${statusLabel}` : logName);
       button.classList.toggle("active", run.id === state.selectedRunId);
       button.setAttribute("aria-current", run.id === state.selectedRunId ? "true" : "false");
-      let dot = button.querySelector(".status-dot");
-      if (!dot) {
-        dot = document.createElement("span");
-        dot.className = "status-dot";
-        dot.setAttribute("role", "img");
-        button.append(dot);
+      let status = button.querySelector(".run-nav-status");
+      if (statusLabel) {
+        if (!status) {
+          status = document.createElement("span");
+          status.className = "run-nav-status";
+          button.append(status);
+        }
+        status.className = `run-nav-status ${canonicalStatus(run.status)}`;
+        status.textContent = statusLabel;
+      } else if (status) {
+        status.remove();
       }
-      dot.className = `status-dot ${run.status}`;
-      dot.title = executionLabel(run.status);
-      dot.setAttribute("aria-label", `Status: ${executionLabel(run.status)}`);
       runList.append(button);
     }
     for (const [runId, button] of existingRuns) {
@@ -441,16 +481,99 @@ function renderProjects() {
   refreshIcons();
 }
 
+function queueReasonText(reason) {
+  if (!reason) return "Queue paused after an incomplete run.";
+  if (typeof reason === "string") return reason;
+  if (typeof reason === "object") return reason.message || reason.detail || reason.reason || "Queue paused after an incomplete run.";
+  return String(reason);
+}
+
+function createQueueRow(runId) {
+  const row = document.createElement("div");
+  row.className = "queue-run-row";
+  row.dataset.queueRunId = runId;
+  row.setAttribute("role", "listitem");
+
+  const select = document.createElement("button");
+  select.className = "queue-run-select";
+  select.type = "button";
+  const name = document.createElement("span");
+  name.className = "queue-run-name";
+  const status = document.createElement("span");
+  status.className = "queue-run-status";
+  select.append(name, status);
+  select.addEventListener("click", () => selectRun(row.dataset.queueRunId).catch(showError));
+
+  const action = document.createElement("button");
+  action.className = "queue-run-action";
+  action.type = "button";
+  action.hidden = true;
+  action.addEventListener("click", (event) => queueRunAction(event).catch(showError));
+  row.append(select, action);
+  return row;
+}
+
+function updateQueueRow(row, run) {
+  const normalized = canonicalStatus(run.status);
+  const name = runLogDirectoryName(run) || run.id || "Queued run";
+  row.dataset.queueRunId = String(run.id);
+  const select = row.querySelector(".queue-run-select");
+  select.title = name;
+  select.setAttribute("aria-label", `Open ${name}, ${executionLabel(normalized)}`);
+  select.setAttribute("aria-current", run.id === state.selectedRunId ? "true" : "false");
+  row.querySelector(".queue-run-name").textContent = name;
+  const status = row.querySelector(".queue-run-status");
+  status.className = `queue-run-status ${normalized}`;
+  status.textContent = executionLabel(normalized);
+
+  const action = row.querySelector(".queue-run-action");
+  const actionName = queueView.actionForRun(run);
+  if (!actionName) {
+    if (document.activeElement === action) select.focus();
+    action.hidden = true;
+    action.disabled = false;
+    delete action.dataset.runAction;
+    delete action.dataset.runId;
+    return;
+  }
+  const label = actionName === "cancel" ? "Cancel" : "Stop";
+  action.hidden = false;
+  action.disabled = false;
+  action.dataset.runId = String(run.id);
+  action.dataset.runAction = actionName;
+  action.textContent = label;
+  action.title = `${label} ${name}`;
+  action.setAttribute("aria-label", `${label} ${name}`);
+}
+
+function renderQueue() {
+  const section = $("#queue-section");
+  const list = $("#queue-list");
+  const queueRuns = state.runs
+    .filter((run) => ["queued", "running", "stopping"].includes(canonicalStatus(run.status)))
+    .sort((left, right) => {
+      const leftActive = canonicalStatus(left.status) === "queued" ? 1 : 0;
+      const rightActive = canonicalStatus(right.status) === "queued" ? 1 : 0;
+      if (leftActive !== rightActive) return leftActive - rightActive;
+      const leftPosition = Number(left.queue_position ?? left.queue_sequence);
+      const rightPosition = Number(right.queue_position ?? right.queue_sequence);
+      if (Number.isFinite(leftPosition) && Number.isFinite(rightPosition) && leftPosition !== rightPosition) {
+        return leftPosition - rightPosition;
+      }
+      return String(left.timestamps?.created_at || "").localeCompare(String(right.timestamps?.created_at || ""));
+    });
+  const paused = Boolean(state.queue?.paused);
+  section.hidden = !paused && !queueRuns.length;
+  $("#resume-queue-button").hidden = !paused;
+  const pausedReason = $("#queue-paused-reason");
+  pausedReason.hidden = !paused;
+  pausedReason.textContent = paused ? queueReasonText(state.queue?.reason) : "";
+
+  queueView.reconcileRows(list, queueRuns, createQueueRow, updateQueueRow);
+}
+
 function renderRuns() {
-  const queued = state.runs.filter((run) => run.status === "queued").length;
-  const running = state.runs.filter((run) => ["running", "stopping"].includes(run.status)).length;
-  const queueIndicator = $("#queue-indicator");
-  const queueParts = [];
-  if (running) queueParts.push(`${running} running`);
-  if (queued) queueParts.push(`${queued} queued`);
-  queueIndicator.textContent = queueParts.join(" · ");
-  queueIndicator.hidden = !queueParts.length;
-  queueIndicator.classList.toggle("busy", Boolean(queueParts.length));
+  renderQueue();
   renderProjects();
   renderRunHistory();
 }
@@ -495,7 +618,6 @@ function populateProjectForm(project) {
   $("#task-model").value = options.model_for_all_agents || "";
   $("#agent-steps").value = options.agent_steps;
   $("#exec-timeout").value = options.exec_timeout;
-  $("#parallel-workers").value = options.exec_parallel_workers;
   $("#total-time-limit").value = options.agent_total_time_limit;
   $("#final-retrain").checked = options.final_retrain_enabled;
   $("#run-name-label").textContent = "Run name";
@@ -523,7 +645,6 @@ function populateRunForm(run) {
   $("#task-model").value = runConfiguredModel(run);
   $("#agent-steps").value = options.agent_steps ?? "";
   $("#exec-timeout").value = options.exec_timeout ?? "";
-  $("#parallel-workers").value = options.exec_parallel_workers ?? "";
   $("#total-time-limit").value = options.agent_total_time_limit ?? "";
   $("#final-retrain").checked = options.final_retrain_enabled === true;
   $("#run-name-label").textContent = "Run name";
@@ -552,9 +673,7 @@ function renderEditorState() {
     const model = runConfiguredModel(state.selectedRun);
     if (model) parts.push(model);
     if (options.agent_steps != null) parts.push(`${options.agent_steps} steps`);
-    if (options.exec_parallel_workers != null) {
-      parts.push(`${options.exec_parallel_workers} worker${options.exec_parallel_workers === 1 ? "" : "s"}`);
-    }
+    parts.push(computeWorkerLabel(options.exec_parallel_workers));
     $("#run-config-summary").textContent = parts.length
       ? `${parts.join(" · ")} · CLI configuration`
       : "CLI configuration";
@@ -566,7 +685,7 @@ function renderEditorState() {
   const settingsModel = configuredDefaultModel();
   const model = options.model_for_all_agents
     || (settingsModel ? `${settingsModel} (Settings)` : "repository default");
-  $("#run-config-summary").textContent = `${model} · ${options.agent_steps} steps · ${options.exec_parallel_workers} worker${options.exec_parallel_workers === 1 ? "" : "s"}`;
+  $("#run-config-summary").textContent = `${model} · ${options.agent_steps} steps · ${computeWorkerLabel(options.exec_parallel_workers)}`;
 }
 
 function collectProjectOptions() {
@@ -574,7 +693,7 @@ function collectProjectOptions() {
     model_for_all_agents: $("#task-model").value.trim() || null,
     agent_steps: Number($("#agent-steps").value),
     exec_timeout: Number($("#exec-timeout").value),
-    exec_parallel_workers: Number($("#parallel-workers").value),
+    exec_parallel_workers: "auto",
     agent_total_time_limit: Number($("#total-time-limit").value),
     final_retrain_enabled: $("#final-retrain").checked,
   };
@@ -679,13 +798,13 @@ function renderRunSummary() {
   if (!run) {
     $("#run-result-status").hidden = true;
     $("#run-action-button").hidden = true;
-    $("#run-error-summary").hidden = true;
+    $("#run-lifecycle-detail").hidden = true;
     return;
   }
   const execution = $("#run-execution-status");
-  execution.className = `status-pill ${run.status}`;
+  execution.className = `status-pill ${canonicalStatus(run.status)}`;
   execution.textContent = executionLabel(run.status);
-  execution.title = `Execution status: ${run.status}`;
+  execution.title = `Execution status: ${executionLabel(run.status)}`;
 
   const result = resultPresentation(run);
   const resultPill = $("#run-result-status");
@@ -738,10 +857,24 @@ function renderRunSummary() {
     actionButton.hidden = true;
   }
 
-  const error = run.error || run.observed?.results?.latest?.error;
-  const errorSummary = $("#run-error-summary");
-  errorSummary.hidden = !error;
-  errorSummary.textContent = error ? `Error: ${typeof error === "string" ? error : JSON.stringify(error)}` : "";
+  const error = run.status_reason || run.reason || run.lifecycle?.reason || run.error || run.observed?.results?.latest?.error;
+  const terminalEvent = run.terminal_event || run.lifecycle?.terminal_event || run.observed?.terminal_event;
+  const terminalEventName = typeof terminalEvent === "string"
+    ? terminalEvent
+    : (terminalEvent?.event || terminalEvent?.type || terminalEvent?.name || "");
+  const rawStatus = String(run.status || "");
+  const detailedStatus = run.detailed_status
+    || (rawStatus && rawStatus !== canonicalStatus(rawStatus) ? rawStatus : "");
+  const lifecycleDetail = $("#run-lifecycle-detail");
+  lifecycleDetail.className = canonicalStatus(run.status) === "incomplete"
+    ? "run-lifecycle-detail incomplete"
+    : "run-lifecycle-detail";
+  const detailParts = [];
+  if (detailedStatus) detailParts.push(`Detailed status: ${formatEventName(detailedStatus)}`);
+  if (error) detailParts.push(`Reason: ${typeof error === "string" ? error : JSON.stringify(error)}`);
+  if (terminalEventName) detailParts.push(`Terminal event: ${terminalEventName}`);
+  lifecycleDetail.hidden = !detailParts.length;
+  lifecycleDetail.textContent = detailParts.join(" · ");
   refreshIcons();
 }
 
@@ -775,6 +908,50 @@ async function runAction(event) {
   await refreshRuns(true);
   schedulePoll(0);
   toast(action === "requeue" ? "Run requeued" : `${action[0].toUpperCase()}${action.slice(1)} requested`);
+}
+
+async function queueRunAction(event) {
+  const button = event.currentTarget;
+  const runId = button.dataset.runId;
+  const action = button.dataset.runAction;
+  const run = runById(runId);
+  if (!run || !["cancel", "stop"].includes(action)) return;
+  const name = runLogDirectoryName(run) || runId;
+  if (!window.confirm(`${action === "cancel" ? "Cancel" : "Stop"} ${name}?`)) return;
+  button.disabled = true;
+  try {
+    await api(runApiPath(runId, `/${action}`), { method: "POST" });
+    await refreshRuns(true);
+    schedulePoll(0);
+    toast(action === "cancel" ? "Queued run cancelled" : "Stop requested");
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+}
+
+async function resumeQueue() {
+  const button = $("#resume-queue-button");
+  button.disabled = true;
+  try {
+    const generation = Number(state.queue?.pause_generation);
+    if (!Number.isInteger(generation) || generation < 0) {
+      throw new Error("Queue state is stale; refresh before resuming");
+    }
+    const response = await api("/api/queue/resume", {
+      method: "POST",
+      body: JSON.stringify({ pause_generation: generation }),
+    });
+    applyQueueControl(response);
+    await refreshRuns(true);
+    schedulePoll(0);
+    if (state.queue?.paused) {
+      toast("Queue changed while resuming; it remains paused", "error");
+    } else {
+      toast("Queue resumed");
+    }
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function loadSelectedRun(forceTree = false) {
@@ -1411,12 +1588,174 @@ function setConnectionIndicator(message = "", kind = "") {
   indicator.hidden = !message;
 }
 
+function resourceMetric(label, value) {
+  const metric = document.createElement("div");
+  metric.className = "system-resource-metric";
+  const name = document.createElement("span");
+  name.textContent = label;
+  const reading = document.createElement("strong");
+  reading.textContent = value;
+  metric.append(name, reading);
+  return metric;
+}
+
+function renderSystemResources(snapshot) {
+  state.systemResourceSnapshot = snapshot;
+  const summary = $("#system-resource-summary");
+  summary.textContent = systemResourceView.buildSummary(snapshot);
+  summary.setAttribute("aria-label", summary.textContent);
+
+  const freshness = $("#system-resource-freshness");
+  const sampledAt = formatDate(snapshot?.sampled_at, true);
+  freshness.textContent = `${snapshot?.stale ? "Stale" : "Sampled"}${sampledAt ? ` ${sampledAt}` : ""}`;
+
+  const overview = $("#system-resource-overview");
+  overview.replaceChildren(
+    resourceMetric("CPU", systemResourceView.formatPercent(snapshot?.cpu?.utilization_percent)),
+    resourceMetric(
+      "RAM",
+      `${systemResourceView.formatPercent(snapshot?.memory?.utilization_percent)} · ${systemResourceView.formatMemoryUsage(snapshot?.memory?.used_bytes, snapshot?.memory?.total_bytes)}`,
+    ),
+  );
+
+  const gpuList = $("#system-resource-gpus");
+  gpuList.replaceChildren();
+  const gpus = Array.isArray(snapshot?.nvidia_gpus) ? snapshot.nvidia_gpus : [];
+  for (const gpu of gpus) {
+    const card = document.createElement("section");
+    card.className = "system-resource-gpu";
+    const name = document.createElement("strong");
+    name.textContent = `GPU ${gpu.index ?? "?"} · ${gpu.name || "NVIDIA GPU"}`;
+    const metrics = document.createElement("div");
+    metrics.className = "system-resource-gpu-metrics";
+    metrics.append(
+      resourceMetric("Utilization", systemResourceView.formatPercent(gpu.utilization_percent)),
+      resourceMetric("Memory", systemResourceView.formatMemoryUsage(gpu.memory_used_bytes, gpu.memory_total_bytes)),
+      resourceMetric(
+        "Temperature",
+        gpu.temperature_celsius != null && Number.isFinite(Number(gpu.temperature_celsius))
+          ? `${Math.round(Number(gpu.temperature_celsius))} °C`
+          : "—",
+      ),
+    );
+    card.append(name, metrics);
+    gpuList.append(card);
+  }
+  const appleGpu = snapshot?.apple_gpu;
+  if (!gpus.length && (appleGpu || snapshot?.apple_mps?.available === true)) {
+    const apple = document.createElement("section");
+    apple.className = "system-resource-gpu";
+    const title = document.createElement("strong");
+    title.textContent = "Apple GPU";
+    const metrics = document.createElement("div");
+    metrics.className = "system-resource-gpu-metrics";
+    metrics.append(
+      resourceMetric("Utilization", systemResourceView.formatPercent(appleGpu?.utilization_percent)),
+      resourceMetric("Shared memory", systemResourceView.formatBytes(appleGpu?.shared_memory_used_bytes)),
+    );
+    apple.append(title, metrics);
+    gpuList.append(apple);
+  } else if (!gpus.length) {
+    const unavailable = document.createElement("p");
+    unavailable.className = "system-resource-gpu-empty";
+    unavailable.textContent = "No GPU metrics available.";
+    gpuList.append(unavailable);
+  }
+
+}
+
+function renderSystemResourceFailure(message) {
+  const staleSnapshot = systemResourceView.markStale(state.systemResourceSnapshot, message);
+  if (staleSnapshot) {
+    renderSystemResources(staleSnapshot);
+    return;
+  }
+  $("#system-resource-summary").textContent = "System · unavailable";
+  $("#system-resource-freshness").textContent = "Unavailable";
+  $("#system-resource-overview").replaceChildren();
+  $("#system-resource-gpus").replaceChildren();
+}
+
+function scheduleSystemResourcePoll(delay = SYSTEM_RESOURCE_POLL_INTERVAL_MS) {
+  if (state.systemResourceTimer) window.clearTimeout(state.systemResourceTimer);
+  state.systemResourceTimer = null;
+  if (document.hidden || state.systemResourceEndpointAvailable === false) return;
+  state.systemResourceTimer = window.setTimeout(() => {
+    state.systemResourceTimer = null;
+    pollSystemResources().catch((error) => console.error(error));
+  }, Math.max(0, delay));
+}
+
+async function pollSystemResources() {
+  if (state.systemResourcePolling || document.hidden || state.systemResourceEndpointAvailable === false) return;
+  if (state.systemResourceTimer) window.clearTimeout(state.systemResourceTimer);
+  state.systemResourceTimer = null;
+  state.systemResourcePolling = true;
+  try {
+    const snapshot = await api("/api/system/resources");
+    state.systemResourceEndpointAvailable = true;
+    renderSystemResources(snapshot);
+  } catch (error) {
+    if ([404, 405].includes(error.status)) {
+      state.systemResourceEndpointAvailable = false;
+      renderSystemResourceFailure("System resource monitoring is unavailable on this server.");
+    } else {
+      renderSystemResourceFailure("System resource refresh failed; retrying.");
+    }
+  } finally {
+    state.systemResourcePolling = false;
+    scheduleSystemResourcePoll();
+  }
+}
+
 function nextPollDelay() {
   return refreshPolicy.pollDelay({
     hidden: document.hidden,
     hasActive: state.runs.some((run) => refreshPolicy.isActive(run.status)),
     failures: state.pollFailures,
   });
+}
+
+function applyQueueControl(value) {
+  if (!value || typeof value !== "object") return false;
+  const control = value.queue_control || value.queue || value;
+  if (!control || typeof control !== "object" || !("paused" in control)) return false;
+  state.queue = {
+    ...state.queue,
+    ...control,
+    paused: Boolean(control.paused),
+    reason: control.reason ?? null,
+  };
+  return true;
+}
+
+async function fetchQueueControl() {
+  if (state.queueEndpointAvailable === false) return;
+  try {
+    const control = await api("/api/queue");
+    state.queueEndpointAvailable = true;
+    applyQueueControl(control);
+  } catch (error) {
+    if ([404, 405].includes(error.status)) {
+      state.queueEndpointAvailable = false;
+      return;
+    }
+    console.warn("Queue status is temporarily unavailable", error);
+  }
+}
+
+async function fetchRunsState() {
+  const payload = await api("/api/runs");
+  if (Array.isArray(payload)) {
+    await fetchQueueControl();
+    return payload;
+  }
+  if (!payload || !Array.isArray(payload.runs)) {
+    throw new Error("Run list returned an invalid response");
+  }
+  const hasEmbeddedQueue = applyQueueControl(payload.queue_control || payload.queue);
+  if (!hasEmbeddedQueue) await fetchQueueControl();
+  return payload.runs;
 }
 
 function schedulePoll(delay = nextPollDelay(), options = {}) {
@@ -1430,7 +1769,7 @@ function schedulePoll(delay = nextPollDelay(), options = {}) {
 }
 
 async function refreshRunData(force = false) {
-  const runs = await api("/api/runs");
+  const runs = await fetchRunsState();
   state.runs = runs;
   const listedSelectedRun = state.selectedRunId ? runById(state.selectedRunId) : null;
   if (listedSelectedRun) {
@@ -1500,6 +1839,7 @@ function bindEvents() {
   });
   $("#run-button").addEventListener("click", () => queueRun().catch(showError));
   $("#run-action-button").addEventListener("click", (event) => runAction(event).catch(showError));
+  $("#resume-queue-button").addEventListener("click", () => resumeQueue().catch(showError));
   $("#settings-button").addEventListener("click", () => openSettings().catch(showError));
   $("#settings-form").addEventListener("submit", (event) => saveEnvironment(event).catch(showError));
   $("#settings-dialog").addEventListener("close", clearVisibleSecrets);
@@ -1556,11 +1896,17 @@ function bindEvents() {
     if (document.hidden) {
       if (state.pollTimer) window.clearTimeout(state.pollTimer);
       state.pollTimer = null;
+      if (state.systemResourceTimer) window.clearTimeout(state.systemResourceTimer);
+      state.systemResourceTimer = null;
       return;
     }
     schedulePoll(0);
+    scheduleSystemResourcePoll(0);
   });
-  window.addEventListener("online", () => schedulePoll(0));
+  window.addEventListener("online", () => {
+    schedulePoll(0);
+    if (state.systemResourceEndpointAvailable !== false) scheduleSystemResourcePoll(0);
+  });
   window.addEventListener("offline", () => setConnectionIndicator("Offline · waiting for connection", "error"));
   window.addEventListener("message", (event) => {
     const frame = $("#tree-frame");
@@ -1597,7 +1943,7 @@ async function initialize() {
   bindEvents();
   refreshIcons();
   const [runs, datasets, environment] = await Promise.all([
-    api("/api/runs"),
+    fetchRunsState(),
     api("/api/datasets"),
     api("/api/env"),
   ]);
@@ -1614,6 +1960,7 @@ async function initialize() {
   else await loadSelectedRun(true);
   if (activeRun) setMobileView("run");
   schedulePoll(nextPollDelay());
+  scheduleSystemResourcePoll(0);
 }
 
 document.addEventListener("DOMContentLoaded", () => initialize().catch(showError));

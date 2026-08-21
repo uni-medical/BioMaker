@@ -10,6 +10,7 @@ jsonschema==4.19.2
 omegaconf>=2.3.0
 openai>=1.69.0
 python-dotenv
+psutil>=6,<8
 requests==2.31.0
 rich==13.7.0
 shutup>=0.2.0

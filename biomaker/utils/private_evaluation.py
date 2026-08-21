@@ -656,7 +656,10 @@ def _private_gt_path(private_dir: Path, value: Any) -> Path:
 
 
 def evaluate_private_outputs(
-    workspace_dir: Path | str, private_dir: Path | str
+    workspace_dir: Path | str,
+    private_dir: Path | str,
+    *,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """Evaluate private test metrics for user inspection only."""
     workspace_dir = Path(workspace_dir)
@@ -677,7 +680,11 @@ def evaluate_private_outputs(
         return None
 
     if (workspace_dir / "evaluator.py").is_file():
-        validation = validate_submission_with_evaluator(workspace_dir, timeout=120)
+        validation = validate_submission_with_evaluator(
+            workspace_dir,
+            timeout=120,
+            env_overrides=env_overrides,
+        )
         if not validation.ok:
             return {
                 "visible_to_agent": False,

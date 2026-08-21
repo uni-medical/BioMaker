@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import io
 import json
 import threading
 import time
+from pathlib import Path
 from urllib.parse import quote
 
 import webui.server as server
@@ -11,11 +11,53 @@ from fastapi.testclient import TestClient
 from webui.server import create_app
 
 
+def prepare_fake_run(command, kwargs, output):
+    launch_token = kwargs["env"]["BIOMAKER_LAUNCH_TOKEN"]
+
+    def argument_value(name):
+        prefix = f"{name}="
+        return next(
+            argument.removeprefix(prefix)
+            for argument in command
+            if argument.startswith(prefix)
+        )
+
+    logs_root = Path(argument_value("log_dir"))
+    log_dir = logs_root / f"api-fake-{launch_token}"
+    log_dir.mkdir(parents=True)
+    (log_dir / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "launch_token": launch_token,
+                "created_at": "2026-08-21T00:00:00+00:00",
+                "data_dir": argument_value("data_dir"),
+                "workspace_dir": str(
+                    Path(argument_value("workspace_dir")) / log_dir.name
+                ),
+                "config": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    events_path = log_dir / "events.jsonl"
+    events_path.write_text('{"event":"run_started"}\n', encoding="utf-8")
+    kwargs["stdout"].write(output)
+    kwargs["stdout"].flush()
+    return events_path
+
+
+def append_fake_event(events_path, event, **details):
+    with events_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": event, **details}) + "\n")
+
+
 class ImmediateProcess:
     pid = None
 
-    def __init__(self, *_args, **_kwargs):
-        self.stdout = io.StringIO("finished\n")
+    def __init__(self, command, **kwargs):
+        self.stdout = None
+        events_path = prepare_fake_run(command, kwargs, "finished\n")
+        append_fake_event(events_path, "run_finished")
         self.returncode = 0
 
     def poll(self):
@@ -31,35 +73,52 @@ class ImmediateProcess:
         self.returncode = -9
 
 
-class BlockingProcess(ImmediateProcess):
-    def __init__(self, *_args, **_kwargs):
-        self.stdout = io.StringIO("running\n")
+class BlockingProcess:
+    pid = None
+
+    def __init__(self, command, **kwargs):
+        self.stdout = None
+        self.events_path = prepare_fake_run(command, kwargs, "running\n")
         self.returncode = None
         self.done = threading.Event()
+        self.terminal_written = False
+
+    def poll(self):
+        return self.returncode
 
     def wait(self, timeout=None):
         self.done.wait(timeout or 2)
         return self.returncode
 
     def terminate(self):
+        if not self.terminal_written:
+            append_fake_event(self.events_path, "run_interrupted", reason="stopped")
+            self.terminal_written = True
         self.returncode = -15
         self.done.set()
 
     def kill(self):
+        if not self.terminal_written:
+            append_fake_event(self.events_path, "run_interrupted", reason="killed")
+            self.terminal_written = True
         self.returncode = -9
         self.done.set()
 
 
-def wait_for_api_status(client, run_id, expected, timeout=3):
+def wait_for_api_status(client, run_id, expected, *, detailed_status=None, timeout=3):
     deadline = time.monotonic() + timeout
+    body = None
     while time.monotonic() < deadline:
         response = client.get(f"/api/runs/{run_id}")
         assert response.status_code == 200
-        current = response.json()["status"]
+        body = response.json()
+        current = body["status"]
         if current in expected:
-            return current
+            if detailed_status is not None:
+                assert body["detailed_status"] == detailed_status
+            return body
         time.sleep(0.02)
-    raise AssertionError(f"Run did not reach {expected}")
+    raise AssertionError(f"Run did not reach {expected}; current={body}")
 
 
 def experiment_payload(dataset, template):
@@ -91,7 +150,9 @@ def test_env_run_and_artifact_api(settings):
     dataset, template = prepare_workspace(settings)
     app = create_app(settings, process_factory=ImmediateProcess)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
-        assert client.get("/api/health").json()["status"] == "ok"
+        health = client.get("/api/health").json()
+        assert health["status"] == "ok"
+        assert health["run_ledger"] == app.state.run_store.database_path
         templates = client.get("/api/task-templates").json()
         assert templates[0]["dataset_path"] == str(dataset.resolve())
 
@@ -142,7 +203,10 @@ def test_env_run_and_artifact_api(settings):
         )
         assert response.status_code == 202
         run = response.json()
-        assert wait_for_api_status(client, run["id"], {"succeeded"}) == "succeeded"
+        completed = wait_for_api_status(
+            client, run["id"], {"complete"}, detailed_status="succeeded"
+        )
+        assert completed["terminal_event"] == "run_finished"
         assert "finished" in client.get(f"/api/runs/{run['id']}/log").text
 
         log_dir = settings.logs_root / "1-api-run"
@@ -193,6 +257,7 @@ def test_run_updates_exposes_revisions_and_terminal_barrier(settings):
         assert response.status_code == 200
         first = response.json()
         assert first["status"] == "running"
+        assert client.get(f"/api/runs/{run_id}").json()["detailed_status"] == "running"
         assert first["terminal"] is False
         assert first["final_barrier"] is False
         assert isinstance(first["run_revision"], str)
@@ -221,7 +286,7 @@ def test_run_updates_exposes_revisions_and_terminal_barrier(settings):
         )
 
         final = client.get(f"/api/runs/{run_id}/updates").json()
-        assert final["status"] == "succeeded"
+        assert final["status"] == "complete"
         assert final["terminal"] is True
         assert final["final_barrier"] is True
         assert final["run_revision"] != first["run_revision"]
@@ -229,8 +294,79 @@ def test_run_updates_exposes_revisions_and_terminal_barrier(settings):
         assert final["events"]["revision"] != first["events"]["revision"]
         assert final["console"]["revision"] != first["console"]["revision"]
         assert final["artifacts"]["revision"] != first["artifacts"]["revision"]
+        assert client.get(f"/api/runs/{run_id}").json()["detailed_status"] == (
+            "succeeded"
+        )
 
         assert client.get("/api/runs/missing/updates").status_code == 404
+
+
+def test_queue_and_system_resources_api(settings, monkeypatch):
+    resource_snapshot = {
+        "sampled_at": "2026-08-21T08:09:10Z",
+        "stale": False,
+        "error": None,
+        "cpu": {"utilization_percent": 12.5},
+        "memory": {
+            "used_bytes": 2_000,
+            "total_bytes": 8_000,
+            "utilization_percent": 25.0,
+        },
+        "nvidia_gpus": [],
+        "apple_mps": {
+            "available": True,
+            "utilization_percent": None,
+            "memory_used_bytes": None,
+            "memory_total_bytes": None,
+        },
+    }
+    monkeypatch.setattr(server, "get_system_resources", lambda: resource_snapshot)
+    app = create_app(settings, process_factory=ImmediateProcess)
+
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        queue = client.get("/api/queue")
+        assert queue.status_code == 200
+        assert queue.json()["paused"] is False
+        assert queue.json()["reason"] is None
+        assert queue.json()["pause_generation"] == 0
+        assert queue.json()["runner_token"] is None
+
+        resumed = client.post(
+            "/api/queue/resume",
+            json={"pause_generation": queue.json()["pause_generation"]},
+        )
+        assert resumed.status_code == 202
+        assert resumed.json()["paused"] is False
+        assert resumed.json()["reason"] is None
+
+        app.state.run_store.update_queue_control(
+            {"paused": True, "reason": "first pause", "pause_generation": 1}
+        )
+        stale_generation = app.state.run_store.get_queue_control()["pause_generation"]
+        app.state.run_store.update_queue_control(
+            {"paused": True, "reason": "new failure pause", "pause_generation": 2}
+        )
+        conflict = client.post(
+            "/api/queue/resume",
+            json={"pause_generation": stale_generation},
+        )
+        assert conflict.status_code == 409
+        assert "pause changed" in conflict.json()["detail"]
+        still_paused = client.get("/api/queue").json()
+        assert still_paused["paused"] is True
+        assert still_paused["reason"] == "new failure pause"
+        assert still_paused["pause_generation"] == 2
+        resumed = client.post(
+            "/api/queue/resume",
+            json={"pause_generation": still_paused["pause_generation"]},
+        )
+        assert resumed.status_code == 202
+        assert resumed.json()["paused"] is False
+
+        resources = client.get("/api/system/resources")
+        assert resources.status_code == 200
+        assert resources.json() == resource_snapshot
+        assert resources.headers["cache-control"] == "no-store"
 
 
 def test_model_discovery_uses_configured_or_supplied_credentials(settings, monkeypatch):
@@ -310,6 +446,10 @@ def test_secret_bearing_settings_endpoints_require_loopback(settings):
         )
         assert client.post("/api/models/discover", json={}).status_code == 403
         assert (
+            client.post("/api/queue/resume", json={"pause_generation": 0}).status_code
+            == 403
+        )
+        assert (
             client.post(
                 "/api/runs",
                 json={"experiment": experiment_payload(dataset, template)},
@@ -368,18 +508,48 @@ def test_api_cancel_pending_and_stop_active_run(settings):
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         payload = {"experiment": experiment_payload(dataset, template)}
         first = client.post("/api/runs", json=payload).json()
-        assert wait_for_api_status(client, first["id"], {"running"}) == "running"
+        wait_for_api_status(client, first["id"], {"running"}, detailed_status="running")
         second = client.post("/api/runs", json=payload).json()
-        assert wait_for_api_status(client, second["id"], {"queued"}) == "queued"
+        wait_for_api_status(client, second["id"], {"queued"}, detailed_status="queued")
 
-        assert client.post(f"/api/runs/{second['id']}/cancel").status_code == 200
-        assert wait_for_api_status(client, second["id"], {"cancelled"}) == "cancelled"
-        assert client.post(f"/api/runs/{first['id']}/stop").status_code == 202
-        assert wait_for_api_status(client, first["id"], {"stopped"}) == "stopped"
+        cancel_response = client.post(f"/api/runs/{second['id']}/cancel")
+        assert cancel_response.status_code == 200
+        assert cancel_response.json()["status"] == "incomplete"
+        assert cancel_response.json()["detailed_status"] == "cancelled"
+        cancelled = wait_for_api_status(
+            client, second["id"], {"incomplete"}, detailed_status="cancelled"
+        )
+        assert cancelled["status_reason"] == "Cancelled before the run started."
+        stop_response = client.post(f"/api/runs/{first['id']}/stop")
+        assert stop_response.status_code == 202
+        assert stop_response.json()["status"] == "stopping"
+        assert stop_response.json()["detailed_status"] == "stopping"
+        assert stop_response.json()["allowed_actions"] == []
+        stopped = wait_for_api_status(
+            client, first["id"], {"incomplete"}, detailed_status="stopped"
+        )
+        assert stopped["status_reason"] == "Stopped by the user."
+        assert stopped["terminal_event"] == "run_interrupted"
+        paused = client.get("/api/queue")
+        assert paused.status_code == 200
+        assert paused.json()["paused"] is True
+        assert "stopped" in paused.json()["reason"]
 
         retry = client.post(f"/api/runs/{first['id']}/requeue")
         assert retry.status_code == 202
         assert retry.json()["id"] != first["id"]
+        assert retry.json()["status"] == "queued"
+        assert retry.json()["detailed_status"] == "queued"
+        resumed = client.post(
+            "/api/queue/resume",
+            json={"pause_generation": paused.json()["pause_generation"]},
+        )
+        assert resumed.status_code == 202
+        assert resumed.json()["paused"] is False
+        retry_id = retry.json()["id"]
+        wait_for_api_status(client, retry_id, {"running"}, detailed_status="running")
+        client.post(f"/api/runs/{retry_id}/stop")
+        wait_for_api_status(client, retry_id, {"incomplete"}, detailed_status="stopped")
 
 
 def test_logs_are_the_run_history_and_keep_cli_directory_names(settings):
@@ -449,7 +619,9 @@ def test_logs_are_the_run_history_and_keep_cli_directory_names(settings):
         assert run["actual_exp_name"] == run_name
         assert run["dataset_name"] == "dermamnist_224"
         assert run["dataset_path"] == str(dataset)
-        assert run["status"] == "succeeded"
+        assert run["status"] == "complete"
+        assert run["detailed_status"] == "succeeded"
+        assert run["terminal_event"] == "run_finished"
         assert run["progress"] == {
             "completed_steps": 35,
             "total_steps": 35,
@@ -467,8 +639,7 @@ def test_logs_are_the_run_history_and_keep_cli_directory_names(settings):
         assert detail["observed"]["results"]["best_metric"] == 0.8783649052841476
         assert client.post(f"/api/runs/{run_name}/requeue").status_code == 409
 
-        app.state.run_store.add_record(
-            "runs",
+        duplicate = app.state.manager.import_log_record(
             {
                 "id": "current-webui-session",
                 "project_snapshot": {
@@ -483,14 +654,15 @@ def test_logs_are_the_run_history_and_keep_cli_directory_names(settings):
                 "timestamps": {},
             },
         )
+        assert duplicate["id"] == run_name
         merged = client.get("/api/runs").json()
         assert len(merged) == 1
-        assert merged[0]["id"] == "current-webui-session"
+        assert merged[0]["id"] == run_name
         assert merged[0]["actual_exp_name"] == run_name
         assert merged[0]["dataset_path"] == str(dataset)
         assert merged[0]["dataset_name"] == "dermamnist_224"
-        assert (
-            merged[0]["project_snapshot"]["task_body"] == manifest["task_description"]
+        assert merged[0]["project_snapshot"]["task_body"] == (
+            manifest["task_description"]
         )
         assert merged[0]["options"]["model_for_all_agents"] is None
         assert merged[0]["options"]["main_model"] == "deepseek-v4-flash"
@@ -544,15 +716,21 @@ def test_cli_lifecycle_events_drive_status_and_special_names_are_routable(settin
     app = create_app(settings, process_factory=ImmediateProcess)
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         runs = {run["id"]: run for run in client.get("/api/runs").json()}
-        assert runs[running_name]["status"] == "running"
-        assert runs[failed_name]["status"] == "failed"
+        assert runs[running_name]["status"] == "incomplete"
+        assert runs[running_name]["detailed_status"] == "orphaned"
+        assert runs[running_name]["terminal_event"] is None
+        assert "no terminal lifecycle event" in runs[running_name]["status_reason"]
+        assert runs[failed_name]["status"] == "incomplete"
+        assert runs[failed_name]["detailed_status"] == "failed"
+        assert runs[failed_name]["terminal_event"] == "run_failed"
+        assert runs[failed_name]["status_reason"] == "report failed"
         assert runs[failed_name]["error"] == "report failed"
 
         running_updates = client.get(
             f"/api/runs/{quote(running_name, safe='')}/updates"
         ).json()
-        assert running_updates["terminal"] is False
-        assert running_updates["final_barrier"] is False
+        assert running_updates["terminal"] is True
+        assert running_updates["final_barrier"] is True
 
         failed_updates = client.get(
             f"/api/runs/{quote(failed_name, safe='')}/updates"
