@@ -114,11 +114,14 @@ class AgentConfig:
 @dataclass
 class ExecConfig:
     timeout: int
-    parallel_workers: int
+    parallel_workers: int | str
     agent_file_name: str
     format_tb_ipython: bool
     enforce_environment: bool
     include_medical_packages: bool
+    requested_parallel_workers: int | str | None = None
+    effective_parallel_workers: int | None = None
+    compute_slots: list[dict[str, object]] | None = None
 
 
 @dataclass
@@ -188,11 +191,18 @@ def _load_cfg(
 
 def _validate_exec_config(cfg: Config) -> None:
     exec_cfg = cfg.exec
-    positive_int_fields = ("timeout", "parallel_workers")
-    for name in positive_int_fields:
+    for name in ("timeout",):
         value = getattr(exec_cfg, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"exec.{name} must be an integer >= 1, got {value!r}.")
+    workers = exec_cfg.parallel_workers
+    if workers != "auto" and (
+        isinstance(workers, bool) or not isinstance(workers, int) or workers < 1
+    ):
+        raise ValueError(
+            "exec.parallel_workers must be 'auto' or an integer >= 1, "
+            f"got {workers!r}."
+        )
     split_builder_cfg = getattr(cfg, "split_builder", None)
     if split_builder_cfg is not None:
         attempts = split_builder_cfg.attempts

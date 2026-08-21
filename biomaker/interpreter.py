@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -379,6 +380,7 @@ class Interpreter:
         agent_file_name: str = "runfile.py",
         enforce_environment: bool = True,
         include_medical_packages: bool = True,
+        environment: Mapping[str, str] | None = None,
     ):
         """
         Simulates a standalone Python REPL with an execution time limit.
@@ -400,6 +402,7 @@ class Interpreter:
         self.agent_file_name = agent_file_name
         self.enforce_environment = enforce_environment
         self.include_medical_packages = include_medical_packages
+        self.environment = dict(environment or {})
 
     def run(self, code: str, reset_session=True) -> ExecutionResult:
         """
@@ -467,6 +470,9 @@ class Interpreter:
                 "stdout": stdout_capture,
                 "stderr": stderr_capture,
                 "text": True,
+                "env": (
+                    {**os.environ, **self.environment} if self.environment else None
+                ),
             }
             if os.name == "posix":
                 # A candidate-owned PGID survives leader exit, while remaining in the

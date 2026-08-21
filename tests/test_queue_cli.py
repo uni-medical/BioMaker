@@ -94,7 +94,7 @@ def _raw_cfg(tmp_path):
         exp_name="cli-test",
         model_for_all_agents="test-model",
         agent=SimpleNamespace(steps=4, total_time_limit=100),
-        exec=SimpleNamespace(timeout=30, parallel_workers=2),
+        exec=SimpleNamespace(timeout=30, parallel_workers="auto"),
         final_retrain=SimpleNamespace(enabled=True),
     )
 
@@ -180,7 +180,7 @@ def test_cli_submission_waits_in_fifo_streams_log_and_returns_child_code(
         "task_template_path": None,
         "task_body": "Train a model",
     }
-    assert kwargs["options"]["exec_parallel_workers"] == 2
+    assert kwargs["options"]["exec_parallel_workers"] == "auto"
     assert kwargs["requested_exp_name"] == "cli-test"
     assert kwargs["logs_root"] == (tmp_path / "shared" / "logs").resolve()
     assert kwargs["workspaces_root"] == (tmp_path / "shared" / "workspaces").resolve()
@@ -501,7 +501,7 @@ def test_enqueue_command_runs_through_fifo_with_direct_child_environment(tmp_pat
         command,
         cwd=method_root,
         project_snapshot={"task_body": "test"},
-        options={"exec_parallel_workers": 2},
+        options={"exec_parallel_workers": "auto"},
         requested_exp_name="cli-run",
     )
     saved = _wait_for_terminal(store, queued["id"])
@@ -511,7 +511,7 @@ def test_enqueue_command_runs_through_fifo_with_direct_child_environment(tmp_pat
     assert saved["command"] == command
     assert saved["cwd"] == str(method_root.resolve())
     assert saved["project_snapshot"] == {"task_body": "test"}
-    assert saved["options"] == {"exec_parallel_workers": 2}
+    assert saved["options"] == {"exec_parallel_workers": "auto"}
     assert saved["logs_root"] == str(settings.logs_root.resolve())
     assert saved["workspaces_root"] == str(settings.workspaces_root.resolve())
     assert len(factory.calls) == 1

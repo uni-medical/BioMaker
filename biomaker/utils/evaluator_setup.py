@@ -2075,6 +2075,7 @@ def score_candidate_with_evaluator(
     workspace_dir: Path | str,
     timeout: int = 120,
     hidden_score_path: Path | str | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> EvaluatorRunResult:
     """Run the frozen evaluator against the current ./working artifacts."""
     workspace_dir = Path(workspace_dir)
@@ -2089,6 +2090,8 @@ def score_candidate_with_evaluator(
     )
     try:
         evaluator_env = _hidden_score_env(workspace_dir, hidden_score_path)
+        if env_overrides:
+            evaluator_env.update(env_overrides)
         completed = _run_python(
             workspace_dir,
             code,
@@ -2189,6 +2192,7 @@ def score_candidate_with_evaluator(
 def validate_submission_with_evaluator(
     workspace_dir: Path | str,
     timeout: int = 120,
+    env_overrides: dict[str, str] | None = None,
 ) -> EvaluatorRunResult:
     """Run only the frozen evaluator's public test-submission validation."""
     workspace_dir = Path(workspace_dir)
@@ -2205,6 +2209,7 @@ def validate_submission_with_evaluator(
             workspace_dir,
             code,
             timeout=timeout,
+            env=env_overrides,
         )
     except subprocess.TimeoutExpired as exc:
         output = (exc.stdout or "") + (exc.stderr or "")

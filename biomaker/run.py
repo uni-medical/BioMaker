@@ -40,6 +40,7 @@ from .utils.config import (
     save_run,
     sync_node_working_to_run_workspace,
 )
+from .utils.compute import ComputePool
 from .utils.evaluator_setup import (
     clean_candidate_outputs,
     prepare_evaluator,
@@ -77,7 +78,13 @@ logger.setLevel(logging.INFO)  # set default level
 
 def _interpreter_kwargs(cfg):
     kwargs = dict(OmegaConf.to_container(cfg.exec))  # type: ignore
-    kwargs.pop("parallel_workers", None)
+    for runtime_key in (
+        "parallel_workers",
+        "requested_parallel_workers",
+        "effective_parallel_workers",
+        "compute_slots",
+    ):
+        kwargs.pop(runtime_key, None)
     return kwargs
 
 
@@ -565,6 +572,13 @@ def _private_metrics_summary(history: list) -> dict:
 
 
 def _run(cfg: Config) -> int:
+    requested_parallel_workers = cfg.exec.parallel_workers
+    compute_pool = ComputePool.detect(requested_parallel_workers)
+    cfg.exec.requested_parallel_workers = requested_parallel_workers
+    cfg.exec.effective_parallel_workers = compute_pool.effective_workers
+    cfg.exec.compute_slots = [slot.as_dict() for slot in compute_pool.slots]
+    parallel_workers = compute_pool.effective_workers
+
     log_level = cfg.log_level.upper()
     level = getattr(logging, log_level, None)
     if log_level == "TRACE":
@@ -604,9 +618,22 @@ def _run(cfg: Config) -> int:
         workspace_dir=cfg.workspace_dir,
         steps=cfg.agent.steps,
         per_node_timeout_seconds=cfg.exec.timeout,
-        parallel_workers=cfg.exec.parallel_workers,
+        parallel_workers=parallel_workers,
+        requested_parallel_workers=requested_parallel_workers,
+        effective_parallel_workers=parallel_workers,
+        compute_slots=[slot.as_dict() for slot in compute_pool.slots],
         total_time_limit_seconds=cfg.agent.total_time_limit,
     )
+    compute_manifest_path = write_run_manifest(cfg, None)
+    append_event(
+        cfg.log_dir,
+        "run_manifest_updated",
+        path=compute_manifest_path,
+        stage="compute_configured",
+    )
+    if compute_pool.warning_metadata is not None:
+        logger.warning(compute_pool.warning_metadata["message"])
+        append_event(cfg.log_dir, "run_warning", **compute_pool.warning_metadata)
 
     task_desc = load_task_desc(cfg)
     manifest_path = write_run_manifest(cfg, task_desc)
@@ -733,62 +760,84 @@ def _run(cfg: Config) -> int:
         execution_workspace = (
             prepare_node_workspace(cfg, node) if node is not None else cfg.workspace_dir
         )
-        append_event(
-            cfg.log_dir,
-            "execution_started",
-            code_chars=len(str(args[0])) if args else None,
-            node_id=node.id if node is not None else None,
-            execution_workspace=str(execution_workspace),
-            timeout_seconds=cfg.exec.timeout,
-        )
-        clean_candidate_outputs(execution_workspace)
-        node_interpreter = Interpreter(
-            execution_workspace,
-            **_interpreter_kwargs(cfg),
-        )
-        res = node_interpreter.run(*args, **kwargs)
-        if res.exc_type is None:
-            normalization_messages = normalize_working_outputs(
-                execution_workspace, str(agent_task_desc)
+        with compute_pool.lease() as slot:
+            slot_payload = slot.as_dict()
+            append_event(
+                cfg.log_dir,
+                "execution_started",
+                code_chars=len(str(args[0])) if args else None,
+                node_id=node.id if node is not None else None,
+                execution_workspace=str(execution_workspace),
+                timeout_seconds=cfg.exec.timeout,
+                compute_backend=slot.backend,
+                compute_slot=slot_payload,
             )
-            if normalization_messages:
-                res.append_system_output(
-                    "artifact_normalization",
-                    "\n".join(normalization_messages),
-                    details={"messages": normalization_messages},
+            try:
+                clean_candidate_outputs(execution_workspace)
+                node_interpreter = Interpreter(
+                    execution_workspace,
+                    **_interpreter_kwargs(cfg),
+                    environment=slot.env_overrides,
                 )
-            artifact_check = validate_working_outputs(
-                execution_workspace, str(agent_task_desc)
-            )
-            attach_artifact_validation_result(
-                res,
-                artifact_check,
-                failure_reason="generated artifacts failed validation",
-            )
-        if res.exc_type is None:
-            evaluator_result = score_candidate_with_evaluator(
-                execution_workspace,
-                timeout=min(180, cfg.exec.timeout),
-                hidden_score_path=cfg.log_dir / "private_gt" / "score_val.csv",
-            )
-            attach_evaluator_run_result(
-                res,
-                evaluator_result,
-                failure_phase="evaluator_scoring",
-                failure_type="EvaluatorValidationError",
-                failure_message_prefix="EvaluatorValidationError",
-            )
-        res.exec_time = time.monotonic() - node_start_time
-        append_event(
-            cfg.log_dir,
-            "execution_finished",
-            node_id=node.id if node is not None else None,
-            execution_workspace=str(execution_workspace),
-            exec_time=res.exec_time,
-            exc_type=res.exc_type,
-            resource_usage=res.resource_usage,
-        )
-        return res
+                res = node_interpreter.run(*args, **kwargs)
+                if res.exc_type is None:
+                    normalization_messages = normalize_working_outputs(
+                        execution_workspace, str(agent_task_desc)
+                    )
+                    if normalization_messages:
+                        res.append_system_output(
+                            "artifact_normalization",
+                            "\n".join(normalization_messages),
+                            details={"messages": normalization_messages},
+                        )
+                    artifact_check = validate_working_outputs(
+                        execution_workspace, str(agent_task_desc)
+                    )
+                    attach_artifact_validation_result(
+                        res,
+                        artifact_check,
+                        failure_reason="generated artifacts failed validation",
+                    )
+                if res.exc_type is None:
+                    evaluator_result = score_candidate_with_evaluator(
+                        execution_workspace,
+                        timeout=min(180, cfg.exec.timeout),
+                        hidden_score_path=cfg.log_dir / "private_gt" / "score_val.csv",
+                        env_overrides=slot.env_overrides,
+                    )
+                    attach_evaluator_run_result(
+                        res,
+                        evaluator_result,
+                        failure_phase="evaluator_scoring",
+                        failure_type="EvaluatorValidationError",
+                        failure_message_prefix="EvaluatorValidationError",
+                    )
+                res.exec_time = time.monotonic() - node_start_time
+                append_event(
+                    cfg.log_dir,
+                    "execution_finished",
+                    node_id=node.id if node is not None else None,
+                    execution_workspace=str(execution_workspace),
+                    exec_time=res.exec_time,
+                    exc_type=res.exc_type,
+                    resource_usage=res.resource_usage,
+                    compute_backend=slot.backend,
+                    compute_slot=slot_payload,
+                )
+                return res
+            except BaseException as exc:
+                append_event(
+                    cfg.log_dir,
+                    "execution_finished",
+                    node_id=node.id if node is not None else None,
+                    execution_workspace=str(execution_workspace),
+                    exec_time=time.monotonic() - node_start_time,
+                    exc_type=type(exc).__name__,
+                    error=str(exc),
+                    compute_backend=slot.backend,
+                    compute_slot=slot_payload,
+                )
+                raise
 
     def live_display_journal(extra_nodes: list[Node] | None = None) -> Journal:
         transient_nodes = [
@@ -873,7 +922,6 @@ def _run(cfg: Config) -> int:
     global_step = 0
     round_index = 0
     end_with_exception = False
-    parallel_workers = int(cfg.exec.parallel_workers)
     workflow_agent: WorkflowAgent = agent.workflow[0]
     proposal_agent = agent.proposal_agent
     scheduler = SchedulerState()
@@ -1258,7 +1306,12 @@ def _run(cfg: Config) -> int:
         private_metrics = None
         private_error = None
         try:
-            private_metrics = evaluate_private_outputs(solution_workspace, private_dir)
+            with compute_pool.lease() as private_slot:
+                private_metrics = evaluate_private_outputs(
+                    solution_workspace,
+                    private_dir,
+                    env_overrides=private_slot.env_overrides,
+                )
         except Exception as exc:
             logger.warning("Private evaluation failed: %s", exc)
             private_error = str(exc)
@@ -1437,30 +1490,37 @@ def _run(cfg: Config) -> int:
     best_node = journal.get_best_node(only_good=True)
     if cfg.final_retrain.enabled and best_node is not None and not end_with_exception:
         retrain_timeout = _final_retrain_timeout_seconds(cfg)
-        append_event(
-            cfg.log_dir,
-            "final_retrain_started",
-            node_id=best_node.id,
-            node_step=best_node.step,
-            timeout_seconds=retrain_timeout,
-        )
-        retrain_result = run_final_retrain(
-            cfg,
-            best_node,
-            private_dir,
-            timeout=retrain_timeout,
-        )
-        append_event(
-            cfg.log_dir,
-            "final_retrain_finished",
-            ok=retrain_result.ok,
-            workspace_dir=str(retrain_result.workspace_dir),
-            train_rows_before=retrain_result.train_rows_before,
-            score_rows_added=retrain_result.score_rows_added,
-            train_rows_after=retrain_result.train_rows_after,
-            private_metrics=retrain_result.private_metrics,
-            error=retrain_result.error,
-        )
+        with compute_pool.lease(final=True) as final_slot:
+            final_slot_payload = final_slot.as_dict()
+            append_event(
+                cfg.log_dir,
+                "final_retrain_started",
+                node_id=best_node.id,
+                node_step=best_node.step,
+                timeout_seconds=retrain_timeout,
+                compute_backend=final_slot.backend,
+                compute_slot=final_slot_payload,
+            )
+            retrain_result = run_final_retrain(
+                cfg,
+                best_node,
+                private_dir,
+                timeout=retrain_timeout,
+                env_overrides=final_slot.env_overrides,
+            )
+            append_event(
+                cfg.log_dir,
+                "final_retrain_finished",
+                ok=retrain_result.ok,
+                workspace_dir=str(retrain_result.workspace_dir),
+                train_rows_before=retrain_result.train_rows_before,
+                score_rows_added=retrain_result.score_rows_added,
+                train_rows_after=retrain_result.train_rows_after,
+                private_metrics=retrain_result.private_metrics,
+                error=retrain_result.error,
+                compute_backend=final_slot.backend,
+                compute_slot=final_slot_payload,
+            )
         _append_private_metrics_entry(
             cfg,
             {

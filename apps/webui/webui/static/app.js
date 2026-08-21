@@ -9,7 +9,7 @@ const DEFAULT_OPTIONS = {
   model_for_all_agents: null,
   agent_steps: 35,
   exec_timeout: 600,
-  exec_parallel_workers: 1,
+  exec_parallel_workers: "auto",
   agent_total_time_limit: 86400,
   final_retrain_enabled: true,
 };
@@ -232,6 +232,14 @@ function executionLabel(status) {
 function sidebarStatusLabel(status) {
   const normalized = canonicalStatus(status);
   return normalized === "complete" ? null : executionLabel(normalized);
+}
+
+function computeWorkerLabel(value) {
+  if (value == null || String(value).toLowerCase() === "auto") return "Auto compute";
+  const workers = Number(value);
+  return Number.isFinite(workers)
+    ? `${workers} worker${workers === 1 ? "" : "s"}`
+    : "Auto compute";
 }
 
 function resultPresentation(run) {
@@ -598,7 +606,6 @@ function populateProjectForm(project) {
   $("#task-model").value = options.model_for_all_agents || "";
   $("#agent-steps").value = options.agent_steps;
   $("#exec-timeout").value = options.exec_timeout;
-  $("#parallel-workers").value = options.exec_parallel_workers;
   $("#total-time-limit").value = options.agent_total_time_limit;
   $("#final-retrain").checked = options.final_retrain_enabled;
   $("#run-name-label").textContent = "Run name";
@@ -624,7 +631,6 @@ function populateRunForm(run) {
   $("#task-model").value = runConfiguredModel(run);
   $("#agent-steps").value = options.agent_steps ?? "";
   $("#exec-timeout").value = options.exec_timeout ?? "";
-  $("#parallel-workers").value = options.exec_parallel_workers ?? "";
   $("#total-time-limit").value = options.agent_total_time_limit ?? "";
   $("#final-retrain").checked = options.final_retrain_enabled === true;
   $("#run-name-label").textContent = "Run name";
@@ -653,9 +659,7 @@ function renderEditorState() {
     const model = runConfiguredModel(state.selectedRun);
     if (model) parts.push(model);
     if (options.agent_steps != null) parts.push(`${options.agent_steps} steps`);
-    if (options.exec_parallel_workers != null) {
-      parts.push(`${options.exec_parallel_workers} worker${options.exec_parallel_workers === 1 ? "" : "s"}`);
-    }
+    parts.push(computeWorkerLabel(options.exec_parallel_workers));
     $("#run-config-summary").textContent = parts.length
       ? `${parts.join(" · ")} · CLI configuration`
       : "CLI configuration";
@@ -667,7 +671,7 @@ function renderEditorState() {
   const settingsModel = configuredDefaultModel();
   const model = options.model_for_all_agents
     || (settingsModel ? `${settingsModel} (Settings)` : "repository default");
-  $("#run-config-summary").textContent = `${model} · ${options.agent_steps} steps · ${options.exec_parallel_workers} worker${options.exec_parallel_workers === 1 ? "" : "s"}`;
+  $("#run-config-summary").textContent = `${model} · ${options.agent_steps} steps · ${computeWorkerLabel(options.exec_parallel_workers)}`;
 }
 
 function collectProjectOptions() {
@@ -675,7 +679,7 @@ function collectProjectOptions() {
     model_for_all_agents: $("#task-model").value.trim() || null,
     agent_steps: Number($("#agent-steps").value),
     exec_timeout: Number($("#exec-timeout").value),
-    exec_parallel_workers: Number($("#parallel-workers").value),
+    exec_parallel_workers: "auto",
     agent_total_time_limit: Number($("#total-time-limit").value),
     final_retrain_enabled: $("#final-retrain").checked,
   };

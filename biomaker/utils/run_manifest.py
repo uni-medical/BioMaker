@@ -65,11 +65,18 @@ def _monai_rag_index_provenance() -> dict[str, Any] | None:
 
 def _selected_cfg(cfg: Config) -> dict[str, Any]:
     knowledge_cfg = cfg.agent.knowledge_base
+    requested_workers = getattr(
+        cfg.exec, "requested_parallel_workers", cfg.exec.parallel_workers
+    )
+    effective_workers = getattr(cfg.exec, "effective_parallel_workers", None)
     return {
         "agent_steps": cfg.agent.steps,
         "total_time_limit_seconds": cfg.agent.total_time_limit,
         "per_node_timeout_seconds": cfg.exec.timeout,
-        "parallel_workers": cfg.exec.parallel_workers,
+        "parallel_workers": effective_workers or cfg.exec.parallel_workers,
+        "requested_parallel_workers": requested_workers,
+        "effective_parallel_workers": effective_workers,
+        "compute_slots": getattr(cfg.exec, "compute_slots", None),
         "final_retrain_enabled": cfg.final_retrain.enabled,
         "model_for_all_agents": cfg.model_for_all_agents,
         "main_model": cfg.agent.code.model,

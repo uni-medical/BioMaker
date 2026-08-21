@@ -291,6 +291,7 @@ def run_final_retrain(
     private_dir: Path,
     *,
     timeout: int,
+    env_overrides: dict[str, str] | None = None,
 ) -> FinalRetrainResult:
     """Rerun the selected best node after adding score-validation labels to train."""
     result = FinalRetrainResult(
@@ -313,6 +314,7 @@ def run_final_retrain(
             agent_file_name=cfg.exec.agent_file_name,
             enforce_environment=cfg.exec.enforce_environment,
             include_medical_packages=cfg.exec.include_medical_packages,
+            environment=env_overrides,
         )
         exec_result = interpreter.run(best_node.code, reset_session=True)
         result.exec_result = exec_result
@@ -340,7 +342,9 @@ def run_final_retrain(
             return result
 
         submission_check = validate_submission_with_evaluator(
-            retrain_workspace, timeout=min(180, timeout)
+            retrain_workspace,
+            timeout=min(180, timeout),
+            env_overrides=env_overrides,
         )
         attach_evaluator_run_result(
             exec_result,
@@ -360,7 +364,9 @@ def run_final_retrain(
         _copy_retrain_outputs_to_log(cfg, retrain_workspace)
         try:
             result.private_metrics = evaluate_private_outputs(
-                retrain_workspace, private_dir
+                retrain_workspace,
+                private_dir,
+                env_overrides=env_overrides,
             )
         except Exception as exc:
             result.error = f"Private evaluation failed after final retrain: {exc}"

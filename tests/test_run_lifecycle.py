@@ -92,6 +92,44 @@ def test_manifest_failure_is_recorded_as_run_failed(tmp_path, monkeypatch):
     ]
 
 
+def test_compute_detection_failure_writes_one_run_failed(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(
+        log_dir=tmp_path,
+        exec=SimpleNamespace(parallel_workers="auto"),
+    )
+    events = []
+
+    def fail_detection(_requested_workers):
+        raise RuntimeError("compute detection failed")
+
+    monkeypatch.setattr(run_module, "load_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        run_module,
+        "write_run_manifest",
+        lambda _cfg, _task: tmp_path / "run_manifest.json",
+    )
+    monkeypatch.setattr(
+        run_module.ComputePool,
+        "detect",
+        staticmethod(fail_detection),
+    )
+    capture_run_events(monkeypatch, events)
+
+    with pytest.raises(RuntimeError, match="compute detection failed"):
+        run_module.run()
+
+    assert events == [
+        ("run_manifest_written", {"path": tmp_path / "run_manifest.json"}),
+        (
+            "run_failed",
+            {
+                "exc_type": "RuntimeError",
+                "error": "compute detection failed",
+            },
+        ),
+    ]
+
+
 def test_run_emits_interrupted_for_keyboard_interrupt(tmp_path, monkeypatch):
     cfg = SimpleNamespace(log_dir=tmp_path)
     events = []

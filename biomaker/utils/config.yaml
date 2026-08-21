@@ -83,9 +83,13 @@ agent:
 exec:
   # Hard safety timeout for one generated node in seconds. This is a longest tolerated runtime, not a target budget.
   timeout: 600
-  # Number of generated nodes that may execute concurrently. Use 1 for shared GPU-heavy runs.
-  # Even with 1 worker, BioMaker overlaps node execution with generation of later same-round nodes.
-  parallel_workers: 1
+  # Candidate concurrency. Auto assigns one candidate slot per visible CUDA GPU,
+  # or one slot on Apple MPS / CPU. A positive integer remains a CLI override.
+  parallel_workers: auto
+  # Runtime-resolved facts populated by BioMaker; do not set these manually.
+  requested_parallel_workers: null
+  effective_parallel_workers: null
+  compute_slots: null
   agent_file_name: runfile.py
   format_tb_ipython: False
   enforce_environment: True

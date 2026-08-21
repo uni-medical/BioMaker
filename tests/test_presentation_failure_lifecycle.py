@@ -12,6 +12,7 @@ from biomaker.journal import Node
 from biomaker.utils import config as config_module
 from biomaker.utils import final_retrain as final_retrain_module
 from biomaker.utils import tree_export
+from biomaker.utils.compute import ComputePool, ComputeSlot
 from biomaker.utils.metric import MetricValue
 
 
@@ -163,7 +164,10 @@ def _minimal_cfg(tmp_path):
         ),
         exec=SimpleNamespace(
             timeout=30,
-            parallel_workers=1,
+            parallel_workers="auto",
+            requested_parallel_workers=None,
+            effective_parallel_workers=None,
+            compute_slots=None,
         ),
     )
 
@@ -180,6 +184,7 @@ def _install_minimal_run(
     order = []
     live = _LiveThatBreaksOnStop(break_on_stop)
     executor_count = iter(["generation", "execution"])
+    compute_pool = ComputePool((ComputeSlot(index=0, backend="cpu"),))
 
     class Executor(_ImmediateExecutor):
         def __init__(self, **_kwargs):
@@ -269,6 +274,11 @@ def _install_minimal_run(
     monkeypatch.setattr(run_module, "ThreadPoolExecutor", Executor)
     monkeypatch.setattr(run_module, "Live", lambda **_kwargs: live)
     monkeypatch.setattr(run_module, "SHARED_CONSOLE", SimpleNamespace(is_terminal=True))
+    monkeypatch.setattr(
+        run_module.ComputePool,
+        "detect",
+        staticmethod(lambda _requested: compute_pool),
+    )
     monkeypatch.setattr(
         run_module.OmegaConf,
         "select",
