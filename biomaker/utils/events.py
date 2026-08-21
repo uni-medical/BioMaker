@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any
 
-
 MAX_EVENT_STRING_CHARS = 1200
 _EVENT_WRITE_LOCK = RLock()
+TERMINAL_EVENTS = frozenset({"run_finished", "run_failed", "run_interrupted"})
 
 
 def _json_safe(value: Any) -> Any:
@@ -35,17 +36,37 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 
+def _write_event(
+    log_dir: Path,
+    event: str,
+    payload: dict[str, Any],
+    *,
+    durable: bool,
+) -> None:
+    with _EVENT_WRITE_LOCK:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **_json_safe(payload),
+        }
+        with (log_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            if durable:
+                handle.flush()
+                os.fsync(handle.fileno())
+
+
 def append_event(log_dir: Path, event: str, **payload: Any) -> None:
-    """Append one compact JSON event line. This must never fail the run."""
+    """Append one non-terminal lifecycle fact on a best-effort basis."""
     try:
-        with _EVENT_WRITE_LOCK:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            record = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "event": event,
-                **_json_safe(payload),
-            }
-            with (log_dir / "events.jsonl").open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        _write_event(log_dir, event, payload, durable=False)
     except Exception:
         return
+
+
+def append_terminal_event(log_dir: Path, event: str, **payload: Any) -> None:
+    """Durably append one terminal lifecycle fact or propagate the write failure."""
+    if event not in TERMINAL_EVENTS:
+        raise ValueError(f"Unsupported terminal event: {event}")
+    _write_event(log_dir, event, payload, durable=True)

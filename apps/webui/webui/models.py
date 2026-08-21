@@ -68,6 +68,12 @@ class RunCreate(BaseModel):
     options: AdvancedOptionsPatch | None = None
 
 
+class QueueResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pause_generation: Annotated[int, Field(ge=0)]
+
+
 class EnvUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

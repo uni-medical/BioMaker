@@ -16,6 +16,8 @@
     "cancelled",
     "stopped",
     "interrupted",
+    "complete",
+    "incomplete",
   ]);
   const BACKOFF_DELAYS = [2000, 4000, 8000, 16000, 30000];
 

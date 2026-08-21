@@ -38,6 +38,8 @@ const state = {
   pollStopped: false,
   updateSnapshot: null,
   resources: null,
+  queue: { paused: false, reason: null, pause_generation: 0 },
+  queueEndpointAvailable: null,
   treeLoadToken: 0,
   treeLoadCancel: null,
   treeViewState: {},
@@ -61,6 +63,8 @@ const refreshPolicy = window.BioMakerRefreshPolicy || {
     return autoUpdate ? "load" : "pending";
   },
 };
+
+const queueView = window.BioMakerQueueView;
 
 function emptyResourceState() {
   return {
@@ -122,7 +126,9 @@ async function api(path, options = {}) {
     } catch (_) {
       // Keep the HTTP status as the fallback message.
     }
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   if (response.status === 204) {
     return null;
@@ -189,7 +195,15 @@ function autoTaskName(datasetPath, goal) {
 }
 
 function isTerminal(status) {
-  return ["succeeded", "failed", "cancelled", "stopped", "interrupted"].includes(status);
+  return ["complete", "incomplete"].includes(canonicalStatus(status));
+}
+
+function canonicalStatus(status) {
+  const value = String(status || "").trim().toLowerCase();
+  if (["succeeded", "success", "complete", "completed"].includes(value)) return "complete";
+  if (["queued", "running", "stopping"].includes(value)) return value;
+  if (["failed", "cancelled", "stopped", "interrupted", "incomplete"].includes(value)) return "incomplete";
+  return value || "incomplete";
 }
 
 function formatDuration(startValue, endValue = Date.now()) {
@@ -210,12 +224,14 @@ function executionLabel(status) {
     queued: "Queued",
     running: "Running",
     stopping: "Stopping",
-    succeeded: "Process completed",
-    failed: "Process failed",
-    cancelled: "Cancelled",
-    stopped: "Stopped",
-    interrupted: "Interrupted",
-  }[status] || String(status || "Unknown");
+    complete: "Complete",
+    incomplete: "Incomplete",
+  }[canonicalStatus(status)] || String(status || "Incomplete");
+}
+
+function sidebarStatusLabel(status) {
+  const normalized = canonicalStatus(status);
+  return normalized === "complete" ? null : executionLabel(normalized);
 }
 
 function resultPresentation(run) {
@@ -246,7 +262,7 @@ function resultPresentation(run) {
     };
   }
   if (isTerminal(run?.status)) {
-    return { text: "No valid result", kind: run.status === "succeeded" ? "warning" : "neutral" };
+    return { text: "No valid result", kind: canonicalStatus(run.status) === "complete" ? "warning" : "neutral" };
   }
   return null;
 }
@@ -310,10 +326,10 @@ function runDatasetPath(run) {
   return String(run?.dataset_path || run?.project_snapshot?.dataset_path || "").trim();
 }
 
-function runLogDirectoryName(run) {
+function runLogDirectoryName(run, fallback = "") {
   const rawLogDir = String(run?.log_dir || "").replace(/[\\/]+$/, "");
   if (rawLogDir) return rawLogDir.split(/[\\/]/).filter(Boolean).at(-1) || rawLogDir;
-  return run?.actual_exp_name || run?.requested_exp_name || run?.id || "";
+  return queueView.readableRunName(run, fallback);
 }
 
 function runConfiguredModel(run) {
@@ -415,19 +431,23 @@ function renderProjects() {
       keepRuns.add(run.id);
       const logName = runLogDirectoryName(run);
       button.querySelector(".run-log-name").textContent = logName;
-      button.title = logName;
+      const statusLabel = sidebarStatusLabel(run.status);
+      button.title = statusLabel ? `${logName} — ${statusLabel}` : logName;
+      button.setAttribute("aria-label", statusLabel ? `${logName}, ${statusLabel}` : logName);
       button.classList.toggle("active", run.id === state.selectedRunId);
       button.setAttribute("aria-current", run.id === state.selectedRunId ? "true" : "false");
-      let dot = button.querySelector(".status-dot");
-      if (!dot) {
-        dot = document.createElement("span");
-        dot.className = "status-dot";
-        dot.setAttribute("role", "img");
-        button.append(dot);
+      let status = button.querySelector(".run-nav-status");
+      if (statusLabel) {
+        if (!status) {
+          status = document.createElement("span");
+          status.className = "run-nav-status";
+          button.append(status);
+        }
+        status.className = `run-nav-status ${canonicalStatus(run.status)}`;
+        status.textContent = statusLabel;
+      } else if (status) {
+        status.remove();
       }
-      dot.className = `status-dot ${run.status}`;
-      dot.title = executionLabel(run.status);
-      dot.setAttribute("aria-label", `Status: ${executionLabel(run.status)}`);
       runList.append(button);
     }
     for (const [runId, button] of existingRuns) {
@@ -441,16 +461,99 @@ function renderProjects() {
   refreshIcons();
 }
 
+function queueReasonText(reason) {
+  if (!reason) return "Queue paused after an incomplete run.";
+  if (typeof reason === "string") return reason;
+  if (typeof reason === "object") return reason.message || reason.detail || reason.reason || "Queue paused after an incomplete run.";
+  return String(reason);
+}
+
+function createQueueRow(runId) {
+  const row = document.createElement("div");
+  row.className = "queue-run-row";
+  row.dataset.queueRunId = runId;
+  row.setAttribute("role", "listitem");
+
+  const select = document.createElement("button");
+  select.className = "queue-run-select";
+  select.type = "button";
+  const name = document.createElement("span");
+  name.className = "queue-run-name";
+  const status = document.createElement("span");
+  status.className = "queue-run-status";
+  select.append(name, status);
+  select.addEventListener("click", () => selectRun(row.dataset.queueRunId).catch(showError));
+
+  const action = document.createElement("button");
+  action.className = "queue-run-action";
+  action.type = "button";
+  action.hidden = true;
+  action.addEventListener("click", (event) => queueRunAction(event).catch(showError));
+  row.append(select, action);
+  return row;
+}
+
+function updateQueueRow(row, run) {
+  const normalized = canonicalStatus(run.status);
+  const name = runLogDirectoryName(run, "Queued run");
+  row.dataset.queueRunId = String(run.id);
+  const select = row.querySelector(".queue-run-select");
+  select.title = name;
+  select.setAttribute("aria-label", `Open ${name}, ${executionLabel(normalized)}`);
+  select.setAttribute("aria-current", run.id === state.selectedRunId ? "true" : "false");
+  row.querySelector(".queue-run-name").textContent = name;
+  const status = row.querySelector(".queue-run-status");
+  status.className = `queue-run-status ${normalized}`;
+  status.textContent = executionLabel(normalized);
+
+  const action = row.querySelector(".queue-run-action");
+  const actionName = queueView.actionForRun(run);
+  if (!actionName) {
+    if (document.activeElement === action) select.focus();
+    action.hidden = true;
+    action.disabled = false;
+    delete action.dataset.runAction;
+    delete action.dataset.runId;
+    return;
+  }
+  const label = actionName === "cancel" ? "Cancel" : "Stop";
+  action.hidden = false;
+  action.disabled = false;
+  action.dataset.runId = String(run.id);
+  action.dataset.runAction = actionName;
+  action.textContent = label;
+  action.title = `${label} ${name}`;
+  action.setAttribute("aria-label", `${label} ${name}`);
+}
+
+function renderQueue() {
+  const section = $("#queue-section");
+  const list = $("#queue-list");
+  const queueRuns = state.runs
+    .filter((run) => ["queued", "running", "stopping"].includes(canonicalStatus(run.status)))
+    .sort((left, right) => {
+      const leftActive = canonicalStatus(left.status) === "queued" ? 1 : 0;
+      const rightActive = canonicalStatus(right.status) === "queued" ? 1 : 0;
+      if (leftActive !== rightActive) return leftActive - rightActive;
+      const leftPosition = Number(left.queue_position ?? left.queue_sequence);
+      const rightPosition = Number(right.queue_position ?? right.queue_sequence);
+      if (Number.isFinite(leftPosition) && Number.isFinite(rightPosition) && leftPosition !== rightPosition) {
+        return leftPosition - rightPosition;
+      }
+      return String(left.timestamps?.created_at || "").localeCompare(String(right.timestamps?.created_at || ""));
+    });
+  const paused = Boolean(state.queue?.paused);
+  section.hidden = !paused && !queueRuns.length;
+  $("#resume-queue-button").hidden = !paused;
+  const pausedReason = $("#queue-paused-reason");
+  pausedReason.hidden = !paused;
+  pausedReason.textContent = paused ? queueReasonText(state.queue?.reason) : "";
+
+  queueView.reconcileRows(list, queueRuns, createQueueRow, updateQueueRow);
+}
+
 function renderRuns() {
-  const queued = state.runs.filter((run) => run.status === "queued").length;
-  const running = state.runs.filter((run) => ["running", "stopping"].includes(run.status)).length;
-  const queueIndicator = $("#queue-indicator");
-  const queueParts = [];
-  if (running) queueParts.push(`${running} running`);
-  if (queued) queueParts.push(`${queued} queued`);
-  queueIndicator.textContent = queueParts.join(" · ");
-  queueIndicator.hidden = !queueParts.length;
-  queueIndicator.classList.toggle("busy", Boolean(queueParts.length));
+  renderQueue();
   renderProjects();
   renderRunHistory();
 }
@@ -512,9 +615,7 @@ function populateRunForm(run) {
   if (!run) return;
   const snapshot = run.project_snapshot || {};
   const options = run.options || {};
-  const name = run.log_dir
-    ? runLogDirectoryName(run)
-    : (run.actual_exp_name || run.requested_exp_name || "");
+  const name = runLogDirectoryName(run, "Run");
   setProjectFormReadOnly(true);
   $("#project-name").value = name;
   $("#dataset-path").value = run.dataset_path || snapshot.dataset_path || "";
@@ -673,19 +774,19 @@ function renderRunSummary() {
   const summary = $("#run-summary");
   summary.hidden = !run;
   $(".detail-pane").classList.toggle("no-run", !run);
-  const name = run ? runLogDirectoryName(run) : "";
+  const name = run ? runLogDirectoryName(run, "Run") : "";
   $("#selected-run-name").textContent = name;
   renderRunHistory();
   if (!run) {
     $("#run-result-status").hidden = true;
     $("#run-action-button").hidden = true;
-    $("#run-error-summary").hidden = true;
+    $("#run-lifecycle-detail").hidden = true;
     return;
   }
   const execution = $("#run-execution-status");
-  execution.className = `status-pill ${run.status}`;
+  execution.className = `status-pill ${canonicalStatus(run.status)}`;
   execution.textContent = executionLabel(run.status);
-  execution.title = `Execution status: ${run.status}`;
+  execution.title = `Execution status: ${executionLabel(run.status)}`;
 
   const result = resultPresentation(run);
   const resultPill = $("#run-result-status");
@@ -738,10 +839,24 @@ function renderRunSummary() {
     actionButton.hidden = true;
   }
 
-  const error = run.error || run.observed?.results?.latest?.error;
-  const errorSummary = $("#run-error-summary");
-  errorSummary.hidden = !error;
-  errorSummary.textContent = error ? `Error: ${typeof error === "string" ? error : JSON.stringify(error)}` : "";
+  const error = run.status_reason || run.reason || run.lifecycle?.reason || run.error || run.observed?.results?.latest?.error;
+  const terminalEvent = run.terminal_event || run.lifecycle?.terminal_event || run.observed?.terminal_event;
+  const terminalEventName = typeof terminalEvent === "string"
+    ? terminalEvent
+    : (terminalEvent?.event || terminalEvent?.type || terminalEvent?.name || "");
+  const rawStatus = String(run.status || "");
+  const detailedStatus = run.detailed_status
+    || (rawStatus && rawStatus !== canonicalStatus(rawStatus) ? rawStatus : "");
+  const lifecycleDetail = $("#run-lifecycle-detail");
+  lifecycleDetail.className = canonicalStatus(run.status) === "incomplete"
+    ? "run-lifecycle-detail incomplete"
+    : "run-lifecycle-detail";
+  const detailParts = [];
+  if (detailedStatus) detailParts.push(`Detailed status: ${formatEventName(detailedStatus)}`);
+  if (error) detailParts.push(`Reason: ${typeof error === "string" ? error : JSON.stringify(error)}`);
+  if (terminalEventName) detailParts.push(`Terminal event: ${terminalEventName}`);
+  lifecycleDetail.hidden = !detailParts.length;
+  lifecycleDetail.textContent = detailParts.join(" · ");
   refreshIcons();
 }
 
@@ -775,6 +890,50 @@ async function runAction(event) {
   await refreshRuns(true);
   schedulePoll(0);
   toast(action === "requeue" ? "Run requeued" : `${action[0].toUpperCase()}${action.slice(1)} requested`);
+}
+
+async function queueRunAction(event) {
+  const button = event.currentTarget;
+  const runId = button.dataset.runId;
+  const action = button.dataset.runAction;
+  const run = runById(runId);
+  if (!run || !["cancel", "stop"].includes(action)) return;
+  const name = runLogDirectoryName(run, "Queued run");
+  if (!window.confirm(`${action === "cancel" ? "Cancel" : "Stop"} ${name}?`)) return;
+  button.disabled = true;
+  try {
+    await api(runApiPath(runId, `/${action}`), { method: "POST" });
+    await refreshRuns(true);
+    schedulePoll(0);
+    toast(action === "cancel" ? "Queued run cancelled" : "Stop requested");
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+}
+
+async function resumeQueue() {
+  const button = $("#resume-queue-button");
+  button.disabled = true;
+  try {
+    const generation = Number(state.queue?.pause_generation);
+    if (!Number.isInteger(generation) || generation < 0) {
+      throw new Error("Queue state is stale; refresh before resuming");
+    }
+    const response = await api("/api/queue/resume", {
+      method: "POST",
+      body: JSON.stringify({ pause_generation: generation }),
+    });
+    applyQueueControl(response);
+    await refreshRuns(true);
+    schedulePoll(0);
+    if (state.queue?.paused) {
+      toast("Queue changed while resuming; it remains paused", "error");
+    } else {
+      toast("Queue resumed");
+    }
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function loadSelectedRun(forceTree = false) {
@@ -1419,6 +1578,48 @@ function nextPollDelay() {
   });
 }
 
+function applyQueueControl(value) {
+  if (!value || typeof value !== "object") return false;
+  const control = value.queue_control || value.queue || value;
+  if (!control || typeof control !== "object" || !("paused" in control)) return false;
+  state.queue = {
+    ...state.queue,
+    ...control,
+    paused: Boolean(control.paused),
+    reason: control.reason ?? null,
+  };
+  return true;
+}
+
+async function fetchQueueControl() {
+  if (state.queueEndpointAvailable === false) return;
+  try {
+    const control = await api("/api/queue");
+    state.queueEndpointAvailable = true;
+    applyQueueControl(control);
+  } catch (error) {
+    if ([404, 405].includes(error.status)) {
+      state.queueEndpointAvailable = false;
+      return;
+    }
+    console.warn("Queue status is temporarily unavailable", error);
+  }
+}
+
+async function fetchRunsState() {
+  const payload = await api("/api/runs");
+  if (Array.isArray(payload)) {
+    await fetchQueueControl();
+    return payload;
+  }
+  if (!payload || !Array.isArray(payload.runs)) {
+    throw new Error("Run list returned an invalid response");
+  }
+  const hasEmbeddedQueue = applyQueueControl(payload.queue_control || payload.queue);
+  if (!hasEmbeddedQueue) await fetchQueueControl();
+  return payload.runs;
+}
+
 function schedulePoll(delay = nextPollDelay(), options = {}) {
   if (state.pollTimer) window.clearTimeout(state.pollTimer);
   state.pollTimer = null;
@@ -1430,7 +1631,7 @@ function schedulePoll(delay = nextPollDelay(), options = {}) {
 }
 
 async function refreshRunData(force = false) {
-  const runs = await api("/api/runs");
+  const runs = await fetchRunsState();
   state.runs = runs;
   const listedSelectedRun = state.selectedRunId ? runById(state.selectedRunId) : null;
   if (listedSelectedRun) {
@@ -1500,6 +1701,7 @@ function bindEvents() {
   });
   $("#run-button").addEventListener("click", () => queueRun().catch(showError));
   $("#run-action-button").addEventListener("click", (event) => runAction(event).catch(showError));
+  $("#resume-queue-button").addEventListener("click", () => resumeQueue().catch(showError));
   $("#settings-button").addEventListener("click", () => openSettings().catch(showError));
   $("#settings-form").addEventListener("submit", (event) => saveEnvironment(event).catch(showError));
   $("#settings-dialog").addEventListener("close", clearVisibleSecrets);
@@ -1597,7 +1799,7 @@ async function initialize() {
   bindEvents();
   refreshIcons();
   const [runs, datasets, environment] = await Promise.all([
-    api("/api/runs"),
+    fetchRunsState(),
     api("/api/datasets"),
     api("/api/env"),
   ]);

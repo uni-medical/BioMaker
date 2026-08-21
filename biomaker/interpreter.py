@@ -8,11 +8,12 @@ Supports:
 
 import logging
 import os
-import signal
 import shutil
-import sys
 import subprocess
+import sys
+import tempfile
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,12 @@ from typing import Any
 import humanize
 from dataclasses_json import DataClassJsonMixin
 
-from .utils.environment import validate_code_environment
+from .utils.environment import validate_code_environment, validate_process_containment
+from .utils.process_tree import (
+    ProcessTreeInspectionError,
+    ProcessTreeTracker,
+    drain_uncaptured_process_group,
+)
 
 logger = logging.getLogger("biomaker")
 
@@ -410,25 +416,28 @@ class Interpreter:
 
         logger.debug("Executing generated script")
 
-        if self.enforce_environment:
-            preflight = validate_code_environment(
+        preflight = (
+            validate_code_environment(
                 code, include_medical=self.include_medical_packages
             )
-            if not preflight.ok:
-                return ExecutionResult(
-                    term_out=[preflight.message],
-                    exec_time=0.0,
-                    exc_type=preflight.error_type,
-                    exc_info=preflight.exc_info,
-                    exc_stack=None,
-                    resource_usage=None,
-                    stderr=preflight.message,
-                    candidate_output=preflight.message,
-                    candidate_exec_time=0.0,
-                    candidate_exc_type=preflight.error_type,
-                    candidate_exc_info=preflight.exc_info,
-                    failure_phase="environment_preflight",
-                )
+            if self.enforce_environment
+            else validate_process_containment(code)
+        )
+        if not preflight.ok:
+            return ExecutionResult(
+                term_out=[preflight.message],
+                exec_time=0.0,
+                exc_type=preflight.error_type,
+                exc_info=preflight.exc_info,
+                exc_stack=None,
+                resource_usage=None,
+                stderr=preflight.message,
+                candidate_output=preflight.message,
+                candidate_exec_time=0.0,
+                candidate_exc_type=preflight.error_type,
+                candidate_exc_info=preflight.exc_info,
+                failure_phase="environment_preflight",
+            )
 
         script_path = self.working_dir / self.agent_file_name
         script_path.write_text(code, encoding="utf-8")
@@ -440,20 +449,57 @@ class Interpreter:
             if self.format_tb_ipython
             else [sys.executable, self.agent_file_name]
         )
+        process: subprocess.Popen[str] | None = None
+        process_tree: ProcessTreeTracker | None = None
+        stdout_capture: Any | None = None
+        stderr_capture: Any | None = None
+        uncaptured_drained = False
+        capture_stack = ExitStack()
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=self.working_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
+            stdout_capture = capture_stack.enter_context(
+                tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
             )
+            stderr_capture = capture_stack.enter_context(
+                tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+            )
+            popen_kwargs: dict[str, Any] = {
+                "cwd": self.working_dir,
+                "stdout": stdout_capture,
+                "stderr": stderr_capture,
+                "text": True,
+            }
+            if os.name == "posix":
+                # A candidate-owned PGID survives leader exit, while remaining in the
+                # top-level run session for session-wide Stop handling.
+                popen_kwargs["process_group"] = 0
+            process = subprocess.Popen(command, **popen_kwargs)
+            try:
+                process_tree = ProcessTreeTracker.capture(process.pid)
+            except (
+                OSError,
+                ProcessLookupError,
+                ProcessTreeInspectionError,
+                ValueError,
+            ):
+                drain_uncaptured_process_group(process)
+                uncaptured_drained = True
+                raise RuntimeError(
+                    "Could not capture generated process identity"
+                ) from None
             stdout = ""
             stderr = ""
             timed_out = False
             next_gpu_sample_time = 0.0
             while True:
+                process_tree.refresh_best_effort()
+                if process_tree.root_has_exited(process):
+                    process_tree.terminate_and_wait(root_process=process)
+                    stdout_capture.seek(0)
+                    stderr_capture.seek(0)
+                    stdout = stdout_capture.read()
+                    stderr = stderr_capture.read()
+                    break
+
                 now = time.time()
                 sample_gpu = now >= next_gpu_sample_time
                 sample = _sample_process_usage(process.pid, sample_gpu=sample_gpu)
@@ -466,20 +512,16 @@ class Interpreter:
                 remaining = self.timeout - elapsed
                 if remaining <= 0:
                     timed_out = True
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except Exception:
-                        process.kill()
-                    stdout, stderr = process.communicate()
+                    process_tree.terminate_and_wait(
+                        root_process=process,
+                    )
+                    stdout_capture.seek(0)
+                    stderr_capture.seek(0)
+                    stdout = stdout_capture.read()
+                    stderr = stderr_capture.read()
                     break
 
-                try:
-                    stdout, stderr = process.communicate(
-                        timeout=min(0.5, max(0.05, remaining))
-                    )
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
+                time.sleep(min(0.25, max(0.05, remaining)))
 
             exec_time = time.time() - start_time
             resource_usage = _summarize_usage(
@@ -550,35 +592,15 @@ class Interpreter:
                 candidate_exc_info=exc_info,
                 failure_phase="candidate_run",
             )
-        except subprocess.TimeoutExpired as e:
-            resource_usage = _summarize_usage(
-                usage_samples, gpu_baseline_mb=gpu_baseline_mb
-            )
-            output_text = (e.stdout or "") + (e.stderr or "")
-            output = [
-                output_text,
-                f"TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(self.timeout)}",
-            ]
-            usage_line = _format_usage_line(resource_usage)
-            if usage_line:
-                output.insert(1, usage_line)
-            return ExecutionResult(
-                output,
-                float(self.timeout),
-                "TimeoutError",
-                {"timeout": str(self.timeout)},
-                None,
-                resource_usage,
-                stdout=e.stdout or "",
-                stderr=e.stderr or "",
-                candidate_output=output_text,
-                candidate_exec_time=float(self.timeout),
-                candidate_exc_type="TimeoutError",
-                candidate_exc_info={"timeout": str(self.timeout)},
-                failure_phase="candidate_run",
-            )
         finally:
             try:
-                script_path.unlink()
-            except FileNotFoundError:
-                pass
+                if process_tree is not None:
+                    process_tree.terminate_and_wait(root_process=process)
+                elif process is not None and not uncaptured_drained:
+                    drain_uncaptured_process_group(process)
+            finally:
+                capture_stack.close()
+                try:
+                    script_path.unlink()
+                except FileNotFoundError:
+                    pass

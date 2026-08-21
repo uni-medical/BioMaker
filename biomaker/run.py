@@ -6,6 +6,8 @@ import logging
 import math
 import shutil
 import signal
+import os
+import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -43,7 +45,7 @@ from .utils.evaluator_setup import (
     prepare_evaluator,
     score_candidate_with_evaluator,
 )
-from .utils.events import append_event
+from .utils.events import append_event, append_terminal_event
 from .utils.execution_record import (
     attach_artifact_validation_result,
     attach_evaluator_run_result,
@@ -687,19 +689,6 @@ def _run(cfg: Config) -> int:
         prediction_spec = json.loads(prepared_evaluator.prediction_spec)
     except Exception:
         prediction_spec = {"raw": prepared_evaluator.prediction_spec}
-    metric_name = "n/a"
-    if isinstance(prediction_spec, dict):
-        metric_value = prediction_spec.get("primary_metric")
-        if metric_value is None and isinstance(
-            prediction_spec.get("validation_artifact"), dict
-        ):
-            metric_value = prediction_spec["validation_artifact"].get("primary_metric")
-        if metric_value is None and isinstance(prediction_spec.get("metrics"), list):
-            metrics = prediction_spec["metrics"]
-            if metrics:
-                metric_value = metrics[0]
-        if metric_value is not None:
-            metric_name = str(metric_value)
     refresh_exp_guide(
         "after_evaluator",
         prediction_spec if isinstance(prediction_spec, dict) else None,
@@ -813,28 +802,66 @@ def _run(cfg: Config) -> int:
             else journal
         )
 
+    presentation_warnings: set[str] = set()
+
+    def record_presentation_warning(component: str, exc: BaseException) -> None:
+        """Record a best-effort UI warning without risking the experiment."""
+        if component in presentation_warnings:
+            return
+        presentation_warnings.add(component)
+        try:
+            append_event(
+                cfg.log_dir,
+                "run_warning",
+                component=component,
+                exc_type=type(exc).__name__,
+                error=str(exc),
+            )
+        except Exception:
+            # A warning sink is presentation infrastructure too. Its failure
+            # must not turn the original display problem into a run failure.
+            pass
+        try:
+            logger.warning("%s unavailable; continuing the run: %s", component, exc)
+        except Exception:
+            # The warning destination is itself presentation infrastructure.
+            pass
+
     def save_live_tree(extra_nodes: list[Node] | None = None) -> Journal:
-        """Update tree_plot.html with completed journal plus transient round nodes."""
+        """Best-effort tree export for completed and transient nodes."""
         display_journal = live_display_journal(extra_nodes)
-        tree_export.generate(
-            cfg,
-            display_journal,
-            cfg.log_dir / "tree_plot.html",
-            live=display_journal is not journal,
-        )
+        try:
+            tree_export.generate(
+                cfg,
+                display_journal,
+                cfg.log_dir / "tree_plot.html",
+                live=display_journal is not journal,
+            )
+        except Exception as exc:
+            record_presentation_warning("tree_export", exc)
         return display_journal
 
     def agent_loop_exit_handler(end_with_exception: bool):
         logger.info("Exiting agent loop...")
 
         if cfg.generate_report and not end_with_exception:
-            print("Generating final report from journal...")
+            append_event(cfg.log_dir, "report_started")
             report = journal2report(journal, agent_task_desc, cfg.report)
-            print(report)
             report_file_path = cfg.log_dir / "report.md"
-            with open(report_file_path, "w") as f:
+            with open(report_file_path, "w", encoding="utf-8") as f:
                 f.write(report)
-            print("Report written to file:", report_file_path)
+            append_event(
+                cfg.log_dir,
+                "report_finished",
+                path=report_file_path,
+                chars=len(report),
+            )
+            try:
+                print("Generating final report from journal...")
+                print(report)
+                print("Report written to file:", report_file_path)
+            except Exception as exc:
+                record_presentation_warning("report_console", exc)
 
     timeout_seconds = OmegaConf.select(cfg, "agent.total_time_limit", default=None)
     total_timer = Timer(timeout_seconds=timeout_seconds)
@@ -863,13 +890,20 @@ def _run(cfg: Config) -> int:
     round_item_count_by_round = scheduler.round_item_count_by_round
     best_node_before_by_round = scheduler.best_node_before_by_round
     live_tree_lock = RLock()
-    live_tree_display = Live(
-        console=SHARED_CONSOLE,
-        auto_refresh=False,
-        transient=False,
-        vertical_overflow="visible",
-    )
+    live_tree_display = None
     live_tree_display_started = False
+    live_tree_display_enabled = bool(SHARED_CONSOLE.is_terminal)
+    if live_tree_display_enabled:
+        try:
+            live_tree_display = Live(
+                console=SHARED_CONSOLE,
+                auto_refresh=False,
+                transient=False,
+                vertical_overflow="visible",
+            )
+        except Exception as exc:
+            live_tree_display_enabled = False
+            record_presentation_warning("terminal_live_display", exc)
 
     def live_nodes() -> list[Node]:
         return scheduler.live_nodes()
@@ -881,17 +915,28 @@ def _run(cfg: Config) -> int:
         return journal_to_rich_tree(display_journal)
 
     def refresh_live_tree(log_tree: bool = True) -> None:
-        nonlocal live_tree_display_started
+        nonlocal live_tree_display_started, live_tree_display_enabled
         with live_tree_lock:
             display_journal = save_live_tree(live_display_nodes())
-            if log_tree:
+            if log_tree and live_tree_display_enabled:
                 if not live_tree_display_started:
-                    live_tree_display.start()
-                    live_tree_display_started = True
-                live_tree_display.update(
-                    live_tree_view(display_journal),
-                    refresh=True,
-                )
+                    try:
+                        assert live_tree_display is not None
+                        live_tree_display.start()
+                        live_tree_display_started = True
+                    except Exception as exc:
+                        live_tree_display_enabled = False
+                        record_presentation_warning("terminal_live_display", exc)
+                        return
+                try:
+                    assert live_tree_display is not None
+                    live_tree_display.update(
+                        live_tree_view(display_journal),
+                        refresh=True,
+                    )
+                except Exception as exc:
+                    live_tree_display_enabled = False
+                    record_presentation_warning("terminal_live_display", exc)
 
     def remaining_schedule_budget() -> int:
         return scheduler.remaining_budget(total_steps, global_step)
@@ -1240,8 +1285,17 @@ def _run(cfg: Config) -> int:
                     "private_error": private_error,
                 },
             )
-        tree = journal_to_rich_tree(journal)
-        save_run(cfg, journal, tree)
+        try:
+            tree = journal_to_rich_tree(journal)
+        except Exception as exc:
+            tree = None
+            record_presentation_warning("tree_snapshot", exc)
+        save_run(
+            cfg,
+            journal,
+            tree,
+            presentation_error_handler=record_presentation_warning,
+        )
         append_event(
             cfg.log_dir,
             "step_saved",
@@ -1356,16 +1410,30 @@ def _run(cfg: Config) -> int:
                 logger.error(f"Exception during async generation/execution round: {e}")
                 raise e
     finally:
-        with live_tree_lock:
-            if live_tree_display_started:
+        try:
+            with live_tree_lock:
                 display_journal = save_live_tree(live_display_nodes())
-                live_tree_display.update(
-                    live_tree_view(display_journal),
-                    refresh=True,
-                )
-                live_tree_display.stop()
-        generation_executor.shutdown(wait=True)
-        executor.shutdown(wait=True)
+                if live_tree_display_started:
+                    try:
+                        try:
+                            assert live_tree_display is not None
+                            live_tree_display.update(
+                                live_tree_view(display_journal),
+                                refresh=True,
+                            )
+                        except Exception as exc:
+                            record_presentation_warning("terminal_live_display", exc)
+                    finally:
+                        try:
+                            assert live_tree_display is not None
+                            live_tree_display.stop()
+                        except Exception as exc:
+                            record_presentation_warning("terminal_live_display", exc)
+        finally:
+            try:
+                generation_executor.shutdown(wait=True)
+            finally:
+                executor.shutdown(wait=True)
     best_node = journal.get_best_node(only_good=True)
     if cfg.final_retrain.enabled and best_node is not None and not end_with_exception:
         retrain_timeout = _final_retrain_timeout_seconds(cfg)
@@ -1418,23 +1486,42 @@ def _run(cfg: Config) -> int:
                 "train_rows_after": retrain_result.train_rows_after,
             },
         )
+        if not retrain_result.ok:
+            raise RuntimeError(
+                "Final retrain did not complete successfully: "
+                + (retrain_result.error or "unknown error")
+            )
     elif cfg.final_retrain.enabled and best_node is None and not end_with_exception:
         append_event(cfg.log_dir, "final_retrain_skipped", reason="no_best_node")
+        raise RuntimeError("Final retrain is enabled but no valid best node exists.")
     agent_loop_exit_handler(end_with_exception=end_with_exception)
     return global_step
 
 
-def run() -> None:
+def _run_direct_entry() -> None:
     """Run BioMaker and leave one authoritative terminal lifecycle event."""
 
     cfg = load_cfg()
-    manifest_path = write_run_manifest(cfg, None)
-    append_event(cfg.log_dir, "run_manifest_written", path=manifest_path)
     previous_sigterm_handler = None
+    terminal_reservation: tuple[str, str] | None = None
+
+    def emit_terminal(event: str, **payload) -> None:
+        nonlocal terminal_reservation
+        if terminal_reservation is not None:
+            return
+        terminal_reservation = ("writing", event)
+        try:
+            append_terminal_event(cfg.log_dir, event, **payload)
+        except BaseException:
+            # A signal can re-enter emit_terminal while the durable write is in
+            # progress. Keep the original event reserved even when that write
+            # fails, so no competing terminal fact can be appended afterward.
+            terminal_reservation = ("write_failed", event)
+            raise
+        terminal_reservation = ("written", event)
 
     def handle_sigterm(signum, _frame):
-        append_event(
-            cfg.log_dir,
+        emit_terminal(
             "run_interrupted",
             reason="sigterm",
             signal=signum,
@@ -1448,22 +1535,49 @@ def run() -> None:
         previous_sigterm_handler = None
     try:
         try:
+            manifest_path = write_run_manifest(cfg, None)
+            append_event(cfg.log_dir, "run_manifest_written", path=manifest_path)
             completed_steps = _run(cfg)
         except KeyboardInterrupt:
-            append_event(cfg.log_dir, "run_interrupted", reason="keyboard_interrupt")
+            emit_terminal("run_interrupted", reason="keyboard_interrupt")
             raise
         except Exception as exc:
-            append_event(
-                cfg.log_dir,
+            emit_terminal(
                 "run_failed",
                 exc_type=type(exc).__name__,
                 error=str(exc),
             )
             raise
-        append_event(cfg.log_dir, "run_finished", completed_steps=completed_steps)
+        emit_terminal("run_finished", completed_steps=completed_steps)
     finally:
         if previous_sigterm_handler is not None:
             signal.signal(signal.SIGTERM, previous_sigterm_handler)
+
+
+def _queue_cli_invocation() -> bool:
+    if os.environ.get("BIOMAKER_QUEUE_DIRECT") == "1":
+        return False
+    if os.environ.get("BIOMAKER_DISABLE_RUN_QUEUE") == "1":
+        return False
+    entrypoint = Path(sys.argv[0]).stem.lower()
+    return entrypoint in {"biomaker", "run"}
+
+
+def run() -> None:
+    """Submit CLI launches to the durable FIFO, or execute a supervised child."""
+
+    if _queue_cli_invocation():
+        queue_sidecar = Path(__file__).resolve().parents[1] / "apps" / "webui"
+        if not (queue_sidecar / "webui" / "runner.py").is_file():
+            raise RuntimeError(
+                "The durable run queue is unavailable in this installation. "
+                "Run BioMaker from the source checkout, or set "
+                "BIOMAKER_DISABLE_RUN_QUEUE=1 to explicitly opt out of queueing."
+            )
+        from .utils.queue_client import submit_cli_and_wait
+
+        raise SystemExit(submit_cli_and_wait())
+    _run_direct_entry()
 
 
 if __name__ == "__main__":

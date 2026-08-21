@@ -10,7 +10,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Hashable, cast
+from typing import Callable, Hashable, cast
 
 import coolname
 import rich
@@ -853,7 +853,13 @@ def _write_results_table(log_dir: Path, journal) -> None:
             )
 
 
-def save_run(cfg: Config, journal, solution_tree: Tree = None):
+def save_run(
+    cfg: Config,
+    journal,
+    solution_tree: Tree = None,
+    *,
+    presentation_error_handler: Callable[[str, BaseException], None] | None = None,
+):
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
     # save journal
@@ -873,7 +879,12 @@ def save_run(cfg: Config, journal, solution_tree: Tree = None):
     # create the tree + code visualization
     from . import tree_export
 
-    tree_export.generate(cfg, journal, cfg.log_dir / "tree_plot.html")
+    try:
+        tree_export.generate(cfg, journal, cfg.log_dir / "tree_plot.html")
+    except Exception as exc:
+        if presentation_error_handler is None:
+            raise
+        presentation_error_handler("tree_export", exc)
     # Save only a runnable best solution. If every node failed, journal.json remains
     # the source of truth instead of writing a misleading best_solution.py.
     best_node = journal.get_best_node(only_good=True)
@@ -890,9 +901,14 @@ def save_run(cfg: Config, journal, solution_tree: Tree = None):
         _copy_best_working_outputs(cfg)
 
     if solution_tree is not None:
-        # save the solution tree
-        console = Console(file=io.StringIO(), record=True)
-        console.print(solution_tree)
-        html_output = console.export_html(inline_styles=True)
-        with open(cfg.log_dir / "tree_snapshot.html", "w") as f:
-            f.write(html_output)
+        try:
+            # Save the optional Rich snapshot without making it a run barrier.
+            console = Console(file=io.StringIO(), record=True)
+            console.print(solution_tree)
+            html_output = console.export_html(inline_styles=True)
+            with open(cfg.log_dir / "tree_snapshot.html", "w", encoding="utf-8") as f:
+                f.write(html_output)
+        except Exception as exc:
+            if presentation_error_handler is None:
+                raise
+            presentation_error_handler("tree_snapshot", exc)

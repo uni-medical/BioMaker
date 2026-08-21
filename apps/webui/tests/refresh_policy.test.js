@@ -33,6 +33,8 @@ test("status helpers distinguish active, terminal, and unknown runs", () => {
     "cancelled",
     "stopped",
     "interrupted",
+    "complete",
+    "incomplete",
   ]) {
     assert.equal(isTerminal(status), true, `${status} should be terminal`);
     assert.equal(isActive(status), false, `${status} should not be active`);

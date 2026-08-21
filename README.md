@@ -74,6 +74,13 @@ uv run python -m webui.server --host 127.0.0.1 --port 7860
 ```
 Open <http://127.0.0.1:7860>, configure the endpoint and API key in Settings, then select a local dataset folder to start an experiment. The experiment list is read directly from `logs/`, grouped by dataset, and uses the existing log directory names.
 
+## Command line runs
+
+From a complete source checkout, `uv run biomaker ...` submits through the same
+workspace-level `.biomaker/` durable FIFO as the WebUI. The command remains
+attached to the durable console log and returns the experiment process's exit
+code; closing that terminal or the WebUI does not terminate the experiment.
+
 ## Workflow
 
 The default run is intentionally simple:

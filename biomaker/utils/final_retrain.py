@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -356,7 +357,6 @@ def run_final_retrain(
             )
             return result
 
-        result.ok = True
         _copy_retrain_outputs_to_log(cfg, retrain_workspace)
         try:
             result.private_metrics = evaluate_private_outputs(
@@ -364,15 +364,28 @@ def run_final_retrain(
             )
         except Exception as exc:
             result.error = f"Private evaluation failed after final retrain: {exc}"
+            return result
+        result.ok = True
         return result
     except Exception as exc:
         logger.warning("Final retrain failed: %s", exc)
         result.error = str(exc)
         return result
     finally:
-        (cfg.log_dir / "final_retrain").mkdir(parents=True, exist_ok=True)
-        (cfg.log_dir / "final_retrain" / "completed_at.txt").write_text(
-            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            encoding="utf-8",
-        )
-        _write_result(cfg, result)
+        active_exception = sys.exc_info()[0] is not None
+        try:
+            (cfg.log_dir / "final_retrain").mkdir(parents=True, exist_ok=True)
+            (cfg.log_dir / "final_retrain" / "completed_at.txt").write_text(
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                encoding="utf-8",
+            )
+            _write_result(cfg, result)
+        except Exception as exc:
+            if not active_exception:
+                raise
+            try:
+                logger.warning(
+                    "Could not persist final retrain interruption details: %s", exc
+                )
+            except Exception:
+                pass

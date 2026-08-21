@@ -11,9 +11,9 @@ from .settings import Settings
 
 MAX_MANIFEST_BYTES = 5_000_000
 TERMINAL_EVENT_STATUSES = {
-    "run_finished": "succeeded",
-    "run_failed": "failed",
-    "run_interrupted": "interrupted",
+    "run_finished": "complete",
+    "run_failed": "incomplete",
+    "run_interrupted": "incomplete",
 }
 
 
@@ -107,8 +107,25 @@ def run_from_log_dir(settings: Settings, log_dir: Path) -> dict[str, Any] | None
     status = (
         TERMINAL_EVENT_STATUSES[str(terminal_event.get("event"))]
         if terminal_event is not None
-        else "running"
+        else "incomplete"
     )
+    terminal_event_name = (
+        str(terminal_event.get("event")) if terminal_event is not None else None
+    )
+    detailed_status = {
+        "run_finished": "succeeded",
+        "run_failed": "failed",
+        "run_interrupted": "interrupted",
+    }.get(terminal_event_name, "orphaned")
+    if terminal_event is None:
+        status_reason = (
+            "The process is not known to be alive and no terminal lifecycle "
+            "event was recorded."
+        )
+    else:
+        status_reason = (terminal_event or {}).get("error") or (
+            (terminal_event or {}).get("reason") if status == "incomplete" else None
+        )
 
     config = manifest.get("config") if isinstance(manifest.get("config"), dict) else {}
     total_steps = config.get("agent_steps")
@@ -151,6 +168,9 @@ def run_from_log_dir(settings: Settings, log_dir: Path) -> dict[str, Any] | None
         "dataset_name": dataset_name,
         "status": status,
         "status_source": "events",
+        "detailed_status": detailed_status,
+        "status_reason": status_reason,
+        "terminal_event": terminal_event_name,
         "requested_exp_name": None,
         "actual_exp_name": resolved.name,
         "options": {
@@ -167,11 +187,8 @@ def run_from_log_dir(settings: Settings, log_dir: Path) -> dict[str, Any] | None
         "workspace_dir": str(workspace_dir) if workspace_dir else None,
         "return_code": None,
         "pid": None,
-        "error": (
-            (terminal_event or {}).get("error")
-            if status in {"failed", "interrupted"}
-            else None
-        ),
+        "launch_token": manifest.get("launch_token"),
+        "error": status_reason if status == "incomplete" else None,
         "timestamps": {
             "created_at": created_at,
             "queued_at": None,
