@@ -9,7 +9,6 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 ENV_FILE_VARIABLE = "BIOMAKER_ENV_FILE"
-LEGACY_ENV_FILE_VARIABLE = "BIOMAKER_WEBUI_ENV_FILE"
 
 SECRET_ENV_KEYS = (
     "OPENAI_API_KEY",
@@ -20,23 +19,16 @@ SECRET_ENV_KEYS = (
 PUBLIC_ENV_KEYS = (
     "OPENAI_BASE_URL",
     "BIOMAKER_MAIN_MODEL",
-    "BIOMAKER_HELPER_MODEL",
-    "OPENAI_MODEL",
-    "OPENAI_HELPER_MODEL",
 )
 
 EDITABLE_ENV_KEYS = (
     *SECRET_ENV_KEYS,
     "OPENAI_BASE_URL",
     "BIOMAKER_MAIN_MODEL",
-    "BIOMAKER_HELPER_MODEL",
 )
 
 RUNTIME_ENV_KEYS = (*SECRET_ENV_KEYS, *PUBLIC_ENV_KEYS)
 FILE_AUTHORITATIVE_ENV_KEYS = (*SECRET_ENV_KEYS, "OPENAI_BASE_URL")
-
-# Kept as a public alias for callers that used the original name.
-MANAGED_ENV_KEYS = EDITABLE_ENV_KEYS
 
 SECRET_MASK = "•" * 8
 VISIBLE_SECRET_PREFIXES = ("sk-", "sk_", "jina_", "jina-")
@@ -46,9 +38,7 @@ def resolve_env_file(method_root: Path | str) -> Path:
     """Resolve the shared BioMaker env-file contract for the WebUI runtime."""
 
     root = Path(method_root).expanduser().resolve()
-    override = os.environ.get(ENV_FILE_VARIABLE) or os.environ.get(
-        LEGACY_ENV_FILE_VARIABLE
-    )
+    override = os.environ.get(ENV_FILE_VARIABLE)
     path = Path(override).expanduser() if override else root / ".env"
     if not path.is_absolute():
         path = root / path
@@ -75,15 +65,7 @@ def read_env_values(
     if not path.is_file():
         return {}
     values = dotenv_values(path)
-    return {
-        key: str(values[key])
-        for key in keys
-        if values.get(key) not in (None, "")
-    }
-
-
-def read_managed_values(path: Path) -> dict[str, str]:
-    return read_env_values(path, EDITABLE_ENV_KEYS)
+    return {key: str(values[key]) for key in keys if values.get(key) not in (None, "")}
 
 
 def mask_value(value: str) -> str:
@@ -98,7 +80,7 @@ def mask_value(value: str) -> str:
 def masked_env(path: Path) -> dict[str, dict[str, str | bool]]:
     values = read_env_values(path)
     result: dict[str, dict[str, str | bool]] = {}
-    for key in (*EDITABLE_ENV_KEYS, "OPENAI_MODEL", "OPENAI_HELPER_MODEL"):
+    for key in EDITABLE_ENV_KEYS:
         configured = key in values
         if key in SECRET_ENV_KEYS:
             result[key] = {

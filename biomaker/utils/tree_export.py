@@ -1,5 +1,6 @@
 """Export journal to HTML visualization of tree + code."""
 
+import hashlib
 import json
 import os
 import tempfile
@@ -14,6 +15,13 @@ from ..journal import Journal
 from .response import format_human_execution_output, truncate_text
 
 _TREE_EXPORT_LOCK = RLock()
+_VENDOR_ASSETS = (
+    ("/* __BIOMAKER_VENDOR_P5_JS__ */", "p5-1.9.0.min.js"),
+    ("/* __BIOMAKER_VENDOR_HIGHLIGHT_CSS__ */", "highlight-github-11.9.0.min.css"),
+    ("/* __BIOMAKER_VENDOR_HIGHLIGHT_JS__ */", "highlight-11.9.0.min.js"),
+    ("__BIOMAKER_LICENSE_P5__", "LICENSE.p5-1.9.0.txt"),
+    ("__BIOMAKER_LICENSE_HIGHLIGHT__", "LICENSE.highlight-11.9.0.txt"),
+)
 
 
 @dataclass
@@ -463,18 +471,28 @@ def cfg_to_tree_struct(cfg, jou: Journal, live: bool = False):
     )
 
 
-def generate_html(tree_graph_str: str):
+def _script_safe_json(value: str) -> str:
+    """Keep JSON data from terminating the inline script element."""
+
+    return (
+        value.replace("<", "\\u003c")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def generate_html(tree_graph_str: str) -> str:
     template_dir = Path(__file__).parent / "viz_templates"
 
-    with open(template_dir / "template.js") as f:
-        js = f.read()
-        js = js.replace("<placeholder>", tree_graph_str)
+    js = (template_dir / "template.js").read_text(encoding="utf-8")
+    js = js.replace("<placeholder>", _script_safe_json(tree_graph_str))
 
-    with open(template_dir / "template.html") as f:
-        html = f.read()
-        html = html.replace("<!-- placeholder -->", js)
-
-        return html
+    html = (template_dir / "template.html").read_text(encoding="utf-8")
+    html = html.replace("<!-- placeholder -->", js)
+    for placeholder, filename in _VENDOR_ASSETS:
+        asset = (template_dir / filename).read_text(encoding="utf-8")
+        html = html.replace(placeholder, asset, 1)
+    return html
 
 
 def _atomic_write_text(out_path: Path, text: str) -> None:
@@ -489,6 +507,8 @@ def _atomic_write_text(out_path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_name, out_path)
     finally:
         try:
@@ -497,8 +517,31 @@ def _atomic_write_text(out_path: Path, text: str) -> None:
             pass
 
 
-def generate(cfg, jou: Journal, out_path: Path, live: bool = False):
+def generate(
+    cfg, jou: Journal, out_path: Path, live: bool = False
+) -> dict[str, bool | str]:
+    """Export the current tree only when its canonical content has changed.
+
+    The returned revision describes the tree data rather than filesystem
+    timestamps.  Callers should treat it as opaque and use ``changed`` to avoid
+    work that is only driven by a periodic refresh attempt.
+    """
+
     with _TREE_EXPORT_LOCK:
-        tree_graph_str = json.dumps(cfg_to_tree_struct(cfg, jou, live=live))
+        tree_graph_str = json.dumps(
+            cfg_to_tree_struct(cfg, jou, live=live),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        revision = hashlib.sha256(tree_graph_str.encode("utf-8")).hexdigest()
         html = generate_html(tree_graph_str)
-        _atomic_write_text(out_path, html)
+        out_path = Path(out_path)
+        try:
+            current_html = out_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            current_html = None
+        changed = current_html != html
+        if changed:
+            _atomic_write_text(out_path, html)
+        return {"changed": changed, "revision": revision}

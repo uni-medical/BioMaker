@@ -1,2 +1,18 @@
 # Local secrets and provider configuration
 .env
+
+# Local runtimes and generated experiment data
+.DS_Store
+.playwright-cli/
+.pytest_cache/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+output/
+logs/
+workspaces/
+apps/webui/state/
+biomaker/monai_rag/monai_rag_db/

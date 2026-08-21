@@ -7,6 +7,7 @@
     <title>BioMaker</title>
     <link rel="stylesheet" href="/static/styles.css">
     <script defer src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+    <script defer src="/static/refresh_policy.js"></script>
     <script defer src="/static/app.js"></script>
   </head>
   <body>
@@ -16,6 +17,7 @@
         <strong>BioMaker</strong>
       </div>
       <div class="header-context">
+        <span id="connection-indicator" class="connection-indicator" role="status" hidden></span>
         <span id="queue-indicator" class="queue-indicator" hidden></span>
       </div>
       <div class="header-actions">
@@ -30,12 +32,18 @@
       </div>
     </header>
 
+    <nav class="mobile-view-switch" aria-label="Workspace views">
+      <button class="mobile-view-button" type="button" data-mobile-view="tasks">Experiments</button>
+      <button class="mobile-view-button active" type="button" data-mobile-view="setup">Setup</button>
+      <button class="mobile-view-button" type="button" data-mobile-view="run">Run</button>
+    </nav>
+
     <main class="workbench">
-      <aside class="sidebar" aria-label="Tasks">
+      <aside class="sidebar" aria-label="Experiments">
         <section class="sidebar-section projects-section">
           <div class="section-heading">
-            <h2>Tasks</h2>
-            <button id="new-project-button" class="new-project-action" type="button" title="New task" aria-label="New task">
+            <h2>Experiments</h2>
+            <button id="new-project-button" class="new-project-action" type="button" title="New experiment" aria-label="New experiment">
               <span class="icon-fallback" aria-hidden="true">+</span>
               <i data-lucide="plus" aria-hidden="true"></i>
               <span>New</span>
@@ -46,27 +54,23 @@
 
       </aside>
 
-      <section class="editor-pane" aria-label="Task editor">
+      <section class="editor-pane" aria-label="Experiment setup">
         <div class="pane-heading editor-heading">
-          <h1 id="editor-title">New task</h1>
-          <div class="editor-actions">
-            <button id="delete-project-button" class="icon-button danger-ghost" type="button" title="Delete task" aria-label="Delete task" hidden>
-              <span class="icon-fallback" aria-hidden="true">×</span>
-              <i data-lucide="trash-2" aria-hidden="true"></i>
-            </button>
-            <button id="save-project-button" class="button secondary" type="button">
-              <i data-lucide="save" aria-hidden="true"></i>
-              Save
-            </button>
+          <div class="editor-title-block">
+            <h1 id="editor-title">New experiment</h1>
           </div>
         </div>
 
         <form id="project-form" class="project-form" autocomplete="off">
-          <input id="project-name" name="name" type="hidden">
           <input id="task-template" name="task_template_path" type="hidden">
 
-          <label class="field dataset-field">
-            <span>Dataset</span>
+          <label class="field name-field">
+            <span><span id="run-name-label">Run name</span> <small id="run-name-optional">(optional)</small></span>
+            <input id="project-name" name="name" type="text" maxlength="80" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,79}" title="Start with a letter or number; use only letters, numbers, dots, underscores, and hyphens" placeholder="CLI chooses one when left blank">
+          </label>
+
+          <div class="field dataset-field">
+            <label for="dataset-path">Dataset</label>
             <div class="input-action-row">
               <input id="dataset-path" name="dataset_path" type="text" list="dataset-options" spellcheck="false" placeholder="/path/to/dataset" required>
               <datalist id="dataset-options"></datalist>
@@ -75,7 +79,7 @@
                 <i data-lucide="folder-open" aria-hidden="true"></i>
               </button>
             </div>
-          </label>
+          </div>
 
           <label class="field task-field">
             <span>Goal</span>
@@ -88,6 +92,18 @@
               <i data-lucide="chevron-down" aria-hidden="true"></i>
             </summary>
             <div class="advanced-fields">
+              <div class="field span-two">
+                <label id="task-model-label" for="task-model">Model override</label>
+                <span class="model-input-row">
+                  <input id="task-model" type="text" list="task-model-options" maxlength="200" autocomplete="off" placeholder="Use the Settings or repository default">
+                  <datalist id="task-model-options"></datalist>
+                  <button id="refresh-task-models-button" class="icon-button" type="button" title="Refresh models" aria-label="Refresh models">
+                    <span class="icon-fallback" aria-hidden="true">↻</span>
+                    <i data-lucide="refresh-cw" aria-hidden="true"></i>
+                  </button>
+                </span>
+                <small id="task-model-status" class="field-help">Leave blank to use the Settings default, then the repository default.</small>
+              </div>
               <label class="field">
                 <span>Agent steps</span>
                 <input id="agent-steps" type="number" min="1" max="1000" step="1">
@@ -111,12 +127,15 @@
               </label>
             </div>
           </details>
+
+          <div id="project-form-status" class="form-status" role="alert" hidden></div>
         </form>
 
         <div class="run-bar">
+          <div id="run-config-summary" class="run-config-summary" aria-live="polite"></div>
           <button id="run-button" class="button primary run-button" type="button">
             <i data-lucide="play" aria-hidden="true"></i>
-            Start run
+            <span id="run-button-label">Run</span>
           </button>
         </div>
       </section>
@@ -126,8 +145,17 @@
           <div class="run-title">
             <strong id="selected-run-name"></strong>
             <select id="run-history-select" class="run-history-select" aria-label="Run history" hidden></select>
+            <span id="selected-run-meta" class="selected-run-meta"></span>
           </div>
-          <div id="selected-run-actions" class="run-actions"></div>
+          <div id="selected-run-actions" class="run-actions">
+            <span id="run-result-status" class="result-pill" hidden></span>
+            <span id="run-execution-status" class="status-pill"></span>
+            <button id="run-action-button" class="button secondary" type="button" hidden>
+              <i id="run-action-icon" data-lucide="rotate-ccw" aria-hidden="true"></i>
+              <span id="run-action-label">Retry</span>
+            </button>
+          </div>
+          <div id="run-error-summary" class="run-error-summary" hidden></div>
         </div>
         <div class="tab-bar" role="tablist" aria-label="Run views">
           <button id="events-tab" class="tab active" type="button" role="tab" data-tab="events" aria-selected="true" aria-controls="events-panel" tabindex="0">
@@ -136,7 +164,7 @@
           </button>
           <button id="tree-tab" class="tab" type="button" role="tab" data-tab="tree" aria-selected="false" aria-controls="tree-panel" tabindex="-1">
             <i data-lucide="git-branch" aria-hidden="true"></i>
-            Search
+            Tree
           </button>
           <button id="console-tab" class="tab" type="button" role="tab" data-tab="console" aria-selected="false" aria-controls="console-panel" tabindex="-1">
             <i data-lucide="terminal" aria-hidden="true"></i>
@@ -151,11 +179,18 @@
         <div class="tab-content">
           <section id="tree-panel" class="tab-panel" role="tabpanel" aria-labelledby="tree-tab">
             <div class="panel-toolbar">
-              <label class="check-label">
-                <input id="tree-auto-refresh" type="checkbox" checked>
-                <span>Auto-refresh</span>
-              </label>
+              <div class="tree-update-controls">
+                <label class="check-label">
+                  <input id="tree-auto-refresh" type="checkbox" checked>
+                  <span>Auto-update</span>
+                </label>
+                <span id="tree-update-status" class="tree-update-status" role="status">Waiting for tree</span>
+              </div>
               <div class="panel-toolbar-actions">
+                <button id="run-focus-button" class="icon-button small" type="button" title="Focus tree" aria-label="Focus tree" aria-pressed="false">
+                  <span class="icon-fallback" aria-hidden="true">&#x26F6;</span>
+                  <i data-lucide="maximize-2" aria-hidden="true"></i>
+                </button>
                 <a id="tree-open-link" class="icon-button small" href="#" target="_blank" rel="noopener" title="Open search" aria-label="Open search" hidden>
                   <span class="icon-fallback" aria-hidden="true">↗</span>
                   <i data-lucide="external-link" aria-hidden="true"></i>
@@ -203,16 +238,17 @@
       </section>
     </main>
 
-    <dialog id="settings-dialog" class="modal">
+    <dialog id="settings-dialog" class="modal" aria-labelledby="settings-title">
       <form method="dialog" class="modal-shell" id="settings-form">
         <div class="modal-heading">
-          <h2>Settings</h2>
+          <h2 id="settings-title">Settings</h2>
           <button class="icon-button" value="cancel" type="submit" title="Close" aria-label="Close">
             <span class="icon-fallback" aria-hidden="true">×</span>
             <i data-lucide="x" aria-hidden="true"></i>
           </button>
         </div>
         <div class="settings-fields">
+          <small id="settings-env-source" class="settings-env-source"></small>
           <div class="field">
             <label for="settings-base-url">Base URL</label>
             <input id="settings-base-url" type="url" inputmode="url" autocomplete="off" placeholder="https://api.example.com/v1">
@@ -231,16 +267,16 @@
           </div>
 
           <div class="field">
-            <label for="settings-model">Model</label>
+            <label for="settings-model">Default model</label>
             <span class="model-input-row">
-              <input id="settings-model" type="text" list="settings-model-options" autocomplete="off" aria-describedby="settings-model-status" placeholder="Search or enter model">
+              <input id="settings-model" type="text" list="settings-model-options" maxlength="200" autocomplete="off" aria-describedby="settings-model-status" placeholder="Search or enter model">
               <datalist id="settings-model-options"></datalist>
               <button id="refresh-models-button" class="icon-button" type="button" title="Refresh models" aria-label="Refresh models">
                 <span class="icon-fallback" aria-hidden="true">↻</span>
                 <i data-lucide="refresh-cw" aria-hidden="true"></i>
               </button>
             </span>
-            <small id="settings-model-status" class="field-status"></small>
+            <small id="settings-model-status" class="field-status">Used by WebUI runs unless a task has a model override.</small>
           </div>
 
           <details class="settings-more">

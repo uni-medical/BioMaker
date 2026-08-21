@@ -1,15 +1,43 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from .settings import Settings
 
 
 class ArtifactError(ValueError):
     pass
+
+
+def opaque_revision(payload: Any) -> str:
+    """Return a stable token whose representation is not an API contract."""
+
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def file_revision(path: Path) -> str | None:
+    """Return a cheap revision for a regular file, or ``None`` if unavailable."""
+
+    try:
+        if path.is_symlink():
+            return None
+        stat = path.stat()
+        if not path.is_file():
+            return None
+    except OSError:
+        return None
+    return opaque_revision({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -56,16 +84,49 @@ def list_artifacts(settings: Settings, run: dict[str, Any]) -> list[dict[str, An
     for path in sorted(log_dir.iterdir(), key=lambda item: item.name.lower()):
         if path.name.startswith(".") or not path.is_file() or path.is_symlink():
             continue
-        stat = path.stat()
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        revision = file_revision(path)
+        if revision is None:
+            continue
         artifacts.append(
             {
                 "name": path.name,
                 "size": stat.st_size,
                 "modified_at": stat.st_mtime,
-                "url": f"/artifacts/runs/{run['id']}/{path.name}",
+                "revision": revision,
+                "url": (
+                    f"/artifacts/runs/{quote(str(run['id']), safe='')}/"
+                    f"{quote(path.name, safe='')}"
+                ),
             }
         )
     return artifacts
+
+
+def artifact_collection_revision(artifacts: list[dict[str, Any]]) -> str | None:
+    """Summarize the visible artifact set without reading artifact contents."""
+
+    if not artifacts:
+        return None
+    return opaque_revision(
+        [
+            {"name": artifact["name"], "revision": artifact["revision"]}
+            for artifact in artifacts
+        ]
+    )
+
+
+def artifact_revision(
+    settings: Settings, run: dict[str, Any], artifact_name: str
+) -> str | None:
+    try:
+        path = resolve_artifact(settings, run, artifact_name)
+    except ArtifactError:
+        return None
+    return file_revision(path)
 
 
 def read_events(
@@ -121,7 +182,8 @@ def read_results_summary(settings: Settings, run: dict[str, Any]) -> dict[str, A
     latest = None
     if rows:
         latest = {
-            key: rows[-1].get(key) for key in ("step", "status", "metric", "outcome")
+            key: rows[-1].get(key)
+            for key in ("step", "status", "metric", "outcome", "exc_type", "error")
         }
     return {"count": len(rows), "best_metric": best_metric, "latest": latest}
 

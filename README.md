@@ -34,7 +34,7 @@ We recommend using `uv` to manage the environment and dependencies.
      ```
 
 4. **Set up API keys**:
-Create `BioMaker/.env` in the repository root. BioMaker, its RAG tools, and the WebUI use this same file regardless of their launch directory. Serper and Jina are optional but recommended for web search: Serper finds relevant pages, and Jina reads those pages into cleaner text.
+Create `.env` in the repository root. BioMaker, its RAG tools, and the WebUI use this same file regardless of their launch directory. Serper and Jina are optional but recommended for web search: Serper finds relevant pages, and Jina reads those pages into cleaner text.
      ```dotenv
      OPENAI_BASE_URL="<your base url>" # (e.g. https://api.openai.com/v1)
      OPENAI_API_KEY="<your key>"
@@ -44,6 +44,7 @@ Create `BioMaker/.env` in the repository root. BioMaker, its RAG tools, and the 
      JINA_API_KEY="<your jina key>"
      ```
 Set `BIOMAKER_ENV_FILE` to an absolute path, or a path relative to the repository root, to use a different file explicitly. Existing shell environment variables still take precedence when running the BioMaker CLI directly.
+The repository default is `deepseek-v4-flash` for every model role. The WebUI Settings dialog can store a default model in `.env`; a task-level model override takes precedence. For CLI runs, pass `model_for_all_agents=<model>` explicitly.
 The embedding variables are only needed when the embedding endpoint differs from the main OpenAI-compatible endpoint. If `SERPER_API_KEY` is missing, BioMaker warns and disables web search for that run. If `JINA_API_KEY` is missing, BioMaker warns and falls back to Serper snippets only.
 
 5. **Set up the MONAI RAG index**
@@ -71,7 +72,7 @@ Start the local WebUI from the repository root:
 cd apps/webui
 uv run python -m webui.server --host 127.0.0.1 --port 7860
 ```
-Open <http://127.0.0.1:7860>, configure the endpoint and API key in Settings, then select a local dataset folder to create a task.
+Open <http://127.0.0.1:7860>, configure the endpoint and API key in Settings, then select a local dataset folder to start an experiment. The experiment list is read directly from `logs/`, grouped by dataset, and uses the existing log directory names.
 
 ## Workflow
 

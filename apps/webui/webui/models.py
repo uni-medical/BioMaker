@@ -35,16 +35,15 @@ class AdvancedOptionsPatch(BaseModel):
     final_retrain_enabled: bool | None = None
 
 
-class ProjectInput(BaseModel):
+class ExperimentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=120)
     dataset_path: str = Field(min_length=1, max_length=4096)
     task_template_path: str | None = Field(default=None, max_length=4096)
     task_body: str = Field(min_length=1, max_length=500_000)
     advanced_defaults: AdvancedOptions = Field(default_factory=AdvancedOptions)
 
-    @field_validator("name", "dataset_path", "task_body")
+    @field_validator("dataset_path", "task_body")
     @classmethod
     def strip_required(cls, value: str) -> str:
         value = value.strip()
@@ -64,7 +63,7 @@ class ProjectInput(BaseModel):
 class RunCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    project_id: str = Field(min_length=1, max_length=64)
+    experiment: ExperimentInput
     requested_exp_name: str | None = Field(default=None, max_length=80)
     options: AdvancedOptionsPatch | None = None
 
@@ -77,7 +76,6 @@ class EnvUpdate(BaseModel):
     SERPER_API_KEY: str | None = Field(default=None, max_length=20_000)
     JINA_API_KEY: str | None = Field(default=None, max_length=20_000)
     BIOMAKER_MAIN_MODEL: str | None = Field(default=None, max_length=200)
-    BIOMAKER_HELPER_MODEL: str | None = Field(default=None, max_length=200)
 
 
 class EnvRevealRequest(BaseModel):

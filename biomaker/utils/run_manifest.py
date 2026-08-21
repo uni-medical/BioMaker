@@ -7,8 +7,10 @@ does not make decisions for the search agent.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -67,8 +69,13 @@ def _selected_cfg(cfg: Config) -> dict[str, Any]:
         "agent_steps": cfg.agent.steps,
         "total_time_limit_seconds": cfg.agent.total_time_limit,
         "per_node_timeout_seconds": cfg.exec.timeout,
+        "parallel_workers": cfg.exec.parallel_workers,
+        "final_retrain_enabled": cfg.final_retrain.enabled,
+        "model_for_all_agents": cfg.model_for_all_agents,
         "main_model": cfg.agent.code.model,
         "feedback_model": cfg.agent.feedback.model,
+        "knowledge_base_model": cfg.agent.knowledge_base.model,
+        "report_model": cfg.report.model,
         "enable_node_tools": cfg.agent.enable_node_tools,
         "enable_monai_knowledge_base": cfg.agent.enable_monai_knowledge_base,
         "monai_rag_mode": getattr(knowledge_cfg, "retrieval_mode", "keyword"),
@@ -90,11 +97,19 @@ def write_run_manifest(
     prediction_spec: dict[str, Any] | None = None,
 ) -> Path:
     """Write run_manifest.json with stable run facts."""
+    out_path = Path(cfg.log_dir) / "run_manifest.json"
+    existing = _read_json(out_path)
+    created_at = (
+        existing.get("created_at")
+        if isinstance(existing, dict) and existing.get("created_at")
+        else datetime.now(timezone.utc).isoformat()
+    )
     spec = prediction_spec or _read_json(
         Path(cfg.workspace_dir) / "evaluator_prediction_spec.json"
     )
     manifest = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": created_at,
+        "launch_token": os.getenv("BIOMAKER_LAUNCH_TOKEN") or None,
         "exp_name": cfg.exp_name,
         "data_dir": str(cfg.data_dir),
         "workspace_dir": str(cfg.workspace_dir),
@@ -113,10 +128,18 @@ def write_run_manifest(
             ),
         },
     }
-    out_path = Path(cfg.log_dir) / "run_manifest.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
+    content = json.dumps(manifest, indent=2, ensure_ascii=False, default=str) + "\n"
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.", suffix=".tmp", dir=out_path.parent
     )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, out_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return out_path

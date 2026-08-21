@@ -375,22 +375,6 @@ def prep_cfg(cfg: Config):
     cfg.log_dir = (top_log_dir / cfg.exp_name).resolve()
     cfg.workspace_dir = (top_workspace_dir / cfg.exp_name).resolve()
 
-    main_model = (
-        os.getenv("BIOMAKER_MAIN_MODEL")
-        or os.getenv("OPENAI_MODEL")
-        or "deepseek-v4-pro"
-    )
-    helper_model = (
-        os.getenv("BIOMAKER_HELPER_MODEL")
-        or os.getenv("OPENAI_HELPER_MODEL")
-        or "deepseek-v4-flash"
-    )
-
-    cfg.agent.code.model = cfg.agent.code.model or main_model
-    cfg.agent.feedback.model = cfg.agent.feedback.model or main_model
-    cfg.agent.knowledge_base.model = cfg.agent.knowledge_base.model or helper_model
-    cfg.report.model = cfg.report.model or helper_model
-
     # if `model_for_all_agents` is set
     # override all model settings with the same model
     if cfg.model_for_all_agents is not None:
@@ -398,6 +382,18 @@ def prep_cfg(cfg: Config):
         cfg.agent.feedback.model = cfg.model_for_all_agents
         cfg.agent.knowledge_base.model = cfg.model_for_all_agents
         cfg.report.model = cfg.model_for_all_agents
+
+    model_roles = {
+        "agent.code.model": cfg.agent.code.model,
+        "agent.feedback.model": cfg.agent.feedback.model,
+        "agent.knowledge_base.model": cfg.agent.knowledge_base.model,
+        "report.model": cfg.report.model,
+    }
+    missing_models = [name for name, value in model_roles.items() if not value]
+    if missing_models:
+        raise ValueError(
+            "Model configuration is required for: " + ", ".join(missing_models)
+        )
 
     # validate the config
     cfg_schema: Config = OmegaConf.structured(Config)

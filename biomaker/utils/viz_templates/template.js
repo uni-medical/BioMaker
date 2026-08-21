@@ -1,14 +1,24 @@
-const bgCol = "#F2F0E7";
-const accentCol = "#2F6FED";
-const bestCol = "#D6A11E";
-const okCol = "#2F7D59";
+const bgCol = "#F7F7F7";
+const accentCol = "#3B82F6";
+const bestCol = "#B88712";
+const nodeCol = "#666666";
 const bugCol = "#B4493D";
 const rootCol = "#50565F";
-const edgeCol = "#9B9486";
+const edgeCol = "#AAA9A4";
+const isEmbeddedTree = document.documentElement.dataset.embed === "true";
+const treeViewId = new URLSearchParams(window.location.search).get("view_id") || "";
+const prefersReducedMotion = window.matchMedia?.(
+  "(prefers-reduced-motion: reduce)",
+)?.matches;
+const treeStatePrefix = "biomaker-tree-state:v1:";
 
-hljs.initHighlightingOnLoad();
+if (window.hljs?.initHighlightingOnLoad) {
+  window.hljs.initHighlightingOnLoad();
+}
 
 const updateTargetDims = () => {
+  if (isEmbeddedTree) return [windowWidth, windowHeight];
+  if (windowWidth <= 900) return [windowWidth, windowHeight * 0.48];
   return [windowWidth * 0.58, windowHeight];
 };
 
@@ -22,6 +32,91 @@ const escapeHtml = (value) =>
 const compact = (value, fallback = "n/a") => {
   const text = String(value ?? "").trim();
   return text.length ? text : fallback;
+};
+
+const nodeStateKey = (treeInd) => {
+  const summary = (treeStructData.summaries || [])[treeInd] || {};
+  const nodeId = compact(summary.node_id, "");
+  if (nodeId) return `node:${nodeId}`;
+  const label = compact((treeStructData.labels || [])[treeInd], "");
+  return label ? `label:${label}` : `index:${treeInd}`;
+};
+
+const treeStateKey = () => {
+  const run = treeStructData.run_summary || {};
+  const runName = compact(run.exp_name || treeStructData.exp_name, "run");
+  return `${treeStatePrefix}${window.location.pathname}:${runName}`;
+};
+
+const validateTreeUiState = (candidate) => {
+  if (!candidate || typeof candidate !== "object") return null;
+  const expanded = {};
+  if (candidate.expanded && typeof candidate.expanded === "object") {
+    Object.entries(candidate.expanded)
+      .slice(0, 160)
+      .forEach(([key, value]) => {
+        if (typeof key === "string" && key.length <= 160) {
+          expanded[key] = Boolean(value);
+        }
+      });
+  }
+  const selectedIndex = Number(candidate.selectedIndex);
+  const panelScroll = Number(candidate.panelScroll);
+  return {
+    drawerOpen: Boolean(candidate.drawerOpen),
+    expanded,
+    panelScroll:
+      Number.isFinite(panelScroll) && panelScroll >= 0
+        ? Math.min(panelScroll, 10_000_000)
+        : 0,
+    selectedIndex:
+      Number.isInteger(selectedIndex) && selectedIndex >= 0
+        ? selectedIndex
+        : null,
+    selectedKey:
+      typeof candidate.selectedKey === "string" &&
+      candidate.selectedKey.length <= 512
+        ? candidate.selectedKey
+        : "",
+  };
+};
+
+const readTreeUiState = () => {
+  const key = treeStateKey();
+  try {
+    const stored = window.sessionStorage.getItem(key);
+    if (stored) return validateTreeUiState(JSON.parse(stored));
+  } catch (_error) {
+    // Sandboxed iframes without allow-same-origin expose opaque storage origins.
+  }
+  try {
+    if (window.name.startsWith(treeStatePrefix)) {
+      const payload = JSON.parse(window.name.slice(treeStatePrefix.length));
+      if (payload?.key === key) return validateTreeUiState(payload.state);
+    }
+  } catch (_error) {
+    // Ignore stale or non-BioMaker window.name values.
+  }
+  return null;
+};
+
+const detailStateKey = (element, index) =>
+  element.id || element.dataset.stateKey || `detail:${index}`;
+
+const collectExpandedState = () => {
+  const expanded = {};
+  document.querySelectorAll("#side-panel details").forEach((element, index) => {
+    expanded[detailStateKey(element, index)] = element.open;
+  });
+  return expanded;
+};
+
+const applyExpandedState = (expanded) => {
+  if (!expanded || typeof expanded !== "object") return;
+  document.querySelectorAll("#side-panel details").forEach((element, index) => {
+    const key = detailStateKey(element, index);
+    if (Object.hasOwn(expanded, key)) element.open = Boolean(expanded[key]);
+  });
 };
 
 const metricLine = (label, value) => `
@@ -65,10 +160,12 @@ const renderCodeBlock = (code) => {
   const lines = text.replace(/\n$/, "").split("\n");
   const rows = lines
     .map((line, index) => {
-      const highlighted = hljs.highlight(line || " ", {
-        language: "python",
-        ignoreIllegals: true,
-      }).value;
+      const highlighted = window.hljs?.highlight
+        ? window.hljs.highlight(line || " ", {
+            language: "python",
+            ignoreIllegals: true,
+          }).value
+        : escapeHtml(line || " ");
       return `<span class="code-line"><span class="line-number">${
         index + 1
       }</span><span class="line-content">${
@@ -84,7 +181,7 @@ const renderPromptSections = (sections) => {
     return '<p class="muted">No prompt sections were saved for this node.</p>';
   }
   return sections
-    .map((section) => {
+    .map((section, index) => {
       const tokens = section.estimated_tokens ?? "";
       const chars = section.chars ?? "";
       const sectionText = section.text || "";
@@ -93,7 +190,9 @@ const renderPromptSections = (sections) => {
           ? renderDetailRecords(sectionText)
           : `<pre>${escapeHtml(sectionText)}</pre>`;
       return `
-        <details class="prompt-section">
+        <details class="prompt-section" data-state-key="prompt:${escapeHtml(
+          section.name || "section",
+        )}:${index}">
           <summary>
             ${escapeHtml(section.name || "section")}
             <span>${formatNumber(tokens)} est. tokens · ${formatNumber(chars)} chars</span>
@@ -117,12 +216,12 @@ const renderDetailRecords = (text) => {
     .map((record, index) => {
       const summary = detailRecordSummary(record, index, roles[index]);
       return `
-        <details class="prompt-section detail-record">
+        <details class="prompt-section detail-record" data-state-key="record:${index}">
           <summary>
             ${escapeHtml(summary)}
             <span>${formatNumber(Math.round(record.length / 4))} est. tokens · ${formatNumber(record.length)} chars</span>
           </summary>
-          ${renderDetailRecordBody(record)}
+          ${renderDetailRecordBody(record, index)}
         </details>
       `;
     })
@@ -172,34 +271,34 @@ const detailRecordRoles = (records) => {
   return roles;
 };
 
-const renderDetailRecordBody = (record) => {
+const renderDetailRecordBody = (record, recordIndex = 0) => {
   const parsed = parseNodeDetailRecord(record);
   if (!parsed) return `<pre>${escapeHtml(record)}</pre>`;
   return `
     <div class="detail-record-body">
-      <details class="prompt-section" open>
+      <details class="prompt-section" data-state-key="record:${recordIndex}:metadata" open>
         <summary>Metadata</summary>
         <pre>${escapeHtml(parsed.metadata)}</pre>
       </details>
       ${
         parsed.artifact
-          ? `<details class="prompt-section">
+          ? `<details class="prompt-section" data-state-key="record:${recordIndex}:artifact">
               <summary>Output Check</summary>
               <pre>${escapeHtml(parsed.artifact)}</pre>
             </details>`
           : ""
       }
-      <details class="prompt-section">
+      <details class="prompt-section" data-state-key="record:${recordIndex}:plan">
         <summary>Plan</summary>
         <pre>${escapeHtml(parsed.plan)}</pre>
       </details>
-      <details class="prompt-section">
+      <details class="prompt-section" data-state-key="record:${recordIndex}:code">
         <summary>Code</summary>
         ${renderCodeBlock(parsed.code)}
       </details>
       ${
         parsed.output
-          ? `<details class="prompt-section">
+          ? `<details class="prompt-section" data-state-key="record:${recordIndex}:output">
               <summary>Execution Output</summary>
               <pre>${escapeHtml(parsed.output)}</pre>
             </details>`
@@ -295,7 +394,7 @@ const renderPromptDetails = (treeInd) => {
   return renderPromptSections(prompt.sections);
 };
 
-const setNodeDetails = (treeInd) => {
+const setNodeDetails = (treeInd, { restoreView = false } = {}) => {
   const summary = (treeStructData.summaries || [])[treeInd] || {};
   const selectedLabel = document.getElementById("selected-label");
   if (selectedLabel) {
@@ -328,13 +427,13 @@ const setNodeDetails = (treeInd) => {
 
   const codeElm = document.getElementById("code");
   if (codeElm) {
-    const code = treeStructData.code[treeInd] || "";
+    const code = (treeStructData.code || [])[treeInd] || "";
     codeElm.innerHTML = renderCodeBlock(code);
   }
 
   const outputElm = document.getElementById("output");
   if (outputElm) {
-    const termOut = treeStructData.term_out[treeInd] || "";
+    const termOut = (treeStructData.term_out || [])[treeInd] || "";
     outputElm.textContent = termOut || "";
   }
 
@@ -346,6 +445,27 @@ const setNodeDetails = (treeInd) => {
   const planElm = document.getElementById("plan");
   if (planElm) {
     planElm.textContent = summary.plan || "";
+  }
+
+  const detailsTrigger = document.getElementById("details-trigger");
+  const selectedText = selectedLabel?.textContent || "selected node";
+  if (detailsTrigger) {
+    detailsTrigger.setAttribute(
+      "aria-label",
+      `Open details for ${selectedText}`,
+    );
+  }
+  canvas?.elt?.setAttribute(
+    "aria-label",
+    `BioMaker search tree. Selected ${selectedText}. Use arrow keys to change nodes and Enter to open details.`,
+  );
+
+  if (restoreView && restoredUiState) {
+    applyExpandedState(restoredUiState.expanded);
+    window.requestAnimationFrame(() => {
+      const panel = document.getElementById("side-panel");
+      if (panel) panel.scrollTop = restoredUiState?.panelScroll || 0;
+    });
   }
 };
 
@@ -360,6 +480,17 @@ const setRunSummary = () => {
     <span>bug ${escapeHtml(s.bug ?? 0)}</span>
     <span>steps ${escapeHtml(s.steps ?? 0)}</span>
   `;
+
+  const toolbar = document.getElementById("tree-status");
+  if (toolbar) {
+    toolbar.innerHTML = `
+      <strong title="${escapeHtml(s.exp_name || "BioMaker run")}">${escapeHtml(
+        s.exp_name || "BioMaker run",
+      )}</strong>
+      <span class="best-value">best ${escapeHtml(compact(s.best_metric))}</span>
+      <span>${escapeHtml(s.steps ?? 0)} steps</span>
+    `;
+  }
 };
 
 const preferredNode = (visibleNodes) => {
@@ -374,12 +505,286 @@ const preferredNode = (visibleNodes) => {
   }) || visibleNodes[0];
 };
 
+const findNodeIndexFromState = (state) => {
+  if (!state) return -1;
+  const count = (treeStructData.layout || []).length;
+  if (state.selectedKey) {
+    for (let index = 0; index < count; index += 1) {
+      if (nodeStateKey(index) === state.selectedKey) return index;
+    }
+  }
+  return Number.isInteger(state.selectedIndex) && state.selectedIndex < count
+    ? state.selectedIndex
+    : -1;
+};
+
+const collectTreeUiState = () => {
+  const panel = document.getElementById("side-panel");
+  return {
+    drawerOpen:
+      isEmbeddedTree &&
+      document.documentElement.dataset.drawerOpen === "true",
+    expanded: collectExpandedState(),
+    panelScroll: panel?.scrollTop || 0,
+    selectedIndex: selectedTreeIndex,
+    selectedKey:
+      Number.isInteger(selectedTreeIndex) && selectedTreeIndex >= 0
+        ? nodeStateKey(selectedTreeIndex)
+        : "",
+  };
+};
+
+const parentOrigin = (() => {
+  if (!isEmbeddedTree) return "";
+  try {
+    const requested = new URLSearchParams(window.location.search).get(
+      "parent_origin",
+    );
+    if (!requested) return "";
+    const parsed = new URL(requested);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.origin : "";
+  } catch (_error) {
+    return "";
+  }
+})();
+
+const postTreeUiState = (state) => {
+  if (!parentOrigin || window.parent === window) return;
+  window.parent.postMessage(
+    {
+      key: treeStateKey(),
+      state,
+      type: "biomaker:tree-state",
+      version: 1,
+      view_id: treeViewId,
+    },
+    parentOrigin,
+  );
+};
+
+const postTreeInteraction = (active) => {
+  if (!parentOrigin || window.parent === window) return;
+  window.parent.postMessage(
+    {
+      active: Boolean(active),
+      type: "biomaker:tree-interaction",
+      version: 1,
+      view_id: treeViewId,
+    },
+    parentOrigin,
+  );
+};
+
+const beginTreeInteraction = () => {
+  window.clearTimeout(treeInteractionTimer);
+  postTreeInteraction(true);
+  treeInteractionTimer = window.setTimeout(() => {
+    treeInteractionTimer = undefined;
+    postTreeInteraction(false);
+  }, 5000);
+};
+
+const endTreeInteraction = (delay = 240) => {
+  window.clearTimeout(treeInteractionTimer);
+  treeInteractionTimer = window.setTimeout(() => {
+    treeInteractionTimer = undefined;
+    postTreeInteraction(false);
+  }, delay);
+};
+
+const markTreeInteraction = () => {
+  beginTreeInteraction();
+  endTreeInteraction(700);
+};
+
+const persistTreeUiState = () => {
+  const key = treeStateKey();
+  const state = validateTreeUiState(collectTreeUiState());
+  if (!state) return;
+  restoredUiState = state;
+  try {
+    window.sessionStorage.setItem(key, JSON.stringify(state));
+  } catch (_error) {
+    // window.name below is the storage fallback for opaque sandbox origins.
+  }
+  try {
+    window.name = `${treeStatePrefix}${JSON.stringify({ key, state })}`;
+  } catch (_error) {
+    // Persistence is best effort; the tree stays usable without it.
+  }
+  postTreeUiState(state);
+};
+
+const scheduleTreeUiPersist = () => {
+  window.clearTimeout(treeStatePersistTimer);
+  treeStatePersistTimer = window.setTimeout(persistTreeUiState, 100);
+};
+
+const setDrawerOpen = (open, { focus = false, persist = true } = {}) => {
+  if (!isEmbeddedTree) return;
+  const expanded = Boolean(open);
+  const root = document.documentElement;
+  const panel = document.getElementById("side-panel");
+  const trigger = document.getElementById("details-trigger");
+  root.dataset.drawerOpen = expanded ? "true" : "false";
+  trigger?.setAttribute("aria-expanded", String(expanded));
+  panel?.setAttribute("aria-hidden", String(!expanded));
+  if (panel) panel.inert = !expanded;
+  if (focus) {
+    window.requestAnimationFrame(() => {
+      if (expanded) document.getElementById("drawer-close")?.focus();
+      else trigger?.focus();
+    });
+  }
+  if (persist) scheduleTreeUiPersist();
+};
+
+const selectTreeNode = (
+  treeInd,
+  {
+    manual = false,
+    openDrawer = false,
+    persist = true,
+    restoreView = false,
+  } = {},
+) => {
+  if (!Number.isInteger(treeInd) || !nodes[treeInd]) return;
+  selectedTreeIndex = treeInd;
+  nodes.forEach((node) => {
+    node.selected = node.treeInd === treeInd;
+  });
+  manualSelection = manual;
+  setNodeDetails(treeInd, { restoreView });
+  if (!restoreView) {
+    const panel = document.getElementById("side-panel");
+    if (panel) panel.scrollTop = 0;
+  }
+  if (openDrawer) setDrawerOpen(true, { persist: false });
+  if (persist) scheduleTreeUiPersist();
+};
+
+const restoreTreeUiState = (state) => {
+  const validated = validateTreeUiState(state);
+  if (!validated) return;
+  restoredUiState = validated;
+  setDrawerOpen(validated.drawerOpen, { persist: false });
+  const restoredIndex = findNodeIndexFromState(validated);
+  if (restoredIndex >= 0 && nodes[restoredIndex]) {
+    selectTreeNode(restoredIndex, {
+      manual: true,
+      persist: false,
+      restoreView: true,
+    });
+  } else {
+    applyExpandedState(validated.expanded);
+  }
+};
+
+const initializeTreeUi = () => {
+  const panel = document.getElementById("side-panel");
+  if (isEmbeddedTree && panel) panel.setAttribute("role", "dialog");
+  setDrawerOpen(restoredUiState?.drawerOpen, { persist: false });
+
+  document
+    .getElementById("details-trigger")
+    ?.addEventListener("click", () => setDrawerOpen(true, { focus: true }));
+  document
+    .getElementById("drawer-close")
+    ?.addEventListener("click", () => setDrawerOpen(false, { focus: true }));
+  document
+    .getElementById("drawer-scrim")
+    ?.addEventListener("click", () => setDrawerOpen(false));
+  panel?.addEventListener("scroll", () => {
+    scheduleTreeUiPersist();
+    markTreeInteraction();
+  }, { passive: true });
+  panel?.addEventListener("toggle", () => {
+    scheduleTreeUiPersist();
+    markTreeInteraction();
+  }, true);
+  panel?.addEventListener("pointerdown", beginTreeInteraction);
+  panel?.addEventListener("pointerup", () => endTreeInteraction());
+
+  document.addEventListener("keydown", (event) => {
+    const drawerOpen =
+      document.documentElement.dataset.drawerOpen === "true";
+    if (drawerOpen) markTreeInteraction();
+    if (
+      event.key === "Tab" &&
+      drawerOpen &&
+      panel
+    ) {
+      const focusable = Array.from(
+        panel.querySelectorAll(
+          'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.closest("[inert]"));
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (first && last) {
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    }
+    if (
+      event.key === "Escape" &&
+      drawerOpen
+    ) {
+      setDrawerOpen(false, { focus: true });
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) noLoop();
+    else if (animationsSettled()) redraw();
+    else loop();
+  });
+  window.addEventListener("pagehide", () => {
+    persistTreeUiState();
+    postTreeInteraction(false);
+  });
+  window.addEventListener("pointerup", () => endTreeInteraction());
+  window.addEventListener("pointercancel", () => endTreeInteraction());
+
+  if (parentOrigin && window.parent !== window) {
+    window.addEventListener("message", (event) => {
+      if (event.source !== window.parent || event.origin !== parentOrigin) return;
+      const data = event.data;
+      if (
+        data?.type !== "biomaker:tree-state-restore" ||
+        data.key !== treeStateKey() ||
+        data.view_id !== treeViewId
+      ) {
+        return;
+      }
+      restoreTreeUiState(data.state);
+    });
+    window.parent.postMessage(
+      {
+        key: treeStateKey(),
+        type: "biomaker:tree-state-request",
+        version: 1,
+        view_id: treeViewId,
+      },
+      parentOrigin,
+    );
+  }
+};
+
 windowResized = () => {
+  persistTreeUiState();
   resizeCanvas(...updateTargetDims());
   nodes = [];
   edges = [];
-  manualSelection = false;
-  awaitingPostResizeOps = true;
+  treeInitialized = false;
+  globalTime = 0;
+  firstFrameTime = undefined;
+  manualSelection = Boolean(restoredUiState?.selectedKey);
+  loop();
 };
 
 const animEase = (t) => 1 - (1 - Math.min(t, 1.0)) ** 5;
@@ -395,22 +800,35 @@ const scaleFactor = 1.0;
 
 let globalTime = 0;
 let manualSelection = false;
-
-let currentElemInd = 0;
+let selectedTreeIndex = null;
+let restoredUiState = null;
+let treeStatePersistTimer = undefined;
+let treeInteractionTimer = undefined;
+let canvas = null;
 
 let treeStructData = <placeholder>
 
-let lastClick = 0;
 let firstFrameTime = undefined;
 
 let nodes = [];
 let edges = [];
-
-let lastScrollPos = 0;
+let treeInitialized = false;
 
 setup = () => {
   canvas = createCanvas(...updateTargetDims());
+  canvas.attribute(
+    "aria-label",
+    "BioMaker search tree. Use arrow keys to change nodes and Enter to open details.",
+  );
+  canvas.attribute("role", "img");
+  canvas.attribute("tabindex", "0");
+  canvas.elt.addEventListener("keydown", handleTreeKeydown);
+  canvas.elt.addEventListener("pointerdown", beginTreeInteraction);
+  frameRate(60);
+  document.documentElement.dataset.treeReady = "true";
+  restoredUiState = readTreeUiState();
   setRunSummary();
+  initializeTreeUi();
 };
 
 class Node {
@@ -484,12 +902,6 @@ class Node {
       dist(mouseXlocalCoords, mouseYlocalCoords, this.x, this.y) <
       this.renderSize / 1.5;
     if (isMouseOver) cursor(HAND);
-    if (isMouseOver && mouseIsPressed) {
-      nodes.forEach((n) => (n.selected = false));
-      this.selected = true;
-      setNodeDetails(this.treeInd);
-      manualSelection = true;
-    }
 
     this.renderSize = this.size;
     if (!this.isStatic) {
@@ -514,7 +926,7 @@ class Node {
     } else if (status === "bug") {
       fill(bugCol);
     } else {
-      fill(okCol);
+      fill(nodeCol);
     }
     const isBest = (treeStructData.is_best || [])[this.treeInd];
     noStroke();
@@ -681,10 +1093,89 @@ class Edge {
   };
 }
 
+const animationsSettled = () =>
+  treeInitialized &&
+  nodes.every((node) => node.isStatic) &&
+  edges.every((edge) => edge.isStatic);
+
+const finishAnimationsImmediately = () => {
+  nodes.forEach((node) => {
+    node.animationStart = 0;
+    node.animationProgress = 1;
+    node.isStatic = true;
+    node.renderSize = node.size;
+  });
+  edges.forEach((edge) => {
+    edge.animationStart = 0;
+    edge.animationProgress = 1;
+    edge.isStatic = true;
+    edge.animX = edge.nodeB.xT;
+    edge.animY = edge.nodeB.yT;
+  });
+};
+
+const nodeAtPointer = () => {
+  const localX = (mouseX - width / 2) / scaleFactor;
+  const localY = (mouseY - height / 2) / scaleFactor;
+  return [...nodes].reverse().find(
+    (node) =>
+      node.animationProgress > 0 &&
+      dist(localX, localY, node.x, node.y) < node.renderSize / 1.5,
+  );
+};
+
+const handleTreeKeydown = (event) => {
+  const navigation = {
+    ArrowDown: 1,
+    ArrowRight: 1,
+    ArrowUp: -1,
+    ArrowLeft: -1,
+  };
+  if (event.key in navigation || ["Home", "End"].includes(event.key)) {
+    event.preventDefault();
+    if (!nodes.length) return;
+    markTreeInteraction();
+    let nextIndex;
+    if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = nodes.length - 1;
+    else {
+      const current = Number.isInteger(selectedTreeIndex) ? selectedTreeIndex : 0;
+      nextIndex = (current + navigation[event.key] + nodes.length) % nodes.length;
+    }
+    selectTreeNode(nextIndex, { manual: true });
+    redraw();
+    return;
+  }
+  if (["Enter", " "].includes(event.key)) {
+    event.preventDefault();
+    markTreeInteraction();
+    const nextIndex = Number.isInteger(selectedTreeIndex) ? selectedTreeIndex : 0;
+    selectTreeNode(nextIndex, { manual: true, persist: false });
+    if (isEmbeddedTree) setDrawerOpen(true, { focus: true });
+    else scheduleTreeUiPersist();
+    redraw();
+  }
+};
+
+mousePressed = (event) => {
+  if (event?.target !== canvas?.elt) return;
+  const hit = nodeAtPointer();
+  if (!hit) return;
+  selectTreeNode(hit.treeInd, {
+    manual: true,
+    openDrawer: isEmbeddedTree,
+  });
+  redraw();
+  return false;
+};
+
+mouseMoved = (event) => {
+  if (event?.target === canvas?.elt && animationsSettled()) redraw();
+};
+
 draw = () => {
   cursor(ARROW);
-  frameRate(120);
-  if (!firstFrameTime && frameCount <= 1) {
+  if (firstFrameTime === undefined) {
     firstFrameTime = millis();
   }
   // ---- update global animation state ----
@@ -692,39 +1183,53 @@ draw = () => {
     (cos(min((millis() - firstFrameTime) / initialSpeedRampMs, 1.0) * PI) +
       1) /
     2;
-  const initialSpeedScalingEase =
-    (cos(
-      min((millis() - firstFrameTime) / initialSpeedRampMs, 1.0) ** (1 / 2) *
-        PI,
-    ) +
-      1) /
-    2;
   const initAnimationSpeedFactor = 1.0 - 0.4 * initialSpeedScalingEaseIO;
   // update global scaling-aware clock
   globalTime += globalAnimSpeed * initAnimationSpeedFactor * deltaTime;
 
-  if (nodes.length == 0) {
-    const spacingHeight = height * 0.84;
-    const spacingWidth = width * 0.92;
-    treeStructData.layout.forEach((lay, index) => {
+  if (!treeInitialized) {
+    treeInitialized = true;
+    const nodeSafeInset = 28;
+    const toolbarBottom = document
+      .getElementById("tree-toolbar")
+      ?.getBoundingClientRect().bottom;
+    const bottomInset = isEmbeddedTree
+      ? Math.min(nodeSafeInset, height / 2)
+      : height * 0.08;
+    const requestedTopInset = Math.max(
+      nodeSafeInset,
+      (toolbarBottom || 0) + nodeSafeInset,
+    );
+    const topInset = isEmbeddedTree
+      ? Math.min(requestedTopInset, Math.max(0, height - bottomInset))
+      : height * 0.08;
+    const spacingHeight = Math.max(0, height - topInset - bottomInset);
+    const spacingWidth = Math.max(0, width - nodeSafeInset * 2);
+    (treeStructData.layout || []).forEach((lay, index) => {
       new Node(
         spacingWidth * (lay[0] - 0.5),
-        spacingHeight * (lay[1] - 0.5),
-        1 - treeStructData.metrics[index],
+        topInset + spacingHeight * lay[1] - height / 2,
+        1 - ((treeStructData.metrics || [])[index] || 0),
         index,
       );
     });
-    treeStructData.edges.forEach((ind) => {
-      nodes[ind[0]].child(nodes[ind[1]]);
+    (treeStructData.edges || []).forEach((ind) => {
+      if (nodes[ind[0]] && nodes[ind[1]]) nodes[ind[0]].child(nodes[ind[1]]);
     });
     nodes.forEach((n) => {
       if (n.isRootNode) n.startAnimation();
     });
     if (nodes.length > 0) {
-      const initialNode = preferredNode(nodes);
-      initialNode.selected = true;
-      setNodeDetails(initialNode.treeInd);
+      const restoredIndex = findNodeIndexFromState(restoredUiState);
+      const initialNode =
+        (restoredIndex >= 0 && nodes[restoredIndex]) || preferredNode(nodes);
+      selectTreeNode(initialNode.treeInd, {
+        manual: restoredIndex >= 0,
+        persist: false,
+        restoreView: restoredIndex >= 0,
+      });
     }
+    if (prefersReducedMotion) finishAnimationsImmediately();
   }
 
   const staticNodes = nodes.filter(
@@ -733,12 +1238,12 @@ draw = () => {
   if (staticNodes.length > 0) {
     const selectedNode = preferredNode(staticNodes);
     if (!manualSelection) {
-      if (!selectedNode.selected) {
-        setNodeDetails(selectedNode.treeInd);
+      if (selectedTreeIndex !== selectedNode.treeInd) {
+        selectTreeNode(selectedNode.treeInd, {
+          manual: false,
+          persist: false,
+        });
       }
-      staticNodes.forEach((node) => {
-        node.selected = node === selectedNode;
-      });
     }
   }
   background(bgCol);
@@ -750,5 +1255,6 @@ draw = () => {
   // ---- fg render ----
   edges.forEach((e) => e.render());
   nodes.forEach((n) => n.render());
-  
+
+  if (animationsSettled()) noLoop();
 };

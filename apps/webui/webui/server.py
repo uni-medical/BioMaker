@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
-import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,9 +15,14 @@ from fastapi.staticfiles import StaticFiles
 
 from .artifacts import (
     ArtifactError,
+    artifact_collection_revision,
     detailed_run,
+    file_revision,
+    list_artifacts,
+    opaque_revision,
     read_events,
     resolve_artifact,
+    resolve_run_log_dir,
     tail_text,
 )
 from .directory_picker import (
@@ -33,12 +37,13 @@ from .model_discovery import discover_models, normalize_base_url
 from .models import (
     EnvRevealRequest,
     EnvUpdate,
+    ExperimentInput,
     ModelDiscoveryRequest,
-    ProjectInput,
     RunCreate,
 )
-from .registry import JsonRegistry, RegistryError
-from .runner import RunManager, utc_now
+from .run_catalog import list_log_runs
+from .run_store import MemoryRunStore
+from .runner import TERMINAL_STATUSES, RunManager
 from .settings import Settings
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -52,12 +57,9 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _normalized_project(
+def _normalized_experiment(
     settings: Settings,
-    payload: ProjectInput,
-    *,
-    project_id: str,
-    created_at: str,
+    payload: ExperimentInput,
 ) -> dict[str, Any]:
     dataset_path = Path(payload.dataset_path).expanduser()
     if not dataset_path.is_absolute():
@@ -84,16 +86,11 @@ def _normalized_project(
             raise HTTPException(status_code=422, detail="Invalid task template path")
         template_path = str(candidate)
 
-    now = utc_now()
     return {
-        "id": project_id,
-        "name": payload.name,
         "dataset_path": str(dataset_path),
         "task_template_path": template_path,
         "task_body": payload.task_body,
         "advanced_defaults": payload.advanced_defaults.model_dump(),
-        "created_at": created_at,
-        "updated_at": now,
     }
 
 
@@ -152,37 +149,26 @@ def _console_path(settings: Settings, run: dict[str, Any]) -> Path:
     if not raw:
         raise HTTPException(status_code=404, detail="Console log is not available")
     path = Path(str(raw)).resolve()
-    root = (settings.state_dir / "console").resolve()
-    if not _inside(path, root) or path.parent != root:
-        raise HTTPException(status_code=404, detail="Invalid console log path")
-    return path
-
-
-def _model_defaults(values: dict[str, str]) -> dict[str, str]:
-    main_source = (
-        "BIOMAKER_MAIN_MODEL"
-        if values.get("BIOMAKER_MAIN_MODEL")
-        else "OPENAI_MODEL" if values.get("OPENAI_MODEL") else ""
-    )
-    helper_source = (
-        "BIOMAKER_HELPER_MODEL"
-        if values.get("BIOMAKER_HELPER_MODEL")
-        else "OPENAI_HELPER_MODEL" if values.get("OPENAI_HELPER_MODEL") else ""
-    )
-    return {
-        "main_model": values.get(main_source, ""),
-        "helper_model": values.get(helper_source, ""),
-        "main_model_source": main_source,
-        "helper_model_source": helper_source,
-        "openai_model": values.get("OPENAI_MODEL", ""),
-    }
+    state_root = (settings.state_dir / "console").resolve()
+    if _inside(path, state_root) and path.parent == state_root and path.is_file():
+        return path
+    try:
+        log_dir = resolve_run_log_dir(settings, run)
+    except ArtifactError:
+        log_dir = None
+    if (
+        log_dir is not None
+        and _inside(path, log_dir)
+        and path.parent == log_dir
+        and path.is_file()
+    ):
+        return path
+    raise HTTPException(status_code=404, detail="Invalid console log path")
 
 
 def _environment_response(settings: Settings) -> dict[str, Any]:
-    values = read_env_values(settings.env_file)
     return {
         "values": masked_env(settings.env_file),
-        "defaults": _model_defaults(values),
         "source": {
             "path": str(settings.env_file),
             "exists": settings.env_file.is_file(),
@@ -231,8 +217,8 @@ def create_app(
 ) -> FastAPI:
     app_settings = settings or Settings.default()
     app_settings.ensure_directories()
-    registry = JsonRegistry(app_settings.state_dir / "registry.json")
-    manager = RunManager(app_settings, registry, process_factory=process_factory)
+    run_store = MemoryRunStore()
+    manager = RunManager(app_settings, run_store, process_factory=process_factory)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -248,7 +234,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = app_settings
-    app.state.registry = registry
+    app.state.run_store = run_store
     app.state.manager = manager
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -260,10 +246,6 @@ def create_app(
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
-
-    @app.exception_handler(RegistryError)
-    async def registry_error(_: Request, exc: RegistryError):
-        return JSONResponse(status_code=500, content={"detail": str(exc)})
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(_: Request, exc: RequestValidationError):
@@ -332,11 +314,7 @@ def create_app(
             api_key = values.get("OPENAI_API_KEY")
         else:
             api_key = None
-        result = discover_models(base_url, api_key)
-        defaults = _model_defaults(values)
-        result["default_model"] = defaults["main_model"]
-        result["default_model_source"] = defaults["main_model_source"]
-        return result
+        return discover_models(base_url, api_key)
 
     @app.post("/api/directories/select")
     def directory_select(request: Request) -> dict[str, Any]:
@@ -360,108 +338,185 @@ def create_app(
     def datasets() -> list[dict[str, str]]:
         return _datasets(app_settings)
 
-    @app.get("/api/projects")
-    def list_projects() -> list[dict[str, Any]]:
+    def session_run(record: dict[str, Any]) -> dict[str, Any]:
+        result = dict(record)
+        result["source"] = "webui_session"
+        result["read_only"] = False
+        result["status_source"] = "session"
+        snapshot = result.get("project_snapshot") or {}
+        dataset_path = str(snapshot.get("dataset_path") or "")
+        result["dataset_path"] = dataset_path or None
+        result["dataset_name"] = Path(dataset_path).name if dataset_path else None
+        status_value = str(result.get("status") or "unknown")
+        actions = []
+        if status_value == "queued":
+            actions.append("cancel")
+        elif status_value in {"running", "stopping"}:
+            actions.append("stop")
+        elif status_value in TERMINAL_STATUSES:
+            actions.append("requeue")
+        result["allowed_actions"] = actions
+        result["controllable"] = bool(actions)
+        return result
+
+    def all_runs() -> list[dict[str, Any]]:
+        discovered = list_log_runs(app_settings)
+        discovered_by_dir = {
+            str(Path(str(run["log_dir"])).resolve()): run
+            for run in discovered
+            if run.get("log_dir")
+        }
+        merged: list[dict[str, Any]] = []
+        used_log_dirs: set[str] = set()
+        for raw_session in run_store.list_records("runs"):
+            current = session_run(raw_session)
+            raw_log_dir = current.get("log_dir")
+            log_key = str(Path(str(raw_log_dir)).resolve()) if raw_log_dir else None
+            base = discovered_by_dir.get(log_key) if log_key else None
+            if base is not None:
+                combined = {**base, **current}
+                # Once the CLI has created a real log directory, its manifest
+                # and directory name are the canonical experiment metadata.
+                combined["progress"] = base.get("progress")
+                combined["project_snapshot"] = base.get("project_snapshot")
+                combined["dataset_path"] = base.get("dataset_path")
+                combined["dataset_name"] = base.get("dataset_name")
+                combined["actual_exp_name"] = base.get("actual_exp_name")
+                combined["options"] = base.get("options")
+                merged.append(combined)
+                used_log_dirs.add(log_key)
+            else:
+                merged.append(current)
+        merged.extend(
+            run for key, run in discovered_by_dir.items() if key not in used_log_dirs
+        )
         return sorted(
-            registry.list_records("projects"),
-            key=lambda item: item.get("updated_at", ""),
+            merged,
+            key=lambda item: (
+                str(item.get("timestamps", {}).get("created_at") or ""),
+                float(item.get("log_modified_at") or 0.0),
+                str(
+                    item.get("actual_exp_name") or item.get("requested_exp_name") or ""
+                ),
+            ),
             reverse=True,
         )
 
-    @app.get("/api/projects/{project_id}")
-    def get_project(project_id: str) -> dict[str, Any]:
-        project = registry.get_record("projects", project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Project not found")
-        return project
-
-    @app.post("/api/projects", status_code=status.HTTP_201_CREATED)
-    def create_project(payload: ProjectInput) -> dict[str, Any]:
-        now = utc_now()
-        project = _normalized_project(
-            app_settings,
-            payload,
-            project_id=uuid.uuid4().hex[:12],
-            created_at=now,
-        )
-        return registry.add_record("projects", project)
-
-    @app.put("/api/projects/{project_id}")
-    def update_project(project_id: str, payload: ProjectInput) -> dict[str, Any]:
-        existing = registry.get_record("projects", project_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="Project not found")
-        project = _normalized_project(
-            app_settings,
-            payload,
-            project_id=project_id,
-            created_at=existing["created_at"],
-        )
-        return registry.replace_record("projects", project_id, project)
-
-    @app.delete("/api/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-    def delete_project(project_id: str) -> Response:
-        try:
-            registry.delete_record("projects", project_id)
-        except KeyError:
-            raise HTTPException(status_code=404, detail="Project not found") from None
-        return Response(status_code=204)
+    def find_run(run_id: str) -> dict[str, Any] | None:
+        return next((run for run in all_runs() if run.get("id") == run_id), None)
 
     @app.get("/api/runs")
-    def list_runs(project_id: str | None = None) -> list[dict[str, Any]]:
-        runs = registry.list_records("runs")
-        if project_id:
-            runs = [run for run in runs if run.get("project_id") == project_id]
-        return sorted(
-            runs,
-            key=lambda item: item.get("timestamps", {}).get("created_at", ""),
-            reverse=True,
-        )
+    def list_runs() -> list[dict[str, Any]]:
+        return all_runs()
 
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
-        run = registry.get_record("runs", run_id)
+        run = find_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return detailed_run(app_settings, run)
 
-    @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
-    def create_run(payload: RunCreate) -> dict[str, Any]:
-        project = registry.get_record("projects", payload.project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="Project not found")
+    @app.get("/api/runs/{run_id}/updates")
+    def run_updates(run_id: str) -> dict[str, Any]:
+        """Return only the revisions needed to update an open run view.
+
+        A true ``final_barrier`` means the logs-backed record was already
+        terminal before artifact revisions were sampled. Clients can therefore
+        apply this response once before stopping their update scheduler.
+        """
+
+        run = find_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        artifacts = list_artifacts(app_settings, run)
+        artifacts_by_name = {item["name"]: item for item in artifacts}
+        tree = artifacts_by_name.get("tree_plot.html")
+        events = artifacts_by_name.get("events.jsonl")
         try:
-            return manager.enqueue_project(
-                project,
-                requested_exp_name=payload.requested_exp_name,
-                option_patch=payload.options,
+            console_revision = file_revision(_console_path(app_settings, run))
+        except HTTPException:
+            console_revision = None
+
+        run_status = str(run.get("status") or "unknown")
+        terminal = run_status in TERMINAL_STATUSES
+        return {
+            "run_id": run_id,
+            "status": run_status,
+            "terminal": terminal,
+            "final_barrier": terminal,
+            "run_revision": opaque_revision(run),
+            "tree": {
+                "available": tree is not None,
+                "revision": tree.get("revision") if tree else None,
+                "url": tree.get("url") if tree else None,
+            },
+            "events": {
+                "available": events is not None,
+                "revision": events.get("revision") if events else None,
+            },
+            "console": {
+                "available": console_revision is not None,
+                "revision": console_revision,
+            },
+            "artifacts": {
+                "revision": artifact_collection_revision(artifacts),
+            },
+        }
+
+    @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
+    def create_run(request: Request, payload: RunCreate) -> dict[str, Any]:
+        _require_loopback(request)
+        experiment = _normalized_experiment(app_settings, payload.experiment)
+        try:
+            return session_run(
+                manager.enqueue_experiment(
+                    experiment,
+                    requested_exp_name=payload.requested_exp_name,
+                    option_patch=payload.options,
+                )
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/cancel")
-    def cancel_run(run_id: str) -> dict[str, Any]:
+    def cancel_run(request: Request, run_id: str) -> dict[str, Any]:
+        _require_loopback(request)
         try:
             return manager.cancel(run_id)
         except KeyError:
+            if find_run(run_id) is not None:
+                raise HTTPException(
+                    status_code=409, detail="This run is view-only"
+                ) from None
             raise HTTPException(status_code=404, detail="Run not found") from None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/stop", status_code=status.HTTP_202_ACCEPTED)
-    def stop_run(run_id: str) -> dict[str, Any]:
+    def stop_run(request: Request, run_id: str) -> dict[str, Any]:
+        _require_loopback(request)
         try:
             return manager.stop(run_id)
         except KeyError:
+            if find_run(run_id) is not None:
+                raise HTTPException(
+                    status_code=409, detail="This run is view-only"
+                ) from None
             raise HTTPException(status_code=404, detail="Run not found") from None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/requeue", status_code=status.HTTP_202_ACCEPTED)
-    def requeue_run(run_id: str) -> dict[str, Any]:
+    def requeue_run(request: Request, run_id: str) -> dict[str, Any]:
+        _require_loopback(request)
         try:
             return manager.requeue(run_id)
         except KeyError:
+            if find_run(run_id) is not None:
+                raise HTTPException(
+                    status_code=409, detail="This run is view-only"
+                ) from None
             raise HTTPException(status_code=404, detail="Run not found") from None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -470,7 +525,7 @@ def create_app(
     def run_events(
         run_id: str, tail: int = Query(default=200, ge=1, le=2000)
     ) -> dict[str, Any]:
-        run = registry.get_record("runs", run_id)
+        run = find_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return read_events(app_settings, run, tail=tail)
@@ -479,14 +534,14 @@ def create_app(
     def run_log(
         run_id: str, tail: int = Query(default=400, ge=1, le=10_000)
     ) -> PlainTextResponse:
-        run = registry.get_record("runs", run_id)
+        run = find_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return PlainTextResponse(tail_text(_console_path(app_settings, run), tail))
 
     @app.get("/artifacts/runs/{run_id}/tree_plot.html", include_in_schema=False)
     def tree_plot(run_id: str) -> FileResponse:
-        run = registry.get_record("runs", run_id)
+        run = find_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         try:
@@ -499,7 +554,7 @@ def create_app(
 
     @app.get("/artifacts/runs/{run_id}/{artifact_name}", include_in_schema=False)
     def artifact(run_id: str, artifact_name: str) -> FileResponse:
-        run = registry.get_record("runs", run_id)
+        run = find_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         try:

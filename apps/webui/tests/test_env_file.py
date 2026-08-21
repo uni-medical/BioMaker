@@ -9,7 +9,7 @@ from pathlib import Path
 from webui.env_file import (
     mask_value,
     masked_env,
-    read_managed_values,
+    read_env_values,
     resolve_env_file,
     subprocess_environment,
     update_env_file,
@@ -23,14 +23,14 @@ def test_env_file_resolution_is_independent_of_cwd(tmp_path, monkeypatch):
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
     monkeypatch.delenv("BIOMAKER_ENV_FILE", raising=False)
-    monkeypatch.delenv("BIOMAKER_WEBUI_ENV_FILE", raising=False)
 
     assert resolve_env_file(method_root) == (method_root / ".env").resolve()
 
     monkeypatch.setenv("BIOMAKER_ENV_FILE", "secrets/provider.env")
-    assert resolve_env_file(method_root) == (
-        method_root / "secrets" / "provider.env"
-    ).resolve()
+    assert (
+        resolve_env_file(method_root)
+        == (method_root / "secrets" / "provider.env").resolve()
+    )
 
 
 def test_env_update_preserves_unmanaged_lines_and_never_returns_secret(tmp_path):
@@ -54,7 +54,7 @@ def test_env_update_preserves_unmanaged_lines_and_never_returns_secret(tmp_path)
     )
 
     rendered = path.read_text(encoding="utf-8")
-    values = read_managed_values(path)
+    values = read_env_values(path)
     masked = masked_env(path)
     assert "# local settings" in rendered
     assert "UNRELATED=value" in rendered
@@ -95,31 +95,22 @@ def test_secret_mask_hides_unknown_prefix_suffix_and_total_length():
 def test_model_settings_are_editable_and_loaded_into_subprocess(tmp_path, monkeypatch):
     path = tmp_path / ".env"
     path.write_text(
-        "BIOMAKER_MAIN_MODEL=main-from-file\n"
-        "BIOMAKER_HELPER_MODEL=helper-from-file\n"
-        "OPENAI_MODEL=fallback-from-file\n",
+        "BIOMAKER_MAIN_MODEL=main-from-file\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("BIOMAKER_MAIN_MODEL", "inherited-main")
-    monkeypatch.setenv("OPENAI_MODEL", "inherited-fallback")
 
     update_env_file(
         path,
-        {
-            "BIOMAKER_MAIN_MODEL": "selected-model",
-            "BIOMAKER_HELPER_MODEL": "selected-model",
-        },
+        {"BIOMAKER_MAIN_MODEL": "selected-model"},
     )
 
     environment = subprocess_environment(path)
     assert environment["BIOMAKER_MAIN_MODEL"] == "selected-model"
-    assert environment["BIOMAKER_HELPER_MODEL"] == "selected-model"
-    assert environment["OPENAI_MODEL"] == "fallback-from-file"
 
     empty_path = tmp_path / "missing.env"
     inherited_environment = subprocess_environment(empty_path)
     assert inherited_environment["BIOMAKER_MAIN_MODEL"] == "inherited-main"
-    assert inherited_environment["OPENAI_MODEL"] == "inherited-fallback"
 
 
 def test_new_env_file_uses_private_permissions():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -15,12 +16,18 @@ from pathlib import Path
 from threading import Event, RLock, Thread
 from typing import Any
 
-from .env_file import subprocess_environment
+from .env_file import read_env_values, subprocess_environment
 from .models import AdvancedOptions, AdvancedOptionsPatch
-from .registry import JsonRegistry
+from .run_store import MemoryRunStore
 from .settings import Settings
 
-TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "stopped", "interrupted"}
+TERMINAL_STATUSES = {
+    "succeeded",
+    "failed",
+    "cancelled",
+    "stopped",
+    "interrupted",
+}
 ACTIVE_STATUSES = {"queued", "running", "stopping"}
 EXPERIMENT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -28,11 +35,6 @@ ANSI_ESCAPE_PATTERN = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def slugify(value: str, fallback: str = "run") -> str:
-    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._")
-    return (value or fallback)[:48]
 
 
 def validate_experiment_name(value: str) -> str:
@@ -60,15 +62,24 @@ def merge_options(
     return AdvancedOptions.model_validate(options).model_dump()
 
 
+def resolve_run_options(settings: Settings, options: dict[str, Any]) -> dict[str, Any]:
+    resolved = AdvancedOptions.model_validate(options).model_dump()
+    if resolved["model_for_all_agents"]:
+        return resolved
+    configured_models = read_env_values(settings.env_file, ("BIOMAKER_MAIN_MODEL",))
+    resolved["model_for_all_agents"] = configured_models.get("BIOMAKER_MAIN_MODEL")
+    return resolved
+
+
 def build_command(
     settings: Settings,
     *,
     dataset_path: str,
     task_file: Path,
-    requested_exp_name: str,
+    requested_exp_name: str | None,
     options: dict[str, Any],
 ) -> list[str]:
-    validated = AdvancedOptions.model_validate(options)
+    validated = AdvancedOptions.model_validate(resolve_run_options(settings, options))
     command = [
         settings.uv_executable,
         "run",
@@ -77,13 +88,18 @@ def build_command(
         f"desc_file={task_file}",
         f"log_dir={settings.logs_root}",
         f"workspace_dir={settings.workspaces_root}",
-        f"exp_name={validate_experiment_name(requested_exp_name)}",
-        f"agent.steps={validated.agent_steps}",
-        f"exec.timeout={validated.exec_timeout}",
-        f"exec.parallel_workers={validated.exec_parallel_workers}",
-        f"agent.total_time_limit={validated.agent_total_time_limit}",
-        f"final_retrain.enabled={str(validated.final_retrain_enabled).lower()}",
     ]
+    if requested_exp_name:
+        command.append(f"exp_name={validate_experiment_name(requested_exp_name)}")
+    command.extend(
+        [
+            f"agent.steps={validated.agent_steps}",
+            f"exec.timeout={validated.exec_timeout}",
+            f"exec.parallel_workers={validated.exec_parallel_workers}",
+            f"agent.total_time_limit={validated.agent_total_time_limit}",
+            f"final_retrain.enabled={str(validated.final_retrain_enabled).lower()}",
+        ]
+    )
     if validated.model_for_all_agents:
         command.append(f"model_for_all_agents={validated.model_for_all_agents}")
     return command
@@ -111,12 +127,12 @@ class RunManager:
     def __init__(
         self,
         settings: Settings,
-        registry: JsonRegistry,
+        store: MemoryRunStore,
         *,
         process_factory: Callable[..., Any] | None = None,
     ):
         self.settings = settings
-        self.registry = registry
+        self.store = store
         self.process_factory = process_factory or subprocess.Popen
         self._queue: queue.Queue[str] = queue.Queue()
         self._shutdown = Event()
@@ -131,7 +147,7 @@ class RunManager:
             if self._worker and self._worker.is_alive():
                 return
             self.settings.ensure_directories()
-            self.recover_incomplete_runs()
+            self.recover_active_runs()
             self._shutdown.clear()
             self._worker = Thread(
                 target=self._worker_loop, name="biomaker-webui-runner", daemon=True
@@ -150,9 +166,9 @@ class RunManager:
         worker = self._worker
         if worker is not None:
             worker.join(timeout=self.settings.stop_grace_seconds + 3)
-        self.recover_incomplete_runs(reason="WebUI stopped before the run completed")
+        self.recover_active_runs(reason="WebUI stopped before the run completed")
 
-    def recover_incomplete_runs(
+    def recover_active_runs(
         self, reason: str = "WebUI restarted before the run completed"
     ) -> int:
         now = utc_now()
@@ -171,25 +187,23 @@ class RunManager:
                 count += 1
             return count
 
-        _, count = self.registry.mutate(recover)
+        _, count = self.store.mutate(recover)
         return count
 
-    def enqueue_project(
+    def enqueue_experiment(
         self,
-        project: dict[str, Any],
+        experiment: dict[str, Any],
         *,
         requested_exp_name: str | None = None,
         option_patch: AdvancedOptionsPatch | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         snapshot = {
-            "project_name": project["name"],
-            "dataset_path": project["dataset_path"],
-            "task_template_path": project.get("task_template_path"),
-            "task_body": project["task_body"],
+            "dataset_path": experiment["dataset_path"],
+            "task_template_path": experiment.get("task_template_path"),
+            "task_body": experiment["task_body"],
         }
-        options = merge_options(project.get("advanced_defaults"), option_patch)
+        options = merge_options(experiment.get("advanced_defaults"), option_patch)
         return self._enqueue_snapshot(
-            project_id=project["id"],
             snapshot=snapshot,
             options=options,
             requested_exp_name=requested_exp_name,
@@ -198,7 +212,6 @@ class RunManager:
     def _enqueue_snapshot(
         self,
         *,
-        project_id: str,
         snapshot: dict[str, Any],
         options: dict[str, Any],
         requested_exp_name: str | None,
@@ -211,16 +224,13 @@ class RunManager:
             raise ValueError("Task body must not be blank")
 
         run_id = uuid.uuid4().hex
-        if requested_exp_name:
-            exp_name = validate_experiment_name(requested_exp_name)
-        else:
-            timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            exp_name = validate_experiment_name(
-                f"webui-{slugify(str(snapshot['project_name']))}-{timestamp}-{run_id[:6]}"
-            )
+        exp_name = (
+            validate_experiment_name(requested_exp_name) if requested_exp_name else None
+        )
         task_file = (self.settings.state_dir / "tasks" / f"{run_id}.md").resolve()
         console_log = (self.settings.state_dir / "console" / f"{run_id}.log").resolve()
         _atomic_write_text(task_file, task_body)
+        options = resolve_run_options(self.settings, options)
         command = build_command(
             self.settings,
             dataset_path=str(dataset_path),
@@ -231,7 +241,6 @@ class RunManager:
         now = utc_now()
         record = {
             "id": run_id,
-            "project_id": project_id,
             "project_snapshot": {**snapshot, "dataset_path": str(dataset_path)},
             "status": "queued",
             "requested_exp_name": exp_name,
@@ -253,7 +262,7 @@ class RunManager:
                 "updated_at": now,
             },
         }
-        self.registry.add_record("runs", record)
+        self.store.add_record("runs", record)
         self._queue.put(run_id)
         return record
 
@@ -267,7 +276,7 @@ class RunManager:
             record["timestamps"]["finished_at"] = now
             record["timestamps"]["updated_at"] = now
 
-        return self.registry.update_record("runs", run_id, cancel_record)
+        return self.store.update_record("runs", run_id, cancel_record)
 
     def stop(self, run_id: str) -> dict[str, Any]:
         now = utc_now()
@@ -279,7 +288,7 @@ class RunManager:
             record["timestamps"]["stop_requested_at"] = now
             record["timestamps"]["updated_at"] = now
 
-        record = self.registry.update_record("runs", run_id, request_stop)
+        record = self.store.update_record("runs", run_id, request_stop)
         with self._lock:
             self._stop_requested.add(run_id)
             process = self._current_process if self._current_run_id == run_id else None
@@ -288,24 +297,25 @@ class RunManager:
         return record
 
     def requeue(self, run_id: str) -> dict[str, Any]:
-        source = self.registry.get_record("runs", run_id)
+        source = self.store.get_record("runs", run_id)
         if source is None:
             raise KeyError(run_id)
         if source.get("status") not in TERMINAL_STATUSES:
             raise ValueError("Only completed runs can be requeued")
-        retry_name = (
-            f"{str(source['requested_exp_name'])[:62].rstrip('-._')}"
-            f"-retry-{uuid.uuid4().hex[:5]}"
-        )
+        retry_name = source.get("requested_exp_name")
+        if not retry_name:
+            _, separator, suffix = str(source.get("actual_exp_name") or "").partition(
+                "-"
+            )
+            retry_name = suffix if separator else None
         return self._enqueue_snapshot(
-            project_id=source["project_id"],
             snapshot=source["project_snapshot"],
             options=source["options"],
             requested_exp_name=retry_name,
         )
 
     def summary(self) -> dict[str, Any]:
-        records = self.registry.list_records("runs")
+        records = self.store.list_records("runs")
         with self._lock:
             current = self._current_run_id
         return {
@@ -323,12 +333,12 @@ class RunManager:
             except queue.Empty:
                 continue
             try:
-                record = self.registry.get_record("runs", run_id)
+                record = self.store.get_record("runs", run_id)
                 if record and record.get("status") == "queued":
                     try:
                         self._execute_run(record)
                     # This is the queue's supervision boundary: every unexpected
-                    # child failure must become a persisted terminal state.
+                    # child failure must become a terminal state for this session.
                     except Exception as exc:  # noqa: BLE001
                         self._append_console_error(record, exc)
                         self._finish_run(run_id, "failed", None, str(exc))
@@ -343,11 +353,7 @@ class RunManager:
     def _execute_run(self, record: dict[str, Any]) -> None:
         run_id = record["id"]
         started_at = utc_now()
-        started_epoch = time.time()
-        baseline = {
-            path.name for path in self.settings.logs_root.iterdir() if path.is_dir()
-        }
-        record = self.registry.update_record(
+        record = self.store.update_record(
             "runs",
             run_id,
             {
@@ -373,7 +379,10 @@ class RunManager:
                     "encoding": "utf-8",
                     "errors": "replace",
                     "bufsize": 1,
-                    "env": subprocess_environment(self.settings.env_file),
+                    "env": {
+                        **subprocess_environment(self.settings.env_file),
+                        "BIOMAKER_LAUNCH_TOKEN": run_id,
+                    },
                 }
                 if os.name == "posix":
                     kwargs["start_new_session"] = True
@@ -386,7 +395,7 @@ class RunManager:
             with self._lock:
                 self._current_run_id = run_id
                 self._current_process = process
-            self.registry.update_record(
+            self.store.update_record(
                 "runs", run_id, {"pid": getattr(process, "pid", None)}
             )
             reader = Thread(
@@ -403,9 +412,7 @@ class RunManager:
             shutdown_termination_started = False
             while process.poll() is None:
                 if not discovered:
-                    discovered = self._discover_output_dir(
-                        run_id, record["requested_exp_name"], baseline, started_epoch
-                    )
+                    discovered = self._discover_output_dir(run_id)
                 if self._shutdown.is_set():
                     if not shutdown_termination_started:
                         shutdown_termination_started = True
@@ -416,13 +423,11 @@ class RunManager:
             return_code = process.wait()
             reader.join(timeout=2)
             if not discovered:
-                self._discover_output_dir(
-                    run_id, record["requested_exp_name"], baseline, started_epoch
-                )
+                self._discover_output_dir(run_id)
             console.write(f"\n[BioMaker exited with code {return_code}]\n")
             console.flush()
 
-        current = self.registry.get_record("runs", run_id) or record
+        current = self.store.get_record("runs", run_id) or record
         if self._shutdown.is_set():
             status = "interrupted"
             error = "WebUI stopped before the run completed"
@@ -459,7 +464,7 @@ class RunManager:
                 stream.close()
             except (OSError, ValueError):
                 # The child may close its pipe while the reader is unwinding.
-                return
+                pass
 
     @staticmethod
     def _append_console_error(record: dict[str, Any], exc: Exception) -> None:
@@ -475,32 +480,39 @@ class RunManager:
     def _discover_output_dir(
         self,
         run_id: str,
-        requested_exp_name: str,
-        baseline: set[str],
-        started_epoch: float,
     ) -> bool:
         candidates: list[Path] = []
         try:
-            for path in self.settings.logs_root.iterdir():
-                if not path.is_dir():
-                    continue
-                _, separator, suffix = path.name.partition("-")
-                if (
-                    separator
-                    and suffix == requested_exp_name
-                    and (
-                        path.name not in baseline
-                        or path.stat().st_mtime >= started_epoch - 2
-                    )
-                ):
-                    candidates.append(path)
+            paths = list(self.settings.logs_root.iterdir())
         except OSError:
             return False
+        for path in paths:
+            try:
+                if path.is_symlink() or not path.is_dir():
+                    continue
+                manifest_path = path / "run_manifest.json"
+                if (
+                    manifest_path.is_symlink()
+                    or not manifest_path.is_file()
+                    or manifest_path.stat().st_size > 5_000_000
+                ):
+                    continue
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(manifest, dict)
+                    and manifest.get("launch_token") == run_id
+                ):
+                    candidates.append(path)
+            except (OSError, json.JSONDecodeError):
+                continue
         if not candidates:
             return False
-        log_dir = max(candidates, key=lambda path: path.stat().st_mtime).resolve()
+        try:
+            log_dir = max(candidates, key=lambda path: path.stat().st_mtime).resolve()
+        except OSError:
+            return False
         actual_name = log_dir.name
-        self.registry.update_record(
+        self.store.update_record(
             "runs",
             run_id,
             {
@@ -510,7 +522,7 @@ class RunManager:
                     (self.settings.workspaces_root / actual_name).resolve()
                 ),
                 "timestamps": {
-                    **(self.registry.get_record("runs", run_id) or {}).get(
+                    **(self.store.get_record("runs", run_id) or {}).get(
                         "timestamps", {}
                     ),
                     "updated_at": utc_now(),
@@ -537,7 +549,7 @@ class RunManager:
             record["timestamps"]["updated_at"] = now
 
         try:
-            self.registry.update_record("runs", run_id, finish)
+            self.store.update_record("runs", run_id, finish)
         except KeyError:
             pass
 

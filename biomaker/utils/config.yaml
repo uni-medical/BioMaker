@@ -60,23 +60,23 @@ agent:
     max_debug_depth: 2
     topk_improve: 3
 
-  # LLM settings for coding. Null means read BIOMAKER_MAIN_MODEL / OPENAI_MODEL from .env.
+  # LLM settings for coding. Override per run with model_for_all_agents if needed.
   code:
-    model: null
+    model: deepseek-v4-flash
     temp: 0.7
 
-  # LLM settings for knowledge base / simple helper work. Null means read BIOMAKER_HELPER_MODEL from .env.
+  # LLM settings for knowledge base / simple helper work.
   knowledge_base:
-    model: null
+    model: deepseek-v4-flash
     temp: 0.0
     # Retrieval backend for the local MONAI documentation index: embedding or keyword.
     retrieval_mode: ${oc.env:BIOMAKER_RAG_MODE,keyword}
     embedding_model: ${oc.env:BIOMAKER_EMBEDDING_MODEL,text-embedding-3-large}
     topk: ${oc.decode:${oc.env:BIOMAKER_RAG_TOPK,5}}
 
-  # LLM settings for evaluating program output / tracebacks. Null means read BIOMAKER_MAIN_MODEL from .env.
+  # LLM settings for evaluating program output / tracebacks.
   feedback:
-    model: null
+    model: deepseek-v4-flash
     temp: 0.0
 
 # settings for code execution
@@ -94,7 +94,7 @@ exec:
 # LLM settings for final report from journal
 generate_report: True
 report:
-  model: null
+  model: deepseek-v4-flash
   temp: 1.0
   
 log_level: INFO

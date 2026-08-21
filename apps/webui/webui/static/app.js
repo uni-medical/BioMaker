@@ -1,7 +1,6 @@
 "use strict";
 
 const PREFERRED_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
-const PREFERRED_MODEL = PREFERRED_MODELS[0];
 const MAX_MODEL_SUGGESTIONS = 8;
 let secretReadGeneration = 0;
 let modelDiscoveryGeneration = 0;
@@ -22,21 +21,58 @@ const SECRET_FIELDS = {
 };
 
 const state = {
-  projects: [],
   runs: [],
   datasets: [],
   models: [],
   env: {},
-  envDefaults: {},
-  selectedProjectId: null,
+  envSource: {},
   selectedRunId: null,
   selectedRun: null,
   activeTab: "events",
+  mobileView: "setup",
   dirty: false,
   polling: false,
-  treeRunId: null,
-  lastTreeRefresh: 0,
+  pollQueued: false,
+  pollTimer: null,
+  pollFailures: 0,
+  pollStopped: false,
+  updateSnapshot: null,
+  resources: null,
+  treeLoadToken: 0,
+  treeLoadCancel: null,
+  treeViewState: {},
+  treeViewId: null,
+  treeInteracting: false,
 };
+
+const refreshPolicy = window.BioMakerRefreshPolicy || {
+  isActive: (status) => ["queued", "running", "stopping"].includes(status),
+  isTerminal,
+  pollDelay: ({ hidden, hasActive, failures }) => {
+    if (hidden) return null;
+    if (failures) return Math.min(30000, 2000 * (2 ** (failures - 1)));
+    return hasActive ? 3000 : 30000;
+  },
+  treeDecision: ({ available, revision, loadedRevision, loadingRevision, autoUpdate, force }) => {
+    if (!available || !revision) return "unavailable";
+    if (force) return "load";
+    if (revision === loadedRevision || revision === loadingRevision) return "current";
+    return autoUpdate ? "load" : "pending";
+  },
+};
+
+function emptyResourceState() {
+  return {
+    runRevision: null,
+    artifactsRevision: null,
+    finalBarrier: null,
+    tree: { loaded: null, loading: null, pending: null },
+    events: { loaded: null, loading: null },
+    console: { loaded: null, loading: null },
+  };
+}
+
+state.resources = emptyResourceState();
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -96,6 +132,10 @@ async function api(path, options = {}) {
     : response.text();
 }
 
+function runApiPath(runId, suffix = "") {
+  return `/api/runs/${encodeURIComponent(String(runId))}${suffix}`;
+}
+
 function toast(message, kind = "info") {
   const element = document.createElement("div");
   element.className = `toast ${kind}`;
@@ -130,20 +170,8 @@ function formatEventName(value) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function projectById(projectId) {
-  return state.projects.find((project) => project.id === projectId) || null;
-}
-
 function runById(runId) {
   return state.runs.find((run) => run.id === runId) || null;
-}
-
-function runsForProject(projectId) {
-  return state.runs.filter((run) => run.project_id === projectId);
-}
-
-function latestRunForProject(projectId) {
-  return runsForProject(projectId)[0] || null;
 }
 
 function autoTaskName(datasetPath, goal) {
@@ -156,11 +184,96 @@ function autoTaskName(datasetPath, goal) {
     return firstSentence.length > 64 ? `${firstSentence.slice(0, 61).trimEnd()}...` : firstSentence;
   }
   const dataset = String(datasetPath || "").split(/[\\/]/).filter(Boolean).at(-1);
-  return dataset || "New task";
+  return dataset || "New experiment";
 }
 
 function isTerminal(status) {
   return ["succeeded", "failed", "cancelled", "stopped", "interrupted"].includes(status);
+}
+
+function formatDuration(startValue, endValue = Date.now()) {
+  const start = new Date(startValue || 0).getTime();
+  const end = new Date(endValue || Date.now()).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start <= 0 || end < start) return "";
+  const totalSeconds = Math.max(0, Math.round((end - start) / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `${minutes}m ${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function executionLabel(status) {
+  return {
+    queued: "Queued",
+    running: "Running",
+    stopping: "Stopping",
+    succeeded: "Process completed",
+    failed: "Process failed",
+    cancelled: "Cancelled",
+    stopped: "Stopped",
+    interrupted: "Interrupted",
+  }[status] || String(status || "Unknown");
+}
+
+function resultPresentation(run) {
+  const results = run?.observed?.results || {};
+  const latest = results.latest || {};
+  if (results.best_metric != null && Number.isFinite(Number(results.best_metric))) {
+    return { text: `Best: ${Number(results.best_metric).toFixed(4)}`, kind: "good" };
+  }
+  const outcome = String(latest.outcome || "").trim().toLowerCase();
+  if (outcome) {
+    const outcomeKinds = {
+      bug: "bad",
+      error: "bad",
+      failed: "bad",
+      failure: "bad",
+      invalid: "bad",
+      regressed_parent: "warning",
+      first_success: "good",
+      new_best: "good",
+      improved_parent: "good",
+      better: "good",
+      matched_best: "neutral",
+      valid_non_improving: "neutral",
+    };
+    return {
+      text: `Result: ${formatEventName(outcome)}`,
+      kind: outcomeKinds[outcome] || "neutral",
+    };
+  }
+  if (isTerminal(run?.status)) {
+    return { text: "No valid result", kind: run.status === "succeeded" ? "warning" : "neutral" };
+  }
+  return null;
+}
+
+function revisionKey(snapshot) {
+  if (!snapshot) return null;
+  return [
+    snapshot.run_revision,
+    snapshot.tree?.revision,
+    snapshot.events?.revision,
+    snapshot.console?.revision,
+    snapshot.artifacts?.revision,
+  ].join(":");
+}
+
+function resetSelectedResources() {
+  if (state.treeLoadCancel) state.treeLoadCancel();
+  state.treeLoadCancel = null;
+  state.treeInteracting = false;
+  state.treeViewId = null;
+  state.resources = emptyResourceState();
+  state.updateSnapshot = null;
+  state.treeLoadToken += 1;
+  const frame = $("#tree-frame");
+  if (frame) {
+    frame.onload = null;
+    frame.onerror = null;
+  }
 }
 
 function renderDatasetOptions() {
@@ -170,30 +283,138 @@ function renderDatasetOptions() {
     .join("");
 }
 
+function runDatasetPath(run) {
+  return String(run?.dataset_path || run?.project_snapshot?.dataset_path || "").trim();
+}
+
+function runLogDirectoryName(run) {
+  const rawLogDir = String(run?.log_dir || "").replace(/[\\/]+$/, "");
+  if (rawLogDir) return rawLogDir.split(/[\\/]/).filter(Boolean).at(-1) || rawLogDir;
+  return run?.actual_exp_name || run?.requested_exp_name || run?.id || "";
+}
+
+function runConfiguredModel(run) {
+  return run?.options?.model_for_all_agents || run?.options?.main_model || "";
+}
+
+function runSetupSignature(run) {
+  if (!run) return "";
+  const snapshot = run.project_snapshot || {};
+  const options = run.options || {};
+  return JSON.stringify([
+    Boolean(run.log_dir),
+    run.log_dir ? runLogDirectoryName(run) : (run.actual_exp_name || run.requested_exp_name || ""),
+    run.dataset_path || snapshot.dataset_path || "",
+    snapshot.task_template_path || "",
+    snapshot.task_body || "",
+    runConfiguredModel(run) || null,
+    options.agent_steps ?? null,
+    options.exec_timeout ?? null,
+    options.exec_parallel_workers ?? null,
+    options.agent_total_time_limit ?? null,
+    options.final_retrain_enabled ?? null,
+  ]);
+}
+
+function groupedRunsByDataset() {
+  const groups = new Map();
+  for (const run of state.runs) {
+    // The navigation is a view of logs/, so do not invent a temporary label
+    // before the CLI has created the real log directory.
+    if (!run?.log_dir) continue;
+    const datasetPath = runDatasetPath(run);
+    if (!datasetPath) continue;
+    const datasetName = datasetPath.split(/[\\/]/).filter(Boolean).at(-1);
+    if (!datasetName) continue;
+    if (!groups.has(datasetName)) groups.set(datasetName, { datasetPath, datasetName, runs: [] });
+    groups.get(datasetName).runs.push(run);
+  }
+  return Array.from(groups.values()).sort((left, right) =>
+    left.datasetName.localeCompare(right.datasetName, undefined, { sensitivity: "base" }),
+  );
+}
+
 function renderProjects() {
   const list = $("#project-list");
-  if (!state.projects.length) {
-    list.innerHTML = emptyStateMarkup("folder-plus", "No tasks");
+  const groups = groupedRunsByDataset();
+  if (!groups.length) {
+    list.innerHTML = emptyStateMarkup("folder-plus", "No experiments");
     refreshIcons();
     return;
   }
-  list.innerHTML = state.projects
-    .map((project) => {
-      const dataset = project.dataset_path.split(/[\\/]/).filter(Boolean).at(-1) || project.dataset_path;
-      const latestRun = latestRunForProject(project.id);
-      return `
-        <button class="nav-item ${project.id === state.selectedProjectId ? "active" : ""}" type="button" data-project-id="${escapeHtml(project.id)}">
-          <span class="nav-item-main">
-            <span class="nav-item-title">${escapeHtml(project.name)}</span>
-            <span class="nav-item-meta">${escapeHtml(dataset)}</span>
-          </span>
-          ${latestRun ? `<span class="status-dot ${escapeHtml(latestRun.status)}" title="${escapeHtml(latestRun.status)}" role="img" aria-label="Latest run: ${escapeHtml(latestRun.status)}"></span>` : ""}
-        </button>`;
-    })
-    .join("");
-  list.querySelectorAll("[data-project-id]").forEach((button) => {
-    button.addEventListener("click", () => selectProject(button.dataset.projectId).catch(showError));
-  });
+  if (list.querySelector(".empty-state")) list.textContent = "";
+  const existingGroups = new Map(
+    Array.from(list.querySelectorAll("[data-dataset-name]")).map((group) => [group.dataset.datasetName, group]),
+  );
+  const keepGroups = new Set();
+  for (const group of groups) {
+    let details = existingGroups.get(group.datasetName);
+    if (!details) {
+      details = document.createElement("details");
+      details.className = "dataset-group";
+      details.dataset.datasetName = group.datasetName;
+      details.open = true;
+
+      const summary = document.createElement("summary");
+      summary.className = "dataset-group-summary";
+      summary.title = group.datasetPath;
+      const icon = document.createElement("i");
+      icon.setAttribute("data-lucide", "folder");
+      icon.setAttribute("aria-hidden", "true");
+      const name = document.createElement("span");
+      name.className = "dataset-folder-name";
+      summary.append(icon, name);
+      const runList = document.createElement("div");
+      runList.className = "dataset-run-list";
+      details.append(summary, runList);
+    }
+    keepGroups.add(group.datasetName);
+    details.querySelector(".dataset-folder-name").textContent = group.datasetName;
+    if (group.runs.some((run) => run.id === state.selectedRunId)) details.open = true;
+
+    const runList = details.querySelector(".dataset-run-list");
+    const existingRuns = new Map(
+      Array.from(runList.querySelectorAll("[data-run-id]")).map((button) => [button.dataset.runId, button]),
+    );
+    const keepRuns = new Set();
+    for (const run of group.runs) {
+      let button = existingRuns.get(run.id);
+      if (!button) {
+        button = document.createElement("button");
+        button.className = "nav-item run-nav-item";
+        button.type = "button";
+        button.dataset.runId = run.id;
+        const title = document.createElement("span");
+        title.className = "run-log-name";
+        button.append(title);
+        button.addEventListener("click", () => selectRun(button.dataset.runId).catch(showError));
+      }
+      keepRuns.add(run.id);
+      const logName = runLogDirectoryName(run);
+      button.querySelector(".run-log-name").textContent = logName;
+      button.title = logName;
+      button.classList.toggle("active", run.id === state.selectedRunId);
+      button.setAttribute("aria-current", run.id === state.selectedRunId ? "true" : "false");
+      let dot = button.querySelector(".status-dot");
+      if (!dot) {
+        dot = document.createElement("span");
+        dot.className = "status-dot";
+        dot.setAttribute("role", "img");
+        button.append(dot);
+      }
+      dot.className = `status-dot ${run.status}`;
+      dot.title = executionLabel(run.status);
+      dot.setAttribute("aria-label", `Status: ${executionLabel(run.status)}`);
+      runList.append(button);
+    }
+    for (const [runId, button] of existingRuns) {
+      if (!keepRuns.has(runId)) button.remove();
+    }
+    list.append(details);
+  }
+  for (const [datasetName, group] of existingGroups) {
+    if (!keepGroups.has(datasetName)) group.remove();
+  }
   refreshIcons();
 }
 
@@ -214,17 +435,8 @@ function renderRuns() {
 function renderRunHistory() {
   const select = $("#run-history-select");
   const title = $("#selected-run-name");
-  const runs = state.selectedProjectId ? runsForProject(state.selectedProjectId) : [];
-  select.innerHTML = runs
-    .map((run) => {
-      const name = run.actual_exp_name || run.requested_exp_name;
-      const label = `${name} · ${formatDate(run.timestamps?.created_at, true)}`;
-      return `<option value="${escapeHtml(run.id)}" ${run.id === state.selectedRunId ? "selected" : ""}>${escapeHtml(label)}</option>`;
-    })
-    .join("");
-  const hasHistory = runs.length > 1;
-  select.hidden = !hasHistory;
-  title.hidden = hasHistory || !state.selectedRun;
+  select.hidden = true;
+  title.hidden = !state.selectedRun;
 }
 
 function emptyProject() {
@@ -237,147 +449,180 @@ function emptyProject() {
   };
 }
 
+function setProjectFormReadOnly(readOnly) {
+  const form = $("#project-form");
+  form.classList.toggle("run-snapshot", readOnly);
+  form.setAttribute("aria-readonly", String(readOnly));
+  form.querySelectorAll('input:not([type="hidden"]), textarea').forEach((field) => {
+    if (field.type === "checkbox") field.disabled = readOnly;
+    else field.readOnly = readOnly;
+  });
+  $("#browse-datasets-button").disabled = readOnly;
+  $("#refresh-task-models-button").disabled = readOnly;
+}
+
 function populateProjectForm(project) {
   const value = project || emptyProject();
   const options = { ...DEFAULT_OPTIONS, ...(value.advanced_defaults || {}) };
+  setProjectFormReadOnly(false);
   $("#project-name").value = value.name || "";
   $("#dataset-path").value = value.dataset_path || "";
   $("#task-template").value = value.task_template_path || "";
   $("#task-body").value = value.task_body || "";
+  $("#task-model").value = options.model_for_all_agents || "";
   $("#agent-steps").value = options.agent_steps;
   $("#exec-timeout").value = options.exec_timeout;
   $("#parallel-workers").value = options.exec_parallel_workers;
   $("#total-time-limit").value = options.agent_total_time_limit;
   $("#final-retrain").checked = options.final_retrain_enabled;
-  $("#editor-title").textContent = project?.name || "New task";
-  $("#delete-project-button").hidden = true;
+  $("#run-name-label").textContent = "Run name";
+  $("#run-name-optional").hidden = false;
+  $("#task-model-label").textContent = "Model override";
+  $("#task-model-status").textContent = "Leave blank to use the Settings default, then the repository default.";
+  $("#editor-title").textContent = project?.name || "New experiment";
+  $("#project-form-status").hidden = true;
   state.dirty = false;
+  renderEditorState();
+}
+
+function populateRunForm(run) {
+  if (!run) return;
+  const snapshot = run.project_snapshot || {};
+  const options = run.options || {};
+  const name = run.log_dir
+    ? runLogDirectoryName(run)
+    : (run.actual_exp_name || run.requested_exp_name || "");
+  setProjectFormReadOnly(true);
+  $("#project-name").value = name;
+  $("#dataset-path").value = run.dataset_path || snapshot.dataset_path || "";
+  $("#task-template").value = snapshot.task_template_path || "";
+  $("#task-body").value = snapshot.task_body || "";
+  $("#task-model").value = runConfiguredModel(run);
+  $("#agent-steps").value = options.agent_steps ?? "";
+  $("#exec-timeout").value = options.exec_timeout ?? "";
+  $("#parallel-workers").value = options.exec_parallel_workers ?? "";
+  $("#total-time-limit").value = options.agent_total_time_limit ?? "";
+  $("#final-retrain").checked = options.final_retrain_enabled === true;
+  $("#run-name-label").textContent = "Run name";
+  $("#run-name-optional").hidden = true;
+  $("#task-model-label").textContent = "Model";
+  $("#task-model-status").textContent = runConfiguredModel(run)
+    ? "Recorded in the CLI run configuration."
+    : "Not recorded by this run.";
+  $("#editor-title").textContent = name || "Run configuration";
+  $("#project-form-status").hidden = true;
+  state.dirty = false;
+  renderEditorState();
 }
 
 function updateNewTaskTitle() {
-  if (state.selectedProjectId) return;
-  $("#editor-title").textContent = autoTaskName($("#dataset-path").value, $("#task-body").value);
+  const explicitName = $("#project-name").value.trim();
+  $("#editor-title").textContent = explicitName
+    || autoTaskName($("#dataset-path").value, $("#task-body").value);
+}
+
+function renderEditorState() {
+  if (state.selectedRun) {
+    $("#run-button").hidden = true;
+    const options = state.selectedRun.options || {};
+    const parts = [];
+    const model = runConfiguredModel(state.selectedRun);
+    if (model) parts.push(model);
+    if (options.agent_steps != null) parts.push(`${options.agent_steps} steps`);
+    if (options.exec_parallel_workers != null) {
+      parts.push(`${options.exec_parallel_workers} worker${options.exec_parallel_workers === 1 ? "" : "s"}`);
+    }
+    $("#run-config-summary").textContent = parts.length
+      ? `${parts.join(" · ")} · CLI configuration`
+      : "CLI configuration";
+    return;
+  }
+  $("#run-button").hidden = false;
+  $("#run-button-label").textContent = "Run";
+  const options = collectProjectOptions();
+  const settingsModel = configuredDefaultModel();
+  const model = options.model_for_all_agents
+    || (settingsModel ? `${settingsModel} (Settings)` : "repository default");
+  $("#run-config-summary").textContent = `${model} · ${options.agent_steps} steps · ${options.exec_parallel_workers} worker${options.exec_parallel_workers === 1 ? "" : "s"}`;
+}
+
+function collectProjectOptions() {
+  return {
+    model_for_all_agents: $("#task-model").value.trim() || null,
+    agent_steps: Number($("#agent-steps").value),
+    exec_timeout: Number($("#exec-timeout").value),
+    exec_parallel_workers: Number($("#parallel-workers").value),
+    agent_total_time_limit: Number($("#total-time-limit").value),
+    final_retrain_enabled: $("#final-retrain").checked,
+  };
+}
+
+function markProjectDirty() {
+  state.dirty = true;
+  $("#project-form-status").hidden = true;
+  updateNewTaskTitle();
+  renderEditorState();
 }
 
 function collectProjectForm() {
   const datasetPath = $("#dataset-path").value.trim();
   const taskBody = $("#task-body").value.trim();
-  const existing = projectById(state.selectedProjectId);
   return {
-    name: existing?.name || autoTaskName(datasetPath, taskBody),
     dataset_path: datasetPath,
-    task_template_path: existing?.task_template_path || null,
+    task_template_path: $("#task-template").value.trim() || null,
     task_body: taskBody,
-    advanced_defaults: {
-      model_for_all_agents: null,
-      agent_steps: Number($("#agent-steps").value),
-      exec_timeout: Number($("#exec-timeout").value),
-      exec_parallel_workers: Number($("#parallel-workers").value),
-      agent_total_time_limit: Number($("#total-time-limit").value),
-      final_retrain_enabled: $("#final-retrain").checked,
-    },
+    advanced_defaults: collectProjectOptions(),
   };
-}
-
-async function selectProject(projectId) {
-  const project = projectById(projectId);
-  if (!project) return;
-  if (projectId === state.selectedProjectId) {
-    renderProjects();
-    renderRunHistory();
-    return;
-  }
-  if (state.dirty && !window.confirm("Discard unsaved changes?")) {
-    return;
-  }
-  state.selectedProjectId = projectId;
-  populateProjectForm(project);
-  renderProjects();
-  const latestRun = latestRunForProject(projectId);
-  state.selectedRunId = latestRun?.id || null;
-  await loadSelectedRun(true);
-  renderRuns();
 }
 
 function newProject() {
   if (state.dirty && !window.confirm("Discard unsaved changes?")) {
     return;
   }
-  state.selectedProjectId = null;
   state.selectedRunId = null;
   state.selectedRun = null;
+  resetSelectedResources();
   populateProjectForm(null);
   renderProjects();
   loadSelectedRun(true).catch(showError);
-  $("#dataset-path").focus();
-}
-
-async function saveProject({ quiet = false } = {}) {
-  const payload = collectProjectForm();
-  if (!payload.dataset_path || !payload.task_body) {
-    throw new Error("Dataset and goal are required");
-  }
-  const existing = state.selectedProjectId;
-  const project = await api(existing ? `/api/projects/${existing}` : "/api/projects", {
-    method: existing ? "PUT" : "POST",
-    body: JSON.stringify(payload),
-  });
-  const index = state.projects.findIndex((item) => item.id === project.id);
-  if (index >= 0) state.projects[index] = project;
-  else state.projects.unshift(project);
-  state.selectedProjectId = project.id;
-  state.dirty = false;
-  populateProjectForm(project);
-  renderProjects();
-  if (!quiet) toast("Task saved");
-  return project;
-}
-
-async function deleteProject(projectId = state.selectedProjectId) {
-  if (!projectId) return;
-  const project = projectById(projectId);
-  if (!project) return;
-  if (!window.confirm(`Delete task “${project?.name || ""}”? Runs will be kept.`)) {
-    return;
-  }
-  const deletedIndex = state.projects.findIndex((item) => item.id === projectId);
-  await api(`/api/projects/${projectId}`, { method: "DELETE" });
-  state.projects = state.projects.filter((item) => item.id !== projectId);
-
-  if (state.selectedProjectId !== projectId) {
-    renderRuns();
-    toast("Task deleted");
-    return;
-  }
-
-  state.dirty = false;
-  state.selectedProjectId = null;
-  const nextIndex = Math.min(Math.max(deletedIndex, 0), state.projects.length - 1);
-  const nextProject = state.projects[nextIndex] || null;
-  if (nextProject) {
-    await selectProject(nextProject.id);
-  } else {
-    newProject();
-  }
-  toast("Task deleted");
+  setMobileView("setup");
+  $("#project-name").focus();
 }
 
 async function queueRun() {
   const button = $("#run-button");
   button.disabled = true;
   try {
-    const project = await saveProject({ quiet: true });
+    const form = $("#project-form");
+    const formStatus = $("#project-form-status");
+    if (!form.reportValidity()) {
+      formStatus.textContent = "Check the highlighted fields before running.";
+      formStatus.hidden = false;
+      throw new Error("Please correct the experiment fields");
+    }
+    const experiment = collectProjectForm();
+    if (!experiment.dataset_path || !experiment.task_body) {
+      formStatus.textContent = "Dataset and goal cannot be blank.";
+      formStatus.hidden = false;
+      throw new Error("Dataset and goal are required");
+    }
     const run = await api("/api/runs", {
       method: "POST",
       body: JSON.stringify({
-        project_id: project.id,
-        requested_exp_name: null,
+        experiment,
+        requested_exp_name: $("#project-name").value.trim() || null,
       }),
     });
+    formStatus.hidden = true;
     state.runs.unshift(run);
     state.selectedRunId = run.id;
+    state.selectedRun = run;
+    resetSelectedResources();
+    populateRunForm(run);
     renderRuns();
+    setMobileView("run", { focus: true });
     await loadSelectedRun(true);
+    schedulePoll(0);
     toast("Run queued");
   } finally {
     button.disabled = false;
@@ -386,16 +631,17 @@ async function queueRun() {
 
 async function selectRun(runId) {
   const run = runById(runId);
-  const project = run ? projectById(run.project_id) : null;
-  if (project && project.id !== state.selectedProjectId) {
-    if (state.dirty && !window.confirm("Discard unsaved changes?")) return;
-    state.selectedProjectId = project.id;
-    populateProjectForm(project);
+  if (!run) return;
+  if (state.dirty && !window.confirm("Discard unsaved changes?")) {
+    renderProjects();
+    return;
   }
   state.selectedRunId = runId;
-  state.treeRunId = null;
-  state.lastTreeRefresh = 0;
+  state.selectedRun = run;
+  resetSelectedResources();
+  populateRunForm(run);
   renderRuns();
+  setMobileView("run", { focus: true });
   await loadSelectedRun(true);
 }
 
@@ -404,33 +650,83 @@ function renderRunSummary() {
   const summary = $("#run-summary");
   summary.hidden = !run;
   $(".detail-pane").classList.toggle("no-run", !run);
-  const name = run?.actual_exp_name || run?.requested_exp_name || "";
+  const name = run ? runLogDirectoryName(run) : "";
   $("#selected-run-name").textContent = name;
   renderRunHistory();
-  const actions = $("#selected-run-actions");
   if (!run) {
-    actions.innerHTML = "";
+    $("#run-result-status").hidden = true;
+    $("#run-action-button").hidden = true;
+    $("#run-error-summary").hidden = true;
     return;
   }
-  let command = "";
-  if (run.status === "queued") {
-    command = '<button class="button danger" type="button" data-run-action="cancel"><i data-lucide="x" aria-hidden="true"></i>Cancel</button>';
-  } else if (["running", "stopping"].includes(run.status)) {
-    command = `<button class="button danger" type="button" data-run-action="stop" ${run.status === "stopping" ? "disabled" : ""}><i data-lucide="square" aria-hidden="true"></i>${run.status === "stopping" ? "Stopping" : "Stop"}</button>`;
-  } else if (isTerminal(run.status)) {
-    command = '<button class="button secondary" type="button" data-run-action="requeue"><i data-lucide="rotate-ccw" aria-hidden="true"></i>Requeue</button>';
+  const execution = $("#run-execution-status");
+  execution.className = `status-pill ${run.status}`;
+  execution.textContent = executionLabel(run.status);
+  execution.title = `Execution status: ${run.status}`;
+
+  const result = resultPresentation(run);
+  const resultPill = $("#run-result-status");
+  resultPill.hidden = !result;
+  if (result) {
+    resultPill.className = `result-pill ${result.kind}`;
+    resultPill.textContent = result.text;
   }
-  actions.innerHTML = `<span class="status-pill ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>${command}`;
-  const actionButton = actions.querySelector("[data-run-action]");
-  if (actionButton) actionButton.addEventListener("click", (event) => runAction(event).catch(showError));
+
+  const startedAt = run.timestamps?.started_at;
+  const finishedAt = run.timestamps?.finished_at;
+  const elapsed = formatDuration(startedAt, finishedAt || Date.now());
+  const metaParts = [];
+  const model = runConfiguredModel(run);
+  const completedValue = run.progress?.completed_steps;
+  const totalValue = run.progress?.total_steps ?? run.options?.agent_steps;
+  const completedSteps = completedValue == null ? NaN : Number(completedValue);
+  const totalSteps = totalValue == null ? NaN : Number(totalValue);
+  if (model) metaParts.push(model);
+  if (Number.isFinite(completedSteps) && Number.isFinite(totalSteps)) {
+    metaParts.push(`${completedSteps}/${totalSteps} steps`);
+  }
+  if (startedAt) metaParts.push(`Started ${formatDate(startedAt, true)}`);
+  if (elapsed) metaParts.push(elapsed);
+  $("#selected-run-meta").textContent = metaParts.join(" · ");
+
+  const actionButton = $("#run-action-button");
+  const actionLabel = $("#run-action-label");
+  const actionIcon = $("#run-action-icon");
+  const allowedActions = new Set(run.allowed_actions || []);
+  actionButton.hidden = false;
+  actionButton.disabled = false;
+  actionButton.className = "button secondary";
+  if (allowedActions.has("cancel")) {
+    actionButton.dataset.runAction = "cancel";
+    actionButton.className = "button danger";
+    actionLabel.textContent = "Cancel";
+    actionIcon.setAttribute("data-lucide", "x");
+  } else if (allowedActions.has("stop")) {
+    actionButton.dataset.runAction = "stop";
+    actionButton.className = "button danger";
+    actionButton.disabled = run.status === "stopping";
+    actionLabel.textContent = run.status === "stopping" ? "Stopping" : "Stop";
+    actionIcon.setAttribute("data-lucide", "square");
+  } else if (allowedActions.has("requeue")) {
+    actionButton.dataset.runAction = "requeue";
+    actionLabel.textContent = "Retry";
+    actionIcon.setAttribute("data-lucide", "rotate-ccw");
+  } else {
+    actionButton.hidden = true;
+  }
+
+  const error = run.error || run.observed?.results?.latest?.error;
+  const errorSummary = $("#run-error-summary");
+  errorSummary.hidden = !error;
+  errorSummary.textContent = error ? `Error: ${typeof error === "string" ? error : JSON.stringify(error)}` : "";
   refreshIcons();
 }
 
 function clearSelectedRun() {
   state.selectedRunId = null;
   state.selectedRun = null;
-  state.treeRunId = null;
-  state.lastTreeRefresh = 0;
+  resetSelectedResources();
+  populateProjectForm(null);
   renderRunSummary();
   renderTree();
   renderArtifacts();
@@ -445,13 +741,16 @@ async function runAction(event) {
   if (action !== "requeue" && !window.confirm(`${labels[action][0].toUpperCase()}${labels[action].slice(1)} this run?`)) {
     return;
   }
-  const result = await api(`/api/runs/${state.selectedRunId}/${action}`, { method: "POST" });
+  const result = await api(runApiPath(state.selectedRunId, `/${action}`), { method: "POST" });
   if (action === "requeue") {
     state.runs.unshift(result);
     state.selectedRunId = result.id;
-    state.treeRunId = null;
+    state.selectedRun = result;
+    resetSelectedResources();
+    populateRunForm(result);
   }
   await refreshRuns(true);
+  schedulePoll(0);
   toast(action === "requeue" ? "Run requeued" : `${action[0].toUpperCase()}${action.slice(1)} requested`);
 }
 
@@ -461,9 +760,10 @@ async function loadSelectedRun(forceTree = false) {
     clearSelectedRun();
     return;
   }
-  let selectedRun;
   try {
-    selectedRun = await api(`/api/runs/${requestedRunId}`);
+    const snapshot = await api(runApiPath(requestedRunId, "/updates"));
+    if (state.selectedRunId !== requestedRunId) return;
+    await applyUpdateSnapshot(snapshot, { force: forceTree });
   } catch (error) {
     if (state.selectedRunId !== requestedRunId) return;
     if (error.message.includes("not found")) {
@@ -472,64 +772,222 @@ async function loadSelectedRun(forceTree = false) {
     }
     throw error;
   }
-  if (state.selectedRunId !== requestedRunId) return;
-  state.selectedRun = selectedRun;
-  renderRunSummary();
-  if (state.activeTab === "tree") renderTree(forceTree);
-  if (state.activeTab === "console") await loadConsole();
-  if (state.activeTab === "events") await loadEvents();
-  if (state.activeTab === "artifacts") renderArtifacts();
 }
 
-function renderTree(force = false) {
+async function loadRunDetail(snapshot, force = false) {
+  const requestedRunId = state.selectedRunId;
+  if (!requestedRunId) return;
+  const runChanged = snapshot.run_revision !== state.resources.runRevision;
+  const artifactsChanged = snapshot.artifacts?.revision !== state.resources.artifactsRevision;
+  if (!force && !runChanged && !artifactsChanged && state.selectedRun?.observed) return;
+  const selectedRun = await api(runApiPath(requestedRunId));
+  if (state.selectedRunId !== requestedRunId) return;
+  const previousSetupSignature = runSetupSignature(state.selectedRun);
+  state.selectedRun = selectedRun;
+  const index = state.runs.findIndex((item) => item.id === requestedRunId);
+  if (index >= 0) state.runs[index] = selectedRun;
+  state.resources.runRevision = snapshot.run_revision;
+  state.resources.artifactsRevision = snapshot.artifacts?.revision || null;
+  if (runSetupSignature(selectedRun) !== previousSetupSignature) {
+    populateRunForm(selectedRun);
+  }
+  renderRuns();
+  renderRunSummary();
+  if (state.activeTab === "artifacts" || snapshot.final_barrier || force) renderArtifacts();
+}
+
+async function applyUpdateSnapshot(snapshot, { force = false } = {}) {
+  if (!snapshot || snapshot.run_id !== state.selectedRunId) return;
+  state.updateSnapshot = snapshot;
+  const listedRun = runById(snapshot.run_id);
+  if (listedRun && listedRun.status !== snapshot.status) listedRun.status = snapshot.status;
+  if (state.selectedRun && state.selectedRun.id === snapshot.run_id) {
+    state.selectedRun.status = snapshot.status;
+  }
+  await loadRunDetail(snapshot, force);
+  if (snapshot.run_id !== state.selectedRunId) return;
+  renderRunSummary();
+
+  const loadFinalResources = Boolean(snapshot.final_barrier);
+  const tasks = [];
+  if (force || state.activeTab === "tree" || loadFinalResources) {
+    tasks.push(renderTree(force, snapshot));
+  } else {
+    updateTreeAvailability(snapshot);
+  }
+  if ((force || state.activeTab === "events" || loadFinalResources) && snapshot.events?.available) {
+    tasks.push(loadEvents({ revision: snapshot.events?.revision, force }));
+  } else if (!snapshot.events?.available && state.resources.events.loaded !== "unavailable") {
+    state.resources.events.loaded = "unavailable";
+    $("#events-list").innerHTML = emptyStateMarkup("activity", "No activity yet");
+    refreshIcons();
+  }
+  if ((force || state.activeTab === "console" || loadFinalResources) && snapshot.console?.available) {
+    tasks.push(loadConsole({ revision: snapshot.console?.revision, force }));
+  } else if (!snapshot.console?.available && state.resources.console.loaded !== "unavailable") {
+    state.resources.console.loaded = "unavailable";
+    $("#console-output").textContent = "No output yet.";
+  }
+  await Promise.all(tasks);
+  if (snapshot.run_id !== state.selectedRunId) return;
+  if (snapshot.final_barrier) state.resources.finalBarrier = revisionKey(snapshot);
+}
+
+function updateTreeAvailability(snapshot = state.updateSnapshot) {
+  const run = state.selectedRun;
+  const tree = snapshot?.tree;
+  const status = $("#tree-update-status");
+  const openLink = $("#tree-open-link");
+  if (!run || !tree?.available || !tree.revision) {
+    if (!state.resources.tree.loaded) {
+      $("#tree-frame").hidden = true;
+      $("#tree-empty").hidden = false;
+      $("#tree-empty strong").textContent = run && refreshPolicy.isActive(run.status)
+        ? "Tree will appear after the first search update"
+        : "No tree data for this run";
+    }
+    openLink.hidden = true;
+    status.textContent = run && refreshPolicy.isActive(run.status) ? "Waiting for tree" : "No tree";
+    return;
+  }
+  openLink.hidden = false;
+  openLink.href = tree.url;
+  const decision = refreshPolicy.treeDecision({
+    available: true,
+    revision: tree.revision,
+    loadedRevision: state.resources.tree.loaded,
+    loadingRevision: state.resources.tree.loading,
+    autoUpdate: $("#tree-auto-refresh").checked && !state.treeInteracting,
+  });
+  if (decision === "pending") {
+    state.resources.tree.pending = tree.revision;
+    status.textContent = "Update available";
+    status.className = "tree-update-status pending";
+  } else if (decision === "current") {
+    status.textContent = state.resources.tree.loading ? "Updating…" : "Up to date";
+    status.className = `tree-update-status${state.resources.tree.loading ? " loading" : ""}`;
+  } else if (decision === "load") {
+    state.resources.tree.pending = tree.revision;
+    status.textContent = "New revision ready";
+    status.className = "tree-update-status pending";
+  }
+}
+
+function renderTree(force = false, snapshot = state.updateSnapshot) {
   const run = state.selectedRun;
   const frame = $("#tree-frame");
   const empty = $("#tree-empty");
   const openLink = $("#tree-open-link");
-  const hasTree = Boolean(run?.artifacts?.some((artifact) => artifact.name === "tree_plot.html"));
-  if (!run || !hasTree) {
-    frame.hidden = true;
-    frame.removeAttribute("src");
-    openLink.hidden = true;
-    openLink.removeAttribute("href");
-    empty.hidden = false;
-    empty.querySelector("strong").textContent = "No search data yet";
-    state.treeRunId = null;
-    state.lastTreeRefresh = 0;
-    return;
+  const status = $("#tree-update-status");
+  const tree = snapshot?.tree;
+  if (!run || !tree?.available || !tree.revision || !tree.url) {
+    updateTreeAvailability(snapshot);
+    return Promise.resolve();
   }
+  openLink.hidden = false;
+  openLink.href = tree.url;
+  const decision = refreshPolicy.treeDecision({
+    available: true,
+    revision: tree.revision,
+    loadedRevision: state.resources.tree.loaded,
+    loadingRevision: state.resources.tree.loading,
+    autoUpdate: $("#tree-auto-refresh").checked && !state.treeInteracting,
+    force,
+  });
+  if (decision === "current") {
+    updateTreeAvailability(snapshot);
+    return Promise.resolve();
+  }
+  if (decision === "pending") {
+    state.resources.tree.pending = tree.revision;
+    status.textContent = "Update available";
+    status.className = "tree-update-status pending";
+    return Promise.resolve();
+  }
+
+  const requestedRunId = run.id;
+  const requestedRevision = tree.revision;
+  const token = ++state.treeLoadToken;
+  const viewId = `${token}:${requestedRevision}`;
+  state.treeViewId = viewId;
+  const previousCancel = state.treeLoadCancel;
+  state.treeLoadCancel = null;
+  if (previousCancel) previousCancel();
+  state.resources.tree.loading = requestedRevision;
+  status.textContent = "Updating…";
+  status.className = "tree-update-status loading";
   empty.hidden = true;
   frame.hidden = false;
-  openLink.hidden = false;
-  openLink.href = `/artifacts/runs/${encodeURIComponent(run.id)}/tree_plot.html`;
-  const shouldRefresh =
-    force ||
-    state.treeRunId !== run.id ||
-    (["running", "stopping"].includes(run.status) &&
-      $("#tree-auto-refresh").checked &&
-      Date.now() - state.lastTreeRefresh > 8000);
-  if (shouldRefresh) {
-    frame.src = `/artifacts/runs/${encodeURIComponent(run.id)}/tree_plot.html?v=${Date.now()}`;
-    state.treeRunId = run.id;
-    state.lastTreeRefresh = Date.now();
-  }
+  const url = new URL(tree.url, window.location.origin);
+  url.searchParams.set("embed", "1");
+  url.searchParams.set("parent_origin", window.location.origin);
+  url.searchParams.set("revision", requestedRevision);
+  url.searchParams.set("view_id", viewId);
+  if (force) url.searchParams.set("manual", String(Date.now()));
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (loaded) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      if (state.treeLoadCancel === cancel) state.treeLoadCancel = null;
+      if (state.selectedRunId !== requestedRunId || token !== state.treeLoadToken) {
+        resolve();
+        return;
+      }
+      state.resources.tree.loading = null;
+      if (loaded) {
+        state.resources.tree.loaded = requestedRevision;
+        state.resources.tree.pending = null;
+        status.textContent = `Updated ${formatDate(Date.now())}`;
+        status.className = "tree-update-status";
+      } else {
+        frame.hidden = true;
+        empty.hidden = false;
+        empty.querySelector("strong").textContent = "Tree could not be loaded";
+        status.textContent = "Update failed · retrying";
+        status.className = "tree-update-status error";
+        reject(new Error("Tree update could not be loaded"));
+        return;
+      }
+      resolve();
+    };
+    const cancel = () => finish(false);
+    state.treeLoadCancel = cancel;
+    const timeout = window.setTimeout(() => finish(false), 15000);
+    frame.onload = () => finish(true);
+    frame.onerror = () => finish(false);
+    frame.src = url.toString();
+  });
 }
 
-async function loadConsole() {
+async function loadConsole({ revision = state.updateSnapshot?.console?.revision, force = false } = {}) {
   const output = $("#console-output");
   const requestedRunId = state.selectedRunId;
   if (!requestedRunId) {
     output.textContent = "No output yet.";
     return;
   }
-  const consoleText = await api(`/api/runs/${requestedRunId}/log?tail=1200`);
-  if (state.selectedRunId !== requestedRunId) return;
-  output.textContent = consoleText;
-  if (!output.textContent) output.textContent = "No output yet.";
-  if ($("#console-follow").checked) output.scrollTop = output.scrollHeight;
+  if (!force && revision && revision === state.resources.console.loaded) return;
+  if (!force && revision && revision === state.resources.console.loading) return;
+  const loadingRevision = revision || `manual-${Date.now()}`;
+  state.resources.console.loading = loadingRevision;
+  try {
+    const consoleText = await api(runApiPath(requestedRunId, "/log?tail=1200"));
+    if (state.selectedRunId !== requestedRunId) return;
+    output.textContent = consoleText;
+    if (!output.textContent) output.textContent = "No output yet.";
+    if ($("#console-follow").checked) output.scrollTop = output.scrollHeight;
+    state.resources.console.loaded = revision || state.resources.console.loaded;
+  } finally {
+    if (state.selectedRunId === requestedRunId && state.resources.console.loading === loadingRevision) {
+      state.resources.console.loading = null;
+    }
+  }
 }
 
-async function loadEvents() {
+async function loadEvents({ revision = state.updateSnapshot?.events?.revision, force = false } = {}) {
   const list = $("#events-list");
   const requestedRunId = state.selectedRunId;
   if (!requestedRunId) {
@@ -537,8 +995,21 @@ async function loadEvents() {
     refreshIcons();
     return;
   }
-  const response = await api(`/api/runs/${requestedRunId}/events?tail=200`);
-  if (state.selectedRunId !== requestedRunId) return;
+  if (!force && revision && revision === state.resources.events.loaded) return;
+  if (!force && revision && revision === state.resources.events.loading) return;
+  const loadingRevision = revision || `manual-${Date.now()}`;
+  state.resources.events.loading = loadingRevision;
+  let response;
+  try {
+    response = await api(runApiPath(requestedRunId, "/events?tail=200"));
+    if (state.selectedRunId !== requestedRunId) return;
+    state.resources.events.loaded = revision || state.resources.events.loaded;
+  } finally {
+    if (state.selectedRunId === requestedRunId && state.resources.events.loading === loadingRevision) {
+      state.resources.events.loading = null;
+    }
+  }
+  if (!response || state.selectedRunId !== requestedRunId) return;
   if (!response.events.length) {
     list.innerHTML = emptyStateMarkup("activity", "No activity yet");
     refreshIcons();
@@ -557,7 +1028,7 @@ async function loadEvents() {
           <span class="event-marker" aria-hidden="true"></span>
           <span class="event-name">${escapeHtml(formatEventName(event.event))}</span>
           <time class="event-time">${escapeHtml(formatDate(event.ts))}</time>
-          ${payloadText ? `<pre class="event-payload">${escapeHtml(payloadText)}</pre>` : ""}
+          ${payloadText ? `<details class="event-details"><summary>Details</summary><pre class="event-payload">${escapeHtml(payloadText)}</pre></details>` : ""}
         </article>`;
     })
     .join("");
@@ -607,12 +1078,48 @@ function setActiveTab(tabName) {
     tab.tabIndex = active ? 0 : -1;
   });
   $$(".tab-panel").forEach((panel) => {
-    panel.classList.toggle("active", panel.id === `${tabName}-panel`);
+    const active = panel.id === `${tabName}-panel`;
+    panel.classList.toggle("active", active);
+    panel.setAttribute("aria-hidden", String(!active));
   });
-  if (tabName === "tree") renderTree();
-  if (tabName === "console") loadConsole().catch(showError);
-  if (tabName === "events") loadEvents().catch(showError);
+  if (tabName === "tree") renderTree().catch(showError);
+  if (tabName === "console" && state.updateSnapshot?.console?.available) loadConsole().catch(showError);
+  if (tabName === "events" && state.updateSnapshot?.events?.available) loadEvents().catch(showError);
   if (tabName === "artifacts") renderArtifacts();
+  if (tabName !== "tree" && $(".workbench").classList.contains("tree-focus")) toggleTreeFocus(false);
+}
+
+function setMobileView(view, { focus = false } = {}) {
+  if (!["tasks", "setup", "run"].includes(view)) return;
+  state.mobileView = view;
+  $(".workbench").dataset.mobileView = view;
+  $$(".mobile-view-button").forEach((button) => {
+    const active = button.dataset.mobileView === view;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", active ? "page" : "false");
+  });
+  if (focus && window.matchMedia("(max-width: 960px)").matches) {
+    const target = {
+      tasks: $("#new-project-button"),
+      setup: $("#project-name"),
+      run: $(".tab.active"),
+    }[view];
+    window.requestAnimationFrame(() => target?.focus({ preventScroll: true }));
+  }
+}
+
+function toggleTreeFocus(force) {
+  if (state.activeTab !== "tree" && force !== false) setActiveTab("tree");
+  const workbench = $(".workbench");
+  const next = typeof force === "boolean" ? force : !workbench.classList.contains("tree-focus");
+  workbench.classList.toggle("tree-focus", next);
+  const button = $("#run-focus-button");
+  button.setAttribute("aria-pressed", String(next));
+  button.title = next ? "Exit tree focus" : "Focus tree";
+  button.setAttribute("aria-label", button.title);
+  const icon = button.querySelector("[data-lucide]");
+  if (icon) icon.setAttribute("data-lucide", next ? "minimize-2" : "maximize-2");
+  refreshIcons();
 }
 
 function handleTabKeydown(event) {
@@ -630,6 +1137,28 @@ function handleTabKeydown(event) {
   setActiveTab(tabs[nextIndex].dataset.tab);
 }
 
+function trapDialogFocus(event) {
+  const dialog = event.currentTarget;
+  if (event.key !== "Tab" || !dialog.open) return;
+  const focusable = Array.from(
+    dialog.querySelectorAll(
+      'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (element) => element.getClientRects().length > 0 && !element.closest("[inert]"),
+  );
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (!first || !last) return;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function renderEnvironmentFields() {
   const baseUrl = state.env.OPENAI_BASE_URL?.value || "";
   $("#settings-base-url").value = baseUrl;
@@ -642,28 +1171,35 @@ function renderEnvironmentFields() {
     $(field.status).textContent = state.env[key]?.configured ? "" : "Not configured";
     updateSecretToggle(key, false);
   }
-  const currentModel = state.envDefaults.main_model
-    || state.env.BIOMAKER_MAIN_MODEL?.value
-    || state.env.OPENAI_MODEL?.value
-    || "";
+  const currentModel = configuredDefaultModel();
+  $("#settings-model").value = currentModel;
   $("#settings-model").dataset.changed = "false";
-  setModelOptions([], currentModel);
-  $("#settings-model-status").textContent = "";
+  $("#settings-model-status").textContent = currentModel
+    ? "Default for WebUI runs. Task overrides take precedence."
+    : "Using the repository default. Task overrides take precedence.";
+  const source = state.envSource || {};
+  $("#settings-env-source").textContent = source.path
+    ? `Saved in ${source.path}${source.exists ? "" : " (created when you save)"}`
+    : "Settings apply to this local BioMaker workspace.";
   refreshIcons();
 }
 
 async function openSettings() {
   const response = await api("/api/env");
   state.env = response.values;
-  state.envDefaults = response.defaults || {};
+  state.envSource = response.source || {};
   renderEnvironmentFields();
   $("#settings-dialog").showModal();
-  discoverModels().catch(showModelError);
+  discoverModels("settings").catch((error) => showModelError(error, "settings"));
 }
 
-function renderModelOptions(query = "", selected = "") {
+function configuredDefaultModel() {
+  return state.env.BIOMAKER_MAIN_MODEL?.value || "";
+}
+
+function modelSuggestions(query = "", selected = "") {
   const normalizedQuery = query.trim().toLowerCase();
-  const suggestions = state.models
+  return state.models
     .map((model, index) => ({ model, index, lower: model.toLowerCase() }))
     .filter(({ lower }) => !normalizedQuery || lower.includes(normalizedQuery))
     .sort((left, right) => {
@@ -685,61 +1221,70 @@ function renderModelOptions(query = "", selected = "") {
     })
     .slice(0, MAX_MODEL_SUGGESTIONS)
     .map(({ model }) => model);
-  $("#settings-model-options").innerHTML = suggestions
+}
+
+function renderModelOptions(target, query = "", selected = "") {
+  $(target).innerHTML = modelSuggestions(query, selected)
     .map((model) => `<option value="${escapeHtml(model)}"></option>`)
     .join("");
 }
 
-function setModelOptions(models, selected, query = "") {
+function setModelOptions(models) {
   state.models = [...new Set(models.filter(Boolean))];
-  renderModelOptions(query, selected);
-  $("#settings-model").value = selected || "";
+  const taskModel = $("#task-model").value.trim();
+  const settingsModel = $("#settings-model").value.trim();
+  renderModelOptions("#task-model-options", taskModel, taskModel);
+  renderModelOptions("#settings-model-options", settingsModel, settingsModel);
 }
 
-function showModelError(error) {
+function showModelError(error, source = "task") {
   console.error(error);
-  $("#settings-model-status").textContent = error.message || String(error);
+  $(source === "settings" ? "#settings-model-status" : "#task-model-status").textContent = error.message || String(error);
 }
 
 function invalidateModelDiscovery() {
   modelDiscoveryGeneration += 1;
   state.models = [];
+  $("#task-model-options").innerHTML = "";
   $("#settings-model-options").innerHTML = "";
-  $("#settings-model-status").textContent = "";
+  $("#task-model-status").textContent = "Leave blank to use the Settings default, then the repository default.";
+  $("#settings-model-status").textContent = "Refresh to load models from the configured endpoint.";
+  $("#refresh-task-models-button").disabled = false;
   $("#refresh-models-button").disabled = false;
 }
 
-async function discoverModels() {
-  const button = $("#refresh-models-button");
-  const status = $("#settings-model-status");
-  const modelInput = $("#settings-model");
+async function discoverModels(source = "task") {
+  const fromSettings = source === "settings";
+  const button = $(fromSettings ? "#refresh-models-button" : "#refresh-task-models-button");
+  const status = $(fromSettings ? "#settings-model-status" : "#task-model-status");
+  const modelInput = $(fromSettings ? "#settings-model" : "#task-model");
   const discoveryGeneration = ++modelDiscoveryGeneration;
   button.disabled = true;
   state.models = [];
+  $("#task-model-options").innerHTML = "";
   $("#settings-model-options").innerHTML = "";
   status.textContent = "Loading...";
   try {
     const apiKeyInput = $("#settings-api-key");
-    const apiKey = apiKeyInput.dataset.changed === "true" ? apiKeyInput.value : null;
+    const payload = fromSettings
+      ? {
+          base_url: $("#settings-base-url").value.trim() || null,
+          api_key: apiKeyInput.dataset.changed === "true" ? (apiKeyInput.value.trim() || null) : null,
+        }
+      : {};
     const response = await api("/api/models/discover", {
       method: "POST",
-      body: JSON.stringify({
-        base_url: $("#settings-base-url").value.trim() || null,
-        api_key: apiKey || null,
-      }),
+      body: JSON.stringify(payload),
     });
-    if (discoveryGeneration !== modelDiscoveryGeneration || !$("#settings-dialog").open) return;
+    if (discoveryGeneration !== modelDiscoveryGeneration) return;
     const models = response.models || [];
-    const selected = modelInput.dataset.changed === "true"
-      ? modelInput.value
-      : response.default_model || (models.includes(PREFERRED_MODEL) ? PREFERRED_MODEL : "");
-    const query = modelInput.dataset.changed === "true" ? selected : "";
-    setModelOptions(models, selected, query);
+    const selected = modelInput.value.trim();
+    setModelOptions(models);
     status.textContent = response.status === "ok"
-      ? ""
+      ? `${models.length} models available.${selected ? "" : " Enter or select one."}`
       : (response.detail || "Models unavailable");
   } catch (error) {
-    if (discoveryGeneration !== modelDiscoveryGeneration || !$("#settings-dialog").open) return;
+    if (discoveryGeneration !== modelDiscoveryGeneration) return;
     throw error;
   } finally {
     if (discoveryGeneration === modelDiscoveryGeneration) button.disabled = false;
@@ -816,7 +1361,6 @@ async function saveEnvironment(event) {
   const updates = {
     OPENAI_BASE_URL: $("#settings-base-url").value.trim() || null,
     BIOMAKER_MAIN_MODEL: model || null,
-    BIOMAKER_HELPER_MODEL: model || null,
   };
   for (const [key, field] of Object.entries(SECRET_FIELDS)) {
     const input = $(field.input);
@@ -828,7 +1372,9 @@ async function saveEnvironment(event) {
       body: JSON.stringify(updates),
     });
     state.env = response.values;
-    state.envDefaults = response.defaults || state.envDefaults;
+    state.envSource = response.source || state.envSource;
+    invalidateModelDiscovery();
+    renderEditorState();
   }
   clearVisibleSecrets();
   $("#settings-dialog").close();
@@ -849,28 +1395,94 @@ async function chooseDatasetDirectory() {
       throw new Error("The system folder picker returned an invalid result.");
     }
     $("#dataset-path").value = response.path;
-    state.dirty = true;
-    updateNewTaskTitle();
+    markProjectDirty();
   } finally {
     button.disabled = false;
     button.removeAttribute("aria-busy");
   }
 }
 
-async function refreshRuns(force = false) {
-  if (state.polling) return;
-  state.polling = true;
-  try {
-    state.runs = await api("/api/runs");
-    renderRuns();
-    if (state.selectedRunId) {
-      await loadSelectedRun(force);
-    } else if (state.selectedRun) {
-      clearSelectedRun();
+function setConnectionIndicator(message = "", kind = "") {
+  const indicator = $("#connection-indicator");
+  indicator.textContent = message;
+  indicator.className = `connection-indicator${kind ? ` ${kind}` : ""}`;
+  indicator.hidden = !message;
+}
+
+function nextPollDelay() {
+  return refreshPolicy.pollDelay({
+    hidden: document.hidden,
+    hasActive: state.runs.some((run) => refreshPolicy.isActive(run.status)),
+    failures: state.pollFailures,
+  });
+}
+
+function schedulePoll(delay = nextPollDelay(), options = {}) {
+  if (state.pollTimer) window.clearTimeout(state.pollTimer);
+  state.pollTimer = null;
+  if (delay == null || document.hidden || state.pollStopped) return;
+  state.pollTimer = window.setTimeout(() => {
+    state.pollTimer = null;
+    pollNow(options).catch((error) => console.error(error));
+  }, Math.max(0, delay));
+}
+
+async function refreshRunData(force = false) {
+  const runs = await api("/api/runs");
+  state.runs = runs;
+  const listedSelectedRun = state.selectedRunId ? runById(state.selectedRunId) : null;
+  if (listedSelectedRun) {
+    const previousSetupSignature = runSetupSignature(state.selectedRun);
+    state.selectedRun = state.selectedRun
+      ? { ...state.selectedRun, ...listedSelectedRun }
+      : listedSelectedRun;
+    if (runSetupSignature(state.selectedRun) !== previousSetupSignature) {
+      populateRunForm(state.selectedRun);
     }
+  }
+  renderRuns();
+  renderRunSummary();
+  if (state.selectedRunId && listedSelectedRun) {
+    await loadSelectedRun(force);
+  } else if (state.selectedRunId || state.selectedRun) {
+    clearSelectedRun();
+  }
+}
+
+async function pollNow({ force = false, manual = false } = {}) {
+  if (state.polling) {
+    const queued = state.pollQueued || { force: false, manual: false };
+    state.pollQueued = { force: queued.force || force, manual: queued.manual || manual };
+    return;
+  }
+  if (state.pollTimer) window.clearTimeout(state.pollTimer);
+  state.pollTimer = null;
+  state.polling = true;
+  const refreshButton = $("#refresh-button");
+  if (manual) refreshButton.setAttribute("aria-busy", "true");
+  try {
+    await refreshRunData(force);
+    state.pollFailures = 0;
+    setConnectionIndicator();
+  } catch (error) {
+    state.pollFailures += 1;
+    const delay = refreshPolicy.pollDelay({ failures: state.pollFailures, hidden: document.hidden });
+    const seconds = delay == null ? "when this tab is visible" : `in ${Math.round(delay / 1000)}s`;
+    setConnectionIndicator(`Update paused · retrying ${seconds}`, "error");
+    console.error(error);
+    if (manual) toast(error.message || String(error), "error");
   } finally {
     state.polling = false;
+    refreshButton.removeAttribute("aria-busy");
+    const queued = state.pollQueued;
+    state.pollQueued = false;
+    if (queued) schedulePoll(0, queued);
+    else schedulePoll(nextPollDelay());
   }
+}
+
+async function refreshRuns(force = false) {
+  return pollNow({ force, manual: force });
 }
 
 function showError(error) {
@@ -880,14 +1492,21 @@ function showError(error) {
 
 function bindEvents() {
   $("#new-project-button").addEventListener("click", newProject);
-  $("#save-project-button").addEventListener("click", () => saveProject().catch(showError));
-  $("#delete-project-button").addEventListener("click", () => deleteProject().catch(showError));
+  $("#project-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    queueRun().catch(showError);
+  });
   $("#run-button").addEventListener("click", () => queueRun().catch(showError));
+  $("#run-action-button").addEventListener("click", (event) => runAction(event).catch(showError));
   $("#settings-button").addEventListener("click", () => openSettings().catch(showError));
   $("#settings-form").addEventListener("submit", (event) => saveEnvironment(event).catch(showError));
   $("#settings-dialog").addEventListener("close", clearVisibleSecrets);
+  $("#settings-dialog").addEventListener("keydown", trapDialogFocus);
   $("#settings-base-url").addEventListener("input", invalidateModelDiscovery);
-  $("#refresh-models-button").addEventListener("click", () => discoverModels().catch(showModelError));
+  $("#refresh-task-models-button").addEventListener("click", () => discoverModels("task").catch(showModelError));
+  $("#refresh-models-button").addEventListener("click", () => {
+    discoverModels("settings").catch((error) => showModelError(error, "settings"));
+  });
   $$(".secret-toggle").forEach((button) => {
     button.addEventListener("click", (event) => toggleSecret(event).catch(showError));
   });
@@ -897,24 +1516,67 @@ function bindEvents() {
       if (key === "OPENAI_API_KEY") invalidateModelDiscovery();
     });
   }
+  $("#task-model").addEventListener("input", (event) => {
+    renderModelOptions("#task-model-options", event.currentTarget.value, event.currentTarget.value);
+  });
   $("#settings-model").addEventListener("input", (event) => {
     event.currentTarget.dataset.changed = "true";
-    renderModelOptions(event.currentTarget.value, event.currentTarget.value);
+    renderModelOptions("#settings-model-options", event.currentTarget.value, event.currentTarget.value);
   });
   $("#refresh-button").addEventListener("click", () => refreshRuns(true).catch(showError));
-  $("#tree-refresh-button").addEventListener("click", () => renderTree(true));
-  $("#console-refresh-button").addEventListener("click", () => loadConsole().catch(showError));
+  $("#tree-refresh-button").addEventListener("click", () => renderTree(true).catch(showError));
+  $("#tree-auto-refresh").addEventListener("change", (event) => {
+    if (event.currentTarget.checked) renderTree().catch(showError);
+    else updateTreeAvailability();
+  });
+  $("#run-focus-button").addEventListener("click", () => toggleTreeFocus());
+  $("#console-refresh-button").addEventListener("click", () => loadConsole({ force: true }).catch(showError));
   $("#browse-datasets-button").addEventListener("click", () => chooseDatasetDirectory().catch(showError));
   $("#run-history-select").addEventListener("change", (event) => selectRun(event.currentTarget.value).catch(showError));
+  $$(".mobile-view-button").forEach((button) => {
+    button.addEventListener("click", () => setMobileView(button.dataset.mobileView));
+  });
   $$(".tab").forEach((tab) => {
     tab.addEventListener("click", () => setActiveTab(tab.dataset.tab));
     tab.addEventListener("keydown", handleTabKeydown);
   });
   $$("#project-form input, #project-form select, #project-form textarea").forEach((field) => {
-    field.addEventListener("input", () => {
-      state.dirty = true;
-      updateNewTaskTitle();
-    });
+    field.addEventListener("input", markProjectDirty);
+    field.addEventListener("change", markProjectDirty);
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      if (state.pollTimer) window.clearTimeout(state.pollTimer);
+      state.pollTimer = null;
+      return;
+    }
+    schedulePoll(0);
+  });
+  window.addEventListener("online", () => schedulePoll(0));
+  window.addEventListener("offline", () => setConnectionIndicator("Offline · waiting for connection", "error"));
+  window.addEventListener("message", (event) => {
+    const frame = $("#tree-frame");
+    if (!frame.contentWindow || event.source !== frame.contentWindow || !event.data || typeof event.data !== "object") return;
+    if (!state.treeViewId || event.data.view_id !== state.treeViewId) return;
+    const type = event.data.type;
+    if (["biomaker:tree-state", "biomaker-tree-state"].includes(type)) {
+      if (state.selectedRunId) state.treeViewState[state.selectedRunId] = event.data.state || event.data.payload || {};
+    }
+    if (type === "biomaker:tree-state-request") {
+      const savedState = state.selectedRunId ? state.treeViewState[state.selectedRunId] : null;
+      if (savedState && typeof event.data.key === "string") {
+        frame.contentWindow.postMessage({
+          type: "biomaker:tree-state-restore",
+          key: event.data.key,
+          state: savedState,
+          view_id: state.treeViewId,
+        }, "*");
+      }
+    }
+    if (["biomaker:tree-interaction", "biomaker-tree-interaction"].includes(type)) {
+      state.treeInteracting = Boolean(event.data.active);
+      if (!state.treeInteracting && state.resources.tree.pending) renderTree().catch(showError);
+    }
   });
   window.addEventListener("beforeunload", (event) => {
     if (!state.dirty) return;
@@ -926,26 +1588,25 @@ function bindEvents() {
 async function initialize() {
   bindEvents();
   refreshIcons();
-  const [projects, runs, datasets, environment] = await Promise.all([
-    api("/api/projects"),
+  const [runs, datasets, environment] = await Promise.all([
     api("/api/runs"),
     api("/api/datasets"),
     api("/api/env"),
   ]);
-  state.projects = projects;
   state.runs = runs;
   state.datasets = datasets;
   state.env = environment.values;
-  state.envDefaults = environment.defaults || {};
+  state.envSource = environment.source || {};
   renderDatasetOptions();
+  setMobileView("setup");
+  populateProjectForm(null);
+  renderRuns();
   const activeRun = runs.find((run) => ["running", "stopping", "queued"].includes(run.status));
-  const initialProject = projectById(activeRun?.project_id) || projects[0] || null;
-  if (initialProject) {
-    await selectProject(initialProject.id);
-  } else {
-    newProject();
-  }
-  window.setInterval(() => refreshRuns().catch(showError), 2000);
+  const initialRun = activeRun || runs[0] || null;
+  if (initialRun) await selectRun(initialRun.id);
+  else await loadSelectedRun(true);
+  if (activeRun) setMobileView("run");
+  schedulePoll(nextPollDelay());
 }
 
 document.addEventListener("DOMContentLoaded", () => initialize().catch(showError));

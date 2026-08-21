@@ -5,12 +5,12 @@ import json
 import logging
 import math
 import shutil
-import sys
+import signal
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event, RLock, Thread
+from threading import RLock
 
 from omegaconf import OmegaConf
 from rich.live import Live
@@ -23,14 +23,14 @@ from .agents.proposal_agent import ProposalAgent
 from .interpreter import Interpreter
 from .journal import Journal, Node
 from .journal2report import journal2report
+from .utils import tree_export
 from .utils.artifact_validation import (
     normalize_working_outputs,
     validate_working_outputs,
 )
-from .utils import tree_export
 from .utils.config import (
-    Config,
     SHARED_CONSOLE,
+    Config,
     load_cfg,
     load_task_desc,
     prep_agent_workspace,
@@ -38,18 +38,18 @@ from .utils.config import (
     save_run,
     sync_node_working_to_run_workspace,
 )
-from .utils.exp_guide import write_exp_guide
-from .utils.experiment_contract import load_experiment_contract
-from .utils.events import append_event
 from .utils.evaluator_setup import (
     clean_candidate_outputs,
     prepare_evaluator,
     score_candidate_with_evaluator,
 )
+from .utils.events import append_event
 from .utils.execution_record import (
     attach_artifact_validation_result,
     attach_evaluator_run_result,
 )
+from .utils.exp_guide import write_exp_guide
+from .utils.experiment_contract import load_experiment_contract
 from .utils.final_retrain import run_final_retrain
 from .utils.private_evaluation import evaluate_private_outputs
 from .utils.run_manifest import write_run_manifest
@@ -562,8 +562,7 @@ def _private_metrics_summary(history: list) -> dict:
     }
 
 
-def run():
-    cfg = load_cfg()
+def _run(cfg: Config) -> int:
     log_level = cfg.log_level.upper()
     level = getattr(logging, log_level, None)
     if log_level == "TRACE":
@@ -608,6 +607,13 @@ def run():
     )
 
     task_desc = load_task_desc(cfg)
+    manifest_path = write_run_manifest(cfg, task_desc)
+    append_event(
+        cfg.log_dir,
+        "run_manifest_updated",
+        path=manifest_path,
+        stage="task_loaded",
+    )
 
     logger.info("Preparing agent workspace ...")
     prep_agent_workspace(cfg)
@@ -704,7 +710,12 @@ def run():
         split_protocol_text=split_protocol.prompt_text,
         prediction_spec=prediction_spec,
     )
-    append_event(cfg.log_dir, "run_manifest_written", path=manifest_path)
+    append_event(
+        cfg.log_dir,
+        "run_manifest_updated",
+        path=manifest_path,
+        stage="evaluator_ready",
+    )
 
     journal = Journal()
 
@@ -851,13 +862,10 @@ def run():
     round_start_step_by_round = scheduler.round_start_step_by_round
     round_item_count_by_round = scheduler.round_item_count_by_round
     best_node_before_by_round = scheduler.best_node_before_by_round
-    live_tree_refresh_seconds = 1
     live_tree_lock = RLock()
-    live_tree_stop = Event()
-    last_live_tree_log_at = 0.0
     live_tree_display = Live(
         console=SHARED_CONSOLE,
-        refresh_per_second=1,
+        auto_refresh=False,
         transient=False,
         vertical_overflow="visible",
     )
@@ -873,7 +881,7 @@ def run():
         return journal_to_rich_tree(display_journal)
 
     def refresh_live_tree(log_tree: bool = True) -> None:
-        nonlocal last_live_tree_log_at, live_tree_display_started
+        nonlocal live_tree_display_started
         with live_tree_lock:
             display_journal = save_live_tree(live_display_nodes())
             if log_tree:
@@ -884,18 +892,6 @@ def run():
                     live_tree_view(display_journal),
                     refresh=True,
                 )
-                last_live_tree_log_at = time.monotonic()
-
-    def live_tree_ticker() -> None:
-        while not live_tree_stop.wait(live_tree_refresh_seconds):
-            try:
-                if live_display_nodes() and (
-                    time.monotonic() - last_live_tree_log_at
-                    >= live_tree_refresh_seconds
-                ):
-                    refresh_live_tree(log_tree=True)
-            except Exception as exc:
-                logger.debug("Live tree refresh failed: %s", exc)
 
     def remaining_schedule_budget() -> int:
         return scheduler.remaining_budget(total_steps, global_step)
@@ -1280,8 +1276,6 @@ def run():
             for meta in generation_future_to_meta.values()
         )
 
-    live_tree_thread = Thread(target=live_tree_ticker, daemon=True)
-    live_tree_thread.start()
     generation_executor = ThreadPoolExecutor(max_workers=max(1, total_steps))
     executor = ThreadPoolExecutor(max_workers=parallel_workers)
     try:
@@ -1362,8 +1356,6 @@ def run():
                 logger.error(f"Exception during async generation/execution round: {e}")
                 raise e
     finally:
-        live_tree_stop.set()
-        live_tree_thread.join(timeout=2)
         with live_tree_lock:
             if live_tree_display_started:
                 display_journal = save_live_tree(live_display_nodes())
@@ -1428,8 +1420,50 @@ def run():
         )
     elif cfg.final_retrain.enabled and best_node is None and not end_with_exception:
         append_event(cfg.log_dir, "final_retrain_skipped", reason="no_best_node")
-    append_event(cfg.log_dir, "run_finished", completed_steps=global_step)
     agent_loop_exit_handler(end_with_exception=end_with_exception)
+    return global_step
+
+
+def run() -> None:
+    """Run BioMaker and leave one authoritative terminal lifecycle event."""
+
+    cfg = load_cfg()
+    manifest_path = write_run_manifest(cfg, None)
+    append_event(cfg.log_dir, "run_manifest_written", path=manifest_path)
+    previous_sigterm_handler = None
+
+    def handle_sigterm(signum, _frame):
+        append_event(
+            cfg.log_dir,
+            "run_interrupted",
+            reason="sigterm",
+            signal=signum,
+        )
+        raise SystemExit(128 + signum)
+
+    try:
+        previous_sigterm_handler = signal.signal(signal.SIGTERM, handle_sigterm)
+    except (AttributeError, ValueError):
+        # Embedded callers may invoke run() outside the main thread.
+        previous_sigterm_handler = None
+    try:
+        try:
+            completed_steps = _run(cfg)
+        except KeyboardInterrupt:
+            append_event(cfg.log_dir, "run_interrupted", reason="keyboard_interrupt")
+            raise
+        except Exception as exc:
+            append_event(
+                cfg.log_dir,
+                "run_failed",
+                exc_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        append_event(cfg.log_dir, "run_finished", completed_steps=completed_steps)
+    finally:
+        if previous_sigterm_handler is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 if __name__ == "__main__":

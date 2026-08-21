@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import pytest
-
-from webui.artifacts import ArtifactError, list_artifacts, resolve_artifact
+from webui.artifacts import (
+    ArtifactError,
+    artifact_collection_revision,
+    list_artifacts,
+    resolve_artifact,
+)
 
 
 def test_artifact_resolution_is_confined_to_logs_root(settings, tmp_path):
@@ -35,8 +39,17 @@ def test_artifact_listing_excludes_direct_symlinks(settings, tmp_path):
     outside.write_text("secret", encoding="utf-8")
     (log_dir / "linked-secret.txt").symlink_to(outside)
 
-    names = [
-        item["name"]
-        for item in list_artifacts(settings, {"id": "r", "log_dir": str(log_dir)})
-    ]
+    run = {"id": "r", "log_dir": str(log_dir)}
+    artifacts = list_artifacts(settings, run)
+    names = [item["name"] for item in artifacts]
     assert names == ["results.tsv"]
+    assert isinstance(artifacts[0]["revision"], str)
+
+    first_revision = artifacts[0]["revision"]
+    first_collection_revision = artifact_collection_revision(artifacts)
+    (log_dir / "results.tsv").write_text("metric\n10\n", encoding="utf-8")
+    changed = list_artifacts(settings, run)
+
+    assert changed[0]["revision"] != first_revision
+    assert artifact_collection_revision(changed) != first_collection_revision
+    assert artifact_collection_revision([]) is None
