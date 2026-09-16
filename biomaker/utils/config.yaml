@@ -37,6 +37,12 @@ split_builder:
 final_retrain:
   enabled: True
 
+# User-only private evaluation after each search node. Set false for suites
+# that evaluate the private test only after final retraining; this never changes
+# the validation scores used to select the best node.
+private_evaluation:
+  per_node: True
+
 # agent hyperparams
 agent:
   # how many proposal/debug/improve iterations to run

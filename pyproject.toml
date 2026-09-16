@@ -30,6 +30,11 @@ package-data = {biomaker = ["utils/config.yaml", "utils/viz_templates/*"]}
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
 
+[tool.uv]
+# Dependency metadata changes when this file changes, even if pyproject.toml
+# itself has not changed since the previous checkout.
+cache-keys = [{ file = "pyproject.toml" }, { file = "requirements.txt" }]
+
 [tool.setuptools.packages.find]
 include = ["biomaker*"]
 exclude = ["logs*", "workspaces*", "exp_summary*"]

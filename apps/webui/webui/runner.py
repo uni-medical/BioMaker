@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock, Thread
@@ -54,6 +54,7 @@ CLAIMED_LAUNCH_STATE = "claimed"
 EXPERIMENT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 SUPERVISOR_CONFIG_ENV = "BIOMAKER_QUEUE_SUPERVISOR_CONFIG"
 RUN_BOOTSTRAP_ENV = "BIOMAKER_QUEUE_RUN_BOOTSTRAP"
+COMPUTE_ENV_KEYS = ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")
 LAUNCH_GRACE_SECONDS = 10.0
 RUN_BOOTSTRAP_TIMEOUT_SECONDS = 10.0
 UNCAPTURED_SESSION_DRAIN_TIMEOUT_SECONDS = 5.0
@@ -72,6 +73,24 @@ _INLINE_SUPERVISORS_LOCK = RLock()
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _compute_environment_snapshot(
+    environment: Mapping[str, str | None] | None = None,
+) -> dict[str, str | None]:
+    """Keep per-submission CUDA selection without persisting credentials.
+
+    A missing variable (None) and an empty CUDA mask have different meanings;
+    both must override the environment of an already-running supervisor.
+    """
+
+    source = os.environ if environment is None else environment
+    snapshot = {key: source.get(key) for key in COMPUTE_ENV_KEYS}
+    if any(
+        value is not None and not isinstance(value, str) for value in snapshot.values()
+    ):
+        raise ValueError("Compute environment values must be strings or None")
+    return snapshot
 
 
 def _is_claimed_run(record: dict[str, Any]) -> bool:
@@ -550,6 +569,7 @@ class RunManager:
         snapshot: dict[str, Any],
         options: dict[str, Any],
         requested_exp_name: str | None,
+        compute_environment: Mapping[str, str | None] | None = None,
     ) -> dict[str, Any]:
         dataset_path = Path(str(snapshot["dataset_path"])).expanduser().resolve()
         if not dataset_path.is_dir():
@@ -582,6 +602,7 @@ class RunManager:
             task_file=task_file,
             logs_root=self.settings.logs_root,
             workspaces_root=self.settings.workspaces_root,
+            compute_environment=compute_environment,
         )
 
     def enqueue_command(
@@ -594,6 +615,7 @@ class RunManager:
         requested_exp_name: str | None = None,
         logs_root: Path | str | None = None,
         workspaces_root: Path | str | None = None,
+        compute_environment: Mapping[str, str | None] | None = None,
     ) -> dict[str, Any]:
         """Submit a CLI command through the same durable FIFO as the WebUI."""
 
@@ -617,6 +639,7 @@ class RunManager:
             task_file=None,
             logs_root=logs_root or self.settings.logs_root,
             workspaces_root=workspaces_root or self.settings.workspaces_root,
+            compute_environment=compute_environment,
         )
 
     def _add_queued_run(
@@ -631,6 +654,7 @@ class RunManager:
         task_file: Path | None,
         logs_root: Path | str,
         workspaces_root: Path | str,
+        compute_environment: Mapping[str, str | None] | None = None,
     ) -> dict[str, Any]:
         console_log = (self.settings.state_dir / "console" / f"{run_id}.log").resolve()
         now = utc_now()
@@ -644,6 +668,7 @@ class RunManager:
             "command": command,
             "cwd": str(cwd),
             "options": options,
+            "compute_environment": _compute_environment_snapshot(compute_environment),
             "task_file": str(task_file) if task_file is not None else None,
             "console_log": str(console_log),
             "logs_root": str(Path(logs_root).expanduser().resolve()),
@@ -826,11 +851,13 @@ class RunManager:
                 workspaces_root=(
                     source.get("workspaces_root") or self.settings.workspaces_root
                 ),
+                compute_environment=source.get("compute_environment"),
             )
         return self._enqueue_snapshot(
             snapshot=source["project_snapshot"],
             options=source["options"],
             requested_exp_name=retry_name,
+            compute_environment=source.get("compute_environment"),
         )
 
     def summary(self) -> dict[str, Any]:
@@ -1187,6 +1214,16 @@ class RunManager:
             "BIOMAKER_LAUNCH_TOKEN": str(record["launch_token"]),
             "BIOMAKER_QUEUE_DIRECT": "1",
         }
+        # Older records predate per-run CUDA snapshots and retain their original
+        # inheritance behavior. New submissions must not inherit another run's
+        # GPU mask merely because that run started the shared supervisor first.
+        if record.get("compute_environment") is not None:
+            snapshot = _compute_environment_snapshot(record["compute_environment"])
+            for key, value in snapshot.items():
+                if value is None:
+                    environment.pop(key, None)
+                else:
+                    environment[key] = value
         if self._uses_injected_process_factory:
             return (
                 list(record["command"]),

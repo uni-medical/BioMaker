@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from types import SimpleNamespace
@@ -320,6 +321,55 @@ def _install_minimal_run(
 def _set_execution_workspace(node, workspace):
     node.execution_workspace = str(workspace)
     return workspace
+
+
+@pytest.mark.parametrize("per_node", [None, True, False])
+@pytest.mark.parametrize("final_retrain_enabled", [False, True])
+def test_private_evaluation_policy_preserves_search_and_controls_private_history(
+    tmp_path, monkeypatch, per_node, final_retrain_enabled
+):
+    write_private_metrics = run_module._append_private_metrics_entry
+    cfg, events, order, _live = _install_minimal_run(
+        monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False
+    )
+    if per_node is not None:
+        cfg.private_evaluation = SimpleNamespace(per_node=per_node)
+    cfg.final_retrain.enabled = final_retrain_enabled
+    private_dir = cfg.log_dir / "private_gt"
+    private_dir.mkdir()
+    (private_dir / "private_gt.json").write_text("{}", encoding="utf-8")
+    private_calls = []
+
+    def evaluate_private(workspace, hidden_dir, **_kwargs):
+        private_calls.append((workspace, hidden_dir))
+        # A poor private score must never replace the validation metric.
+        return {"results": [{"name": "private_test", "value": 0.1}]}
+
+    monkeypatch.setattr(run_module, "evaluate_private_outputs", evaluate_private)
+    monkeypatch.setattr(run_module, "_append_private_metrics_entry", write_private_metrics)
+
+    run_module._run_direct_entry()
+
+    assert len(private_calls) == int(per_node is not False)
+    assert ("final_retrain" in order) is final_retrain_enabled
+    saved = [payload for name, payload in events if name == "step_saved"]
+    assert len(saved) == 1
+    assert saved[0]["step"] == saved[0]["scheduled_step"] == 0
+    assert saved[0]["best_node_id"] == saved[0]["node_id"]
+    assert events[-1] == ("run_finished", {"completed_steps": 1})
+
+    metrics_path = cfg.log_dir / "private_metrics.json"
+    if per_node is False and not final_retrain_enabled:
+        assert not metrics_path.exists()
+        return
+    payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    history = payload["history"]
+    assert payload["visible_to_agent"] is False
+    assert len(history) == int(per_node is not False) + int(final_retrain_enabled)
+    assert all(entry["metric"]["value"] == 0.9 for entry in history)
+    if final_retrain_enabled:
+        assert history[-1]["stage"] == "final_retrain"
+        assert history[-1]["node_id"] == saved[0]["best_node_id"]
 
 
 def test_broken_pipe_during_final_live_stop_does_not_skip_terminal_work(

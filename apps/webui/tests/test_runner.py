@@ -2806,3 +2806,79 @@ def test_requeue_preserves_model_resolved_from_settings(settings):
     assert retry["options"]["model_for_all_agents"] == "deepseek-v4-pro"
     assert "model_for_all_agents=deepseek-v4-pro" in retry["command"]
     wait_for_status(store, retry["id"], {"succeeded"})
+
+
+@pytest.mark.parametrize("submission", ["cli", "webui"])
+@pytest.mark.parametrize("cuda_mask", ["1", "", None])
+def test_durable_queue_and_retry_preserve_submission_compute_environment(
+    settings, monkeypatch, submission, cuda_mask
+):
+    dataset = settings.datasets_root / "sample"
+    dataset.mkdir()
+    if cuda_mask is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", cuda_mask)
+        monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    monkeypatch.setenv("UNRELATED_API_KEY", "must-not-persist")
+    database = settings.state_dir / "runs.sqlite3"
+    store = SQLiteRunStore(database)
+    manager = RunManager(settings, store)
+    monkeypatch.setattr(manager, "_ensure_supervisor", lambda: None)
+    try:
+        if submission == "cli":
+            run = manager.enqueue_command([sys.executable], cwd=settings.method_root)
+        else:
+            run = manager.enqueue_experiment(experiment_record(dataset))
+        assert run["compute_environment"] == {
+            "CUDA_VISIBLE_DEVICES": cuda_mask,
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID" if cuda_mask is not None else None,
+        }
+        assert "must-not-persist" not in json.dumps(run)
+    finally:
+        store.close()
+
+    # A different caller started the supervisor, or it was restarted under a
+    # different shell. Reload the durable record and exercise the FIFO launcher.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
+    reopened = SQLiteRunStore(database)
+    factory = ProcessFactory(settings, outcomes=[(0, "run_finished")])
+    restarted = RunManager(settings, reopened, process_factory=factory)
+    try:
+        restarted.start()
+        wait_for_status(reopened, run["id"], {"succeeded"})
+        child_env = factory.processes[0].kwargs["env"]
+        if cuda_mask is None:
+            assert "CUDA_VISIBLE_DEVICES" not in child_env
+            assert "CUDA_DEVICE_ORDER" not in child_env
+        else:
+            assert child_env["CUDA_VISIBLE_DEVICES"] == cuda_mask
+            assert child_env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+
+        factory.outcomes.append((0, "run_finished"))
+        retry = restarted.requeue(run["id"])
+        wait_for_status(reopened, retry["id"], {"succeeded"})
+        assert retry["compute_environment"] == run["compute_environment"]
+        retry_env = factory.processes[1].kwargs["env"]
+        for key in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"):
+            assert retry_env.get(key) == child_env.get(key)
+    finally:
+        restarted.shutdown()
+        reopened.close()
+
+
+def test_legacy_queue_record_retains_environment_inheritance(settings, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    store = MemoryRunStore()
+    manager = RunManager(settings, store)
+    try:
+        _command, _cwd, environment = manager._run_process_spec(
+            {"id": "legacy", "launch_token": "legacy-token"}
+        )
+        assert environment["CUDA_VISIBLE_DEVICES"] == "2"
+        assert environment["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    finally:
+        store.close()

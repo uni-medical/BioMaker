@@ -78,6 +78,9 @@ def _selected_cfg(cfg: Config) -> dict[str, Any]:
         "effective_parallel_workers": effective_workers,
         "compute_slots": getattr(cfg.exec, "compute_slots", None),
         "final_retrain_enabled": cfg.final_retrain.enabled,
+        "private_evaluation_per_node": getattr(
+            getattr(cfg, "private_evaluation", None), "per_node", True
+        ),
         "model_for_all_agents": cfg.model_for_all_agents,
         "main_model": cfg.agent.code.model,
         "feedback_model": cfg.agent.feedback.model,

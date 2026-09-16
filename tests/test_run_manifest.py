@@ -1,10 +1,15 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from biomaker.utils import run_manifest
 
 
-def test_run_manifest_preserves_identity_across_atomic_updates(tmp_path, monkeypatch):
+@pytest.mark.parametrize("private_per_node", [None, True, False])
+def test_run_manifest_preserves_identity_across_atomic_updates(
+    tmp_path, monkeypatch, private_per_node
+):
     workspace = tmp_path / "workspaces" / "1-test"
     workspace.mkdir(parents=True)
     log_dir = tmp_path / "logs" / "1-test"
@@ -42,6 +47,8 @@ def test_run_manifest_preserves_identity_across_atomic_updates(tmp_path, monkeyp
         copy_data=False,
         preprocess_data=False,
     )
+    if private_per_node is not None:
+        cfg.private_evaluation = SimpleNamespace(per_node=private_per_node)
     monkeypatch.setenv("BIOMAKER_LAUNCH_TOKEN", "webui-run-token")
     monkeypatch.setattr(run_manifest, "environment_manifest_text", lambda **_: "facts")
 
@@ -58,4 +65,7 @@ def test_run_manifest_preserves_identity_across_atomic_updates(tmp_path, monkeyp
     assert updated["config"]["main_model"] == "main-model"
     assert updated["config"]["knowledge_base_model"] == "helper-model"
     assert updated["config"]["report_model"] == "report-model"
+    assert updated["config"]["private_evaluation_per_node"] is (
+        private_per_node is not False
+    )
     assert not list(log_dir.glob("*.tmp"))

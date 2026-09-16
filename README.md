@@ -81,6 +81,35 @@ workspace-level `.biomaker/` durable FIFO as the WebUI. The command remains
 attached to the durable console log and returns the experiment process's exit
 code; closing that terminal or the WebUI does not terminate the experiment.
 
+`exec.parallel_workers=auto` assigns one candidate per visible CUDA GPU: one on
+a single-GPU workstation and up to four on a four-GPU server. Select a subset
+before submitting a run with `CUDA_VISIBLE_DEVICES`; each queued run and retry
+keeps its own selection, even when a supervisor is already running. An empty
+mask disables CUDA. GPU selection does not reserve a device against other users
+or independently launched jobs.
+
+The method-specific preparation and external queue scripts in `scripts/` use
+the checkout's parent as their workspace by default. Their task registries and
+descriptions live in that workspace's `experiments/main9/` and
+`experiments/fig2_medmnist/`, alongside `datasets/`, `logs/`, and `workspaces/`.
+Use their `--help` options and `--dry-run` queue mode to check a deployment before
+starting experiments. These experiment protocols require their prepared data
+and registry files; synchronizing source code alone does not supply datasets.
+Preparation verifies artifact SHA-256 checksums before reusing an existing package;
+older packages without an integrity inventory need an explicit `--replace` rebuild.
+This check does not prevent queues from reading previously prepared packages.
+The external queues request `private_evaluation.per_node=false` so private test
+metrics are computed only after final retraining. Ordinary runs retain per-node
+user-only evaluation by default. Both modes select candidates using validation
+metrics.
+
+The suite preflight also checks evaluator support. Main9 currently supports
+segmentation through the fixed evaluator; its detection (`coco_map`) and
+enhancement (`psnr`) tasks are blocked. The Figure 2 registry's RetinaMNIST
+`ordinal_accuracy` protocol is also blocked until that metric has a fixed public
+and private evaluator. Use `--only` to select supported tasks; the queues do not
+substitute a different metric or silently skip unsupported tasks.
+
 ## Workflow
 
 The default run is intentionally simple:

@@ -140,6 +140,11 @@ class FinalRetrainConfig:
 
 
 @dataclass
+class PrivateEvaluationConfig:
+    per_node: bool
+
+
+@dataclass
 class Config(Hashable):
     data_dir: Path
     desc_file: Path | None
@@ -160,6 +165,7 @@ class Config(Hashable):
     evaluator_cache: EvaluatorCacheConfig
     split_builder: SplitBuilderConfig
     final_retrain: FinalRetrainConfig
+    private_evaluation: PrivateEvaluationConfig
     generate_report: bool
     report: StageConfig
     agent: AgentConfig
@@ -210,6 +216,13 @@ def _validate_exec_config(cfg: Config) -> None:
             raise ValueError(
                 f"split_builder.attempts must be an integer >= 1, got {attempts!r}."
             )
+
+    private_cfg = getattr(cfg, "private_evaluation", None)
+    if private_cfg is not None and not isinstance(private_cfg.per_node, bool):
+        raise ValueError(
+            "private_evaluation.per_node must be a boolean, "
+            f"got {private_cfg.per_node!r}."
+        )
 
     agent_cfg = getattr(cfg, "agent", None)
     knowledge_cfg = getattr(agent_cfg, "knowledge_base", None)

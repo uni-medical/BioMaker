@@ -1303,41 +1303,42 @@ def _run(cfg: Config) -> int:
                 solution_workspace,
                 target_name="working_best",
             )
-        private_metrics = None
-        private_error = None
-        try:
-            with compute_pool.lease() as private_slot:
-                private_metrics = evaluate_private_outputs(
-                    solution_workspace,
-                    private_dir,
-                    env_overrides=private_slot.env_overrides,
+        if getattr(getattr(cfg, "private_evaluation", None), "per_node", True):
+            private_metrics = None
+            private_error = None
+            try:
+                with compute_pool.lease() as private_slot:
+                    private_metrics = evaluate_private_outputs(
+                        solution_workspace,
+                        private_dir,
+                        env_overrides=private_slot.env_overrides,
+                    )
+            except Exception as exc:
+                logger.warning("Private evaluation failed: %s", exc)
+                private_error = str(exc)
+            if (
+                private_metrics
+                or private_error
+                or (private_dir / "private_gt.json").is_file()
+            ):
+                _append_private_metrics_entry(
+                    cfg,
+                    {
+                        "workflow_step": global_step,
+                        "node_step": node.step,
+                        "node_id": node.id,
+                        "parent_id": node.parent.id if node.parent is not None else None,
+                        "stage": node.node_status,
+                        "is_buggy": bool(node.is_buggy),
+                        "outcome": node.outcome,
+                        "metric": _metric_payload(node),
+                        "is_current_best": node is best_node,
+                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "private_metrics_available": private_metrics is not None,
+                        "private_metrics": private_metrics,
+                        "private_error": private_error,
+                    },
                 )
-        except Exception as exc:
-            logger.warning("Private evaluation failed: %s", exc)
-            private_error = str(exc)
-        if (
-            private_metrics
-            or private_error
-            or (private_dir / "private_gt.json").is_file()
-        ):
-            _append_private_metrics_entry(
-                cfg,
-                {
-                    "workflow_step": global_step,
-                    "node_step": node.step,
-                    "node_id": node.id,
-                    "parent_id": node.parent.id if node.parent is not None else None,
-                    "stage": node.node_status,
-                    "is_buggy": bool(node.is_buggy),
-                    "outcome": node.outcome,
-                    "metric": _metric_payload(node),
-                    "is_current_best": node is best_node,
-                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "private_metrics_available": private_metrics is not None,
-                    "private_metrics": private_metrics,
-                    "private_error": private_error,
-                },
-            )
         try:
             tree = journal_to_rich_tree(journal)
         except Exception as exc:
@@ -1356,6 +1357,7 @@ def _run(cfg: Config) -> int:
             round_item_index=round_node.round_item_index,
             round_item_count=round_node.round_item_count,
             step=solution_node.step,
+            scheduled_step=solution_node.scheduled_step,
             node_id=solution_node.id,
             best_node_id=best_node.id if best_node is not None else None,
         )

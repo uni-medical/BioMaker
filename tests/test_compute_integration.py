@@ -28,8 +28,19 @@ def test_default_config_uses_auto_workers_and_explicit_integer_is_valid():
     default_cfg = config_module._load_cfg(use_cli_args=False)
 
     assert default_cfg.exec.parallel_workers == "auto"
+    assert default_cfg.private_evaluation.per_node is True
     config_module._validate_exec_config(default_cfg)
     config_module._validate_exec_config(SimpleNamespace(exec=_minimal_exec_config(3)))
+
+
+@pytest.mark.parametrize("invalid", ["false", 0, 1, None])
+def test_private_evaluation_config_rejects_non_boolean_policy(invalid):
+    cfg = SimpleNamespace(
+        exec=_minimal_exec_config("auto"),
+        private_evaluation=SimpleNamespace(per_node=invalid),
+    )
+    with pytest.raises(ValueError, match="private_evaluation.per_node must be a boolean"):
+        config_module._validate_exec_config(cfg)
 
 
 @pytest.mark.parametrize("invalid", ["1", "AUTO", "cuda", "", 0, -1, True])
