@@ -21,6 +21,32 @@ choice unspecified. A declared nondefault setting must be preserved or reported
 as unsupported. Equivalent parameter spellings are normalized before checking
 the frozen protocol.
 
+The capability catalog separates `protocol_fields` (accepted settings, aliases,
+defaults and fixed values) from `documentation` (explanations of scoring).
+Each family includes a minimal `metric_contract_example`; the agent adapts its
+settings to the task rather than copying example dataset assumptions.
+`sample_schema` describes the values an adapter returns, not the original
+dataset layout. Column names, storage formats, and decoding remain agent-owned.
+
+Preparation validates data and metric declarations separately. When the builder
+finishes successfully and the data checks pass, a declaration error is returned
+to the preparation agent with the task, prepared data semantics, capability
+catalog, and exact diagnostic. The agent returns a corrected `metric_contract`
+JSON object. Harness validates it before replacing that field; it does not rerun
+the builder or rewrite the split tables, converted files, or private answers.
+Rejected proposals leave the manifest unchanged and are included in the next
+repair prompt. Builder and declaration repairs share the configured preparation
+attempt budget. Data or execution failures still return to the builder.
+
+Known equivalent aliases are normalized without another model call. A named
+primary metric such as `{"name": "aji", "aji_matching": "per_gt_best_iou"}`
+preserves its settings just like their top-level equivalents; conflicting names
+or settings are errors. Custom metric settings are preserved for their separate
+implementation and validation. Unknown fields are never automatically deleted
+or downgraded to notes: the agent must distinguish redundant explanation from a
+real requirement using the task. Unsupported required semantics remain explicit
+errors. Cached packages are revalidated before reuse; invalid ones are rejected.
+
 All supported classification, regression, segmentation, detection, and restoration paths
 use the same adapter runtime and trusted metric kernels. Built-in adapters
 cover familiar declared representations. Generated adapters extend data

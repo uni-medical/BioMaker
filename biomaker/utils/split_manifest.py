@@ -291,7 +291,8 @@ def validate_split_manifest(
     _validate_key_columns(manifest, frames, errors)
     _validate_sample_universe(manifest, output_dir, source_input_dir, frames, errors)
     _validate_prediction_contract(manifest, errors)
-    for key in ("visibility", "prediction_contract", "metric_contract"):
+    # Metric declarations have their own validator and local repair stage.
+    for key in ("visibility", "prediction_contract"):
         if key in manifest and not isinstance(manifest[key], dict):
             errors.append(f"split_manifest.json {key} must be an object.")
     return manifest

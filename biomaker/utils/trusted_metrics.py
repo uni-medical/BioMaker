@@ -193,6 +193,17 @@ _METRIC_ALIASES = {alias: name for name, definition in _METRIC_DEFINITIONS.items
 _METRIC_FAMILIES = {name: definition['family'] for name, definition in _METRIC_DEFINITIONS.items()}
 SUPPORTED_STANDARD_METRICS = dict(_METRIC_FAMILIES)
 
+_METRIC_CONTRACT_EXAMPLES = {
+    'regression': dict(primary_metric='mae', units='months'),
+    'classification': dict(primary_metric='auc', secondary_metrics=['accuracy'],
+                           task_type='binary', class_labels=['negative', 'positive']),
+    'segmentation': dict(primary_metric='aji', secondary_metrics=['binary_dice']),
+    'image_restoration': dict(primary_metric='psnr', secondary_metrics=['ssim'],
+                              restoration_evaluation=dict(data_range=1.0, crop_size=None,
+                                                           groups=None, aggregation='mean_images')),
+    'detection': dict(primary_metric='ap50', secondary_metrics=['recall']),
+}
+
 
 def metric_capabilities():
     """Return the executable registry's JSON-friendly public protocol catalog.
@@ -203,14 +214,26 @@ def metric_capabilities():
     """
     families = copy.deepcopy(_FAMILY_CAPABILITIES)
     for family, definition in families.items():
+        # Keep reference prose out of the parameter namespace presented to Agents.
+        definition['documentation'] = {name: definition.pop(name) for name in
+                                       ('score_scope', 'empty_policy', 'matching', 'unsupported')
+                                       if name in definition}
+        definition['metric_contract_example'] = copy.deepcopy(_METRIC_CONTRACT_EXAMPLES[family])
         definition['metrics'] = [name for name, item in _METRIC_DEFINITIONS.items() if item['family'] == family]
         aliases = {alias: name for name, field in definition['protocol_fields'].items() for alias in field.get('aliases', [])}
         definition['parameter_aliases'] = aliases
         definition['allowed_contract_fields'] = sorted(set(_COMMON_PROTOCOL_FIELDS) | set(definition['protocol_fields']) |
                                                        set(aliases) | set(definition.get('flattened_contract_fields', [])))
-    return dict(api_version=1, metrics=copy.deepcopy(_METRIC_DEFINITIONS),
+    return dict(api_version=2, metrics=copy.deepcopy(_METRIC_DEFINITIONS),
                 aliases=dict(_METRIC_ALIASES), common_protocol_fields=copy.deepcopy(_COMMON_PROTOCOL_FIELDS),
                 families=families,
+                catalog_usage=[
+                    'metric_contract declares requested metrics and settings using common_protocol_fields and the family protocol_fields; allowed_contract_fields includes accepted aliases and flattened forms.',
+                    'Fixed settings and defaults may be omitted; Harness resolves and freezes them. Explicit task requirements take precedence over illustrative examples.',
+                    'metric_contract_example is a valid illustration, not a dataset prescription: choose the requested metrics and adapt data-specific values such as class labels, units and intensity range.',
+                    'sample_schema describes canonical values returned by the data adapter. Agent chooses source columns, paths, file formats and data loading; the schema does not prescribe the original dataset layout.',
+                    'documentation explains scoring behavior and is not a set of metric_contract fields. Optional notes/description carry explanatory prose; they cannot change scoring behavior or replace task-required settings.',
+                ],
                 unsupported_policy='Reject unknown semantic fields, conflicting aliases, unsupported settings and undefined requested metrics; never replace the scoring definition or drop samples.',
                 extension_steps=[
                     'Register the canonical metric, direction, family, aliases and supported protocol in trusted_metrics.py.',

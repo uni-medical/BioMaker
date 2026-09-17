@@ -53,6 +53,7 @@ from .exp_guide import (
 from .experiment_contract import load_experiment_contract
 from .metric_declarations import (
     PROTOCOL_DOCUMENTATION_FIELDS as _PROTOCOL_DOCUMENTATION_FIELDS,
+    canonical_metric_contract,
     declared_metric_names,
     manifest_head_types as _manifest_head_types,
     manifest_primary_metric as _manifest_primary_metric,
@@ -1984,19 +1985,19 @@ def _validate_declared_capabilities(task_desc: Any, workspace_dir: Path) -> None
 def _validate_custom_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_desc: Any) -> None:
     """Custom formulas cannot redefine the prepared protocol or outputs."""
     primary, secondary = _requested_metric_names(task_desc, workspace_dir)
-    if primary and metric_name(str(spec.get("primary_metric", ""))) != primary:
+    actual = _canonical_declared_settings(spec)
+    if primary and actual.get("primary_metric") != primary:
         raise EvaluatorSetupError("Custom evaluator changed the prepared primary metric.")
-    if set(secondary) - {metric_name(str(m)) for m in spec.get("secondary_metrics", [])}:
+    if set(secondary) - set(actual.get("secondary_metrics", [])):
         raise EvaluatorSetupError("Custom evaluator omitted prepared secondary metrics.")
     manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
-    declared = _canonical_declared_settings(manifest.get("metric_contract", {}))
+    declared = _canonical_declared_settings(manifest.get("metric_contract", {}), fallback_primary=primary)
     blocks = re.findall(r"```restoration-evaluation\s*\n(.*?)```", _task_payload(task_desc), re.S)
     if len(blocks) > 1:
         raise EvaluatorSetupError("Declare exactly one restoration-evaluation contract.")
     if blocks:
         declared["restoration_evaluation"] = {**declared.get("restoration_evaluation", {}), **json.loads(blocks[0])}
-        declared = _canonical_declared_settings(declared)
-    actual = _canonical_declared_settings(spec)
+        declared = _canonical_declared_settings(declared, fallback_primary=primary)
     def preserves(value, expected):
         if isinstance(expected, dict):
             return isinstance(value, dict) and all(key in value and preserves(value[key], item) for key, item in expected.items())
@@ -2015,39 +2016,11 @@ def _validate_custom_metric_contract(spec: dict[str, Any], workspace_dir: Path, 
             raise EvaluatorSetupError("Custom evaluator changed or omitted prepared prediction field: " + key)
 
 
-def _canonical_declared_settings(values: dict[str, Any]) -> dict[str, Any]:
-    """Normalize supported spelling aliases even in custom metric extensions."""
-    from .trusted_metrics import metric_capabilities, normalize_ssim_parameters
-    result = json.loads(json.dumps(values))
-    families = metric_capabilities()["families"]
-    for capability in families.values():
-        for alias, name in capability["parameter_aliases"].items():
-            if alias in result:
-                value = result.pop(alias)
-                if name in result and result[name] != value:
-                    raise EvaluatorSetupError("Conflicting metric parameter aliases: " + name)
-                result[name] = value
-    names = [metric_name(str(m)) for m in [result.get("primary_metric"), *result.get("secondary_metrics", [])] if m]
-    if any(metric_info(m) and metric_info(m).task_family == "image_restoration" for m in names) or "restoration_evaluation" in result:
-        fields = families["image_restoration"]["protocol_fields"]["restoration_evaluation"]["fields"]
-        protocol = {key: result.pop(key) for key in list(result) if key in fields and key != "ssim_parameters"}
-        for key, value in result.get("restoration_evaluation", {}).items():
-            if key in protocol and protocol[key] != value:
-                raise EvaluatorSetupError("Conflicting nested restoration setting: " + key)
-            protocol[key] = value
-        if "ssim_parameters" in protocol:
-            nested = protocol.pop("ssim_parameters")
-            if "ssim_parameters" in result and normalize_ssim_parameters(result["ssim_parameters"]) != normalize_ssim_parameters(nested):
-                raise EvaluatorSetupError("Conflicting SSIM parameters.")
-            result["ssim_parameters"] = nested
-        if protocol:
-            if "crop_mode" in protocol:
-                mode = fields["crop_mode"]
-                protocol["crop_mode"] = mode["value_aliases"].get(protocol["crop_mode"], protocol["crop_mode"])
-            result["restoration_evaluation"] = protocol
-    if "ssim_parameters" in result:
-        result["ssim_parameters"] = normalize_ssim_parameters(result["ssim_parameters"])
-    return result
+def _canonical_declared_settings(values: dict[str, Any], *, fallback_primary: str | None = None) -> dict[str, Any]:
+    try:
+        return canonical_metric_contract(values, fallback_primary=fallback_primary)
+    except ValueError as exc:
+        raise EvaluatorSetupError(str(exc)) from exc
 
 
 def _freeze_data_adapter(workspace_dir: Path, source: str, task_desc: Any, hidden_score_path: Path) -> None:
@@ -2099,7 +2072,7 @@ def _resolve_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_des
         for key in ("prediction_columns", "file_reference_columns", "prediction_type", "class_labels", "positive_class", "image_column"):
             if key in output:
                 spec[key] = output[key]
-    spec = normalize_metric_spec(spec)
+    spec = normalize_metric_spec(_canonical_declared_settings(spec))
     if not require_match:
         reader = data_adapter_capabilities()["families"][spec["task_family"]]
         if spec.get("prediction_type") not in reader["prediction_types"]:
@@ -2113,16 +2086,8 @@ def _resolve_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_des
             raise EvaluatorSetupError("File-valued predictions require a data adapter for this reader.")
     # Structured protocol declarations are authoritative. The agent may map data
     # representations, but cannot weaken the evaluation to pass preparation.
-    contract = {key: value for key, value in manifest.get("metric_contract", {}).items()
+    contract = {key: value for key, value in _canonical_declared_settings(manifest.get("metric_contract", {}), fallback_primary=spec["primary_metric"]).items()
                 if key not in _PROTOCOL_DOCUMENTATION_FIELDS}
-    if isinstance(contract.get("primary_metric"), dict):
-        contract["primary_metric"] = _manifest_primary_metric(manifest)
-    for alias in ("decision_threshold", "classification_threshold"):
-        if alias in contract:
-            value = contract.pop(alias)
-            if "threshold" in contract and contract["threshold"] != value:
-                raise EvaluatorSetupError("Conflicting classification threshold aliases in metric_contract.")
-            contract["threshold"] = value
     supported_fields = set(metric_capabilities()["families"][spec["task_family"]]["allowed_contract_fields"])
     unknown_fields = set(contract) - supported_fields
     if unknown_fields:

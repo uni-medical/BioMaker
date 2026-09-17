@@ -320,7 +320,7 @@ class PreNodeRobustnessTests(unittest.TestCase):
             spec = _infer_fixed_segmentation_spec(workspace, hidden)
 
             self.assertIsNotNone(spec)
-            self.assertEqual(spec["primary_metric"], "AJI")
+            self.assertEqual(spec["primary_metric"], "aji")
             self.assertEqual(spec["key_columns"], ["image_id"])
             self.assertEqual(spec["image_column"], "image_path")
 

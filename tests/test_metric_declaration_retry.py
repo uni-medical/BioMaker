@@ -2,6 +2,7 @@
 
 import copy
 import json
+import hashlib
 
 import pandas as pd
 import pytest
@@ -51,7 +52,7 @@ def write_contract(root, contract):
     ({**SEGMENTATION, "aggregation": "pooled_pixels"}, "Unsupported declared metric setting aggregation"),
     ({"primary_metric": "ap50", "iou_threshold": 0.75}, "Unsupported declared metric setting iou_threshold"),
     ({"primary_metric": "auc", "threshold": 1.2}, "threshold must be in [0,1]"),
-    ({"primary_metric": "auc", "threshold": 0.4, "decision_threshold": 0.5}, "Conflicting classification threshold aliases"),
+    ({"primary_metric": "auc", "threshold": 0.4, "decision_threshold": 0.5}, "Conflicting metric protocol field: threshold"),
     ({"primary_metric": "mae", "maximize": True}, "maximize conflicts"),
     ({"primary_metric": "aji", "secondary_metrics": ["mae"]}, "different canonical sample families"),
     ({"primary_metric": "ssim", "ssim_parameters": {"win_size": 4}}, "win_size"),
@@ -106,48 +107,132 @@ def test_supported_partial_declarations_and_custom_extension_still_pass(package,
     assert result["ok"], result["errors"]
 
 
+def builder_source(package):
+    return (
+        "import argparse, shutil\nfrom pathlib import Path\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--input-dir')\nparser.add_argument('--output-dir')\n"
+        "out = Path(parser.parse_args().output_dir)\n"
+        f"shutil.copytree({str(package)!r}, out, dirs_exist_ok=True)\n"
+        "with (out / 'builder_executions.txt').open('a') as f: f.write('run\\n')\n"
+    )
+
+
+def data_fingerprints(root):
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for folder in ("biomaker_splits", "private_gt", "public")
+        for path in (root / folder).rglob("*")
+        if path.is_file() and path.name != "split_manifest.json"
+    }
+
+
 @pytest.mark.parametrize("repair", [True, False])
-def test_real_empty_policy_error_is_sent_to_next_builder_attempt(package, tmp_path, monkeypatch, repair):
-    write_contract(package, {**SEGMENTATION, "empty_policy": EMPTY_POLICY})
+@pytest.mark.parametrize("initial", [{**SEGMENTATION, "empty_policy": EMPTY_POLICY}, []])
+@pytest.mark.parametrize("first_response", ["not JSON", json.dumps({**SEGMENTATION, "aji_matching": "one_to_one"})])
+def test_declaration_repair_preserves_data_and_retries_without_builder(
+    package, tmp_path, monkeypatch, repair, initial, first_response,
+):
+    write_contract(package, initial)
+    # Exercise both supported manifest locations and non-CSV prepared artifacts.
+    (package / "biomaker_splits/split_manifest.json").write_bytes((package / "split_manifest.json").read_bytes())
+    (package / "public").mkdir()
+    (package / "public/converted.bin").write_bytes(b"prepared image")
     input_dir = tmp_path / "input"
     input_dir.mkdir()
     task_file = tmp_path / "task.md"
     task_file.write_text("Primary metric: AJI.")
-    failures = []
+    output = tmp_path / "generated"
+    builder_calls, failures = [], []
+    originals = {}
 
     def query(*args, previous_failure=None, **kwargs):
-        failures.append(copy.deepcopy(previous_failure))
-        source = (
-            "import argparse, json, shutil\nfrom pathlib import Path\n"
-            "parser = argparse.ArgumentParser()\n"
-            "parser.add_argument('--input-dir')\nparser.add_argument('--output-dir')\n"
-            "out = Path(parser.parse_args().output_dir)\n"
-            f"shutil.copytree({str(package)!r}, out, dirs_exist_ok=True)\n"
-        )
-        if previous_failure and repair:
-            source += (
-                "path = out / 'split_manifest.json'\n"
-                "manifest = json.loads(path.read_text())\n"
-                "contract = manifest['metric_contract']\n"
-                "contract['notes'] = contract.pop('empty_policy')\n"
-                "path.write_text(json.dumps(manifest))\n"
-            )
-        return source, "```python\n" + source + "\n```", {}
+        builder_calls.append(previous_failure)
+        return builder_source(package), "builder response", {}
+
+    def repair_query(task, manifest, errors, previous_response=None, **kwargs):
+        assert data_fingerprints(output) == data_fingerprints(package)
+        assert (output / "builder_executions.txt").read_text() == "run\n"
+        for relative in ("split_manifest.json", "biomaker_splits/split_manifest.json"):
+            current = (output / relative).read_bytes()
+            originals.setdefault(relative, current)
+            assert current == originals[relative]  # rejected proposals never reach disk
+        failures.append(errors)
+        if len(failures) == 1:
+            assert previous_response is None
+            return first_response, {}
+        assert previous_response == first_response
+        assert "Invalid metric_contract" in errors[0]
+        result = {**SEGMENTATION, "notes": EMPTY_POLICY} if repair else initial
+        return json.dumps(result), {}
 
     monkeypatch.setattr(planner, "_query_builder", query)
+    monkeypatch.setattr(planner, "_query_metric_contract", repair_query)
     monkeypatch.setattr(planner, "split_builder_cache_key", lambda **kwargs: ("test", {}))
-    output = tmp_path / "generated"
     if repair:
-        result = planner.run_agentic_split_builder_probe(input_dir, task_file, output, max_attempts=2)
+        result = planner.run_agentic_split_builder_probe(input_dir, task_file, output, max_attempts=3)
         assert result.verifier["ok"]
-        assert [attempt["ok"] for attempt in result.plan["attempts"]] == [False, True]
-        final = json.loads((output / "split_manifest.json").read_text())["metric_contract"]
-        assert final == {**SEGMENTATION, "notes": EMPTY_POLICY}
+        assert [attempt["ok"] for attempt in result.plan["attempts"]] == [False, False, True]
+        assert [attempt["stage"] for attempt in result.plan["attempts"]] == ["data_builder", "metric_contract", "metric_contract"]
+        final = json.loads((output / "split_manifest.json").read_text())
+        assert final["metric_contract"] == {**SEGMENTATION, "notes": EMPTY_POLICY}
+        original = json.loads(originals["split_manifest.json"])
+        assert {k: v for k, v in final.items() if k != "metric_contract"} == {k: v for k, v in original.items() if k != "metric_contract"}
+        assert (output / "split_manifest.json").read_bytes() == (output / "biomaker_splits/split_manifest.json").read_bytes()
     else:
-        with pytest.raises(RuntimeError, match="Unsupported declared metric protocol fields: empty_policy"):
-            planner.run_agentic_split_builder_probe(input_dir, task_file, output, max_attempts=2)
-    assert len(failures) == 2 and failures[0] is None
-    assert "empty_policy" in " ".join(failures[1]["errors"])
+        with pytest.raises(RuntimeError, match="Invalid metric_contract"):
+            planner.run_agentic_split_builder_probe(input_dir, task_file, output, max_attempts=3)
+        for relative, content in originals.items():
+            assert (output / relative).read_bytes() == content
+    assert builder_calls == [None]
+    assert len(failures) == 2
+    assert data_fingerprints(output) == data_fingerprints(package)
+
+
+@pytest.mark.parametrize("failure", ["data", "exit"])
+def test_data_or_execution_failure_still_reaches_builder(package, tmp_path, monkeypatch, failure):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    task = tmp_path / "task.md"
+    task.write_text("Primary metric: AJI.")
+    calls = []
+
+    def query(*args, previous_failure=None, **kwargs):
+        calls.append(previous_failure)
+        code = builder_source(package)
+        if len(calls) == 1:
+            code += ("(out / 'private_gt/score_val.csv').unlink()\n" if failure == "data" else "raise SystemExit(1)\n")
+        return code, "builder response", {}
+
+    monkeypatch.setattr(planner, "_query_builder", query)
+    monkeypatch.setattr(planner, "_query_metric_contract", lambda *a, **kw: pytest.fail("Data failures need the builder"))
+    monkeypatch.setattr(planner, "split_builder_cache_key", lambda **kwargs: ("test", {}))
+    result = planner.run_agentic_split_builder_probe(input_dir, task, tmp_path / "out", max_attempts=2)
+    assert result.verifier["ok"]
+    assert len(calls) == 2 and not calls[1]["ok"]
+    assert [a["stage"] for a in result.plan["attempts"]] == ["data_builder", "data_builder"]
+
+
+@pytest.mark.parametrize("response", [json.dumps(SEGMENTATION), "Here is the correction:\n```json\n" + json.dumps(SEGMENTATION) + "\n```"])
+def test_contract_response_accepts_json_with_optional_fence(response):
+    assert planner._parse_metric_contract_response(response) == SEGMENTATION
+
+
+def test_repair_prompt_contains_task_data_semantics_and_diagnostics(monkeypatch):
+    captured = {}
+    def query(**kwargs):
+        captured.update(kwargs)
+        return json.dumps(SEGMENTATION), {}
+    monkeypatch.setattr(planner.backend, "query", query)
+    manifest = {"metric_contract": SEGMENTATION, "data_semantics": {"axes": "YX"}, "prediction_contract": {"prediction_columns": ["my_mask"]}}
+    planner._query_metric_contract("Task-owned definition", manifest, ["specific error"], model="test", temperature=0, previous_response="rejected proposal")
+    prompt = captured["user_message"]
+    assert prompt["Task Description"] == "Task-owned definition"
+    assert prompt["Prepared Data Contract"] == manifest
+    assert prompt["Declaration Errors"] == ["specific error"]
+    assert prompt["Previous Repair Response"] == "rejected proposal"
+    scope = " ".join(prompt["Repair Scope"])
+    assert "do not silently drop" in scope and "custom definition" in scope
 
 
 def test_cache_cannot_admit_unsupported_metric_declaration(package, tmp_path):
@@ -165,5 +250,5 @@ def test_builder_prompt_separates_catalog_documentation_from_protocol_keys(monke
     monkeypatch.setattr("biomaker.utils.environment.environment_manifest_text", lambda **kwargs: "test")
     fields = " ".join(planner._builder_user_prompt("", {})["Required split_manifest.json Fields"])
     assert "allowed_contract_fields" in fields
-    assert "empty_policy" in fields and "documentation, not protocol fields" in fields
-    assert "never remove or replace task-required settings" in fields
+    assert "documentation section" in fields and "metric_contract_example" in fields
+    assert "Never remove or replace task-required settings" in fields

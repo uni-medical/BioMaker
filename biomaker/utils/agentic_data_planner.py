@@ -5,6 +5,7 @@ It follows a small loop:
 1. Observe the dataset directory as facts.
 2. Ask an LLM to write a dataset-specific builder script.
 3. Run that script and verify output invariants and declared metric capabilities.
+4. Repair declaration-only failures without rebuilding validated data.
 
 The verifier does not decide whether a task is classification, segmentation,
 detection, report generation, or something else. That semantic decision belongs
@@ -28,7 +29,7 @@ import pandas as pd
 from PIL import Image
 
 from .. import backend
-from .metric_declarations import validate_declared_capabilities
+from .metric_declarations import canonical_metric_contract, validate_declared_capabilities
 from .split_manifest import (
     legacy_manifest,
     load_split_manifest,
@@ -44,7 +45,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 8
+SPLIT_BUILDER_CACHE_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -457,7 +458,8 @@ def _builder_user_prompt(
             "prediction_contract.prediction_columns lists predicted values only, excluding key_columns. The candidate CSV contains key_columns followed by prediction_columns; for example key_columns=['id'] and prediction_columns=['boneage'], not prediction_columns=['id', 'boneage'].",
             "prediction_contract.file_reference_columns must be a subset of prediction_contract.prediction_columns: it describes candidate outputs only. Declare existing input file columns separately in input_file_reference_columns or data_semantics; never put image_path there when the prediction is a numeric scalar.",
             "metric_contract: object with primary_metric, secondary_metrics, maximize, and every task-required metric setting. The task and experiment protocol determine these settings; the Harness computes the declared metrics.",
-            "For registered metrics, metric_contract keys must come from the family's allowed_contract_fields in the Harness Metric Capability Catalog, plus optional notes/description. Explanatory catalog entries such as sample_schema, score_scope, empty_policy, matching, and unsupported are documentation, not protocol fields; put relevant explanations in notes. Do not copy those entries into metric_contract. If a task genuinely requires unsupported semantics, report them explicitly; never remove or replace task-required settings to pass verification.",
+            "For registered metrics, use the family's protocol_fields and allowed_contract_fields in the Harness Metric Capability Catalog; metric_contract_example shows a minimal declaration. The documentation section explains scoring behavior and is not a set of parameters to copy. Optional notes/description may explain your interpretation. Never remove or replace task-required settings to pass verification. Unknown metrics retain their custom settings for separate implementation and validation.",
+            "primary_metric accepts a name or a named object using name, metric, or id. Settings inside a named object are preserved and combined with outer settings; conflicting declarations are errors. Choose dataset columns and encodings freely and document their meaning separately in prediction_contract and data_semantics.",
             "For image restoration with PSNR/SSIM, declare evaluation semantics in metric_contract: input_column, target_column, data_range, crop_size (null for whole-image or the size of four corner crops), group_column and groups (both null if ungrouped), aggregation (mean_images or mean_groups), and ssim_parameters. For another crop rule, declare crop_mode and its actual parameters explicitly. Preserve task-specific metric settings; do not invent a supported setting to fit an implementation. Choose column names and sample keys yourself, and declare prediction_columns/file_reference_columns in prediction_contract. Input paths may also be sample keys. Different column names or file encodings require data adaptation, not new implementations of PSNR/SSIM.",
             "hidden_answers: object mirroring private_gt/private_gt.json answer_columns.",
         ],
@@ -535,6 +537,60 @@ def _query_builder(
     raw_response = str(response)
     code = extract_code(raw_response)
     return code, raw_response, metadata
+
+
+def _query_metric_contract(
+    task_text: str,
+    manifest: dict[str, Any],
+    errors: list[str],
+    *,
+    model: str,
+    temperature: float,
+    previous_response: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Ask the preparation agent to repair a declaration, without executable code."""
+    from .trusted_metrics import metric_capabilities
+
+    response, metadata = backend.query(
+        system_message=(
+            "You are the evaluation-preparation agent. The data package has passed its "
+            "checks. Resolve the metric declaration errors using the task, prepared data "
+            "semantics, and Harness capabilities. Return the corrected metric_contract "
+            "as one JSON object, optionally in a json code fence."
+        ),
+        user_message={
+            "Task Description": task_text,
+            "Prepared Data Contract": _compact_split_manifest_for_prompt(manifest),
+            "Harness Metric Capability Catalog": metric_capabilities(),
+            "Declaration Errors": errors,
+            "Previous Repair Response": previous_response,
+            "Repair Scope": [
+                "Return only the metric_contract object, not a manifest or Python script. Harness preserves all prepared tables, files, sample identities, and other manifest fields.",
+                "Use protocol_fields and allowed_contract_fields for registered metric settings. documentation explains behavior; metric_contract_example illustrates the declaration shape. Equivalent parameter aliases are normalized by Harness.",
+                "Preserve every task-required metric and scoring rule. If an erroneous declaration misrepresented the task, correct it using the task and data semantics. Use notes/description to explain the correction when useful.",
+                "An unknown field may describe a real scoring requirement: do not silently drop it, move it into notes, rename the metric, or substitute supported defaults merely to pass. Only redundant explanation of an already represented rule belongs in notes.",
+                "For genuinely new metrics, retain their full custom definition and settings for the custom evaluator. If required standard-metric semantics are unsupported, retain the requirement so preparation reports the limitation explicitly.",
+            ],
+        },
+        model=model,
+        temperature=temperature,
+        return_metadata=True,
+    )
+    return str(response), metadata
+
+
+def _parse_metric_contract_response(response: str) -> dict[str, Any]:
+    blocks = re.findall(r"```(?:json)?\s*\n(.*?)```", response, re.S | re.I)
+    if len(blocks) > 1:
+        raise ValueError("Return one metric_contract JSON object, not multiple code blocks.")
+    return canonical_metric_contract(json.loads(blocks[0] if blocks else response))
+
+
+def _write_prepared_manifest(output_dir: Path, manifest: dict[str, Any]) -> None:
+    write_split_manifest(output_dir, manifest)
+    nested = output_dir / "biomaker_splits/split_manifest.json"
+    if nested.is_file():
+        write_split_manifest(nested.parent, manifest)
 
 
 def _read_output_csv(
@@ -1026,18 +1082,23 @@ def verify_split_package(
         errors=errors,
         warnings=warnings,
     )
+    metric_errors: list[str] = []
     try:
-        validate_declared_capabilities(split_manifest, task_text)
+        contract = canonical_metric_contract(split_manifest.get("metric_contract", {}))
+        validate_declared_capabilities({**split_manifest, "metric_contract": contract}, task_text)
+        if contract != split_manifest.get("metric_contract", {}):
+            split_manifest["metric_contract"] = contract
+            normalized_manifest = True
     except (ValueError, TypeError) as exc:
-        errors.append(f"Invalid metric_contract: {exc}")
+        metric_errors.append(f"Invalid metric_contract: {exc}")
     if normalized_manifest:
-        write_split_manifest(output_dir, split_manifest)
-        nested_manifest = output_dir / "biomaker_splits/split_manifest.json"
-        if nested_manifest.is_file():
-            nested_manifest.write_text(json.dumps(split_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_prepared_manifest(output_dir, split_manifest)
     return {
-        "ok": not errors,
-        "errors": errors,
+        "ok": not errors and not metric_errors,
+        "data_ok": not errors,
+        "data_errors": errors,
+        "metric_errors": metric_errors,
+        "errors": errors + metric_errors,
         "warnings": warnings,
         "row_counts": row_counts,
         "hidden_answers": manifest,
@@ -1139,113 +1200,91 @@ def run_agentic_split_builder_probe(
 
     final_verifier: dict[str, Any] | None = None
     for attempt_index in range(1, max_attempts + 1):
-        code, raw_response, metadata = _query_builder(
-            task_text,
-            facts,
-            model=model,
-            temperature=temperature,
-            previous_script=previous_script,
-            previous_failure=previous_failure,
-            previous_stdout=previous_stdout,
+        repair_metric = bool(
+            previous_failure
+            and previous_failure.get("data_ok")
+            and previous_failure.get("builder_returncode") == 0
         )
-        if not code.strip():
-            verifier = {
-                "ok": False,
-                "errors": [
-                    "Builder response did not contain a valid Python code block.",
-                    "Return a brief explanation followed by exactly one fenced Python code block, for example ```python ... ```.",
-                ],
-                "builder_returncode": None,
-            }
-            attempts.append(
-                {
-                    "attempt": attempt_index,
-                    "ok": False,
-                    "verifier": verifier,
-                    "stdout_tail": raw_response[-4000:],
-                    "prompt_tokens": metadata.get("prompt_tokens"),
-                    "completion_tokens": metadata.get("completion_tokens"),
-                }
+        stage = "metric_contract" if repair_metric else "data_builder"
+        if repair_metric:
+            manifest = load_split_manifest(output_dir)
+            raw_response, metadata = _query_metric_contract(
+                task_text, manifest, previous_failure["metric_errors"],
+                model=model, temperature=temperature,
+                previous_response=previous_stdout if attempts[-1]["stage"] == "metric_contract" else None,
             )
-            if debug_artifacts:
-                debug_dir = output_dir / "_debug"
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                (debug_dir / f"response_{attempt_index}.txt").write_text(
-                    raw_response, encoding="utf-8"
+            stdout = raw_response
+            verifier = dict(previous_failure)
+            try:
+                contract = _parse_metric_contract_response(raw_response)
+                candidate = {**manifest, "metric_contract": contract}
+                validate_declared_capabilities(candidate, task_text)
+            except (ValueError, TypeError) as exc:
+                verifier.update(ok=False, metric_errors=[f"Invalid metric_contract: {exc}"])
+                verifier["errors"] = verifier["data_errors"] + verifier["metric_errors"]
+            else:
+                # Only a validated declaration is written. No generated code runs,
+                # and the accepted data files and other manifest fields stay intact.
+                _write_prepared_manifest(output_dir, candidate)
+                verifier.update(ok=True, errors=[], metric_errors=[],
+                                split_manifest=_manifest_summary_for_verifier(candidate))
+        else:
+            code, raw_response, metadata = _query_builder(
+                task_text, facts, model=model, temperature=temperature,
+                previous_script=previous_script, previous_failure=previous_failure,
+                previous_stdout=previous_stdout,
+            )
+            previous_script = code or None
+            if not code.strip():
+                stdout = raw_response
+                verifier = {
+                    "ok": False, "data_ok": False,
+                    "errors": [
+                        "Builder response did not contain a valid Python code block.",
+                        "Return a brief explanation followed by exactly one fenced Python code block, for example ```python ... ```.",
+                    ],
+                    "builder_returncode": None,
+                }
+            else:
+                builder_path = output_dir / f"_builder_attempt_{attempt_index}.py"
+                builder_path.write_text(code, encoding="utf-8")
+                for rel in ("biomaker_splits", "private_gt"):
+                    path = output_dir / rel
+                    if path.exists():
+                        shutil.rmtree(path)
+                completed = subprocess.run(
+                    [sys.executable, str(builder_path), "--input-dir", str(input_dir),
+                     "--output-dir", str(output_dir)],
+                    cwd=str(output_dir), text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, timeout=timeout, check=False,
                 )
-                (debug_dir / f"stdout_{attempt_index}.txt").write_text(
-                    raw_response, encoding="utf-8"
+                stdout = completed.stdout
+                verifier = verify_split_package(
+                    output_dir, source_input_dir=input_dir, facts=facts, task_text=task_text
                 )
-                (debug_dir / f"verifier_{attempt_index}.json").write_text(
-                    json.dumps(verifier, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-            final_verifier = verifier
-            previous_script = None
-            previous_failure = verifier
-            previous_stdout = raw_response
-            continue
-
-        builder_path = output_dir / f"_builder_attempt_{attempt_index}.py"
-        builder_path.write_text(code, encoding="utf-8")
-
-        for rel in ("biomaker_splits", "private_gt"):
-            path = output_dir / rel
-            if path.exists():
-                shutil.rmtree(path)
-
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(builder_path),
-                "--input-dir",
-                str(input_dir),
-                "--output-dir",
-                str(output_dir),
-            ],
-            cwd=str(output_dir),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-        )
-        verifier = verify_split_package(
-            output_dir, source_input_dir=input_dir, facts=facts, task_text=task_text
-        )
-        verifier["builder_returncode"] = completed.returncode
-        if completed.returncode != 0:
-            verifier["ok"] = False
-            verifier.setdefault("errors", []).append("builder script exited nonzero")
-        attempts.append(
-            {
-                "attempt": attempt_index,
-                "ok": bool(verifier.get("ok")),
-                "verifier": verifier,
-                "stdout_tail": completed.stdout[-4000:],
-                "prompt_tokens": metadata.get("prompt_tokens"),
-                "completion_tokens": metadata.get("completion_tokens"),
-            }
-        )
+                verifier["builder_returncode"] = completed.returncode
+                if completed.returncode != 0:
+                    verifier["ok"] = False
+                    verifier["errors"].append("builder script exited nonzero")
+        attempts.append({
+            "attempt": attempt_index, "stage": stage, "ok": bool(verifier.get("ok")),
+            "verifier": verifier, "stdout_tail": stdout[-4000:],
+            "prompt_tokens": metadata.get("prompt_tokens"),
+            "completion_tokens": metadata.get("completion_tokens"),
+        })
         if debug_artifacts:
             debug_dir = output_dir / "_debug"
             debug_dir.mkdir(parents=True, exist_ok=True)
-            (debug_dir / f"response_{attempt_index}.txt").write_text(
-                raw_response, encoding="utf-8"
-            )
-            (debug_dir / f"stdout_{attempt_index}.txt").write_text(
-                completed.stdout, encoding="utf-8"
-            )
+            (debug_dir / f"response_{attempt_index}.txt").write_text(raw_response, encoding="utf-8")
+            (debug_dir / f"stdout_{attempt_index}.txt").write_text(stdout, encoding="utf-8")
             (debug_dir / f"verifier_{attempt_index}.json").write_text(
                 json.dumps(verifier, indent=2, ensure_ascii=False), encoding="utf-8"
             )
-
         final_verifier = verifier
         if verifier.get("ok"):
             break
-        previous_script = code
         previous_failure = verifier
-        previous_stdout = completed.stdout
+        previous_stdout = stdout
 
     if final_verifier is None:
         raise RuntimeError("Dataset planning verifier did not run")
@@ -1266,7 +1305,7 @@ def run_agentic_split_builder_probe(
                 _compact_builder_failure_for_prompt(final_verifier),
                 ensure_ascii=False,
             )
-            + "\nLast builder output:\n"
+            + "\nLast preparation output:\n"
             + str(previous_stdout or "")[-4000:]
         )
 
