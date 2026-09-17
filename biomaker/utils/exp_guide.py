@@ -15,6 +15,71 @@ from .experiment_contract import load_experiment_contract
 EXP_GUIDE_VERSION = 1
 EXP_GUIDE_FILENAME = "exp_guide.json"
 MEDICAL_IMAGE_SUFFIXES = {".nii", ".nii.gz", ".nrrd", ".mha", ".mhd"}
+_OUTPUT_ENCODING_FIELDS = {
+    "format", "encoding", "value_encoding", "prediction_type",
+    "prediction_schema", "prediction_tuple", "prediction_shape",
+    "box_schema", "box_format", "coordinate_convention", "class_labels",
+    "positive_class", "probability_semantics",
+}
+_NON_OUTPUT_FIELDS = {
+    "answer_columns", "answer_schema", "answer_encoding", "answer_path",
+    "truth_schema", "truth_encoding", "truth_path", "hidden_answers",
+    "private_gt", "private_path", "target", "target_column", "target_columns",
+    "target_schema", "target_encoding", "target_path", "key_columns",
+}
+
+
+def _encoding_details(value: Any) -> Any:
+    """Copy representation declarations, excluding answer-side subtrees."""
+    if isinstance(value, dict):
+        return {
+            key: _encoding_details(item) for key, item in value.items()
+            if str(key).lower() not in _NON_OUTPUT_FIELDS
+        }
+    if isinstance(value, list):
+        return [_encoding_details(item) for item in value]
+    return value
+
+
+def _public_output_details(
+    declared: dict[str, Any], frozen: dict[str, Any], *,
+    prediction_columns: list[str], key_columns: set[str],
+    input_columns: set[str], data_semantics: Any,
+) -> dict[str, Any]:
+    """Expose output encodings without copying whole metric/target contracts.
+
+    Positional encodings may live under an arbitrary prediction-column name in
+    the prepared manifest. Keep those declarations even when a custom frozen
+    adapter publishes only its column names. Frozen declarations take priority.
+    """
+    result = {}
+    output_columns = set(prediction_columns) - key_columns
+    for label, source in (("prepared", declared), ("frozen", frozen)):
+        details = {
+            key: _encoding_details(value) for key, value in source.items()
+            if key in _OUTPUT_ENCODING_FIELDS and key not in key_columns
+        }
+        per_column = {
+            column: _encoding_details(source[column])
+            for column in sorted(output_columns)
+            if column in source and isinstance(source[column], (dict, str))
+        }
+        if per_column:
+            details["columns"] = per_column
+        if details:
+            result[label] = details
+    # Input representation facts are included only for declared columns that
+    # actually appear in public scoring/test metadata. Do not copy mixed free
+    # text such as boxes_encoding that may also describe hidden answer tuples.
+    if isinstance(data_semantics, dict):
+        inputs = {
+            column: _encoding_details(data_semantics[column])
+            for column in sorted(input_columns)
+            if column in data_semantics
+        }
+        if inputs:
+            result["public_inputs"] = inputs
+    return result
 
 
 def _compound_suffix(path: Path) -> str:
@@ -305,6 +370,17 @@ def build_exp_guide(
     }
 
     dataset_report = _read_json_dict(split_dir / "dataset_report.json")
+    public_columns = {
+        column for name in ("score_val", "test")
+        for column in split_guide.get(name, {}).get("columns", [])
+    }
+    output_details = _public_output_details(
+        declared_prediction, raw_prediction_spec,
+        prediction_columns=prediction_contract.prediction_columns,
+        key_columns=key_columns,
+        input_columns=(set(file_columns) | set(declared_prediction.get("input_columns", []))) & public_columns,
+        data_semantics=manifest.get("data_semantics"),
+    )
     return {
         "version": EXP_GUIDE_VERSION,
         "source": "workspace_artifacts",
@@ -320,6 +396,7 @@ def build_exp_guide(
             ),
         },
         "prediction": prediction,
+        "output_encoding": output_details,
         "metric": metric,
         "evaluation_protocol": {
             key: value for key, value in raw_prediction_spec.items()
@@ -358,6 +435,7 @@ def _guide_view(guide: dict[str, Any], *, include_samples: bool) -> dict[str, An
         "splits": guide.get("splits", {}),
         "target": guide.get("target", {}),
         "prediction": guide.get("prediction", {}),
+        "output_encoding": guide.get("output_encoding", {}),
         "metric": guide.get("metric", {}),
         "data_semantics": guide.get("data_semantics", {}),
         "visibility": guide.get("visibility", {}),

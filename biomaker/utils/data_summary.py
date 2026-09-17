@@ -148,6 +148,17 @@ def _append_artifacts(lines: list[str], guide: dict[str, Any]) -> None:
     lines.append("```json")
     lines.append(json.dumps(contract, ensure_ascii=False, sort_keys=True))
     lines.append("```")
+    output_encoding = _as_dict(guide.get("output_encoding"))
+    if output_encoding:
+        lines.extend([
+            "", "Public prediction encoding:", "```json",
+            json.dumps(output_encoding, ensure_ascii=False, sort_keys=True), "```",
+            "- Follow the declared field order, coordinate units and confidence "
+            "representation; sample key columns are separate from predictions. "
+            "Frozen output details take precedence over prepared declarations. "
+            "Consult `evaluator.prediction_spec()` and its decoder if needed; "
+            "do not infer a positional format from the prediction column name.",
+        ])
     lines.extend(["", "Required evaluator artifacts:"])
     if prediction.get("validation_artifact"):
         lines.append(f"- validation predictions: `{prediction['validation_artifact']}`")
