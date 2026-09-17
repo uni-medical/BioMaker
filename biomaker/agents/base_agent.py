@@ -251,6 +251,7 @@ class BaseAgent:
             'All the provided input data is stored in "./input" directory.',
             "When building data loading code, base it on the actual existing data files rather than relying entirely on the annotation file.",
             "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` for score-validation predictions and `./working/submission.csv`.",
+            "The Experiment guide's evaluation_protocol provides the complete frozen output and metric contract, including thresholds, class order, units, crops and aggregation when applicable. Harness owns final metric calculation; your program produces predictions. Choose the model, loss, training strategy, augmentation and preprocessing yourself within the task requirements, and convert final predictions back to the declared evaluation representation.",
             "BioMaker computes the final node score after your script exits using hidden score labels that are not available to generated code. You may call `evaluator.validate_submission()` yourself after writing the required files, but do not call `evaluator.score_val()` inside generated code because the hidden score labels are only supplied to BioMaker's external scoring process.",
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
         ]

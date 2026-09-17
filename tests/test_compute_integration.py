@@ -10,6 +10,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 
 from biomaker import interpreter as interpreter_module
 from biomaker.interpreter import ExecutionResult, Interpreter
@@ -33,13 +34,46 @@ def test_default_config_uses_auto_workers_and_explicit_integer_is_valid():
     config_module._validate_exec_config(SimpleNamespace(exec=_minimal_exec_config(3)))
 
 
+@pytest.mark.parametrize(
+    "slots",
+    [
+        (ComputeSlot(index=0, backend="cpu"),),
+        (ComputeSlot(index=0, backend="mps"),),
+        (
+            ComputeSlot(index=0, backend="cuda", selector="GPU-a"),
+            ComputeSlot(index=1, backend="cuda", selector="GPU-b"),
+        ),
+    ],
+)
+def test_structured_config_accepts_runtime_compute_slots(slots, tmp_path):
+    defaults = config_module._load_cfg(use_cli_args=False)
+    defaults.data_dir = str(tmp_path)
+    defaults.exp_name = "compute-config-test"
+    cfg = OmegaConf.merge(
+        OmegaConf.structured(config_module.Config),
+        defaults,
+    )
+    pool = ComputePool(slots)
+    cfg.exec.requested_parallel_workers = cfg.exec.parallel_workers
+    cfg.exec.effective_parallel_workers = pool.effective_workers
+    cfg.exec.compute_slots = [slot.as_dict() for slot in pool.slots]
+
+    restored = OmegaConf.create(OmegaConf.to_yaml(cfg))
+    assert OmegaConf.to_container(restored.exec.compute_slots) == [
+        slot.as_dict() for slot in slots
+    ]
+    assert restored.exec.effective_parallel_workers == len(slots)
+
+
 @pytest.mark.parametrize("invalid", ["false", 0, 1, None])
 def test_private_evaluation_config_rejects_non_boolean_policy(invalid):
     cfg = SimpleNamespace(
         exec=_minimal_exec_config("auto"),
         private_evaluation=SimpleNamespace(per_node=invalid),
     )
-    with pytest.raises(ValueError, match="private_evaluation.per_node must be a boolean"):
+    with pytest.raises(
+        ValueError, match="private_evaluation.per_node must be a boolean"
+    ):
         config_module._validate_exec_config(cfg)
 
 
@@ -589,6 +623,21 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monke
     )
     assert calls["evaluator"] == (retrain_workspace, 180, expected_env)
     assert calls["private"] == (retrain_workspace, private_dir, expected_env)
+
+    monkeypatch.setattr(
+        final_retrain_module,
+        "evaluate_private_outputs",
+        lambda *_args, **_kwargs: {"results": [], "error": "requested metric missing"},
+    )
+    scoring_failure = final_retrain_module.run_final_retrain(
+        cfg,
+        best_node,
+        private_dir,
+        timeout=300,
+        env_overrides=expected_env,
+    )
+    assert scoring_failure.ok is False
+    assert "requested metric missing" in scoring_failure.error
 
     monkeypatch.setattr(
         final_retrain_module,

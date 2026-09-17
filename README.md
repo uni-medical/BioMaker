@@ -76,10 +76,16 @@ Open <http://127.0.0.1:7860>, configure the endpoint and API key in Settings, th
 
 ## Command line runs
 
-From a complete source checkout, `uv run biomaker ...` submits through the same
-workspace-level `.biomaker/` durable FIFO as the WebUI. The command remains
-attached to the durable console log and returns the experiment process's exit
-code; closing that terminal or the WebUI does not terminate the experiment.
+`uv run biomaker ...` runs directly in the foreground by default, independently
+of the WebUI queue and its pause state. Ctrl+C interrupts that run; use a terminal
+session manager if it needs to outlive the terminal.
+
+To submit through the same workspace-level `.biomaker/` durable FIFO as the WebUI,
+use `uv run biomaker --queue ...` (requires a complete source checkout). The
+command follows the durable console log and returns the experiment process's
+exit code; closing the terminal or WebUI does not terminate the queued experiment.
+A failed queued run pauses subsequent queued runs until the queue is resumed.
+Direct runs do not reserve GPUs against queued or other independently launched runs.
 
 `exec.parallel_workers=auto` assigns one candidate per visible CUDA GPU: one on
 a single-GPU workstation and up to four on a four-GPU server. Select a subset
@@ -127,6 +133,93 @@ prepare workspace and data
 The multi-agent workflow uses a lightweight solution tree search. BioMaker generates candidate solutions, debugs failed nodes, and refines promising ones based on execution results recorded in shared Memory. When the configured budget ends, the Summarizer packages the best-observed solution.
 
 Generated code runs under a strict dependency policy. BioMaker tells the model which installed packages are allowed, blocks package installation, and performs a preflight import check before execution. If code imports an unavailable package such as `cv2` or `albumentations`, the run fails fast with a policy error so the next debug step can replace it with an allowed package.
+
+### Scoring contract
+
+New runs freeze one evaluator implementing `score(prediction_path, truth_path,
+expected_path)` for both validation and private test evaluation. The harness
+selects the files, aligns sample keys, and computes supported metrics with trusted
+implementations. When a fixed reader cannot interpret the data, the preparation
+agent writes a thin adapter containing `prediction_spec()`, `load_sample()`, and
+`write_dummy_predictions()`. The Harness owns scoring, aggregation, and artifact
+validation. It checks representative samples, then bundles the adapter and metric
+source into one frozen, standalone evaluator. See the [evaluation interface](docs/evaluation_contract.md).
+Private evaluation uses the same formulas and never supplies test answers to search.
+All five standard task families (classification, regression, segmentation,
+detection, and restoration) use this shared runtime. Regression includes
+MAE/MSE/RMSE for scalar or vector targets without rounding; segmentation also
+includes foreground IoU. A machine-readable metric
+catalog supplies aliases, directions, canonical sample schemas and parameter
+settings to both preparation agents and the compiler. A separate reader catalog
+describes available column/file mappings; custom adapters can use other encodings.
+Candidate prompts include the complete frozen `evaluation_protocol`, while model,
+loss, training strategy and preprocessing choices remain with the agent.
+
+`prediction_spec()` declares `evaluator_api_version: 2`, the primary metric,
+boolean `maximize`, and `secondary_metrics`. It also preserves task-specific
+format and metric parameters. Scoring returns a `metrics` mapping containing
+every requested metric; the harness selects the named primary value for search.
+Missing, undefined, or non-finite requested metrics fail explicitly instead of
+substituting a different metric. For detection, Recall's confidence threshold or
+operating-point rule must be frozen along with IoU and the box convention.
+
+The fixed detection template supports class-aware `mAP@0.5` (`ap50`) using
+VOC all-point interpolated AP, averaged across classes with ground truth in the
+scored split, and micro `recall` at IoU >= 0.5. Recall defaults to confidence >= 0
+with no detection cap; `metric_contract.recall_confidence_threshold` can freeze a
+different operating point before search. AP always uses all submitted scored
+boxes. Matching chooses the highest-IoU ground truth of the same class; duplicate
+matches are false positives. Score ties use expected image order then box order.
+The split must declare detection, coordinate units, and unambiguous JSON object
+boxes. Named coordinate fields are recognized; generic `bbox` arrays require an
+explicit `xyxy`, `xywh`, or `cxcywh` declaration. The public prediction schema
+requires an integer class ID and a finite `score` in [0,1] for every box; no
+confidence is invented for old unscored predictions. Other encodings use the
+adapter route. Unsupported semantics, including crowd / ignore annotations,
+must be reported explicitly; adapters cannot silently drop them. Empty images
+are valid, but an entirely unannotated scoring split is an
+explicit error. Frozen detection parameters are included in `prediction_spec()`.
+
+The fixed grayscale restoration template computes PSNR and SSIM through the
+same `score()` entry point for validation and private test. The preparation agent
+chooses column names, sample keys and prediction columns, and declares them in
+`split_manifest.json`. The template reads evaluation semantics from
+`metric_contract`: `input_column`, `target_column`, `data_range`, `crop_size`
+(null for whole images, otherwise four corner crops), `group_column`, `groups`
+(both null for no grouping), and `aggregation` (`mean_images` or `mean_groups`).
+An optional legacy `restoration-evaluation` task block is still supported; users
+do not need to write it. Unmapped data encodings use a generated adapter with the
+same trusted metric backend. Unsupported settings fail explicitly. A custom
+metric evaluator is generated only for metrics without a registered implementation;
+it can reuse the supplied trusted kernels for any additional standard metrics.
+
+Sample keys may be independent IDs, observed input paths or composite columns;
+only the complete declared key must be unique. Hidden targets and predicted
+outputs cannot serve as keys. Prediction columns come from the agent's declared
+contract, defaulting to `restored_image_path` only when no output is declared.
+Grayscale image files and numeric 2D `.npy` arrays are supported, including float
+predictions without mandatory uint8 quantization. NumPy pickle loading is disabled.
+
+SSIM defaults to a uniform 7x7 window, sample covariance, K1=0.01 and K2=0.03.
+Its supported explicit settings are normalized and frozen; `window_size` and
+`win_size` identify the same parameter, and conflicting values are rejected.
+Predictions are clipped to the declared range; image dimensions must
+match the input/reference. Scores are averaged over crops, then images within
+each group; `mean_groups` weights groups equally. Per-group metrics survive in
+private reports. Zero-MSE PSNR raises an explicit error under the finite-score
+contract rather than using a cap or arbitrary epsilon. Crop-wise inference is a
+task requirement that cannot be proved from stitched outputs. The frozen
+`prediction_spec()` records the resolved protocol for every candidate. Reference
+tests additionally use scikit-image when available. Preparation fixtures and their
+referenced files remain available until every Harness probe completes; cleanup
+belongs to the Harness. Private probe answers remain outside the agent workspace.
+
+Private test results stay outside candidate feedback and selection. Final
+retraining uses the same scorer and reports failure if private scoring fails.
+Old frozen evaluators and existing running processes are not rewritten: API-v1
+artifacts require a new run to prepare API-v2 scoring, and evaluator caches were
+versioned accordingly. Workspace-side cross-method benchmark scripts remain
+separate tools; this contract governs BioMaker's own runtime scoring.
 
 ## Test with Example Dataset
 You can download the example dataset from [Huggingface](https://huggingface.co/datasets/blueyo0/organmnist3d).

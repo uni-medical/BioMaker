@@ -368,6 +368,11 @@ def run_final_retrain(
                 private_dir,
                 env_overrides=env_overrides,
             )
+            if result.private_metrics and result.private_metrics.get("error"):
+                result.error = "Private evaluation failed after final retrain: " + str(
+                    result.private_metrics["error"]
+                )
+                return result
         except Exception as exc:
             result.error = f"Private evaluation failed after final retrain: {exc}"
             return result

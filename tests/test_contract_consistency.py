@@ -634,9 +634,13 @@ class ContractConsistencyTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    agentic_data_planner, "_query_builder", side_effect=fake_query_builder
+                    agentic_data_planner,
+                    "_query_builder",
+                    side_effect=fake_query_builder,
                 ),
-                patch.object(agentic_data_planner.subprocess, "run", side_effect=fake_run),
+                patch.object(
+                    agentic_data_planner.subprocess, "run", side_effect=fake_run
+                ),
                 patch.object(
                     agentic_data_planner,
                     "verify_split_package",
@@ -1302,6 +1306,8 @@ class ContractConsistencyTests(unittest.TestCase):
         self.assertIn("./input/biomaker_splits/agent_test.csv", text)
 
     def test_private_multilabel_uses_all_answer_columns(self) -> None:
+        from biomaker.utils.evaluator_templates import _FIXED_CLASSIFICATION_EVALUATOR
+
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "workspace"
             private_dir = Path(tmp) / "private_gt"
@@ -1313,6 +1319,9 @@ class ContractConsistencyTests(unittest.TestCase):
                     "prediction_columns": ["prob_1", "prob_2"],
                     "primary_metric": "mean_binary_accuracy",
                     "task_type": "multilabel",
+                    "evaluator_api_version": 2,
+                    "secondary_metrics": [],
+                    "maximize": True,
                 },
             )
             (workspace / "evaluator.py").write_text(
@@ -1348,6 +1357,17 @@ class ContractConsistencyTests(unittest.TestCase):
                 },
             )
 
+            _write_csv(
+                workspace / "input/biomaker_splits/agent_test.csv",
+                [{"Id": 1}, {"Id": 2}],
+            )
+            spec = json.loads(
+                (workspace / "evaluator_prediction_spec.json").read_text()
+            )
+            spec["answer_columns"] = ["class_1", "class_2"]
+            (workspace / "evaluator.py").write_text(
+                _FIXED_CLASSIFICATION_EVALUATOR.replace("__BIOMAKER_SPEC__", repr(spec))
+            )
             result = evaluate_private_outputs(workspace, private_dir)
             self.assertIsNotNone(result)
             private_result = result["results"][0]

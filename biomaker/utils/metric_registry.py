@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .trusted_metrics import metric_capabilities
+
 
 @dataclass(frozen=True)
 class MetricInfo:
@@ -12,23 +14,13 @@ class MetricInfo:
     task_family: str
 
 
+# Compatibility facade: the executable kernel catalog owns metric names,
+# aliases, task families and direction. No independent support table can drift.
+_CAPABILITIES = metric_capabilities()
 SUPPORTED_METRICS: dict[str, MetricInfo] = {
-    "accuracy": MetricInfo("accuracy", True, "classification"),
-    "acc": MetricInfo("accuracy", True, "classification"),
-    "auc": MetricInfo("auc", True, "classification"),
-    "roc_auc": MetricInfo("auc", True, "classification"),
-    "macro_auc": MetricInfo("auc", True, "classification"),
-    "ovr_auc": MetricInfo("auc", True, "classification"),
-    "mean_roc_auc": MetricInfo("mean_roc_auc", True, "classification"),
-    "mean_binary_accuracy": MetricInfo("mean_binary_accuracy", True, "classification"),
-    "binary_dice": MetricInfo("binary_dice", True, "segmentation"),
-    "dice": MetricInfo("binary_dice", True, "segmentation"),
-    "mean_dice": MetricInfo("binary_dice", True, "segmentation"),
-    "aji": MetricInfo("aji", True, "segmentation"),
-    "mean_aji": MetricInfo("aji", True, "segmentation"),
-    "hd95": MetricInfo("hd95", False, "segmentation"),
-    "hausdorff95": MetricInfo("hd95", False, "segmentation"),
-    "hausdorff_95": MetricInfo("hd95", False, "segmentation"),
+    alias: MetricInfo(name, _CAPABILITIES["metrics"][name]["maximize"],
+                      _CAPABILITIES["metrics"][name]["family"])
+    for alias, name in _CAPABILITIES["aliases"].items()
 }
 
 

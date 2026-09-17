@@ -180,6 +180,8 @@ def _load_hidden_answers(
 ) -> dict[str, HiddenAnswerContract]:
     source = _hidden_answer_source(split_plan, split_manifest)
     private_dir = hidden_answers_dir or workspace_dir.parent / "private_gt"
+    if not source:
+        source = _read_json_dict(private_dir / "private_gt.json")
     result: dict[str, HiddenAnswerContract] = {}
     for split in ("score_val", "test"):
         entry = source.get(split)

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -42,7 +43,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 4
+SPLIT_BUILDER_CACHE_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -285,6 +286,8 @@ def split_builder_cache_key(
     model: str,
     temperature: float = 0.0,
 ) -> tuple[str, dict[str, Any]]:
+    from .trusted_metrics import metric_capabilities
+
     facts = build_dataset_facts(input_dir)
     payload = {
         "cache_version": SPLIT_BUILDER_CACHE_VERSION,
@@ -292,6 +295,7 @@ def split_builder_cache_key(
         "temperature": temperature,
         "task_text": task_text,
         "facts": facts,
+        "metric_capabilities": metric_capabilities(),
     }
     text = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24], facts
@@ -305,6 +309,43 @@ def _builder_system_prompt() -> str:
         "and evaluator-only hidden-answer files. Infer semantics from evidence; do not rely on "
         "a fixed task type or one naming convention."
     )
+
+
+def parse_split_constraints(task_text: str) -> dict[str, Any]:
+    """Read optional task-owned constraints on original files and split roles.
+
+    These constraints describe file membership, not task or dataset heuristics.
+    Ratios, row representation, keys and column names remain builder decisions.
+    """
+    blocks = re.findall(r"```split-constraints\s*\n(.*?)```", task_text, re.S)
+    if not blocks:
+        return {}
+    if len(blocks) != 1:
+        raise ValueError("Declare exactly one split-constraints JSON block.")
+    value = json.loads(blocks[0])
+    if not isinstance(value, dict) or set(value) - {
+        "required_splits", "required_answer_splits", "source_rules"
+    }:
+        raise ValueError("split-constraints requires an object with required_splits, required_answer_splits and source_rules only.")
+    for key, allowed in (("required_splits", {"train", "score_val", "test"}),
+                         ("required_answer_splits", {"score_val", "test"})):
+        items = value.get(key, [])
+        if not isinstance(items, list) or any(not isinstance(item, str) or item not in allowed for item in items):
+            raise ValueError(f"split-constraints {key} must list supported split roles: {sorted(allowed)}.")
+    rules = value.get("source_rules", [])
+    if not isinstance(rules, list):
+        raise ValueError("split-constraints source_rules must be a list.")
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) - {"root", "allowed_splits", "require_complete"}:
+            raise ValueError("Each split source rule requires root, allowed_splits and optional require_complete.")
+        root, roles = rule.get("root"), rule.get("allowed_splits")
+        if not isinstance(root, str) or not root.strip() or Path(root).is_absolute() or ".." in Path(root).parts:
+            raise ValueError("Split source rule root must be a nonempty relative path within the original input directory.")
+        if not isinstance(roles, list) or not roles or any(not isinstance(role, str) or role not in {"train", "score_val", "test"} for role in roles):
+            raise ValueError("Split source rule allowed_splits must be a nonempty list of train, score_val or test.")
+        if type(rule.get("require_complete", False)) is not bool:
+            raise ValueError("Split source rule require_complete must be boolean.")
+    return value
 
 
 def _compact_error_list(errors: Any, *, limit: int = 40) -> dict[str, Any]:
@@ -338,6 +379,8 @@ def _compact_split_manifest_for_prompt(manifest: Any) -> dict[str, Any]:
         "prediction_contract",
         "metric_contract",
         "hidden_answers",
+        "data_semantics",
+        "input_file_reference_columns",
     ):
         if key in manifest:
             compact[key] = manifest[key]
@@ -384,15 +427,21 @@ def _builder_user_prompt(
     previous_failure: dict[str, Any] | None = None,
     previous_stdout: str | None = None,
 ) -> dict[str, Any]:
+    from .trusted_metrics import metric_capabilities
+    from .environment import environment_manifest_text
+
     prompt: dict[str, Any] = {
         "Task Description": task_text,
+        "Task-owned Split Constraints": parse_split_constraints(task_text),
+        "Harness Metric Capability Catalog": metric_capabilities(),
+        "Installed Reader Environment": environment_manifest_text(include_medical=True),
         "Observed Data Facts": json.dumps(facts, indent=2, ensure_ascii=False),
         "Required Output Files": [
             "biomaker_splits/agent_train.csv: public training rows; may include training answers.",
             "biomaker_splits/score_val.csv: public validation-input rows; must not include validation answers.",
             "biomaker_splits/agent_test.csv: public test-input rows when a test source exists; must not include private test answers.",
-            "private_gt/score_val.csv: validation rows with the hidden answers retained.",
-            "private_gt/test.csv: private test rows with hidden answers retained when private answers exist.",
+            "private_gt/score_val.csv: matching validation key_columns plus answer_columns. Public input/metadata columns may be omitted: Harness supplies those separately as expected_row. Row order may differ when keys are declared.",
+            "private_gt/test.csv: matching test key_columns plus answer_columns when private answers exist; copying public input/metadata columns is optional. With an explicit row_order_contract and no keys, preserve public row order exactly.",
             'private_gt/private_gt.json: hidden-answer index with keys score_val and test. Each entry must contain answer_columns, for example {"score_val":{"answer_columns":["label"]},"test":{"answer_columns":["label"]}}.',
             "split_manifest.json: structured data contract for the prepared task.",
             "public/: optional generated agent-visible files only when a derived/converted/anonymized public artifact is truly needed; CSV paths may reference this directory.",
@@ -404,22 +453,35 @@ def _builder_user_prompt(
             "task_heads: list of task heads, each either a string or object with type such as classification, multilabel, segmentation_2d, detection, regression, survival, or segmentation_3d.",
             "visibility: object listing agent_visible, evaluator_only, and forbidden columns/files.",
             "prediction_contract: object describing required candidate output files/columns and probability/file-path semantics.",
-            "metric_contract: object with primary_metric and maximize.",
+            "prediction_contract.prediction_columns lists predicted values only, excluding key_columns. The candidate CSV contains key_columns followed by prediction_columns; for example key_columns=['id'] and prediction_columns=['boneage'], not prediction_columns=['id', 'boneage'].",
+            "prediction_contract.file_reference_columns must be a subset of prediction_contract.prediction_columns: it describes candidate outputs only. Declare existing input file columns separately in input_file_reference_columns or data_semantics; never put image_path there when the prediction is a numeric scalar.",
+            "metric_contract: object with primary_metric, secondary_metrics, maximize, and every task-required metric setting. The task and experiment protocol determine these settings; the Harness computes the declared metrics.",
+            "For image restoration with PSNR/SSIM, declare evaluation semantics in metric_contract: input_column, target_column, data_range, crop_size (null for whole-image or the size of four corner crops), group_column and groups (both null if ungrouped), aggregation (mean_images or mean_groups), and ssim_parameters. For another crop rule, declare crop_mode and its actual parameters explicitly. Preserve task-specific metric settings; do not invent a supported setting to fit an implementation. Choose column names and sample keys yourself, and declare prediction_columns/file_reference_columns in prediction_contract. Input paths may also be sample keys. Different column names or file encodings require data adaptation, not new implementations of PSNR/SSIM.",
             "hidden_answers: object mirroring private_gt/private_gt.json answer_columns.",
+        ],
+        "Evaluation Responsibilities and Adapter Interface": [
+            "This builder prepares data and declares its meaning. Do not implement metric formulas or scoring loops in the builder. The Harness uses trusted metric implementations when the declared metric and settings are supported; only unavailable metrics require a separately validated custom evaluator.",
+            "A later evaluation-preparation agent can adapt your schema through prediction_spec(), load_sample(prediction_row, target_row, expected_row), and write_dummy_predictions(expected_rows, artifact_path). Document sample identity, answer columns, array/channel conventions, grouping, units, spacing, and any serialized values clearly enough for that adapter. Do not generate adapter code in this builder response.",
+            "The adapter receives rows already aligned by the Harness. load_sample returns canonical prediction and target values plus applicable group, input_shape, spacing, or prediction_spacing metadata; target_row is None during public format validation, which must not access private answers. write_dummy_predictions writes only preparation fixtures at caller-provided paths and retains their referenced files until Harness cleanup.",
+            "The public adapter contract is documented in docs/evaluation_contract.md. Schema adaptation cannot change requested metric settings. Unsupported settings must be reported explicitly rather than silently approximated or replaced.",
         ],
         "Optional split_manifest.json Fields": [
             "row_representation: short explanation when one CSV row is not one prediction sample.",
             "dropped_samples: compact list of excluded samples with reasons, only when samples are intentionally dropped.",
             "sample_universe_summary: compact counts or source-file summary when useful; do not enumerate every sample.",
+            "data_semantics: optional object documenting input/target units, columns and encodings, array axes/channels, class meanings, spacing, and source-to-derived file lineage for the later data adapter.",
+            "input_file_reference_columns: optional list of public input/source path columns, separate from prediction file references.",
         ],
         "Builder Interface": [
             "Return one Python script.",
             "The script must accept --input-dir and --output-dir.",
-            "Use deterministic splitting with seed 42 when no explicit validation source exists.",
-            "Use only Python standard library plus pandas and PIL if needed.",
+            "Follow task-assigned source roles, not directory names: an official directory named validation may be reserved for final private test. In that case split the allowed training source into agent_train and score_val deterministically with seed 42; reserve every final held-out row for agent_test/private_gt/test.",
+            "Use deterministic splitting with seed 42 when the task leaves internal validation membership unspecified. Choose the ratio and appropriate grouping/stratification yourself unless the task specifies them.",
+            "Use Python standard library and installed allowed packages from Installed Reader Environment for the actual data format, including the available medical image readers. Do not install packages.",
         ],
         "Principles": [
             "Treat tables and directories as equally valid sample sources.",
+            "If Task-owned Split Constraints is nonempty, obey every required public/answer split and source rule. A source root means all original files recursively under that directory (or the exact source file); require_complete forbids omissions. Harness verifies actual source-file references across public and matching private rows. Keep nonsensitive original input references in public row metadata, including for derived inputs; retain original answer-file references only in private answers. Never expose hidden mask/target paths just to prove coverage. Do not move one original source file into multiple split roles under different sample IDs.",
             "If a folder level, table column, or referenced file is evidence of an answer, keep it in agent_train.csv but hide it from score_val.csv and agent_test.csv.",
             "If an answer is stored as a file path, hide that path from public score/test files and retain it in hidden answers.",
             "If a column is computed from the answer, hide it from public score/test files too.",
@@ -482,7 +544,9 @@ def _read_output_csv(
             errors.append(f"Missing required file: {rel}")
         return None
     try:
-        return pd.read_csv(path)
+        # Sample identities are serialized CSV strings, including leading zeros
+        # and names such as NA; do not coerce them before matching private truth.
+        return pd.read_csv(path, dtype=str, keep_default_na=False)
     except Exception as exc:
         errors.append(f"Could not read {rel}: {exc}")
         return None
@@ -655,10 +719,154 @@ def _check_generated_public_does_not_copy_inputs(
         )
 
 
+def _check_split_constraints(
+    constraints: dict[str, Any],
+    frames: dict[str, pd.DataFrame | None],
+    answers: dict[str, pd.DataFrame | None],
+    source_input_dir: Path | None,
+    output_dir: Path,
+    errors: list[str],
+) -> dict[str, Any]:
+    """Check actual original-file references against task-owned source roles."""
+    if not constraints:
+        return {}
+    for role in constraints.get("required_splits", []):
+        if frames[role] is None or frames[role].empty:
+            errors.append(f"Task split-constraints requires a nonempty public {role} split.")
+    for role in constraints.get("required_answer_splits", []):
+        if frames[role] is None or frames[role].empty or answers[role] is None or answers[role].empty:
+            errors.append(f"Task split-constraints requires public rows and private answers for {role}.")
+    rules = constraints.get("source_rules", [])
+    if rules and source_input_dir is None:
+        errors.append("Task split-constraints source rules require the original source_input_dir.")
+        return {}
+    source_files: list[set[Path]] = []
+    for rule in rules:
+        root = source_input_dir / rule["root"]
+        paths = ({root.resolve()} if root.is_file() else
+                 {path.resolve() for path in root.rglob("*") if path.is_file()} if root.is_dir() else set())
+        if not paths:
+            errors.append(f"Task split source root {rule['root']!r} is missing or contains no original files.")
+        source_files.append(paths)
+    original_files = set().union(*source_files) if source_files else set()
+    membership: dict[Path, set[str]] = {}
+    resolved_values: dict[str, Path | None] = {}
+    for role, frame in [*frames.items(), *answers.items()]:
+        if frame is None:
+            continue
+        for column in frame.columns:
+            for value in frame[column].dropna().unique():
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                if value not in resolved_values:
+                    resolved = _resolve_path(value, source_input_dir or output_dir, output_dir)
+                    resolved_values[value] = resolved.resolve() if resolved is not None else None
+                source = resolved_values[value]
+                if source in original_files:
+                    membership.setdefault(source, set()).add(role)
+    overlaps = [path for path, roles in membership.items() if len(roles) > 1]
+    if overlaps:
+        errors.append("Task split-constraints found original files reused across public split roles: "
+                      + ", ".join(str(path) for path in sorted(overlaps)[:5]))
+    report = []
+    for rule, paths in zip(rules, source_files):
+        allowed = set(rule["allowed_splits"])
+        wrong = [(path, membership[path] - allowed) for path in paths & membership.keys()
+                 if membership[path] - allowed]
+        if wrong:
+            examples = "; ".join(f"{path}: {sorted(roles)}" for path, roles in sorted(wrong)[:5])
+            errors.append(f"Task source rule {rule['root']!r} allows only {sorted(allowed)}; found forbidden split roles: {examples}")
+        missing = paths - membership.keys()
+        if rule.get("require_complete", False) and missing:
+            errors.append(f"Task source rule {rule['root']!r} requires complete original-file coverage; missing {len(missing)} of {len(paths)} files. Examples: "
+                          + ", ".join(str(path) for path in sorted(missing)[:5]))
+        report.append({"root": rule["root"], "original_files": len(paths),
+                       "referenced_files": len(paths) - len(missing),
+                       "forbidden_role_files": len(wrong), "allowed_splits": rule["allowed_splits"]})
+    return {"constraints": constraints, "source_rules": report}
+
+
+def _check_prediction_file_columns(split_manifest: dict[str, Any], errors: list[str]) -> None:
+    contract = split_manifest.get("prediction_contract", {})
+    if not isinstance(contract, dict) or "file_reference_columns" not in contract:
+        return
+    columns, files = contract.get("prediction_columns", []), contract["file_reference_columns"]
+    if not isinstance(columns, list) or not isinstance(files, list) or any(
+        not isinstance(value, str) for value in columns + files
+    ):
+        errors.append("prediction_contract prediction_columns/file_reference_columns must be lists of column names.")
+        return
+    if set(files) - set(columns):
+        errors.append("prediction_contract.file_reference_columns must be a subset of prediction_columns; "
+                      "put input/source paths in input_file_reference_columns instead. Invalid columns: "
+                      + ", ".join(sorted(set(files) - set(columns))))
+
+
+def _normalize_prediction_columns(
+    split_manifest: dict[str, Any], errors: list[str], warnings: list[str],
+) -> bool:
+    """Separate known identity columns from predicted values without an LLM."""
+    contract = split_manifest.get("prediction_contract", {})
+    keys = split_manifest.get("key_columns", [])
+    if not isinstance(contract, dict) or not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
+        return False
+    columns = contract.get("prediction_columns")
+    if not isinstance(columns, list) or any(not isinstance(column, str) for column in columns):
+        return False
+    filtered = [column for column in columns if column not in keys]
+    changed = filtered != columns
+    if changed:
+        removed = list(dict.fromkeys(column for column in columns if column in keys))
+        contract["prediction_columns"] = filtered
+        warning = (f"Removed declared sample key columns {removed} from prediction_contract.prediction_columns; "
+                   "candidate artifacts still contain key_columns plus prediction_columns.")
+        warnings.append(warning)
+        retained = split_manifest.get("normalization_warnings", [])
+        retained = retained if isinstance(retained, list) and all(isinstance(item, str) for item in retained) else []
+        split_manifest["normalization_warnings"] = list(dict.fromkeys([*retained, warning]))
+    if not filtered:
+        errors.append("prediction_contract.prediction_columns must contain at least one predicted value column after excluding sample keys.")
+    return changed
+
+
+def _check_truth_alignment(
+    public: pd.DataFrame,
+    private: pd.DataFrame,
+    role: str,
+    key_columns: list[str],
+    row_order_contract: bool,
+    errors: list[str],
+) -> None:
+    if len(public) != len(private):
+        errors.append(f"{role}/private_gt row mismatch: {len(public)} vs {len(private)}")
+    if key_columns:
+        for name, frame in ((role, public), ("private_gt/" + role, private)):
+            missing = sorted(set(key_columns) - set(frame.columns))
+            if missing:
+                errors.append(f"{name} missing declared sample key columns: {missing}")
+                return
+            if frame[key_columns].isna().any().any() or frame[key_columns].apply(lambda column: column.astype(str).str.strip().eq("")).any().any():
+                errors.append(f"{name} has empty sample keys.")
+            if frame.duplicated(key_columns).any():
+                errors.append(f"{name} has duplicate sample keys.")
+        public_keys = set(public[key_columns].itertuples(index=False, name=None))
+        private_keys = set(private[key_columns].itertuples(index=False, name=None))
+        if public_keys != private_keys:
+            errors.append(f"{role}/private_gt sample keys do not match exactly.")
+    elif not row_order_contract:
+        # Preserve the old metadata-bearing format for legacy packages without
+        # declared identities. New keyless packages must explicitly choose order.
+        missing = sorted(set(public.columns) - set(private.columns))
+        if missing:
+            errors.append(f"private_gt/{role}.csv without keys or an explicit row_order_contract must retain all public columns; missing {missing}")
+
+
 def verify_split_package(
     output_dir: Path,
     source_input_dir: Path | None = None,
     facts: dict[str, Any] | None = None,
+    *,
+    task_text: str = "",
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -688,6 +896,16 @@ def verify_split_package(
         manifest = {}
 
     split_manifest = load_split_manifest(output_dir)
+    retained_warnings = split_manifest.get("normalization_warnings", [])
+    if isinstance(retained_warnings, list):
+        warnings.extend(item for item in retained_warnings if isinstance(item, str))
+    normalized_manifest = _normalize_prediction_columns(split_manifest, errors, warnings)
+    constraints = parse_split_constraints(task_text)
+    constraint_report = _check_split_constraints(
+        constraints, {"train": train_df, "score_val": score_df, "test": test_df},
+        {"score_val": score_gt_df, "test": test_gt_df}, source_input_dir, output_dir, errors,
+    )
+    _check_prediction_file_columns(split_manifest, errors)
 
     if train_df is not None and len(train_df) == 0:
         errors.append("agent_train.csv has zero rows.")
@@ -724,17 +942,10 @@ def verify_split_package(
     )
 
     if score_df is not None and score_gt_df is not None:
-        if len(score_df) != len(score_gt_df):
-            errors.append(
-                f"score_val/private_gt row mismatch: {len(score_df)} vs {len(score_gt_df)}"
-            )
+        _check_truth_alignment(score_df, score_gt_df, "score_val", key_columns,
+                               split_manifest.get("row_order_contract") is True, errors)
         public_cols = set(map(str, score_df.columns))
         private_cols = set(map(str, score_gt_df.columns))
-        if not public_cols <= private_cols:
-            errors.append(
-                "private_gt/score_val.csv must retain all public score_val columns; "
-                f"missing {sorted(public_cols - private_cols)}"
-            )
         answers = set(
             map(str, manifest.get("score_val", {}).get("answer_columns") or [])
         )
@@ -759,18 +970,13 @@ def verify_split_package(
             errors.append(f"score_val public file leaks answer columns: {leaked}")
 
     if test_df is not None and test_gt_df is not None:
-        if len(test_df) != len(test_gt_df):
-            errors.append(
-                f"test/private_gt row mismatch: {len(test_df)} vs {len(test_gt_df)}"
-            )
+        _check_truth_alignment(test_df, test_gt_df, "test", key_columns,
+                               split_manifest.get("row_order_contract") is True, errors)
         public_cols = set(map(str, test_df.columns))
         private_cols = set(map(str, test_gt_df.columns))
-        if not public_cols <= private_cols:
-            errors.append(
-                "private_gt/test.csv must retain all public agent_test columns; "
-                f"missing {sorted(public_cols - private_cols)}"
-            )
         answers = set(map(str, manifest.get("test", {}).get("answer_columns") or []))
+        if "test" in constraints.get("required_answer_splits", []) and not answers:
+            errors.append("Task-required private test answers must declare nonempty test answer_columns.")
         hidden_columns = private_cols - public_cols
         unlisted_hidden = sorted(hidden_columns - answers)
         if unlisted_hidden:
@@ -818,6 +1024,11 @@ def verify_split_package(
         errors=errors,
         warnings=warnings,
     )
+    if normalized_manifest:
+        write_split_manifest(output_dir, split_manifest)
+        nested_manifest = output_dir / "biomaker_splits/split_manifest.json"
+        if nested_manifest.is_file():
+            nested_manifest.write_text(json.dumps(split_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     return {
         "ok": not errors,
         "errors": errors,
@@ -826,6 +1037,7 @@ def verify_split_package(
         "hidden_answers": manifest,
         "private_gt": manifest,
         "split_manifest": _manifest_summary_for_verifier(split_manifest),
+        "split_constraints": constraint_report,
     }
 
 
@@ -907,6 +1119,7 @@ def run_agentic_split_builder_probe(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     task_text = task_file.read_text(encoding="utf-8", errors="replace")
+    parse_split_constraints(task_text)
     _cache_key, facts = split_builder_cache_key(
         input_dir=input_dir,
         task_text=task_text,
@@ -992,7 +1205,7 @@ def run_agentic_split_builder_probe(
             check=False,
         )
         verifier = verify_split_package(
-            output_dir, source_input_dir=input_dir, facts=facts
+            output_dir, source_input_dir=input_dir, facts=facts, task_text=task_text
         )
         verifier["builder_returncode"] = completed.returncode
         if completed.returncode != 0:

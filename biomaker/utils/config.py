@@ -10,7 +10,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Hashable, cast
+from typing import Any, Callable, Hashable, cast
 
 import coolname
 import rich
@@ -121,7 +121,7 @@ class ExecConfig:
     include_medical_packages: bool
     requested_parallel_workers: int | str | None = None
     effective_parallel_workers: int | None = None
-    compute_slots: list[dict[str, object]] | None = None
+    compute_slots: list[dict[str, Any]] | None = None
 
 
 @dataclass

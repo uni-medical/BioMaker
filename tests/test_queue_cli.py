@@ -345,12 +345,13 @@ def test_ctrl_c_retries_when_queued_run_is_claimed_during_cancel(tmp_path, monke
     assert manager.store.record["status"] == "stopped"
 
 
+@pytest.mark.parametrize("queue_flag", [[], ["--queue"]])
 def test_queue_direct_child_bypasses_submission_and_prevents_recursion(
-    monkeypatch,
+    monkeypatch, queue_flag,
 ):
     calls = []
     monkeypatch.setenv("BIOMAKER_QUEUE_DIRECT", "1")
-    monkeypatch.setattr(run_module.sys, "argv", ["biomaker"])
+    monkeypatch.setattr(run_module.sys, "argv", ["biomaker", *queue_flag])
     monkeypatch.setattr(
         queue_client,
         "submit_cli_and_wait",
@@ -361,17 +362,52 @@ def test_queue_direct_child_bypasses_submission_and_prevents_recursion(
     run_module.run()
 
     assert calls == ["direct"]
+    assert "--queue" not in run_module.sys.argv
 
 
-def test_interactive_cli_returns_queue_exit_code_as_system_exit(monkeypatch):
+@pytest.mark.parametrize("entrypoint", ["biomaker", "/checkout/biomaker/run.py"])
+def test_cli_defaults_to_direct_without_opening_queue(tmp_path, monkeypatch, entrypoint):
     monkeypatch.delenv("BIOMAKER_QUEUE_DIRECT", raising=False)
     monkeypatch.delenv("BIOMAKER_DISABLE_RUN_QUEUE", raising=False)
-    monkeypatch.setattr(run_module.sys, "argv", ["biomaker"])
-    monkeypatch.setattr(queue_client, "submit_cli_and_wait", lambda: 23)
+    argv = [entrypoint, "goal=detect fractures", "agent.steps=3"]
+    monkeypatch.setattr(run_module.sys, "argv", argv)
+    # Direct mode must also work without an installed queue sidecar.
+    monkeypatch.setattr(run_module, "__file__", str(tmp_path / "biomaker" / "run.py"))
+    monkeypatch.setattr(
+        queue_client, "submit_cli_and_wait",
+        lambda: pytest.fail("default CLI must not access the queue"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        run_module, "_run_direct_entry", lambda: calls.append(list(run_module.sys.argv))
+    )
+
+    run_module.run()
+
+    assert calls == [argv]
+
+
+@pytest.mark.parametrize("entrypoint", ["biomaker", "/checkout/biomaker/run.py"])
+@pytest.mark.parametrize("flag_first", [True, False])
+def test_explicit_queue_returns_exit_code_and_consumes_flag(monkeypatch, entrypoint, flag_first):
+    monkeypatch.delenv("BIOMAKER_QUEUE_DIRECT", raising=False)
+    monkeypatch.delenv("BIOMAKER_DISABLE_RUN_QUEUE", raising=False)
+    overrides = ["goal=detect fractures", "agent.steps=3"]
+    args = ["--queue", *overrides] if flag_first else [*overrides, "--queue"]
+    monkeypatch.setattr(run_module.sys, "argv", [entrypoint, *args])
+
+    def submit():
+        assert run_module.sys.argv == [entrypoint, *overrides]
+        parsed = queue_client._load_cfg(use_cli_args=True)
+        assert parsed.goal == "detect fractures"
+        assert parsed.agent.steps == 3
+        return 23
+
+    monkeypatch.setattr(queue_client, "submit_cli_and_wait", submit)
     monkeypatch.setattr(
         run_module,
         "_run_direct_entry",
-        lambda: pytest.fail("interactive CLI should submit to the queue"),
+        lambda: pytest.fail("--queue should submit to the queue"),
     )
 
     with pytest.raises(SystemExit) as exc_info:
@@ -380,12 +416,12 @@ def test_interactive_cli_returns_queue_exit_code_as_system_exit(monkeypatch):
     assert exc_info.value.code == 23
 
 
-def test_interactive_cli_fails_closed_when_queue_sidecar_is_missing(
+def test_explicit_queue_fails_closed_when_queue_sidecar_is_missing(
     tmp_path, monkeypatch
 ):
     monkeypatch.delenv("BIOMAKER_QUEUE_DIRECT", raising=False)
     monkeypatch.delenv("BIOMAKER_DISABLE_RUN_QUEUE", raising=False)
-    monkeypatch.setattr(run_module.sys, "argv", ["biomaker"])
+    monkeypatch.setattr(run_module.sys, "argv", ["biomaker", "--queue"])
     monkeypatch.setattr(run_module, "__file__", str(tmp_path / "biomaker" / "run.py"))
     monkeypatch.setattr(
         run_module,
@@ -397,16 +433,18 @@ def test_interactive_cli_fails_closed_when_queue_sidecar_is_missing(
         run_module.run()
 
 
-def test_explicit_queue_opt_out_still_runs_directly(monkeypatch):
+@pytest.mark.parametrize("queue_flag", [[], ["--queue"]])
+def test_explicit_queue_opt_out_still_runs_directly(monkeypatch, queue_flag):
     calls = []
     monkeypatch.delenv("BIOMAKER_QUEUE_DIRECT", raising=False)
     monkeypatch.setenv("BIOMAKER_DISABLE_RUN_QUEUE", "1")
-    monkeypatch.setattr(run_module.sys, "argv", ["biomaker"])
+    monkeypatch.setattr(run_module.sys, "argv", ["biomaker", *queue_flag])
     monkeypatch.setattr(run_module, "_run_direct_entry", lambda: calls.append("direct"))
 
     run_module.run()
 
     assert calls == ["direct"]
+    assert "--queue" not in run_module.sys.argv
 
 
 class _ImmediateQueuedProcess:

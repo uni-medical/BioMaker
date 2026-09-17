@@ -156,12 +156,28 @@ class DeterministicEvaluatorCompilerTests(unittest.TestCase):
             workspace.mkdir(parents=True)
             hidden.parent.mkdir(parents=True)
             hidden.write_text("Id,class\n1,0\n", encoding="utf-8")
+            _write_csv(workspace / "input/biomaker_splits/score_val.csv", [{"Id": 1}])
+            _write_csv(
+                workspace / "working/validation_predictions.csv",
+                [{"Id": 1, "prob_0": 1.0}],
+            )
+            (workspace / "evaluator_prediction_spec.json").write_text(
+                json.dumps(
+                    {
+                        "evaluator_api_version": 2,
+                        "maximize": True,
+                        "secondary_metrics": [],
+                        "primary_metric": "accuracy",
+                        "key_columns": ["Id"],
+                        "prediction_columns": ["prob_0"],
+                    }
+                )
+            )
             (workspace / "evaluator.py").write_text(
                 "\n".join(
                     [
                         "import os",
-                        "def score_val():",
-                        "    path = os.environ['BIOMAKER_SCORE_VAL_PATH']",
+                        "def score(prediction_path, path, expected_path):",
                         "    print('BIOMAKER_SCORE_VAL_PATH=' + path)",
                         "    raise RuntimeError('hidden path: ' + path)",
                     ]
@@ -466,12 +482,19 @@ class DeterministicEvaluatorCompilerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "working").mkdir(parents=True)
+            _write_csv(
+                workspace / "working/validation_predictions.csv", [{"prob_0": 1.0}]
+            )
+            _write_csv(workspace / "input/biomaker_splits/score_val.csv", [{"Id": 1}])
+            _write_csv(workspace / "private_gt/score_val.csv", [{"Id": 1, "class": 0}])
             (workspace / "evaluator.py").write_text(
                 "\n".join(
                     [
                         "from pathlib import Path",
                         "def prediction_spec():",
-                        "    return {'validation_artifact': './working/validation_predictions.csv', 'test_submission': './working/submission.csv', 'key_columns': [], 'prediction_columns': ['prob_0'], 'primary_metric': 'accuracy'}",
+                        "    return {'evaluator_api_version': 2, 'secondary_metrics': [], 'maximize': True, 'validation_artifact': './working/validation_predictions.csv', 'test_submission': './working/submission.csv', 'key_columns': [], 'prediction_columns': ['prob_0'], 'primary_metric': 'accuracy'}",
+                        "def score(prediction_path, truth_path, expected_path):",
+                        "    return {'metric': 1.0, 'maximize': True, 'metrics': {'accuracy': 1.0}}",
                         "def score_val():",
                         "    return {'metric': 1.0, 'maximize': True}",
                         "def validate_submission():",

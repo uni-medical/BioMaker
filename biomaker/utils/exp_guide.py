@@ -129,6 +129,21 @@ def _path_observation(path_value: Any, input_dir: Path) -> dict[str, Any] | None
     if not path.is_file():
         return result
     result["size_bytes"] = int(path.stat().st_size)
+    if path.suffix.lower() in {".npy", ".npz"}:
+        try:
+            if path.suffix.lower() == ".npy":
+                array = np.load(path, mmap_mode="r", allow_pickle=False)
+                result.update(kind="numpy_array", array_shape=list(array.shape), array_dtype=str(array.dtype))
+            else:
+                with np.load(path, allow_pickle=False) as archive:
+                    result.update(kind="numpy_archive", arrays={
+                        key: {"shape": list(archive[key].shape), "dtype": str(archive[key].dtype)}
+                        for key in archive.files[:8]
+                    })
+            return result
+        except Exception as exc:
+            result["read_error"] = str(exc)
+            return result
     try:
         with Image.open(path) as image:
             arr = np.asarray(image)
@@ -139,6 +154,7 @@ def _path_observation(path_value: Any, input_dir: Path) -> dict[str, Any] | None
                     "pil_size": list(image.size),
                     "array_shape": list(arr.shape),
                     "array_dtype": str(arr.dtype),
+                    "frame_count": getattr(image, "n_frames", 1),
                 }
             )
             return result
@@ -164,12 +180,13 @@ def _path_observation(path_value: Any, input_dir: Path) -> dict[str, Any] | None
     return result
 
 
-def _sample_profile(df: pd.DataFrame | None, input_dir: Path) -> dict[str, Any] | None:
+def _sample_profile(df: pd.DataFrame | None, input_dir: Path, *, declared_columns=(), file_columns=()) -> dict[str, Any] | None:
     if df is None or df.empty:
         return None
     row = df.iloc[0]
     values: dict[str, Any] = {}
-    for column in df.columns[:8]:
+    columns = list(dict.fromkeys([c for c in declared_columns if c in df] + list(df.columns[:8])))
+    for column in columns:
         value = row[column]
         if isinstance(value, np.generic):
             value = value.item()
@@ -178,12 +195,15 @@ def _sample_profile(df: pd.DataFrame | None, input_dir: Path) -> dict[str, Any] 
         )
 
     path_observations = {}
-    for column in df.columns:
+    for column in dict.fromkeys([c for c in file_columns if c in df] + list(df.columns)):
         column_name = str(column)
-        if "path" not in column_name.lower() and "file" not in column_name.lower():
+        value = row[column]
+        declared_file = column in file_columns
+        looks_like_path = isinstance(value, str) and ("/" in value or "." in value)
+        if not declared_file and not looks_like_path and "path" not in column_name.lower() and "file" not in column_name.lower():
             continue
-        observation = _path_observation(row[column], input_dir)
-        if observation is not None:
+        observation = _path_observation(value, input_dir)
+        if observation is not None and (declared_file or observation["exists"] or "path" in column_name.lower() or "file" in column_name.lower()):
             path_observations[column_name] = observation
         if len(path_observations) >= 4:
             break
@@ -215,6 +235,20 @@ def build_exp_guide(
         for column in hidden.answer_columns
     }
     key_columns = set(prediction_contract.key_columns)
+    manifest = contract.split_manifest
+    declared_prediction = manifest.get("prediction_contract", {})
+    declared_metric = manifest.get("metric_contract", {})
+    restoration = declared_metric.get("restoration_evaluation", declared_metric)
+    file_columns = list(dict.fromkeys([
+        *manifest.get("input_file_reference_columns", []),
+        *declared_prediction.get("input_file_reference_columns", []),
+        *declared_prediction.get("file_reference_columns", []),
+        *[c for c in [declared_prediction.get("image_column"), restoration.get("input_column"), restoration.get("target_column")] if isinstance(c, str)],
+    ]))
+    declared_columns = list(dict.fromkeys([
+        *manifest.get("key_columns", []), *declared_prediction.get("input_columns", []),
+        *declared_prediction.get("prediction_columns", []), *sorted(answer_columns), *file_columns,
+    ]))
     for split_name in ["train", "score_val", "test"]:
         split = contract.splits.get(split_name)
         if split is None:
@@ -226,7 +260,7 @@ def build_exp_guide(
             "legacy public validation" if split.legacy_alias is not None else split.role
         )
         split_guide[split_name] = profile
-        sample = _sample_profile(df, input_dir)
+        sample = _sample_profile(df, input_dir, declared_columns=declared_columns, file_columns=file_columns)
         if sample is not None:
             samples[split_name] = sample
         if split_name == "train":
@@ -287,6 +321,11 @@ def build_exp_guide(
         },
         "prediction": prediction,
         "metric": metric,
+        "evaluation_protocol": {
+            key: value for key, value in raw_prediction_spec.items()
+            if key not in {"answer_columns", "truth_schema"}
+        },
+        "data_semantics": {key: manifest[key] for key in ("data_semantics", "row_representation", "semantic_assumptions", "sample_unit", "task_heads", "input_file_reference_columns") if key in manifest},
         "visibility": {
             "agent_input_root": "./input",
             "agent_output_root": "./working",
@@ -320,9 +359,13 @@ def _guide_view(guide: dict[str, Any], *, include_samples: bool) -> dict[str, An
         "target": guide.get("target", {}),
         "prediction": guide.get("prediction", {}),
         "metric": guide.get("metric", {}),
+        "data_semantics": guide.get("data_semantics", {}),
         "visibility": guide.get("visibility", {}),
     }
     if include_samples:
+        # Candidate prompts include the complete frozen public interface, not
+        # only a metric name and a shortened output-column summary.
+        view["evaluation_protocol"] = guide.get("evaluation_protocol", {})
         view["samples"] = guide.get("samples", {})
         view["split_profiles"] = guide.get("split_profiles", {})
     return view

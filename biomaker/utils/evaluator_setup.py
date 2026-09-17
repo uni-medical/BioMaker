@@ -26,9 +26,23 @@ from PIL import Image
 
 from .. import backend
 from .environment import environment_manifest_text, validate_code_environment
-from .evaluator_templates import (
-    _FIXED_CLASSIFICATION_EVALUATOR,
-    _FIXED_SEGMENTATION_EVALUATOR,
+from .evaluator_adapter import ADAPTER_API, compile_adapter
+from .restoration_contract import fixed_restoration_spec
+from .restoration_evaluator_template import _RESTORATION_DATA_ADAPTER
+from .detection_contract import fixed_detection_spec
+from .standard_data_adapters import (
+    _REGRESSION_DATA_ADAPTER,
+    _CLASSIFICATION_DATA_ADAPTER,
+    _SEGMENTATION_DATA_ADAPTER,
+    _DETECTION_DATA_ADAPTER,
+    data_adapter_capabilities,
+)
+from .evaluator_protocol import (
+    EVALUATOR_API_VERSION,
+    metric_name,
+    requested_metrics,
+    validate_score,
+    validate_scoring_rows,
 )
 from .events import append_event
 from .exp_guide import (
@@ -40,6 +54,7 @@ from .experiment_contract import load_experiment_contract
 from .metric_registry import (
     is_classification_metric_supported,
     is_segmentation_metric_supported,
+    metric_info,
     metric_maximize,
 )
 from .process_tree import (
@@ -56,7 +71,8 @@ _RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
 _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 _SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
-_EVALUATOR_CACHE_VERSION = 2
+_EVALUATOR_CACHE_VERSION = 5
+_PROTOCOL_DOCUMENTATION_FIELDS = {"notes", "description"}
 
 
 class EvaluatorSetupError(RuntimeError):
@@ -163,18 +179,39 @@ def _exp_guide_prompt_view(
     return evaluator_exp_guide_view(guide)
 
 
+def _preparation_context(workspace_dir: Path, hidden_score_path: Path | None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Complete public input contract, independent of earlier evaluator outputs."""
+    manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
+    declared = {key: manifest[key] for key in (
+        "sample_unit", "key_columns", "task_heads", "metric_contract", "prediction_contract",
+        "data_semantics", "row_representation", "semantic_assumptions", "sample_universe_summary",
+        "input_file_reference_columns",
+    ) if key in manifest}
+    declared = json.loads(_sanitize_private_paths(json.dumps(declared, default=str), hidden_score_path))
+    guide = _exp_guide_prompt_view(workspace_dir, hidden_score_path)
+    guide["prediction"] = declared.get("prediction_contract", {})
+    guide["metric"] = declared.get("metric_contract", {})
+    observations = build_exp_guide(workspace_dir).get("samples", {})
+    return guide, declared, observations
+
+
 def _evaluator_prompt(
     task_desc: Any, workspace_dir: Path, hidden_score_path: Path | None = None
 ) -> dict[str, Any]:
+    guide, declared, observations = _preparation_context(workspace_dir, hidden_score_path)
     return {
         "Introduction": (
-            "You are writing the frozen evaluator for a machine learning task. "
+            "You are writing a custom-metric evaluator because a requested metric "
+            "has no registered trusted Harness implementation. This route is never "
+            "used solely for a data-schema mismatch. "
             "This evaluator is created once before solution search. Candidate solutions "
             "will train models and write prediction artifacts; BioMaker will call this evaluator "
             "after each candidate finishes, so all candidates are scored with the same code."
         ),
         "Task description": _task_payload(task_desc),
-        "Experiment guide": _exp_guide_prompt_view(workspace_dir, hidden_score_path),
+        "Experiment guide": guide,
+        "Prepared data and metric declarations": declared,
+        "Public sample observations": observations,
         "Environment contract": environment_manifest_text(include_medical=True),
         "Evaluator requirements": [
             "Write exactly one Python file.",
@@ -183,6 +220,9 @@ def _evaluator_prompt(
             "Do not use Python eval() or exec(). Parse serialized values with json.loads or ast.literal_eval.",
             "Use the Experiment guide as the source of truth for public splits, hidden answers, visibility boundaries, and output paths.",
             "Define prediction_spec() returning a concise JSON-serializable dict with these top-level keys: validation_artifact, test_submission, key_columns, prediction_columns, primary_metric. key_columns may be [] only when row order is the contract.",
+            "Evaluator API v2: prediction_spec() must include evaluator_api_version=2, boolean maximize, and secondary_metrics as a list of metric names. Preserve all primary and secondary metric requirements from the task. Declare metric parameters (thresholds, averaging, class mapping, coordinate conventions) explicitly in the public spec; use exactly those settings on every split.",
+            "Define score(prediction_path, truth_path, expected_path). This is the ONLY scoring implementation for both validation and private test. Read predictions, hidden truth, and public expected rows from these explicit paths. Never hardcode validation filenames, row counts, or the score-validation environment variable inside score(). Never infer the split from its size. Referenced relative image/mask/annotation paths remain workspace-relative. Return {'metrics': {metric_name: finite_number, ...}, 'metric': primary_value, 'maximize': bool}. Include every requested secondary metric. For detection, explicitly freeze the confidence threshold or operating-point rule for Recall as well as IoU and box format; do not tune the rule on private test answers.",
+            "score_val() must only delegate to score() with the validation prediction path, os.environ['BIOMAKER_SCORE_VAL_PATH'], and the public validation CSV. Do not duplicate metric computation for different splits. validate_submission() checks format only and must not read private test answers.",
             "test_submission must be exactly './working/submission.csv'.",
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
             "The candidate validation artifact must contain predictions for rows in the Experiment guide's score validation split, usually ./input/biomaker_splits/score_val.csv and sometimes legacy ./input/biomaker_splits/agent_val.csv.",
@@ -197,16 +237,101 @@ def _evaluator_prompt(
             "Define validate_submission() with no required arguments. It must validate ./working/submission.csv and any referenced files against the same contract, returning a dict or raising a clear exception.",
             "For tabular prediction artifacts, align rows by the declared key columns after normalizing keys to strings; reject missing keys, duplicate keys, extra keys, bad shapes, and invalid numeric values.",
             "For probability outputs, validate with numeric tolerance and return a clear error when rows are not valid probabilities.",
-            "If a primary metric is mathematically undefined on the current validation split, return a deterministic fallback metric with an explanatory field instead of crashing.",
+            "If any requested metric is mathematically undefined, raise a clear error naming that metric. Never substitute accuracy for AUC or silently omit a requested metric.",
             f"Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real public score validation and agent_test split CSVs, exactly follow prediction_spec(), call score_val() with os.environ['{_SCORE_ENV_VAR}'] available, call validate_submission(), assert the returned metric is numeric, then print EVALUATOR_OK.",
-            "Keep the evaluator simple and deterministic. Use standard metrics from sklearn when directly applicable and small direct numpy/PIL implementations for image masks.",
+            "self_test() MUST leave its validation/submission CSVs and ALL referenced files available after returning. Harness reads them again for a relocated-path scoring probe and owns cleanup after every preparation check finishes. Do not delete them or place referenced files in a TemporaryDirectory context that closes before returning.",
+            "Keep the evaluator simple and deterministic. Implement and verify only unavailable metric definitions; reuse supplied trusted_score_samples(samples, spec) for registered metrics. Its canonical sample/parameter interface is documented below. Do not reimplement PSNR, SSIM, Dice, AJI, HD95, accuracy, AUC, AP50, or Recall.",
             "For segmentation masks, support mask files referenced from CSV. The prediction spec should make this explicit with prediction_type='mask_file_path' or file_reference_columns for the mask path column. Binary Dice should treat nonzero pixels as foreground. AJI/instance metrics should use integer connected/instance labels if the task asks for them.",
         ],
+        "Trusted metric API": _trusted_metric_api(),
         "Output format": (
             "Return a brief note followed by exactly one markdown Python code block. "
             "No extra code blocks."
         ),
     }
+
+
+def _trusted_metric_api() -> str:
+    from .trusted_metrics import METRIC_API_DESCRIPTION
+
+    return (
+        "trusted_score_samples(samples, spec) is supplied by Harness in this standalone file. "
+        "samples is an iterable of mappings with prediction, target and optional group, "
+        "input_shape, spacing, prediction_spacing. It returns metric/maximize/metrics/n. "
+        "Use a spec naming only the registered metrics for that call, then combine your "
+        "independently verified new metric in the final metrics mapping.\n" + METRIC_API_DESCRIPTION
+    )
+
+
+def _adapter_prompt(task_desc: Any, workspace_dir: Path, hidden_score_path: Path) -> dict[str, Any]:
+    from .trusted_metrics import METRIC_API_DESCRIPTION, metric_capabilities
+
+    manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
+    guide, declared, observations = _preparation_context(workspace_dir, hidden_score_path)
+    return {
+        "Introduction": (
+            "Write only a thin data adapter for the task's trusted metrics. "
+            "The task and experiment protocol determine metric semantics. "
+            "Harness supplies tested metric functions and owns scoring, alignment, "
+            "aggregation, private answers, preparation probes, and frozen entry points. "
+            "A dataset schema mismatch is an adapter issue, never a reason to rewrite metrics."
+        ),
+        "Task description": _task_payload(task_desc),
+        "Experiment guide": guide,
+        "Prepared data and metric declarations": declared,
+        "Public sample observations": observations,
+        "Environment contract": environment_manifest_text(include_medical=True),
+        "Data adapter API": ADAPTER_API,
+        "Trusted metric API and parameters": METRIC_API_DESCRIPTION,
+        "Metric capability catalog": metric_capabilities(),
+        "Built-in data reader catalog": data_adapter_capabilities(),
+        "Complete reference adapter (illustrative schema only)": _adapter_reference_example(task_desc, manifest),
+        "Protocol requirements": (
+            "Preserve every task-specified metric, parameter, crop, group, and aggregation. "
+            "Do not choose alternative semantics merely to pass a probe. Unsupported "
+            "metric semantics must be reported explicitly. Implement only data decoding, "
+            "path/column mapping and representation conversion. No hidden truth values "
+            "or private test answers are provided to you."
+        ),
+        "Output format": "Return a brief note and exactly one markdown Python code block.",
+    }
+
+
+def _adapter_reference_example(task_desc: Any, manifest: dict[str, Any]) -> str:
+    primary, _ = requested_metrics(_task_payload(task_desc))
+    info = metric_info(primary or _manifest_primary_metric(manifest))
+    family = info.task_family if info else "classification"
+    spec = dict(evaluator_api_version=2, key_columns=["sample_id"],
+                validation_artifact="./working/validation_predictions.csv",
+                test_submission="./working/submission.csv", maximize=True)
+    if family == "regression":
+        spec.update(task_type=family, primary_metric="mae", secondary_metrics=["rmse"],
+                    maximize=False, prediction_columns=["estimated_value"], answer_columns=["reference_value"],
+                    target_shape=[], aggregation="mean_samples", multioutput="uniform_average", rounding="none")
+        template = _REGRESSION_DATA_ADAPTER
+    elif family == "image_restoration":
+        spec.update(task_type=family, primary_metric="psnr", secondary_metrics=["ssim"],
+                    prediction_columns=["estimate_file"], answer_columns=["reference_file"],
+                    restoration_evaluation=dict(input_column="observed_file", target_column="reference_file",
+                        data_range=255, crop_size=None, group_column=None, groups=None, aggregation="mean_images"))
+        template = _RESTORATION_DATA_ADAPTER
+    elif family == "segmentation":
+        spec.update(task_type=family, primary_metric="binary_dice", secondary_metrics=["aji"],
+                    prediction_columns=["estimated_mask"], answer_columns=["reference_mask"],
+                    image_column="observed_image")
+        template = _SEGMENTATION_DATA_ADAPTER
+    elif family == "detection":
+        schema = dict(class_key="category", coordinate_keys=["bbox"], box_format="xyxy")
+        spec.update(task_type=family, primary_metric="ap50", secondary_metrics=["recall"],
+                    prediction_columns=["detections"], answer_columns=["reference_boxes"],
+                    prediction_schema=schema, truth_schema=schema)
+        template = _DETECTION_DATA_ADAPTER
+    else:
+        spec.update(task_type="binary", primary_metric="auc", secondary_metrics=["accuracy"],
+                    prediction_columns=["probability_no", "probability_yes"], answer_columns=["class_name"],
+                    class_labels=["no", "yes"], positive_class="yes")
+        template = _CLASSIFICATION_DATA_ADAPTER
+    return template.replace("__BIOMAKER_SPEC__", repr(spec)).strip()
 
 
 def _run_python(
@@ -336,28 +461,62 @@ def _run_self_test(
     timeout: int,
     hidden_score_path: Path | str | None = None,
 ) -> str:
-    code = (
-        "import evaluator\n"
-        "import json\n"
-        "required = ['prediction_spec', 'score_val', 'validate_submission']\n"
-        "missing = [name for name in required if not hasattr(evaluator, name)]\n"
-        "if missing:\n"
-        "    raise RuntimeError('evaluator missing required functions: ' + ', '.join(missing))\n"
-        "spec = evaluator.prediction_spec()\n"
-        "if isinstance(spec, str):\n"
-        "    spec = json.loads(spec)\n"
-        "if not isinstance(spec, dict):\n"
-        "    raise RuntimeError('prediction_spec() must return a dict')\n"
-        "for key in ['validation_artifact', 'test_submission', 'key_columns']:\n"
-        "    if key not in spec:\n"
-        "        raise RuntimeError('prediction_spec() missing key: ' + key)\n"
-        "if 'prediction_columns' not in spec and 'file_reference_columns' not in spec:\n"
-        "    raise RuntimeError('prediction_spec() must declare prediction_columns or file_reference_columns')\n"
-        "if not hasattr(evaluator, 'self_test'):\n"
-        "    raise RuntimeError('evaluator.self_test() is missing')\n"
-        "evaluator.self_test()\n"
-        "print('EVALUATOR_OK')\n"
-    )
+    code = """
+import evaluator
+import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
+required = ['prediction_spec', 'score', 'score_val', 'validate_submission', 'self_test']
+missing = [name for name in required if not hasattr(evaluator, name)]
+if missing:
+    raise RuntimeError('evaluator missing required functions: ' + ', '.join(missing))
+spec = evaluator.prediction_spec()
+if isinstance(spec, str):
+    spec = json.loads(spec)
+if not isinstance(spec, dict):
+    raise RuntimeError('prediction_spec() must return a dict')
+for key in ['validation_artifact', 'test_submission', 'key_columns']:
+    if key not in spec:
+        raise RuntimeError('prediction_spec() missing key: ' + key)
+if 'prediction_columns' not in spec and 'file_reference_columns' not in spec:
+    raise RuntimeError('prediction_spec() must declare prediction_columns or file_reference_columns')
+try:
+    probe = evaluator.self_test()
+    if spec.get('adapter_api_version') == 1:
+        sources = [probe[k] for k in ('prediction_path', 'truth_path', 'expected_path')]
+    else:
+        sources = [spec['validation_artifact'], os.environ['BIOMAKER_SCORE_VAL_PATH'],
+                   spec.get('score_split', './input/biomaker_splits/score_val.csv')]
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = []
+        for i, source in enumerate(sources):
+            if not Path(source).is_file():
+                raise RuntimeError('self_test() must retain CSVs and referenced files until Harness finishes all probes; cleanup belongs to Harness.')
+            target = Path(tmp) / (str(i) + '.csv')
+            shutil.copyfile(source, target)
+            paths.append(str(target))
+        os.environ.pop('BIOMAKER_SCORE_VAL_PATH', None)
+        expected_error = probe.get('score_error') if spec.get('adapter_api_version') == 1 else None
+        score_error = None
+        try:
+            score = evaluator.score(*paths)
+        except Exception as exc:
+            if (not expected_error or not isinstance(exc, evaluator.UndefinedMetricError)
+                    or {'metric': exc.metric, 'reason': exc.reason} != expected_error):
+                raise
+            score = None
+            score_error = expected_error
+        if spec.get('adapter_api_version') == 1 and (score != probe['score'] or score_error != expected_error):
+            raise RuntimeError('Adapter probe changed when paths were relocated or test fixtures were written; preserve all referenced files and split-independent interpretation.')
+        print('EVALUATOR_PROBE_JSON=' + json.dumps({'spec': spec, 'score': score,
+            'score_error': score_error, 'structural_probe': probe.get('structural_probe') if isinstance(probe, dict) else None}))
+finally:
+    if spec.get('adapter_api_version') == 1:
+        evaluator.cleanup_self_test()
+print('EVALUATOR_OK')
+"""
     completed = _run_python(
         workspace_dir,
         code,
@@ -368,7 +527,50 @@ def _run_self_test(
     if completed.returncode != 0 or "EVALUATOR_OK" not in output:
         output = _sanitize_private_paths(output, hidden_score_path)
         raise EvaluatorSetupError("Evaluator self-test failed.\n" + output[-4000:])
+    probes = [
+        line.removeprefix("EVALUATOR_PROBE_JSON=")
+        for line in output.splitlines()
+        if line.startswith("EVALUATOR_PROBE_JSON=")
+    ]
+    if not probes:
+        raise EvaluatorSetupError(
+            "Evaluator did not pass the split-independent scoring probe."
+        )
+    probe = json.loads(probes[-1])
+    _validate_scoring_contract(probe["spec"])
+    if probe.get("score_error"):
+        if probe["spec"].get("adapter_api_version") != 1 or not (probe.get("structural_probe") or {}).get("validated_samples"):
+            raise EvaluatorSetupError("Undefined dummy metric requires a completed Harness structural probe.")
+    else:
+        validate_score(probe["score"], probe["spec"])
     return output
+
+
+def _validate_scoring_contract(spec: dict[str, Any], task_desc: Any = None) -> None:
+    if spec.get("evaluator_api_version") != EVALUATOR_API_VERSION:
+        raise EvaluatorSetupError(
+            "prediction_spec must declare evaluator_api_version=2."
+        )
+    if not isinstance(spec.get("maximize"), bool):
+        raise EvaluatorSetupError("prediction_spec must declare boolean maximize.")
+    secondary = spec.get("secondary_metrics")
+    if not isinstance(secondary, list) or any(
+        not isinstance(m, str) or not m.strip() for m in secondary
+    ):
+        raise EvaluatorSetupError(
+            "prediction_spec must declare secondary_metrics as a list of names."
+        )
+    primary, requested_secondary = requested_metrics(_task_payload(task_desc))
+    actual_primary = metric_name(str(spec.get("primary_metric", "")))
+    if primary and actual_primary != primary:
+        raise EvaluatorSetupError(
+            f"Requested primary metric {primary}, evaluator declares {actual_primary}."
+        )
+    missing = set(requested_secondary) - {metric_name(m) for m in secondary}
+    if missing:
+        raise EvaluatorSetupError(
+            f"Evaluator omitted requested secondary metrics: {sorted(missing)}"
+        )
 
 
 def _load_prediction_spec(workspace_dir: Path) -> str:
@@ -502,6 +704,7 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         )
 
     normalized: dict[str, Any] = {
+        **spec,
         "validation_artifact": validation_artifact
         or "./working/validation_predictions.csv",
         "test_submission": test_submission,
@@ -591,7 +794,7 @@ def _run_public_artifact_contract_test(
         spec = json.loads(prediction_spec)
     except Exception as exc:
         raise EvaluatorSetupError(f"Could not parse normalized prediction_spec: {exc}")
-    if not isinstance(spec, dict) or not _should_run_tabular_contract_test(spec):
+    if not isinstance(spec, dict) or spec.get("adapter_api_version") == 1 or not _should_run_tabular_contract_test(spec):
         return
 
     key_columns = _list_of_strings(spec.get("key_columns"))
@@ -1389,29 +1592,10 @@ def _infer_fixed_classification_spec(
 
 
 def _primary_metric_from_task_desc(task_desc: Any, task_type: str) -> str | None:
-    text = _task_payload(task_desc)
-    match = re.search(
-        r"primary\s+validation\s+metric\s*:\s*([^\n\r.]+)",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return None
-    metric = match.group(1).strip().strip("`*_ ")
-    lower = metric.lower()
-    if "aji" in lower:
-        return "aji"
-    if "dice" in lower:
-        return "binary_dice"
-    if "hd95" in lower or "hausdorff" in lower:
-        return "hd95"
-    if "auc" in lower:
-        return "mean_roc_auc" if task_type == "multilabel" else "auc"
-    if "balanced" in lower and "accuracy" in lower:
-        return "balanced_accuracy"
-    if "accuracy" in lower or lower in {"acc"}:
-        return "mean_binary_accuracy" if task_type == "multilabel" else "accuracy"
-    return metric.replace(" ", "_").lower()
+    primary, _ = requested_metrics(_task_payload(task_desc))
+    if task_type == "multilabel":
+        return {"auc": "mean_roc_auc", "accuracy": "mean_binary_accuracy"}.get(primary, primary)
+    return primary
 
 
 def _fixed_classification_metric_supported(metric: str) -> bool:
@@ -1491,15 +1675,75 @@ def _write_fixed_classification_evaluator(
             spec["primary_metric"] = metric
     if not _fixed_classification_metric_supported(str(spec.get("primary_metric", ""))):
         return None
+    _, secondary = requested_metrics(_task_payload(task_desc))
+    if not secondary:
+        secondary = _split_manifest(workspace_dir / "input/biomaker_splits").get("metric_contract", {}).get("secondary_metrics", [])
+        secondary = [metric_name(m) for m in secondary]
+    if any(name not in {"accuracy", "auc"} for name in secondary):
+        return None
+    spec.update(
+        evaluator_api_version=EVALUATOR_API_VERSION, secondary_metrics=secondary
+    )
+    spec = _resolve_metric_contract(spec, workspace_dir, task_desc, require_match=False)
     return _write_fixed_evaluator(
         workspace_dir=workspace_dir,
         log_dir=log_dir,
         hidden_score_path=hidden_score_path,
         timeout=timeout,
         spec=spec,
-        template=_FIXED_CLASSIFICATION_EVALUATOR,
+        template=compile_adapter(_CLASSIFICATION_DATA_ADAPTER.replace("__BIOMAKER_SPEC__", repr(spec)), spec),
         run_public_contract=True,
         log_message="Fixed evaluator prepared",
+    )
+
+
+def _write_fixed_regression_evaluator(
+    workspace_dir: Path, log_dir: Path, hidden_score_path: Path,
+    timeout: int, task_desc: Any = None,
+) -> PreparedEvaluator | None:
+    context = _load_fixed_split_context(workspace_dir, hidden_score_path)
+    if context is None:
+        return None
+    manifest = context["split_manifest"]
+    primary, secondary = _requested_metric_names(task_desc, workspace_dir)
+    names = [primary, *secondary]
+    if not primary or any(not metric_info(name) or metric_info(name).task_family != "regression" for name in names):
+        return None
+    answers = context["answer_columns"]
+    if not answers or any(column not in context["train_df"] or column not in context["hidden_df"] for column in answers):
+        return None
+    # Numeric storage is the only built-in assumption. JSON, array files and
+    # other representations go through the same generated data-adapter API.
+    for frame in (context["train_df"], context["hidden_df"]):
+        for column in answers:
+            values = pd.to_numeric(frame[column], errors="coerce")
+            if not np.isfinite(values).all():
+                return None
+    keys = _manifest_key_columns(manifest) or _infer_key_columns(
+        context["score_df"], context["test_df"], context["hidden_df"], answers,
+    )
+    if not keys and not context["split_plan"].get("row_order_contract", manifest.get("row_order_contract", False)):
+        return None
+    columns = manifest.get("prediction_contract", {}).get("prediction_columns")
+    if not columns:
+        used = set(keys)
+        columns = [_prediction_column_name("pred_" + column, used) for column in answers]
+    if len(columns) != len(answers):
+        return None
+    spec = dict(
+        evaluator_api_version=EVALUATOR_API_VERSION,
+        validation_artifact="./working/validation_predictions.csv",
+        test_submission="./working/submission.csv",
+        score_split="./" + str(context["score_path"].relative_to(workspace_dir)),
+        key_columns=keys, prediction_columns=columns, answer_columns=answers,
+        primary_metric=primary, secondary_metrics=secondary, maximize=False,
+        task_type="regression", target_shape=[] if len(answers) == 1 else [len(answers)],
+    )
+    spec = _resolve_metric_contract(spec, workspace_dir, task_desc, require_match=False)
+    return _write_fixed_evaluator(
+        workspace_dir, log_dir, hidden_score_path, timeout, spec,
+        compile_adapter(_REGRESSION_DATA_ADAPTER.replace("__BIOMAKER_SPEC__", repr(spec)), spec),
+        run_public_contract=True, log_message="Fixed regression evaluator prepared",
     )
 
 
@@ -1655,20 +1899,72 @@ def _write_fixed_segmentation_evaluator(
         metric = _primary_metric_from_task_desc(
             task_desc, str(spec.get("task_type", ""))
         )
-        if metric is not None and metric != "accuracy":
+        if metric is not None:
             spec["primary_metric"] = metric
     if not is_segmentation_metric_supported(str(spec.get("primary_metric", ""))):
         return None
+    _, secondary = requested_metrics(_task_payload(task_desc))
+    if not secondary:
+        secondary = _split_manifest(workspace_dir / "input/biomaker_splits").get("metric_contract", {}).get("secondary_metrics", [])
+        secondary = [metric_name(m) for m in secondary]
+    if any(not is_segmentation_metric_supported(name) for name in secondary):
+        return None
+    spec.update(
+        evaluator_api_version=EVALUATOR_API_VERSION, secondary_metrics=secondary
+    )
     spec["maximize"] = metric_maximize(str(spec.get("primary_metric", "")))
+    spec = _resolve_metric_contract(spec, workspace_dir, task_desc, require_match=False)
     return _write_fixed_evaluator(
         workspace_dir=workspace_dir,
         log_dir=log_dir,
         hidden_score_path=hidden_score_path,
         timeout=timeout,
         spec=spec,
-        template=_FIXED_SEGMENTATION_EVALUATOR,
+        template=compile_adapter(_SEGMENTATION_DATA_ADAPTER.replace("__BIOMAKER_SPEC__", repr(spec)), spec),
         run_public_contract=False,
         log_message="Fixed segmentation evaluator prepared",
+    )
+
+
+def _write_fixed_detection_evaluator(
+    workspace_dir, log_dir, hidden_score_path, timeout, task_desc=None
+):
+    context = _load_fixed_split_context(workspace_dir, hidden_score_path)
+    if context is None:
+        return None
+    spec = fixed_detection_spec(context, _task_payload(task_desc))
+    if spec is None:
+        return None
+    spec["score_split"] = "./" + str(context["score_path"].relative_to(workspace_dir))
+    spec = _resolve_metric_contract(spec, workspace_dir, task_desc, require_match=False)
+    return _write_fixed_evaluator(
+        workspace_dir,
+        log_dir,
+        hidden_score_path,
+        timeout,
+        spec,
+        compile_adapter(_DETECTION_DATA_ADAPTER.replace("__BIOMAKER_SPEC__", repr(spec)), spec),
+        run_public_contract=True,
+        log_message="Fixed detection evaluator prepared",
+    )
+
+
+def _write_fixed_restoration_evaluator(
+    workspace_dir, log_dir, hidden_score_path, timeout, task_desc=None
+):
+    context = _load_fixed_split_context(workspace_dir, hidden_score_path)
+    if context is None:
+        return None
+    spec = fixed_restoration_spec(context, _task_payload(task_desc))
+    if spec is None:
+        return None
+    spec["score_split"] = "./" + str(context["score_path"].relative_to(workspace_dir))
+    spec = _resolve_metric_contract(spec, workspace_dir, task_desc, require_match=False)
+    return _write_fixed_evaluator(
+        workspace_dir, log_dir, hidden_score_path, timeout, spec,
+        compile_adapter(_RESTORATION_DATA_ADAPTER.replace("__BIOMAKER_SPEC__", repr(spec)), spec),
+        run_public_contract=False,
+        log_message="Fixed restoration evaluator prepared",
     )
 
 
@@ -1680,6 +1976,296 @@ def _sha256_file(path: Path) -> str | None:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _requested_metric_names(task_desc: Any, workspace_dir: Path) -> tuple[str | None, list[str]]:
+    primary, secondary = requested_metrics(_task_payload(task_desc))
+    manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
+    contract = manifest.get("metric_contract", {})
+    manifest_primary = _manifest_primary_metric(manifest)
+    if primary and manifest_primary and metric_name(primary) != metric_name(manifest_primary):
+        raise EvaluatorSetupError("Task and prepared metric_contract disagree on the primary metric; repair data preparation before compiling an evaluator.")
+    if not primary:
+        primary = manifest_primary
+        if not primary:
+            primary = _json_dict(workspace_dir / "input/biomaker_splits/split_plan.json").get("primary_metric")
+    secondary = list(dict.fromkeys([metric_name(str(m)) for m in [*secondary, *contract.get("secondary_metrics", [])]]))
+    return metric_name(str(primary)) if primary else None, secondary
+
+
+def _standard_adapter_required(task_desc: Any, workspace_dir: Path) -> bool:
+    """A schema miss for a known metric must never generate scoring formulas."""
+    primary, secondary = _requested_metric_names(task_desc, workspace_dir)
+    names = [m for m in [primary, *secondary] if m]
+    return bool(names) and all(metric_info(m) is not None for m in names)
+
+
+def _validate_declared_capabilities(task_desc: Any, workspace_dir: Path) -> None:
+    """Reject unsupported declared semantics before asking an Agent to fix data.
+
+    Missing representation details remain the adapter's responsibility. Catalog
+    constraints on supplied parameters already have a deterministic answer.
+    """
+    from .trusted_metrics import metric_capabilities, normalize_metric_spec
+    primary, secondary = _requested_metric_names(task_desc, workspace_dir)
+    names = [m for m in [primary, *secondary] if m]
+    if not names or any(metric_info(m) is None for m in names):
+        return
+    families = {metric_info(m).task_family for m in names}
+    if len(families) != 1:
+        raise EvaluatorSetupError("Requested standard metrics require different canonical sample families; a mixed-head evaluation protocol is not yet supported.")
+    family = families.pop()
+    capabilities = metric_capabilities()["families"][family]
+    manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
+    contract = dict(manifest.get("metric_contract", {}))
+    if family == "image_restoration":
+        blocks = re.findall(r"```restoration-evaluation\s*\n(.*?)```", _task_payload(task_desc), re.S)
+        if len(blocks) > 1:
+            raise EvaluatorSetupError("Declare exactly one restoration-evaluation contract.")
+        if blocks:
+            contract["restoration_evaluation"] = {**contract.get("restoration_evaluation", {}), **json.loads(blocks[0])}
+    unknown = set(contract) - set(capabilities["allowed_contract_fields"]) - _PROTOCOL_DOCUMENTATION_FIELDS
+    if unknown:
+        raise EvaluatorSetupError("Unsupported declared metric protocol fields: " + ", ".join(sorted(unknown)))
+
+    def check_fields(values, fields, prefix=""):
+        for name, field in fields.items():
+            keys = [key for key in [name, *field.get("aliases", [])] if key in values]
+            for key in keys:
+                value = values[key]
+                value = field.get("value_aliases", {}).get(value, value) if isinstance(value, str) else value
+                unsupported = ("fixed" in field and value != field["fixed"] or
+                               "values" in field and value not in field["values"] or
+                               "fixed_by_task_type" in field and value not in field["fixed_by_task_type"].values())
+                if unsupported:
+                    raise EvaluatorSetupError("Unsupported declared metric setting " + prefix + name + "; the Harness requires a validated implementation for this protocol, not another data adapter.")
+                if "fields" in field and isinstance(value, dict):
+                    nested_unknown = set(value) - {k for n, f in field["fields"].items() for k in [n, *f.get("aliases", [])]}
+                    if nested_unknown:
+                        raise EvaluatorSetupError("Unsupported declared metric settings: " + prefix + name + "." + ", ".join(sorted(nested_unknown)))
+                    check_fields(value, field["fields"], prefix + name + ".")
+    check_fields(contract, capabilities["protocol_fields"])
+    if family == "image_restoration":
+        fields = capabilities["protocol_fields"]["restoration_evaluation"]["fields"]
+        check_fields(contract, fields)
+    # Check numeric/range and cross-field constraints as well. Placeholder data
+    # dimensions/labels are used only to validate supplied protocol settings;
+    # they are never frozen or used for dataset interpretation.
+    probe = {key: value for key, value in contract.items() if key not in _PROTOCOL_DOCUMENTATION_FIELDS}
+    probe.update(primary_metric=primary, secondary_metrics=secondary)
+    if family == "classification":
+        output = manifest.get("prediction_contract", {})
+        for key in ("class_labels", "positive_class"):
+            if key not in probe and key in output:
+                probe[key] = output[key]
+        heads = _manifest_head_types(manifest)
+        inferred_type = ("multilabel" if heads & {"multilabel", "multi_label_classification"} or probe.get("aggregation") == "mean_labels"
+                         else "multiclass" if "multiclass" in heads or len(probe.get("class_labels", [])) > 2 else "binary")
+        probe.setdefault("task_type", inferred_type)
+        if probe["task_type"] != "multilabel" and "class_labels" not in probe:
+            positive = probe.get("positive_class", "__protocol_positive__")
+            probe["class_labels"] = ["__protocol_negative__", positive]
+    if family == "image_restoration":
+        protocol = {key: probe.pop(key) for key in list(probe) if key in fields and key != "ssim_parameters"}
+        protocol.update(probe.get("restoration_evaluation", {}))
+        # Unspecified required values are still resolved from data by adapters.
+        clipping = probe.get("prediction_clipping")
+        default_range = clipping[1] if isinstance(clipping, (list, tuple)) and len(clipping) == 2 else 1
+        crop_mode = protocol.get("crop_mode")
+        defaults = dict(
+            data_range=default_range,
+            crop_size=1_000_000 if crop_mode in {"four_corners", "four_corner_crops_no_center"} else None,
+            groups=["__unresolved_public_group__"] if protocol.get("aggregation") == "mean_groups" else None,
+            aggregation="mean_images",
+        )
+        probe["restoration_evaluation"] = {**defaults, **protocol}
+    try:
+        normalize_metric_spec(probe)
+    except ValueError as exc:
+        raise EvaluatorSetupError("Unsupported declared metric protocol: " + str(exc)) from exc
+
+
+def _validate_custom_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_desc: Any) -> None:
+    """Custom formulas cannot redefine the prepared protocol or outputs."""
+    primary, secondary = _requested_metric_names(task_desc, workspace_dir)
+    if primary and metric_name(str(spec.get("primary_metric", ""))) != primary:
+        raise EvaluatorSetupError("Custom evaluator changed the prepared primary metric.")
+    if set(secondary) - {metric_name(str(m)) for m in spec.get("secondary_metrics", [])}:
+        raise EvaluatorSetupError("Custom evaluator omitted prepared secondary metrics.")
+    manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
+    declared = _canonical_declared_settings(manifest.get("metric_contract", {}))
+    blocks = re.findall(r"```restoration-evaluation\s*\n(.*?)```", _task_payload(task_desc), re.S)
+    if len(blocks) > 1:
+        raise EvaluatorSetupError("Declare exactly one restoration-evaluation contract.")
+    if blocks:
+        declared["restoration_evaluation"] = {**declared.get("restoration_evaluation", {}), **json.loads(blocks[0])}
+        declared = _canonical_declared_settings(declared)
+    actual = _canonical_declared_settings(spec)
+    def preserves(value, expected):
+        if isinstance(expected, dict):
+            return isinstance(value, dict) and all(key in value and preserves(value[key], item) for key, item in expected.items())
+        return value == expected
+    for key, value in declared.items():
+        if key in {"primary_metric", "secondary_metrics"} | _PROTOCOL_DOCUMENTATION_FIELDS:
+            continue
+        if key not in actual or not preserves(actual[key], value):
+            raise EvaluatorSetupError("Custom evaluator changed or omitted prepared metric protocol field: " + key)
+    keys = _manifest_key_columns(manifest)
+    if keys and spec.get("key_columns") != keys:
+        raise EvaluatorSetupError("Custom evaluator changed the prepared sample keys.")
+    for key in ("prediction_columns", "file_reference_columns", "prediction_type"):
+        value = manifest.get("prediction_contract", {}).get(key)
+        if value is not None and spec.get(key) != value:
+            raise EvaluatorSetupError("Custom evaluator changed or omitted prepared prediction field: " + key)
+
+
+def _canonical_declared_settings(values: dict[str, Any]) -> dict[str, Any]:
+    """Normalize supported spelling aliases even in custom metric extensions."""
+    from .trusted_metrics import metric_capabilities, normalize_ssim_parameters
+    result = json.loads(json.dumps(values))
+    families = metric_capabilities()["families"]
+    for capability in families.values():
+        for alias, name in capability["parameter_aliases"].items():
+            if alias in result:
+                value = result.pop(alias)
+                if name in result and result[name] != value:
+                    raise EvaluatorSetupError("Conflicting metric parameter aliases: " + name)
+                result[name] = value
+    names = [metric_name(str(m)) for m in [result.get("primary_metric"), *result.get("secondary_metrics", [])] if m]
+    if any(metric_info(m) and metric_info(m).task_family == "image_restoration" for m in names) or "restoration_evaluation" in result:
+        fields = families["image_restoration"]["protocol_fields"]["restoration_evaluation"]["fields"]
+        protocol = {key: result.pop(key) for key in list(result) if key in fields and key != "ssim_parameters"}
+        for key, value in result.get("restoration_evaluation", {}).items():
+            if key in protocol and protocol[key] != value:
+                raise EvaluatorSetupError("Conflicting nested restoration setting: " + key)
+            protocol[key] = value
+        if "ssim_parameters" in protocol:
+            nested = protocol.pop("ssim_parameters")
+            if "ssim_parameters" in result and normalize_ssim_parameters(result["ssim_parameters"]) != normalize_ssim_parameters(nested):
+                raise EvaluatorSetupError("Conflicting SSIM parameters.")
+            result["ssim_parameters"] = nested
+        if protocol:
+            if "crop_mode" in protocol:
+                mode = fields["crop_mode"]
+                protocol["crop_mode"] = mode["value_aliases"].get(protocol["crop_mode"], protocol["crop_mode"])
+            result["restoration_evaluation"] = protocol
+    if "ssim_parameters" in result:
+        result["ssim_parameters"] = normalize_ssim_parameters(result["ssim_parameters"])
+    return result
+
+
+def _freeze_data_adapter(workspace_dir: Path, source: str, task_desc: Any, hidden_score_path: Path) -> None:
+    """Validate declarations against the prepared protocol, then embed constants."""
+    evaluator_path = workspace_dir / "evaluator.py"
+    evaluator_path.write_text(compile_adapter(source), encoding="utf-8")
+    completed = _run_python(
+        workspace_dir,
+        "import evaluator, json\nprint('ADAPTER_SPEC_JSON=' + json.dumps(evaluator._h_spec))\n",
+        timeout=30,
+    )
+    output = (completed.stdout or "") + (completed.stderr or "")
+    values = [line.removeprefix("ADAPTER_SPEC_JSON=") for line in output.splitlines() if line.startswith("ADAPTER_SPEC_JSON=")]
+    if completed.returncode != 0 or not values:
+        raise EvaluatorSetupError("Adapter declaration failed.\n" + output[-4000:])
+    spec = json.loads(_normalize_prediction_spec_json(values[-1]))
+    _validate_scoring_contract(spec, task_desc)
+    split_dir = workspace_dir / "input/biomaker_splits"
+    manifest = _split_manifest(split_dir)
+    plan = _json_dict(split_dir / "split_plan.json")
+    keys = _manifest_key_columns(manifest)
+    if keys and spec["key_columns"] != keys:
+        raise EvaluatorSetupError("Adapter sample keys must preserve the prepared split manifest.")
+    if not spec["key_columns"] and not plan.get("row_order_contract", manifest.get("row_order_contract", False)):
+        raise EvaluatorSetupError("Empty key_columns requires an explicit row_order_contract.")
+    score_path = _score_split_path(workspace_dir)
+    public = pd.read_csv(score_path, dtype=str)
+    answers = _truth_answer_columns(workspace_dir, plan, hidden_score_path, public)
+    if set(spec["answer_columns"]) != set(answers):
+        raise EvaluatorSetupError("Adapter answer_columns must preserve the declared hidden answer schema.")
+    spec["score_split"] = "./" + str(score_path.relative_to(workspace_dir))
+    spec["test_split"] = "./input/biomaker_splits/agent_test.csv"
+
+    actual = _resolve_metric_contract(spec, workspace_dir, task_desc)
+    evaluator_path.write_text(compile_adapter(source, actual), encoding="utf-8")
+
+
+def _resolve_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_desc: Any, *, require_match: bool = True) -> dict[str, Any]:
+    """One capability-backed protocol gate for built-in and generated readers."""
+    from .trusted_metrics import metric_capabilities, normalize_metric_spec
+
+    manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
+    if not require_match:
+        # Declarative readers bind to the preparation agent's column choices.
+        # More complex encodings reach the code-adapter route, with the metric
+        # contract and trusted runtime unchanged.
+        spec = dict(spec)
+        output = manifest.get("prediction_contract", {})
+        for key in ("prediction_columns", "file_reference_columns", "prediction_type", "class_labels", "positive_class", "image_column"):
+            if key in output:
+                spec[key] = output[key]
+    spec = normalize_metric_spec(spec)
+    if not require_match:
+        reader = data_adapter_capabilities()["families"][spec["task_family"]]
+        if spec.get("prediction_type") not in reader["prediction_types"]:
+            raise EvaluatorSetupError("Declared prediction encoding needs a data adapter; metric implementation is unchanged.")
+        for columns, count_key in (("prediction_columns", "prediction_column_count"), ("answer_columns", "answer_column_count")):
+            if count_key in reader and len(spec[columns]) != reader[count_key]:
+                raise EvaluatorSetupError("Declared " + columns + " require a custom data adapter for this reader.")
+        if reader["file_reference_policy"] == "all_prediction_columns":
+            spec["file_reference_columns"] = list(spec["prediction_columns"])
+        elif spec.get("file_reference_columns"):
+            raise EvaluatorSetupError("File-valued predictions require a data adapter for this reader.")
+    # Structured protocol declarations are authoritative. The agent may map data
+    # representations, but cannot weaken the evaluation to pass preparation.
+    contract = {key: value for key, value in manifest.get("metric_contract", {}).items()
+                if key not in _PROTOCOL_DOCUMENTATION_FIELDS}
+    if isinstance(contract.get("primary_metric"), dict):
+        contract["primary_metric"] = _manifest_primary_metric(manifest)
+    for alias in ("decision_threshold", "classification_threshold"):
+        if alias in contract:
+            value = contract.pop(alias)
+            if "threshold" in contract and contract["threshold"] != value:
+                raise EvaluatorSetupError("Conflicting classification threshold aliases in metric_contract.")
+            contract["threshold"] = value
+    supported_fields = set(metric_capabilities()["families"][spec["task_family"]]["allowed_contract_fields"])
+    unknown_fields = set(contract) - supported_fields
+    if unknown_fields:
+        raise EvaluatorSetupError("Unsupported declared metric protocol fields: " + ", ".join(sorted(unknown_fields)))
+    restoration = contract.pop("restoration_evaluation", {})
+    if spec.get("task_family") == "image_restoration":
+        restoration_fields = {"input_column", "target_column", "data_range", "crop_size", "crop_mode", "group_column", "groups", "aggregation"}
+        restoration = {**{k: contract.pop(k) for k in list(contract) if k in restoration_fields}, **restoration}
+        blocks = re.findall(r"```restoration-evaluation\s*\n(.*?)```", _task_payload(task_desc), re.S)
+        if len(blocks) > 1:
+            raise EvaluatorSetupError("Declare exactly one restoration-evaluation contract.")
+        if blocks:
+            restoration.update(json.loads(blocks[0]))
+    expected = json.loads(json.dumps(spec))
+    for key, value in contract.items():
+        if key not in expected and require_match:
+            raise EvaluatorSetupError(
+                "Adapter omitted declared metric protocol field: " + key
+                + ". Declare supported semantics explicitly; unsupported semantics require a Harness implementation."
+            )
+        expected[key] = value
+    if restoration:
+        expected["restoration_evaluation"] = {**expected.get("restoration_evaluation", {}), **restoration}
+        if "crop_size" in restoration and "crop_mode" not in restoration:
+            expected["restoration_evaluation"].pop("crop_mode", None)
+    try:
+        expected = normalize_metric_spec(expected)
+    except ValueError as exc:
+        if require_match:
+            raise EvaluatorSetupError("Adapter changed the frozen metric protocol or declared unsupported settings: " + str(exc)) from exc
+        raise
+    actual = normalize_metric_spec(spec)
+    if not require_match:
+        _validate_scoring_contract(expected, task_desc)
+        return expected
+    for key in set(contract) | ({"restoration_evaluation", "ssim_parameters"} if restoration else set()):
+        if key in actual and actual[key] != expected[key]:
+            raise EvaluatorSetupError("Adapter changed the frozen metric protocol field: " + key)
+    return actual
 
 
 def _package_version(name: str) -> str | None:
@@ -1696,6 +2282,7 @@ def _evaluator_input_fingerprints(
     fingerprints: dict[str, str | None] = {}
     for name in [
         "split_plan.json",
+        "split_manifest.json",
         "agent_train.csv",
         "score_val.csv",
         "agent_val.csv",
@@ -1718,6 +2305,16 @@ def _evaluator_cache_metadata(
     code_fingerprints = {
         "evaluator_setup.py": _sha256_file(Path(__file__).resolve()),
         "evaluator_templates.py": _sha256_file(utils_dir / "evaluator_templates.py"),
+        "detection_evaluator_template.py": _sha256_file(
+            utils_dir / "detection_evaluator_template.py"
+        ),
+        "detection_contract.py": _sha256_file(utils_dir / "detection_contract.py"),
+        "restoration_contract.py": _sha256_file(utils_dir / "restoration_contract.py"),
+        "restoration_evaluator_template.py": _sha256_file(utils_dir / "restoration_evaluator_template.py"),
+        "evaluator_protocol.py": _sha256_file(utils_dir / "evaluator_protocol.py"),
+        "evaluator_adapter.py": _sha256_file(utils_dir / "evaluator_adapter.py"),
+        "trusted_metrics.py": _sha256_file(utils_dir / "trusted_metrics.py"),
+        "standard_data_adapters.py": _sha256_file(utils_dir / "standard_data_adapters.py"),
         "exp_guide.py": _sha256_file(utils_dir / "exp_guide.py"),
         "data_summary.py": _sha256_file(utils_dir / "data_summary.py"),
     }
@@ -1730,7 +2327,7 @@ def _evaluator_cache_metadata(
         "scipy": _package_version("scipy"),
     }
     prompt_hash = hashlib.sha256(
-        json.dumps(prompt, ensure_ascii=False, sort_keys=True, default=str).encode(
+        json.dumps({key: value for key, value in prompt.items() if key != "Preparation diagnostics"}, ensure_ascii=False, sort_keys=True, default=str).encode(
             "utf-8"
         )
     ).hexdigest()
@@ -1782,6 +2379,10 @@ def _try_reuse_cached_evaluator(
             reason="cache manifest missing or version mismatch",
         )
         return None
+    if (manifest.get("evaluator_sha256") != _sha256_file(cached_evaluator)
+            or manifest.get("prediction_spec_sha256") != _sha256_file(cached_spec)):
+        append_event(log_dir, "evaluator_cache_reuse_failed", cache_entry=str(cache_entry), reason="frozen code/spec integrity mismatch")
+        return None
 
     evaluator_path = workspace_dir / "evaluator.py"
     prediction_spec_path = workspace_dir / "evaluator_prediction_spec.json"
@@ -1794,6 +2395,8 @@ def _try_reuse_cached_evaluator(
             timeout=timeout,
             hidden_score_path=hidden_score_path,
         )
+        if json.loads(_normalize_prediction_spec_json(_load_prediction_spec(workspace_dir))) != json.loads(prediction_spec):
+            raise EvaluatorSetupError("Cached evaluator and public prediction spec disagree.")
         _run_public_artifact_contract_test(
             workspace_dir,
             prediction_spec,
@@ -1885,6 +2488,18 @@ def prepare_evaluator(
         if hidden_score_path is not None
         else log_dir / "private_gt" / "score_val.csv"
     )
+    _validate_declared_capabilities(task_desc, workspace_dir)
+    preparation_diagnostics = []
+    try:
+        fixed = _write_fixed_regression_evaluator(
+            workspace_dir, log_dir, hidden_score_path, timeout, task_desc,
+        )
+        if fixed is not None:
+            return fixed
+    except Exception as exc:
+        reason = _sanitize_private_paths(str(exc), hidden_score_path)
+        preparation_diagnostics.append({"reader": "regression", "reason": reason})
+        append_event(log_dir, "fixed_regression_evaluator_failed", reason=truncate_text(reason, max_chars=1200))
     try:
         fixed = _write_fixed_classification_evaluator(
             workspace_dir=workspace_dir,
@@ -1897,6 +2512,7 @@ def prepare_evaluator(
             return fixed
     except Exception as exc:
         reason = _sanitize_private_paths(str(exc), hidden_score_path)
+        preparation_diagnostics.append({"reader": "classification", "reason": reason})
         append_event(
             log_dir,
             "fixed_evaluator_failed",
@@ -1914,13 +2530,45 @@ def prepare_evaluator(
             return fixed
     except Exception as exc:
         reason = _sanitize_private_paths(str(exc), hidden_score_path)
+        preparation_diagnostics.append({"reader": "segmentation", "reason": reason})
         append_event(
             log_dir,
             "fixed_segmentation_evaluator_failed",
             reason=truncate_text(reason, max_chars=1200),
         )
 
-    prompt = _evaluator_prompt(task_desc, workspace_dir, hidden_score_path)
+    try:
+        fixed = _write_fixed_detection_evaluator(
+            workspace_dir, log_dir, hidden_score_path, timeout, task_desc
+        )
+        if fixed is not None:
+            return fixed
+    except Exception as exc:
+        preparation_diagnostics.append({"reader": "detection", "reason": _sanitize_private_paths(str(exc), hidden_score_path)})
+        append_event(
+            log_dir,
+            "fixed_detection_evaluator_failed",
+            reason=truncate_text(
+                _sanitize_private_paths(str(exc), hidden_score_path), max_chars=1200
+            ),
+        )
+
+    fixed_error = None
+    try:
+        fixed = _write_fixed_restoration_evaluator(
+            workspace_dir, log_dir, hidden_score_path, timeout, task_desc
+        )
+        if fixed is not None:
+            return fixed
+    except Exception as exc:
+        fixed_error = _sanitize_private_paths(str(exc), hidden_score_path)
+        preparation_diagnostics.append({"reader": "image_restoration", "reason": fixed_error})
+        append_event(log_dir, "fixed_restoration_evaluator_failed", reason=truncate_text(fixed_error, max_chars=1200))
+
+    adapter_mode = _standard_adapter_required(task_desc, workspace_dir)
+    prompt = (_adapter_prompt if adapter_mode else _evaluator_prompt)(task_desc, workspace_dir, hidden_score_path)
+    if preparation_diagnostics:
+        prompt["Preparation diagnostics"] = preparation_diagnostics
     cache_entry = None
     cache_metadata = None
     if cache_root is not None:
@@ -2008,8 +2656,20 @@ def prepare_evaluator(
             continue
 
         clean_candidate_outputs(workspace_dir)
-        evaluator_path.write_text(code, encoding="utf-8")
         try:
+            if adapter_mode:
+                _freeze_data_adapter(workspace_dir, code, task_desc, hidden_score_path)
+            else:
+                # Custom metrics can call the exact same trusted kernels without
+                # depending on an installed/mutable biomaker package.
+                tree = ast.parse(code)
+                tree.body = [node for node in tree.body if not (isinstance(node, ast.ImportFrom) and node.module == "__future__")]
+                kernels = Path(__file__).with_name("trusted_metrics.py").read_text(encoding="utf-8")
+                evaluator_path.write_text(
+                    "from __future__ import annotations\n" + kernels
+                    + "\ntrusted_score_samples = score_samples\n"
+                    + ast.unparse(tree) + "\n", encoding="utf-8"
+                )
             _run_self_test(
                 workspace_dir,
                 timeout=timeout,
@@ -2018,6 +2678,9 @@ def prepare_evaluator(
             prediction_spec = _normalize_prediction_spec_json(
                 _load_prediction_spec(workspace_dir)
             )
+            _validate_scoring_contract(json.loads(prediction_spec), task_desc)
+            if not adapter_mode:
+                _validate_custom_metric_contract(json.loads(prediction_spec), workspace_dir, task_desc)
             _run_public_artifact_contract_test(
                 workspace_dir,
                 prediction_spec,
@@ -2079,17 +2742,85 @@ def score_candidate_with_evaluator(
 ) -> EvaluatorRunResult:
     """Run the frozen evaluator against the current ./working artifacts."""
     workspace_dir = Path(workspace_dir)
+    contract = load_experiment_contract(workspace_dir)
+    expected_path = contract.split_path("score_val")
+    if expected_path is None:
+        return EvaluatorRunResult(
+            False,
+            None,
+            True,
+            {},
+            "",
+            "Missing score-validation split in experiment contract.",
+        )
+    truth_path = _hidden_score_env(workspace_dir, hidden_score_path)[_SCORE_ENV_VAR]
+    return score_artifacts_with_evaluator(
+        workspace_dir,
+        contract.prediction.validation_artifact,
+        Path(truth_path),
+        expected_path,
+        timeout=timeout,
+        env_overrides=env_overrides,
+        include_artifact_report=True,
+    )
+
+
+def score_artifacts_with_evaluator(
+    workspace_dir: Path | str,
+    prediction_path: Path | str,
+    truth_path: Path | str,
+    expected_path: Path | str,
+    *,
+    timeout: int = 120,
+    env_overrides: dict[str, str] | None = None,
+    include_artifact_report: bool = False,
+) -> EvaluatorRunResult:
+    """Run one frozen scoring implementation on any explicitly supplied split."""
+    workspace_dir = Path(workspace_dir)
+    hidden_score_path = Path(truth_path).resolve()
+    spec = load_experiment_contract(workspace_dir).prediction.raw
+    if spec.get("evaluator_api_version") != EVALUATOR_API_VERSION:
+        return EvaluatorRunResult(
+            ok=False,
+            metric=None,
+            maximize=True,
+            details={},
+            output="",
+            error="This frozen evaluator predates split-independent scoring API v2. "
+            "Start a new run to prepare a compatible evaluator; existing run artifacts were not changed.",
+        )
+    try:
+        _validate_scoring_contract(spec)
+        sample_count = validate_scoring_rows(
+            Path(prediction_path), hidden_score_path, Path(expected_path), spec
+        )
+    except Exception as exc:
+        return EvaluatorRunResult(
+            False,
+            None,
+            bool(spec.get("maximize", True)),
+            {},
+            "",
+            _sanitize_private_paths(str(exc), hidden_score_path),
+        )
     code = (
         "import json, evaluator\n"
+        "if not callable(getattr(evaluator, 'score', None)):\n"
+        "    raise RuntimeError('Frozen evaluator must implement score(prediction_path, truth_path, expected_path)')\n"
         "validation = None\n"
         "if hasattr(evaluator, 'validate_submission'):\n"
         "    validation = evaluator.validate_submission()\n"
-        "score = evaluator.score_val()\n"
+        "    if validation is False or (isinstance(validation, dict) and validation.get('valid') is False):\n"
+        "        raise ValueError('Submission validation rejected the predictions')\n"
+        f"score = evaluator.score({str(Path(prediction_path).resolve())!r}, "
+        f"{str(hidden_score_path)!r}, {str(Path(expected_path).resolve())!r})\n"
         "payload = {'score': score, 'submission_validation': validation}\n"
         f"print('{_RESULT_PREFIX}' + json.dumps(payload, ensure_ascii=False, default=str))\n"
     )
     try:
-        evaluator_env = _hidden_score_env(workspace_dir, hidden_score_path)
+        # score() receives truth explicitly. Do not expose private test answers
+        # through the legacy validation environment variable.
+        evaluator_env = {_SCORE_ENV_VAR: ""}
         if env_overrides:
             evaluator_env.update(env_overrides)
         completed = _run_python(
@@ -2131,41 +2862,23 @@ def score_candidate_with_evaluator(
             continue
         try:
             payload = json.loads(line[len(_RESULT_PREFIX) :])
-            payload["artifact_report"] = inspect_candidate_artifacts(workspace_dir)
+            if include_artifact_report:
+                payload["artifact_report"] = inspect_candidate_artifacts(workspace_dir)
             output_with_report = (
                 output
                 + "\n"
                 + _ARTIFACT_REPORT_PREFIX
                 + json.dumps(
-                    payload["artifact_report"], ensure_ascii=False, default=str
+                    payload.get("artifact_report", {}), ensure_ascii=False, default=str
                 )
             )
-            score = payload.get("score") or {}
-            metric = score.get("metric")
-            if isinstance(metric, bool) or metric is None:
-                raise ValueError("score_val() did not return numeric 'metric'.")
-            metric = float(metric)
-            if not math.isfinite(metric):
-                raise ValueError("score_val() returned a non-finite metric.")
-            maximize = bool(score.get("maximize", True))
-            spec_path = workspace_dir / "evaluator_prediction_spec.json"
-            if spec_path.is_file():
-                try:
-                    spec = json.loads(spec_path.read_text(encoding="utf-8"))
-                except Exception:
-                    spec = {}
-                if isinstance(spec, dict) and "maximize" in spec:
-                    expected_maximize = bool(spec["maximize"])
-                    if maximize != expected_maximize:
-                        raise ValueError(
-                            "score_val() returned maximize="
-                            f"{maximize}, but prediction_spec declares "
-                            f"maximize={expected_maximize}."
-                        )
+            score = validate_score(payload.get("score"), spec)
+            score["n"] = sample_count
+            payload["score"] = score
             return EvaluatorRunResult(
                 ok=True,
-                metric=metric,
-                maximize=maximize,
+                metric=score["metric"],
+                maximize=score["maximize"],
                 details=payload,
                 output=output_with_report,
             )

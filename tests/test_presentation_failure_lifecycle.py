@@ -192,6 +192,14 @@ def _install_minimal_run(
             super().__init__(next(executor_count), order)
 
     monkeypatch.setattr(run_module, "load_cfg", lambda: cfg)
+    to_container = run_module.OmegaConf.to_container
+    # The fixture substitutes SimpleNamespace for the production DictConfig;
+    # let config logging serialize that substitute before exercising lifecycle.
+    monkeypatch.setattr(
+        run_module.OmegaConf,
+        "to_container",
+        lambda value, **kwargs: vars(value) if value is cfg else to_container(value, **kwargs),
+    )
 
     def record_event(_log_dir, event, **payload):
         events.append((event, payload))

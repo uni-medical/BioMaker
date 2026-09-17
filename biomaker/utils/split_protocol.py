@@ -13,8 +13,10 @@ import pandas as pd
 from . import canonical_paths as cpaths
 from .agentic_data_planner import (
     build_dataset_facts,
+    parse_split_constraints,
     run_agentic_split_builder_probe,
     split_builder_cache_key,
+    verify_split_package,
 )
 from .split_manifest import MANIFEST_NAME
 
@@ -517,7 +519,8 @@ def sanitize_agent_visible_input(
 
 
 def _copy_split_package_from_cache(
-    cache_entry: Path, split_dir: Path, private_dir: Path, input_dir: Path
+    cache_entry: Path, split_dir: Path, private_dir: Path, input_dir: Path,
+    *, task_text: str = "",
 ) -> dict[str, Any] | None:
     cached_split = cache_entry / "biomaker_splits"
     cached_private = cache_entry / "private_gt"
@@ -528,13 +531,18 @@ def _copy_split_package_from_cache(
         or not cached_verifier.is_file()
     ):
         return None
+    # A previously saved "ok" flag is not evidence that files still satisfy the
+    # current task/source contract. Revalidate before admitting cached splits.
+    verifier = verify_split_package(cache_entry, source_input_dir=input_dir, task_text=task_text)
+    if not verifier.get("ok"):
+        return None
     _copytree_replace(cached_split, split_dir)
     _copytree_replace(cached_private, private_dir)
     cached_manifest = cache_entry / MANIFEST_NAME
     if cached_manifest.is_file():
         shutil.copy2(cached_manifest, split_dir / MANIFEST_NAME)
     _copy_generated_public_assets(cache_entry, input_dir)
-    return json.loads(cached_verifier.read_text(encoding="utf-8"))
+    return verifier
 
 
 def _store_split_package_cache(
@@ -600,6 +608,7 @@ def prepare_split_protocol(
         task_text = json.dumps(
             task_desc or {}, indent=2, ensure_ascii=False, default=str
         )
+    parse_split_constraints(task_text)
 
     cache_entry = None
     result_verifier: dict[str, Any] | None = None
@@ -613,7 +622,7 @@ def prepare_split_protocol(
         )
         cache_entry = Path(cache_root) / cache_key
         result_verifier = _copy_split_package_from_cache(
-            cache_entry, split_dir, private_dir, input_dir
+            cache_entry, split_dir, private_dir, input_dir, task_text=task_text
         )
         cache_reused = result_verifier is not None
 

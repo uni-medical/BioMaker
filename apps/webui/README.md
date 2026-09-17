@@ -25,7 +25,7 @@ Settings can store a default model for WebUI runs. A task's Advanced model
 override takes precedence, and the resolved model is passed to BioMaker as an
 explicit `model_for_all_agents` run argument.
 
-The WebUI and source-checkout CLI share one workspace-level durable FIFO in
+The WebUI and explicit CLI `--queue` submissions share one workspace-level durable FIFO in
 `.biomaker/runs.sqlite3`. A temporary detached supervisor runs one top-level
 experiment at a time, while stdout and stderr append directly to durable files
 under `.biomaker/console/`. Closing or restarting the WebUI does not stop a run.
@@ -35,8 +35,9 @@ items until **Resume Queue** is explicitly selected.
 Experiment artifacts remain in `logs/` and `workspaces/`. Existing log
 directories are imported idempotently into the ledger for display without
 rewriting their event history. From a complete source checkout,
-`uv run biomaker ...` uses this same queue, follows its console log, and returns
-the experiment process's exit code.
+`uv run biomaker --queue ...` uses this same queue, follows its console log, and
+returns the experiment process's exit code. Without `--queue`, CLI launches run
+directly in the foreground and are unaffected by the queue's pause state.
 
 Run creation, cancellation, stopping, retrying, and settings changes accept
 requests only from the local computer, even if the server is bound to another

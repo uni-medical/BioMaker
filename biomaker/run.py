@@ -12,7 +12,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 
 from omegaconf import OmegaConf
 from rich.live import Live
@@ -608,8 +608,17 @@ def _run(cfg: Config) -> int:
     logger.addHandler(file_handler)
     backend.logger.addHandler(file_handler)
 
-    logger.info(f'Starting run "{cfg.exp_name}"')
-    logger.info(f'Config: "{cfg}"')
+    logger.info('Starting run "%s"', cfg.exp_name, extra={"markup": False})
+    logger.info(
+        "Config:\n%s",
+        json.dumps(
+            OmegaConf.to_container(cfg, resolve=True),
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        ),
+        extra={"markup": False, "highlighter": None},
+    )
     append_event(
         cfg.log_dir,
         "run_started",
@@ -938,6 +947,8 @@ def _run(cfg: Config) -> int:
     round_item_count_by_round = scheduler.round_item_count_by_round
     best_node_before_by_round = scheduler.best_node_before_by_round
     live_tree_lock = RLock()
+    live_tree_stop = Event()
+    live_tree_journal = None
     live_tree_display = None
     live_tree_display_started = False
     live_tree_display_enabled = bool(SHARED_CONSOLE.is_terminal)
@@ -963,9 +974,10 @@ def _run(cfg: Config) -> int:
         return journal_to_rich_tree(display_journal)
 
     def refresh_live_tree(log_tree: bool = True) -> None:
-        nonlocal live_tree_display_started, live_tree_display_enabled
+        nonlocal live_tree_display_started, live_tree_display_enabled, live_tree_journal
         with live_tree_lock:
             display_journal = save_live_tree(live_display_nodes())
+            live_tree_journal = display_journal
             if log_tree and live_tree_display_enabled:
                 if not live_tree_display_started:
                     try:
@@ -985,6 +997,26 @@ def _run(cfg: Config) -> int:
                 except Exception as exc:
                     live_tree_display_enabled = False
                     record_presentation_warning("terminal_live_display", exc)
+
+    def live_tree_ticker() -> None:
+        nonlocal live_tree_display_enabled
+        while not live_tree_stop.wait(1.0):
+            with live_tree_lock:
+                if not live_tree_display_enabled:
+                    return
+                if not live_tree_display_started or live_tree_journal is None:
+                    continue
+                try:
+                    # Recompute elapsed labels without exporting HTML or reading
+                    # scheduler dictionaries concurrently with the main thread.
+                    assert live_tree_display is not None
+                    live_tree_display.update(
+                        live_tree_view(live_tree_journal), refresh=True
+                    )
+                except Exception as exc:
+                    live_tree_display_enabled = False
+                    record_presentation_warning("terminal_live_display", exc)
+                    return
 
     def remaining_schedule_budget() -> int:
         return scheduler.remaining_budget(total_steps, global_step)
@@ -1387,7 +1419,11 @@ def _run(cfg: Config) -> int:
 
     generation_executor = ThreadPoolExecutor(max_workers=max(1, total_steps))
     executor = ThreadPoolExecutor(max_workers=parallel_workers)
+    live_tree_thread = None
     try:
+        if live_tree_display_enabled:
+            live_tree_thread = Thread(target=live_tree_ticker, daemon=True)
+            live_tree_thread.start()
         while global_step < total_steps and not total_timer.is_timeout():
             handle_scheduler_events(executor, block=False)
             round_index += 1
@@ -1465,6 +1501,9 @@ def _run(cfg: Config) -> int:
                 logger.error(f"Exception during async generation/execution round: {e}")
                 raise e
     finally:
+        live_tree_stop.set()
+        if live_tree_thread is not None and live_tree_thread.ident is not None:
+            live_tree_thread.join()
         try:
             with live_tree_lock:
                 display_journal = save_live_tree(live_display_nodes())
@@ -1621,20 +1660,24 @@ def _queue_cli_invocation() -> bool:
         return False
     if os.environ.get("BIOMAKER_DISABLE_RUN_QUEUE") == "1":
         return False
-    entrypoint = Path(sys.argv[0]).stem.lower()
-    return entrypoint in {"biomaker", "run"}
+    return "--queue" in sys.argv[1:]
 
 
 def run() -> None:
-    """Submit CLI launches to the durable FIFO, or execute a supervised child."""
+    """Run directly by default; opt into the durable FIFO with --queue."""
 
-    if _queue_cli_invocation():
+    use_queue = _queue_cli_invocation()
+    # Consume the routing flag before OmegaConf parses configuration overrides,
+    # and before a queued command is persisted for a supervised child.
+    if "--queue" in sys.argv[1:]:
+        sys.argv = [sys.argv[0], *(arg for arg in sys.argv[1:] if arg != "--queue")]
+    if use_queue:
         queue_sidecar = Path(__file__).resolve().parents[1] / "apps" / "webui"
         if not (queue_sidecar / "webui" / "runner.py").is_file():
             raise RuntimeError(
                 "The durable run queue is unavailable in this installation. "
-                "Run BioMaker from the source checkout, or set "
-                "BIOMAKER_DISABLE_RUN_QUEUE=1 to explicitly opt out of queueing."
+                "Run BioMaker from the source checkout to use --queue, "
+                "or omit --queue to run directly."
             )
         from .utils.queue_client import submit_cli_and_wait
 

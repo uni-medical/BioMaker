@@ -21,6 +21,8 @@ PUBLIC_SPEC_KEYS = [
     "class_labels",
     "positive_class",
     "metrics",
+    "secondary_metrics",
+    "evaluator_api_version",
 ]
 
 
@@ -144,15 +146,19 @@ def _wants_auc(spec):
 
 
 def score_val():
+    return score(SPEC["validation_artifact"], os.environ["BIOMAKER_SCORE_VAL_PATH"],
+                 SPEC.get("score_split", "./input/biomaker_splits/score_val.csv"))
+
+
+def score(prediction_path, truth_path, expected_path):
     spec = SPEC
-    score_split = spec.get("score_split", "./input/biomaker_splits/score_val.csv")
+    score_split = expected_path
     key_columns = list(spec["key_columns"])
     prediction_columns = list(spec["prediction_columns"])
     answer_columns = list(spec["answer_columns"])
     pred = _validate_prediction_file(
-        spec["validation_artifact"], score_split
+        prediction_path, score_split
     )
-    truth_path = os.environ.get("BIOMAKER_SCORE_VAL_PATH")
     if not truth_path:
         raise RuntimeError("BIOMAKER_SCORE_VAL_PATH is not set.")
     truth = pd.read_csv(truth_path)
@@ -203,6 +209,11 @@ def score_val():
                 result["metric"] = auc
         elif auc_error:
             result["mean_roc_auc_error"] = auc_error
+        if _wants_auc(spec) and auc is None:
+            raise ValueError("Requested primary AUC is undefined: " + str(auc_error))
+        result["metrics"] = {"accuracy": metric}
+        if auc is not None:
+            result["metrics"]["auc"] = auc
         return result
 
     labels = list(spec.get("class_labels") or [])
@@ -222,6 +233,11 @@ def score_val():
             result["metric"] = auc
     elif auc_error:
         result["macro_roc_auc_error"] = auc_error
+    if _wants_auc(spec) and auc is None:
+        raise ValueError("Requested primary AUC is undefined: " + str(auc_error))
+    result["metrics"] = {"accuracy": accuracy}
+    if auc is not None:
+        result["metrics"]["auc"] = auc
     return result
 
 
@@ -278,6 +294,8 @@ PUBLIC_SPEC_KEYS = [
     "task_type",
     "prediction_type",
     "image_column",
+    "secondary_metrics",
+    "evaluator_api_version",
 ]
 
 
@@ -409,21 +427,6 @@ def _dice(mask_true, mask_pred):
     return float(2.0 * np.logical_and(true_bin, pred_bin).sum() / denom)
 
 
-def _connected_components(mask):
-    if mask.ndim == 3 and mask.shape[-1] in (3, 4):
-        mask = mask[..., 0]
-    unique = np.unique(mask)
-    if mask.max() > 1 and len(unique) > 2:
-        positive = unique[unique > 0]
-        remapped = np.zeros(mask.shape, dtype=np.int32)
-        for index, label in enumerate(positive, start=1):
-            remapped[mask == label] = index
-        return remapped
-    structure = ndi.generate_binary_structure(mask.ndim, 1)
-    labels, _ = ndi.label(mask > 0, structure=structure)
-    return labels.astype(np.int32, copy=False)
-
-
 def _surface_distances(source, target, spacing):
     if not source.any():
         return np.asarray([], dtype=float)
@@ -452,51 +455,64 @@ def _hd95(mask_true, mask_pred, spacing=None):
 
 
 def _aji(mask_true, mask_pred):
-    true_instances = _connected_components(mask_true)
-    pred_instances = _connected_components(mask_pred)
-    true_ids = np.setdiff1d(np.unique(true_instances), [0])
-    pred_ids = np.setdiff1d(np.unique(pred_instances), [0])
-    if len(true_ids) == 0 and len(pred_ids) == 0:
+    # Official MoNuSeg AJI: independent best-IoU match for each GT instance.
+    # https://github.com/ruchikaverma-iitg/MoNuSeg/blob/master/Aggregated_Jaccard_Index_v1_0.m
+    # Preserve supplied instance IDs, including disconnected parts of one ID.
+    mask_true = np.asarray(mask_true)
+    mask_pred = np.asarray(mask_pred)
+    if mask_true.shape != mask_pred.shape:
+        raise ValueError("AJI requires masks with identical shapes.")
+    for mask in (mask_true, mask_pred):
+        if mask.dtype.kind not in "biu" or np.any(mask < 0):
+            raise ValueError("AJI requires nonnegative integer instance labels.")
+
+    true_labels, true_inverse, true_area = np.unique(
+        mask_true, return_inverse=True, return_counts=True
+    )
+    pred_labels, pred_inverse, pred_area = np.unique(
+        mask_pred, return_inverse=True, return_counts=True
+    )
+    true_ids = np.flatnonzero(true_labels > 0)
+    pred_ids = np.flatnonzero(pred_labels > 0)
+    if not len(true_ids) and not len(pred_ids):
+        # Explicit extension for empty images (official MATLAB divides 0/0).
         return 1.0
-    if len(true_ids) == 0 or len(pred_ids) == 0:
+    if not len(true_ids) or not len(pred_ids):
         return 0.0
 
-    true_area = np.bincount(true_instances.ravel())
-    pred_area = np.bincount(pred_instances.ravel())
-    stride = len(pred_area) + 1
-    pair_key = true_instances.ravel().astype(np.int64) * stride + pred_instances.ravel()
-    pair_count = np.bincount(pair_key)
-    candidates = []
-    for key, intersection in enumerate(pair_count):
-        if intersection == 0:
+    # Count only observed pairs, avoiding a dense GT-by-prediction matrix.
+    stride = len(pred_labels)
+    pairs, intersections = np.unique(
+        true_inverse.ravel().astype(np.int64) * stride + pred_inverse.ravel(),
+        return_counts=True,
+    )
+    best = {}
+    for key, intersection in zip(pairs, intersections):
+        true_id, pred_id = divmod(int(key), stride)
+        if true_labels[true_id] == 0 or pred_labels[pred_id] == 0:
             continue
-        true_id = key // stride
-        pred_id = key % stride
-        if true_id == 0 or pred_id == 0:
-            continue
-        union = int(true_area[true_id] + pred_area[pred_id] - intersection)
-        candidates.append(
-            (intersection / union, int(true_id), int(pred_id), int(intersection), union)
-        )
-    candidates.sort(reverse=True)
-    used_true = set()
+        intersection = int(intersection)
+        union = int(true_area[true_id]) + int(pred_area[pred_id]) - intersection
+        iou = intersection / union
+        # Pairs are sorted by ID: strict > retains the lowest prediction ID
+        # on ties, as in the official implementation.
+        if true_id not in best or iou > best[true_id][0]:
+            best[true_id] = (iou, pred_id, intersection, union)
+
     used_pred = set()
     intersection_sum = 0
     union_sum = 0
-    for _, true_id, pred_id, intersection, union in candidates:
-        if true_id in used_true or pred_id in used_pred:
-            continue
-        used_true.add(true_id)
-        used_pred.add(pred_id)
-        intersection_sum += intersection
-        union_sum += union
     for true_id in true_ids:
-        if int(true_id) not in used_true:
-            union_sum += int(true_area[int(true_id)])
-    for pred_id in pred_ids:
-        if int(pred_id) not in used_pred:
-            union_sum += int(pred_area[int(pred_id)])
-    return float(intersection_sum / union_sum) if union_sum else 0.0
+        match = best.get(int(true_id))
+        if match is None:
+            union_sum += int(true_area[true_id])
+        else:
+            _, pred_id, intersection, union = match
+            intersection_sum += intersection
+            union_sum += union
+            used_pred.add(pred_id)  # Reuse is allowed; track only unused areas.
+    union_sum += sum(int(pred_area[j]) for j in pred_ids if int(j) not in used_pred)
+    return float(intersection_sum / union_sum)
 
 
 def _align_predictions(pred, expected, key_columns, path):
@@ -559,15 +575,19 @@ def validate_submission():
 
 
 def score_val():
+    return score(SPEC["validation_artifact"], os.environ["BIOMAKER_SCORE_VAL_PATH"],
+                 SPEC.get("score_split", "./input/biomaker_splits/score_val.csv"))
+
+
+def score(prediction_path, truth_path, expected_path):
     spec = SPEC
-    score_split = spec.get("score_split", "./input/biomaker_splits/score_val.csv")
+    score_split = expected_path
     key_columns = list(spec["key_columns"])
     pred_column = spec["prediction_columns"][0]
     answer_column = spec["answer_columns"][0]
     pred = _validate_prediction_file(
-        spec["validation_artifact"], score_split, False
+        prediction_path, score_split, False
     )
-    truth_path = os.environ.get("BIOMAKER_SCORE_VAL_PATH")
     if not truth_path:
         raise RuntimeError("BIOMAKER_SCORE_VAL_PATH is not set.")
     truth = pd.read_csv(truth_path)
@@ -642,6 +662,9 @@ def score_val():
         "aji": mean_aji,
         "binary_dice": mean_dice,
         "hd95": mean_hd95,
+        "metrics": {name: value for name, value in {
+            "aji": mean_aji, "binary_dice": mean_dice, "hd95": mean_hd95
+        }.items() if math.isfinite(value)},
     }
 
 
