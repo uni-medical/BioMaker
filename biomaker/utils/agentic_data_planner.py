@@ -686,6 +686,66 @@ def _check_referenced_paths(
         errors.append(f"{name} references missing files: {missing}")
 
 
+def _check_restoration_target_values(
+    split_manifest: dict[str, Any],
+    hidden_answers: dict[str, Any],
+    private_frames: dict[str, pd.DataFrame | None],
+    task_text: str,
+    errors: list[str],
+) -> None:
+    """A declared restoration target cannot be absent from a scored sample.
+
+    Do not generalize this to every answer column: empty detection boxes or
+    inline segmentation encodings can be valid answers. No path/column naming
+    heuristic determines whether an answer is required.
+    """
+    from .metric_declarations import declared_metric_names
+    from .metric_registry import metric_info
+
+    try:
+        primary, _ = declared_metric_names(split_manifest, task_text)
+    except (ValueError, TypeError):
+        return  # The metric declaration gate reports malformed contracts.
+    info = metric_info(primary)
+    if info is None or info.task_family != "image_restoration":
+        return
+    contract = split_manifest.get("metric_contract", {})
+    protocol = contract.get("restoration_evaluation", contract)
+    if not isinstance(protocol, dict):
+        return
+    target_column = protocol.get("target_column", contract.get("target_column"))
+    # Task-owned protocol blocks are authoritative in evaluator setup too.
+    blocks = re.findall(r"```restoration-evaluation\s*\n(.*?)```", task_text, re.S)
+    if len(blocks) == 1:
+        try:
+            task_protocol = json.loads(blocks[0])
+        except ValueError:
+            return
+        if isinstance(task_protocol, dict):
+            target_column = task_protocol.get("target_column", target_column)
+    if not isinstance(target_column, str) or not target_column.strip():
+        return  # Do not infer absent representation details from column names.
+    for role, frame in private_frames.items():
+        if frame is None or frame.empty:
+            continue  # Existing split-presence checks handle required files.
+        entry = hidden_answers.get(role, {})
+        answers = entry.get("answer_columns", []) if isinstance(entry, dict) else []
+        if target_column not in answers or target_column not in frame:
+            errors.append(
+                f"private_gt/{role}.csv must contain declared restoration target "
+                f"{target_column!r} as an answer column."
+            )
+            continue
+        values = frame[target_column]
+        missing = values.isna() | values.astype(str).str.strip().eq("")
+        count = int(missing.sum())
+        if count:
+            errors.append(
+                f"private_gt/{role}.csv declared restoration target {target_column!r} "
+                f"is empty in {count} of {len(frame)} rows; populate every hidden target."
+            )
+
+
 def _check_source_coverage(
     facts: dict[str, Any], row_counts: dict[str, Any], errors: list[str]
 ) -> None:
@@ -1051,6 +1111,10 @@ def verify_split_package(
         if leaked:
             errors.append(f"agent_test public file leaks answer columns: {leaked}")
 
+    _check_restoration_target_values(
+        split_manifest, manifest, {"score_val": score_gt_df, "test": test_gt_df},
+        task_text, errors,
+    )
     row_counts = {
         "agent_train": None if train_df is None else int(len(train_df)),
         "score_val": None if score_df is None else int(len(score_df)),
