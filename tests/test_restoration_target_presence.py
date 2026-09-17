@@ -82,7 +82,7 @@ def test_checks_all_target_rows_beyond_path_observation_sample(package):
     assert any("empty in 1 of 202 rows" in error for error in result["errors"])
 
 
-@pytest.mark.parametrize("style", ["nested", "flat", "task_block"])
+@pytest.mark.parametrize("style", ["nested", "flat", "named", "task_block"])
 def test_target_column_is_taken_from_declared_protocol(package, style):
     source, output = package
     contract = {"primary_metric": "psnr"}
@@ -91,6 +91,8 @@ def test_target_column_is_taken_from_declared_protocol(package, style):
         contract["restoration_evaluation"] = PROTOCOL
     elif style == "flat":
         contract.update(PROTOCOL)
+    elif style == "named":
+        contract["primary_metric"] = {"name": "psnr", **PROTOCOL}
     else:
         task = "```restoration-evaluation\n" + json.dumps(PROTOCOL) + "\n```"
     write_manifest(output, contract)
@@ -172,3 +174,82 @@ def test_missing_restoration_data_retries_builder_with_actionable_feedback(packa
     assert [attempt["ok"] for attempt in result.plan["attempts"]] == [False, True]
     assert len(failures) == 2 and failures[0] is None
     assert any("declared restoration target" in error for error in failures[1]["errors"])
+
+
+@pytest.mark.parametrize("repair_style", ["nested", "named"])
+def test_metric_repair_rechecks_new_target_declaration_before_accepting_data(
+    package, tmp_path, monkeypatch, repair_style,
+):
+    source, template = package
+    write_csv(template / "private_gt/score_val.csv", [{"sample": "val", TARGET: ""}])
+    incomplete_protocol = {key: value for key, value in PROTOCOL.items() if key != "target_column"}
+    write_manifest(template, {
+        "primary_metric": "psnr", "secondary_metrics": ["ssim"],
+        "restoration_evaluation": incomplete_protocol,
+        "empty_policy": "A documentation field that needs metric-only repair.",
+    })
+    repaired_contract = {
+        "primary_metric": "psnr", "secondary_metrics": ["ssim"],
+        "restoration_evaluation": PROTOCOL,
+    }
+    if repair_style == "named":
+        repaired_contract = {
+            "primary_metric": {"name": "psnr", **PROTOCOL},
+            "secondary_metrics": ["ssim"],
+        }
+    task_file = tmp_path / "task.md"
+    task_file.write_text("Primary metric: PSNR.\nSecondary metric: SSIM.")
+    output = tmp_path / "generated"
+    builder_failures, repair_errors = [], []
+
+    def query_builder(*args, previous_failure=None, **kwargs):
+        builder_failures.append(copy.deepcopy(previous_failure))
+        script = (
+            "import argparse, csv, json, shutil\nfrom pathlib import Path\n"
+            "parser=argparse.ArgumentParser()\n"
+            "parser.add_argument('--input-dir')\nparser.add_argument('--output-dir')\n"
+            "args=parser.parse_args()\nout=Path(args.output_dir)\n"
+            f"shutil.copytree({str(template)!r},out,dirs_exist_ok=True)\n"
+        )
+        if previous_failure:
+            # A metric-only repair cannot fill missing answers. It must return
+            # to the data builder with the target-presence failure intact.
+            assert not previous_failure["data_ok"]
+            assert previous_failure["builder_returncode"] == 0
+            assert previous_failure["metric_errors"] == []
+            assert any("declared restoration target" in error and "empty" in error
+                       for error in previous_failure["data_errors"])
+            assert pd.read_csv(output / "private_gt/score_val.csv", keep_default_na=False)[TARGET].tolist() == [""]
+            script += (
+                "manifest_path=out/'split_manifest.json'\n"
+                "manifest=json.loads(manifest_path.read_text())\n"
+                f"manifest['metric_contract']=json.loads({json.dumps(repaired_contract)!r})\n"
+                "manifest_path.write_text(json.dumps(manifest))\n"
+                "with (out/'private_gt/score_val.csv').open('w') as f:\n"
+                f"    writer=csv.DictWriter(f,fieldnames=['sample',{TARGET!r}])\n"
+                "    writer.writeheader()\n"
+                f"    writer.writerow({{'sample':'val',{TARGET!r}:str(Path(args.input_dir)/'val.png')}})\n"
+            )
+        return script, "```python\n" + script + "\n```", {}
+
+    def query_repair(task_text, manifest, errors, **kwargs):
+        repair_errors.append(errors)
+        assert "target_column" not in manifest["metric_contract"]["restoration_evaluation"]
+        assert any("empty_policy" in error for error in errors)
+        return json.dumps(repaired_contract), {}
+
+    monkeypatch.setattr(planner, "_query_builder", query_builder)
+    monkeypatch.setattr(planner, "_query_metric_contract", query_repair)
+    monkeypatch.setattr(planner, "split_builder_cache_key", lambda **kwargs: ("test", {}))
+    result = planner.run_agentic_split_builder_probe(source, task_file, output, max_attempts=3)
+
+    assert result.verifier["ok"]
+    assert [attempt["stage"] for attempt in result.plan["attempts"]] == [
+        "data_builder", "metric_contract", "data_builder",
+    ]
+    assert [attempt["ok"] for attempt in result.plan["attempts"]] == [False, False, True]
+    assert len(builder_failures) == 2 and builder_failures[0] is None
+    assert len(repair_errors) == 1
+    assert pd.read_csv(output / "private_gt/score_val.csv")[TARGET].tolist() == [str(source / "val.png")]
+    verified = planner.verify_split_package(output, source_input_dir=source, task_text=task_file.read_text())
+    assert verified["ok"], verified["errors"]

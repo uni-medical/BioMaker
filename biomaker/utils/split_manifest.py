@@ -67,6 +67,8 @@ def _answer_columns(hidden_answers: dict[str, Any]) -> dict[str, Any]:
             result[split_name] = {
                 "answer_columns": list(map(str, entry.get("answer_columns") or []))
             }
+            if "file_reference_columns" in entry:
+                result[split_name]["file_reference_columns"] = entry["file_reference_columns"]
     return result
 
 
@@ -107,6 +109,73 @@ def legacy_manifest(
 
 def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def split_file_reference_roles(
+    manifest: dict[str, Any], hidden_answers: dict[str, Any], errors: list[str],
+) -> dict[str, Any]:
+    """Resolve file encodings independently for inputs and each answer split.
+
+    None means a legacy role without an encoding declaration; an empty set is
+    an explicit declaration that this role contains no file references.
+    Prediction file references describe future outputs and are never inputs.
+    """
+    def columns(value: Any, field: str) -> set[str]:
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+            errors.append(f"{field} must be a list of nonempty column names.")
+            return set()
+        return set(value)
+
+    inputs: set[str] | None = None
+    prediction = manifest.get("prediction_contract", {})
+    for owner, label in ((manifest, "split_manifest"), (prediction, "prediction_contract")):
+        if isinstance(owner, dict) and "input_file_reference_columns" in owner:
+            declared = columns(owner["input_file_reference_columns"], label + ".input_file_reference_columns")
+            inputs = (inputs or set()) | declared
+    answer_columns: dict[str, set[str]] = {}
+    answer_files: dict[str, set[str] | None] = {}
+    manifest_answers = manifest.get("hidden_answers", {})
+    for role in ("score_val", "test"):
+        entry = hidden_answers.get(role, {})
+        answer_columns[role] = {name for name in _as_list(entry.get("answer_columns")) if isinstance(name, str)} if isinstance(entry, dict) else set()
+        answer_files[role] = None
+        for owner, label in ((manifest_answers, "hidden_answers"), (hidden_answers, "private_gt")):
+            spec = owner.get(role, {}) if isinstance(owner, dict) else {}
+            if not isinstance(spec, dict) or "file_reference_columns" not in spec:
+                continue
+            field = f"{label}.{role}.file_reference_columns"
+            declared = columns(spec["file_reference_columns"], field)
+            if declared - answer_columns[role]:
+                errors.append(f"{field} must be a subset of that split's answer_columns.")
+            previous = answer_files[role]
+            if previous is not None and previous != declared:
+                errors.append(f"Conflicting file_reference_columns for hidden answer split {role}.")
+            answer_files[role] = declared if previous is None else previous | declared
+    return {"inputs": inputs, "answer_columns": answer_columns, "answer_files": answer_files}
+
+
+def file_columns_for_frame(
+    roles: dict[str, Any], columns: Any, *, role: str, private: bool = False,
+) -> tuple[set[str], set[str]]:
+    """Return required file columns and legacy columns eligible for inference."""
+    present = set(columns)
+    inputs = roles["inputs"]
+    answers = (set().union(*roles["answer_columns"].values()) if role == "train"
+               else roles["answer_columns"].get(role, set()) if private else set())
+    required = set() if inputs is None else (inputs & present if private else set(inputs))
+    legacy = present - answers if inputs is None else set()
+    for column in answers & present:
+        scopes = ([scope for scope, names in roles["answer_columns"].items() if column in names]
+                  if role == "train" else [role])
+        encodings = [None if roles["answer_files"][scope] is None
+                     else column in roles["answer_files"][scope] for scope in scopes]
+        if encodings and all(value is True for value in encodings):
+            required.add(column)
+        elif any(value is None for value in encodings) or len(set(encodings)) > 1:
+            legacy.add(column)
+    if private and roles["answer_files"].get(role) is not None:
+        required.update(roles["answer_files"][role])
+    return required, legacy - required
 
 
 def _validate_task_heads(manifest: dict[str, Any], errors: list[str]) -> None:

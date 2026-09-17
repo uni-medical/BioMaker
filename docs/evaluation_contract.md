@@ -91,6 +91,18 @@ Preparation records data semantics in `input/biomaker_splits/split_manifest.json
   columns. Declared input columns are included in public sample observations
   even when their names contain neither `path` nor `file`.
 
+`input_file_reference_columns` is the complete list of existing input file
+columns; the existing declaration inside `prediction_contract` is also accepted.
+Keys may be file references when listed there. Other input columns remain opaque
+identifiers or metadata, regardless of slashes or filename extensions in values.
+For each `hidden_answers` split, `file_reference_columns` optionally lists the
+subset of `answer_columns` containing files. Mirror it in the corresponding
+`private_gt/private_gt.json` entry; `[]` explicitly declares inline/scalar answers.
+Input and answer roles without file declarations retain legacy path inference.
+Declared file references must be nonempty existing files on every row, not
+directories. A restoration `target_column` alone does not declare file encoding;
+restoration targets must still be nonempty even with an inline encoding.
+
 Private answer tables need the declared sample keys and answer columns; they
 need not duplicate public input metadata. The Harness aligns keys and supplies
 public metadata separately. Keyless tables require an explicit row-order

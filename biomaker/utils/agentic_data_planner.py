@@ -31,8 +31,10 @@ from PIL import Image
 from .. import backend
 from .metric_declarations import canonical_metric_contract, validate_declared_capabilities
 from .split_manifest import (
+    file_columns_for_frame,
     legacy_manifest,
     load_split_manifest,
+    split_file_reference_roles,
     validate_split_manifest,
     write_split_manifest,
 )
@@ -45,7 +47,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 9
+SPLIT_BUILDER_CACHE_VERSION = 10
 
 
 @dataclass(frozen=True)
@@ -462,6 +464,7 @@ def _builder_user_prompt(
             "primary_metric accepts a name or a named object using name, metric, or id. Settings inside a named object are preserved and combined with outer settings; conflicting declarations are errors. Choose dataset columns and encodings freely and document their meaning separately in prediction_contract and data_semantics.",
             "For image restoration with PSNR/SSIM, declare evaluation semantics in metric_contract: input_column, target_column, data_range, crop_size (null for whole-image or the size of four corner crops), group_column and groups (both null if ungrouped), aggregation (mean_images or mean_groups), and ssim_parameters. For another crop rule, declare crop_mode and its actual parameters explicitly. Preserve task-specific metric settings; do not invent a supported setting to fit an implementation. Choose column names and sample keys yourself, and declare prediction_columns/file_reference_columns in prediction_contract. Input paths may also be sample keys. Different column names or file encodings require data adaptation, not new implementations of PSNR/SSIM.",
             "hidden_answers: object mirroring private_gt/private_gt.json answer_columns.",
+            "Declare input_file_reference_columns for existing public input files (including a key column if that key is also a file path). Other public columns are identifiers or metadata, not file paths. For each hidden_answers split, optionally declare file_reference_columns as the subset of answer_columns containing existing files, mirrored in private_gt/private_gt.json; [] declares inline/scalar answers. Keep this separate from prediction_contract.file_reference_columns, which describes future candidate outputs.",
         ],
         "Evaluation Responsibilities and Adapter Interface": [
             "This builder prepares data and declares its meaning. Do not implement metric formulas or scoring loops in the builder. The Harness uses trusted metric implementations when the declared metric and settings are supported; only unavailable metrics require a separately validated custom evaluator.",
@@ -661,29 +664,35 @@ def _check_referenced_paths(
     output_dir: Path,
     source_input_dir: Path | None,
     errors: list[str],
+    *,
+    file_roles: dict[str, Any] | None = None,
+    role: str = "train",
+    private: bool = False,
 ) -> None:
-    if df is None:
+    if df is None or df.empty:
         return
+    required, legacy = (file_columns_for_frame(file_roles, df.columns, role=role, private=private)
+                        if file_roles is not None else (set(), set(df.columns)))
+    absent = required - set(df.columns)
+    if absent:
+        errors.append(f"{name} is missing declared file reference columns: {sorted(absent)}")
     missing: list[str] = []
-    for column in df.columns:
-        if df[column].dtype != object:
-            continue
-        for value in df[column].dropna().astype(str).head(200).tolist():
-            if not _looks_like_path_text(value):
+    for column in sorted((required | legacy) & set(df.columns)):
+        for value in df[column].unique():
+            if column not in required and not _looks_like_path_text(value):
                 continue
-            if _resolve_path(value, output_dir, output_dir) is not None:
+            candidates = _path_candidates(value, output_dir, output_dir)
+            if source_input_dir is not None:
+                candidates += _path_candidates(value, source_input_dir, source_input_dir)
+            if any(path.is_file() for path in candidates):
                 continue
-            if source_input_dir is not None and _resolve_path(
-                value, source_input_dir, source_input_dir
-            ):
-                continue
-            missing.append(f"{column}={value}")
+            missing.append(f"{column}={value!r}")
             if len(missing) >= 5:
                 break
         if len(missing) >= 5:
             break
     if missing:
-        errors.append(f"{name} references missing files: {missing}")
+        errors.append(f"{name} references missing files (including empty paths or directories): {missing}")
 
 
 def _check_restoration_target_values(
@@ -709,7 +718,12 @@ def _check_restoration_target_values(
     info = metric_info(primary)
     if info is None or info.task_family != "image_restoration":
         return
-    contract = split_manifest.get("metric_contract", {})
+    try:
+        contract = canonical_metric_contract(
+            split_manifest.get("metric_contract", {}), fallback_primary=primary
+        )
+    except (ValueError, TypeError):
+        return  # The metric declaration gate reports malformed contracts.
     protocol = contract.get("restoration_evaluation", contract)
     if not isinstance(protocol, dict):
         return
@@ -844,6 +858,7 @@ def _check_split_constraints(
     source_input_dir: Path | None,
     output_dir: Path,
     errors: list[str],
+    file_roles: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Check actual original-file references against task-owned source roles."""
     if not constraints:
@@ -869,10 +884,13 @@ def _check_split_constraints(
     original_files = set().union(*source_files) if source_files else set()
     membership: dict[Path, set[str]] = {}
     resolved_values: dict[str, Path | None] = {}
-    for role, frame in [*frames.items(), *answers.items()]:
+    for role, frame, private in [*( (role, frame, False) for role, frame in frames.items()),
+                                  *( (role, frame, True) for role, frame in answers.items())]:
         if frame is None:
             continue
-        for column in frame.columns:
+        required, legacy = (file_columns_for_frame(file_roles, frame.columns, role=role, private=private)
+                            if file_roles is not None else (set(), set(frame.columns)))
+        for column in (required | legacy) & set(frame.columns):
             for value in frame[column].dropna().unique():
                 if not isinstance(value, str) or not value.strip():
                     continue
@@ -1014,6 +1032,7 @@ def verify_split_package(
         manifest = {}
 
     split_manifest = load_split_manifest(output_dir)
+    file_roles = split_file_reference_roles(split_manifest, manifest, errors)
     retained_warnings = split_manifest.get("normalization_warnings", [])
     if isinstance(retained_warnings, list):
         warnings.extend(item for item in retained_warnings if isinstance(item, str))
@@ -1022,6 +1041,7 @@ def verify_split_package(
     constraint_report = _check_split_constraints(
         constraints, {"train": train_df, "score_val": score_df, "test": test_df},
         {"score_val": score_gt_df, "test": test_gt_df}, source_input_dir, output_dir, errors,
+        file_roles=file_roles,
     )
     _check_prediction_file_columns(split_manifest, errors)
 
@@ -1122,14 +1142,15 @@ def verify_split_package(
         "score_val_gt": None if score_gt_df is None else int(len(score_gt_df)),
         "test_gt": None if test_gt_df is None else int(len(test_gt_df)),
     }
-    for name, df in (
-        ("agent_train.csv", train_df),
-        ("score_val.csv", score_df),
-        ("agent_test.csv", test_df),
-        ("private_gt/score_val.csv", score_gt_df),
-        ("private_gt/test.csv", test_gt_df),
+    for name, df, role, private in (
+        ("agent_train.csv", train_df, "train", False),
+        ("score_val.csv", score_df, "score_val", False),
+        ("agent_test.csv", test_df, "test", False),
+        ("private_gt/score_val.csv", score_gt_df, "score_val", True),
+        ("private_gt/test.csv", test_gt_df, "test", True),
     ):
-        _check_referenced_paths(df, name, output_dir, source_input_dir, errors)
+        _check_referenced_paths(df, name, output_dir, source_input_dir, errors,
+                                file_roles=file_roles, role=role, private=private)
     if facts is not None:
         _check_source_coverage(facts, row_counts, errors)
     _check_generated_public_does_not_copy_inputs(output_dir, source_input_dir, errors)
@@ -1290,8 +1311,12 @@ def run_agentic_split_builder_probe(
                 # Only a validated declaration is written. No generated code runs,
                 # and the accepted data files and other manifest fields stay intact.
                 _write_prepared_manifest(output_dir, candidate)
-                verifier.update(ok=True, errors=[], metric_errors=[],
-                                split_manifest=_manifest_summary_for_verifier(candidate))
+                # A repaired declaration can change which data columns are required.
+                # Recheck the existing package without rerunning its builder.
+                verifier = verify_split_package(
+                    output_dir, source_input_dir=input_dir, facts=facts, task_text=task_text
+                )
+                verifier["builder_returncode"] = 0
         else:
             code, raw_response, metadata = _query_builder(
                 task_text, facts, model=model, temperature=temperature,
