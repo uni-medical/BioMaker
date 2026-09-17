@@ -4,7 +4,7 @@ It follows a small loop:
 
 1. Observe the dataset directory as facts.
 2. Ask an LLM to write a dataset-specific builder script.
-3. Run that script and verify only universal output invariants.
+3. Run that script and verify output invariants and declared metric capabilities.
 
 The verifier does not decide whether a task is classification, segmentation,
 detection, report generation, or something else. That semantic decision belongs
@@ -28,6 +28,7 @@ import pandas as pd
 from PIL import Image
 
 from .. import backend
+from .metric_declarations import validate_declared_capabilities
 from .split_manifest import (
     legacy_manifest,
     load_split_manifest,
@@ -43,7 +44,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 7
+SPLIT_BUILDER_CACHE_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -456,6 +457,7 @@ def _builder_user_prompt(
             "prediction_contract.prediction_columns lists predicted values only, excluding key_columns. The candidate CSV contains key_columns followed by prediction_columns; for example key_columns=['id'] and prediction_columns=['boneage'], not prediction_columns=['id', 'boneage'].",
             "prediction_contract.file_reference_columns must be a subset of prediction_contract.prediction_columns: it describes candidate outputs only. Declare existing input file columns separately in input_file_reference_columns or data_semantics; never put image_path there when the prediction is a numeric scalar.",
             "metric_contract: object with primary_metric, secondary_metrics, maximize, and every task-required metric setting. The task and experiment protocol determine these settings; the Harness computes the declared metrics.",
+            "For registered metrics, metric_contract keys must come from the family's allowed_contract_fields in the Harness Metric Capability Catalog, plus optional notes/description. Explanatory catalog entries such as sample_schema, score_scope, empty_policy, matching, and unsupported are documentation, not protocol fields; put relevant explanations in notes. Do not copy those entries into metric_contract. If a task genuinely requires unsupported semantics, report them explicitly; never remove or replace task-required settings to pass verification.",
             "For image restoration with PSNR/SSIM, declare evaluation semantics in metric_contract: input_column, target_column, data_range, crop_size (null for whole-image or the size of four corner crops), group_column and groups (both null if ungrouped), aggregation (mean_images or mean_groups), and ssim_parameters. For another crop rule, declare crop_mode and its actual parameters explicitly. Preserve task-specific metric settings; do not invent a supported setting to fit an implementation. Choose column names and sample keys yourself, and declare prediction_columns/file_reference_columns in prediction_contract. Input paths may also be sample keys. Different column names or file encodings require data adaptation, not new implementations of PSNR/SSIM.",
             "hidden_answers: object mirroring private_gt/private_gt.json answer_columns.",
         ],
@@ -1024,6 +1026,10 @@ def verify_split_package(
         errors=errors,
         warnings=warnings,
     )
+    try:
+        validate_declared_capabilities(split_manifest, task_text)
+    except (ValueError, TypeError) as exc:
+        errors.append(f"Invalid metric_contract: {exc}")
     if normalized_manifest:
         write_split_manifest(output_dir, split_manifest)
         nested_manifest = output_dir / "biomaker_splits/split_manifest.json"

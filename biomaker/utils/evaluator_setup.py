@@ -51,6 +51,13 @@ from .exp_guide import (
     load_exp_guide,
 )
 from .experiment_contract import load_experiment_contract
+from .metric_declarations import (
+    PROTOCOL_DOCUMENTATION_FIELDS as _PROTOCOL_DOCUMENTATION_FIELDS,
+    declared_metric_names,
+    manifest_head_types as _manifest_head_types,
+    manifest_primary_metric as _manifest_primary_metric,
+    validate_declared_capabilities,
+)
 from .metric_registry import (
     is_classification_metric_supported,
     is_segmentation_metric_supported,
@@ -72,7 +79,6 @@ _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 _SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
 _EVALUATOR_CACHE_VERSION = 5
-_PROTOCOL_DOCUMENTATION_FIELDS = {"notes", "description"}
 
 
 class EvaluatorSetupError(RuntimeError):
@@ -1197,39 +1203,11 @@ def _split_manifest(split_dir: Path) -> dict[str, Any]:
     return embedded if isinstance(embedded, dict) else {}
 
 
-def _manifest_head_types(manifest: dict[str, Any]) -> set[str]:
-    heads = manifest.get("task_heads")
-    if isinstance(heads, str):
-        return {heads.lower()}
-    result: set[str] = set()
-    if isinstance(heads, list):
-        for head in heads:
-            if isinstance(head, str):
-                result.add(head.lower())
-            elif isinstance(head, dict) and isinstance(head.get("type"), str):
-                result.add(str(head["type"]).lower())
-    return result
-
-
 def _manifest_key_columns(manifest: dict[str, Any]) -> list[str]:
     columns = manifest.get("key_columns")
     if not isinstance(columns, list):
         return []
     return [str(column) for column in columns if str(column).strip()]
-
-
-def _manifest_primary_metric(manifest: dict[str, Any]) -> str | None:
-    metric_contract = manifest.get("metric_contract")
-    if isinstance(metric_contract, dict) and metric_contract.get("primary_metric"):
-        metric = metric_contract["primary_metric"]
-        if isinstance(metric, dict):
-            for key in ("name", "metric", "id"):
-                value = metric.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-            return None
-        return str(metric)
-    return None
 
 
 def _sort_label_values(values: list[Any]) -> list[Any]:
@@ -1979,18 +1957,12 @@ def _sha256_file(path: Path) -> str | None:
 
 
 def _requested_metric_names(task_desc: Any, workspace_dir: Path) -> tuple[str | None, list[str]]:
-    primary, secondary = requested_metrics(_task_payload(task_desc))
     manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
-    contract = manifest.get("metric_contract", {})
-    manifest_primary = _manifest_primary_metric(manifest)
-    if primary and manifest_primary and metric_name(primary) != metric_name(manifest_primary):
-        raise EvaluatorSetupError("Task and prepared metric_contract disagree on the primary metric; repair data preparation before compiling an evaluator.")
-    if not primary:
-        primary = manifest_primary
-        if not primary:
-            primary = _json_dict(workspace_dir / "input/biomaker_splits/split_plan.json").get("primary_metric")
-    secondary = list(dict.fromkeys([metric_name(str(m)) for m in [*secondary, *contract.get("secondary_metrics", [])]]))
-    return metric_name(str(primary)) if primary else None, secondary
+    fallback = _json_dict(workspace_dir / "input/biomaker_splits/split_plan.json").get("primary_metric")
+    try:
+        return declared_metric_names(manifest, _task_payload(task_desc), fallback_primary=fallback)
+    except ValueError as exc:
+        raise EvaluatorSetupError(str(exc)) from exc
 
 
 def _standard_adapter_required(task_desc: Any, workspace_dir: Path) -> bool:
@@ -2001,88 +1973,12 @@ def _standard_adapter_required(task_desc: Any, workspace_dir: Path) -> bool:
 
 
 def _validate_declared_capabilities(task_desc: Any, workspace_dir: Path) -> None:
-    """Reject unsupported declared semantics before asking an Agent to fix data.
-
-    Missing representation details remain the adapter's responsibility. Catalog
-    constraints on supplied parameters already have a deterministic answer.
-    """
-    from .trusted_metrics import metric_capabilities, normalize_metric_spec
-    primary, secondary = _requested_metric_names(task_desc, workspace_dir)
-    names = [m for m in [primary, *secondary] if m]
-    if not names or any(metric_info(m) is None for m in names):
-        return
-    families = {metric_info(m).task_family for m in names}
-    if len(families) != 1:
-        raise EvaluatorSetupError("Requested standard metrics require different canonical sample families; a mixed-head evaluation protocol is not yet supported.")
-    family = families.pop()
-    capabilities = metric_capabilities()["families"][family]
     manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
-    contract = dict(manifest.get("metric_contract", {}))
-    if family == "image_restoration":
-        blocks = re.findall(r"```restoration-evaluation\s*\n(.*?)```", _task_payload(task_desc), re.S)
-        if len(blocks) > 1:
-            raise EvaluatorSetupError("Declare exactly one restoration-evaluation contract.")
-        if blocks:
-            contract["restoration_evaluation"] = {**contract.get("restoration_evaluation", {}), **json.loads(blocks[0])}
-    unknown = set(contract) - set(capabilities["allowed_contract_fields"]) - _PROTOCOL_DOCUMENTATION_FIELDS
-    if unknown:
-        raise EvaluatorSetupError("Unsupported declared metric protocol fields: " + ", ".join(sorted(unknown)))
-
-    def check_fields(values, fields, prefix=""):
-        for name, field in fields.items():
-            keys = [key for key in [name, *field.get("aliases", [])] if key in values]
-            for key in keys:
-                value = values[key]
-                value = field.get("value_aliases", {}).get(value, value) if isinstance(value, str) else value
-                unsupported = ("fixed" in field and value != field["fixed"] or
-                               "values" in field and value not in field["values"] or
-                               "fixed_by_task_type" in field and value not in field["fixed_by_task_type"].values())
-                if unsupported:
-                    raise EvaluatorSetupError("Unsupported declared metric setting " + prefix + name + "; the Harness requires a validated implementation for this protocol, not another data adapter.")
-                if "fields" in field and isinstance(value, dict):
-                    nested_unknown = set(value) - {k for n, f in field["fields"].items() for k in [n, *f.get("aliases", [])]}
-                    if nested_unknown:
-                        raise EvaluatorSetupError("Unsupported declared metric settings: " + prefix + name + "." + ", ".join(sorted(nested_unknown)))
-                    check_fields(value, field["fields"], prefix + name + ".")
-    check_fields(contract, capabilities["protocol_fields"])
-    if family == "image_restoration":
-        fields = capabilities["protocol_fields"]["restoration_evaluation"]["fields"]
-        check_fields(contract, fields)
-    # Check numeric/range and cross-field constraints as well. Placeholder data
-    # dimensions/labels are used only to validate supplied protocol settings;
-    # they are never frozen or used for dataset interpretation.
-    probe = {key: value for key, value in contract.items() if key not in _PROTOCOL_DOCUMENTATION_FIELDS}
-    probe.update(primary_metric=primary, secondary_metrics=secondary)
-    if family == "classification":
-        output = manifest.get("prediction_contract", {})
-        for key in ("class_labels", "positive_class"):
-            if key not in probe and key in output:
-                probe[key] = output[key]
-        heads = _manifest_head_types(manifest)
-        inferred_type = ("multilabel" if heads & {"multilabel", "multi_label_classification"} or probe.get("aggregation") == "mean_labels"
-                         else "multiclass" if "multiclass" in heads or len(probe.get("class_labels", [])) > 2 else "binary")
-        probe.setdefault("task_type", inferred_type)
-        if probe["task_type"] != "multilabel" and "class_labels" not in probe:
-            positive = probe.get("positive_class", "__protocol_positive__")
-            probe["class_labels"] = ["__protocol_negative__", positive]
-    if family == "image_restoration":
-        protocol = {key: probe.pop(key) for key in list(probe) if key in fields and key != "ssim_parameters"}
-        protocol.update(probe.get("restoration_evaluation", {}))
-        # Unspecified required values are still resolved from data by adapters.
-        clipping = probe.get("prediction_clipping")
-        default_range = clipping[1] if isinstance(clipping, (list, tuple)) and len(clipping) == 2 else 1
-        crop_mode = protocol.get("crop_mode")
-        defaults = dict(
-            data_range=default_range,
-            crop_size=1_000_000 if crop_mode in {"four_corners", "four_corner_crops_no_center"} else None,
-            groups=["__unresolved_public_group__"] if protocol.get("aggregation") == "mean_groups" else None,
-            aggregation="mean_images",
-        )
-        probe["restoration_evaluation"] = {**defaults, **protocol}
+    fallback = _json_dict(workspace_dir / "input/biomaker_splits/split_plan.json").get("primary_metric")
     try:
-        normalize_metric_spec(probe)
-    except ValueError as exc:
-        raise EvaluatorSetupError("Unsupported declared metric protocol: " + str(exc)) from exc
+        validate_declared_capabilities(manifest, _task_payload(task_desc), fallback_primary=fallback)
+    except (ValueError, TypeError) as exc:
+        raise EvaluatorSetupError(str(exc)) from exc
 
 
 def _validate_custom_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_desc: Any) -> None:
@@ -2314,6 +2210,7 @@ def _evaluator_cache_metadata(
         "evaluator_protocol.py": _sha256_file(utils_dir / "evaluator_protocol.py"),
         "evaluator_adapter.py": _sha256_file(utils_dir / "evaluator_adapter.py"),
         "trusted_metrics.py": _sha256_file(utils_dir / "trusted_metrics.py"),
+        "metric_declarations.py": _sha256_file(utils_dir / "metric_declarations.py"),
         "standard_data_adapters.py": _sha256_file(utils_dir / "standard_data_adapters.py"),
         "exp_guide.py": _sha256_file(utils_dir / "exp_guide.py"),
         "data_summary.py": _sha256_file(utils_dir / "data_summary.py"),
