@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .metric_registry import metric_maximize
+from .evaluator_protocol import metric_definitions
 from .prediction_contract import (
     PredictionContract,
     artifact_path_from_spec,
@@ -40,6 +41,21 @@ class MetricContract:
     primary_metric: str | None
     maximize: bool
     secondary_metrics: list[str]
+    metrics: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _metric_definitions_from_sources(*sources: dict[str, Any]) -> list[dict[str, Any]]:
+    """Prefer the frozen evaluator, then prepared declarations, for metric facts.
+
+    Empty contracts are possible before preparation. Legacy histories may lack
+    custom secondary directions; preserve those for inspection, not new search.
+    """
+    for source in sources:
+        if "metrics" in source or source.get("primary_metric"):
+            return metric_definitions(
+                source, allow_legacy_unknown="metrics" not in source
+            )
+    return []
 
 
 @dataclass(frozen=True)
@@ -314,6 +330,7 @@ def _build_prediction_contract(
             else None
         ),
         positive_class=spec.get("positive_class"),
+        metrics=_metric_definitions_from_sources(spec, manifest_metric, split_plan),
     )
 
 
@@ -341,9 +358,8 @@ def load_experiment_contract(
             if prediction.primary_metric
             else _manifest_maximize(split_manifest, primary_metric)
         ),
-        secondary_metrics=list_of_strings(
-            prediction_spec.get("secondary_metrics") or prediction_spec.get("metrics")
-        ),
+        secondary_metrics=list_of_strings(prediction_spec.get("secondary_metrics")),
+        metrics=prediction.metrics,
     )
     return ExperimentContract(
         workspace_dir=workspace_dir,

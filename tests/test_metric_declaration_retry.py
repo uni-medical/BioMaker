@@ -96,7 +96,7 @@ def test_task_metric_conflict_reaches_preparation_feedback(package):
     {"primary_metric": {"name": "mean_aji"}, "secondary_metrics": ["dice", "iou"]},
     {"primary_metric": "auc", "decision_threshold": 0.5},
     {"primary_metric": "ssim", "ssim_parameters": {"window_size": 7}},
-    {"primary_metric": "custom_research_metric", "custom_protocol": {"setting": 1}},
+    {"primary_metric": "custom_research_metric", "maximize": True, "custom_protocol": {"setting": 1}},
 ])
 def test_supported_partial_declarations_and_custom_extension_still_pass(package, contract):
     write_contract(package, contract)

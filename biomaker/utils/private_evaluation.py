@@ -49,16 +49,28 @@ def evaluate_private_outputs(
         payload["error"] = result.error or "Frozen evaluator private scoring failed."
         return payload
     score = result.details["score"]
-    payload["results"] = [
-        {
-            "name": "private_test",
-            "source": hidden.path.name,
-            "visible_to_agent": False,
-            "metric_name": "private_" + str(contract.metric.primary_metric),
-            "value": result.metric,
-            "maximize": result.maximize,
-            "metrics": score["metrics"],
-            "n": score.get("n"),
-        }
-    ]
+    item = {
+        "name": "private_test",
+        "source": hidden.path.name,
+        "visible_to_agent": False,
+        "metrics": score["metrics"],
+        "metric_specs": contract.metric.metrics,
+        "n": score.get("n"),
+    }
+    definitions = contract.metric.metrics
+    if contract.prediction.raw.get("evaluator_api_version", 2) == 2:
+        # Original frozen v2 runs retain their scalar reporting contract.
+        item.update(
+            metric_name="private_" + str(contract.metric.primary_metric),
+            value=result.metric,
+            maximize=result.maximize,
+        )
+    elif len(definitions) == 1:
+        spec = definitions[0]
+        item.update(
+            metric_name="private_" + spec["name"],
+            value=score["metrics"].get(spec["name"]),
+            maximize=spec["maximize"],
+        )
+    payload["results"] = [item]
     return payload

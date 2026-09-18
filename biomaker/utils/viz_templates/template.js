@@ -17,9 +17,16 @@ if (window.hljs?.initHighlightingOnLoad) {
 }
 
 const updateTargetDims = () => {
-  if (isEmbeddedTree) return [windowWidth, windowHeight];
-  if (windowWidth <= 900) return [windowWidth, windowHeight * 0.48];
-  return [windowWidth * 0.58, windowHeight];
+  const dims = isEmbeddedTree ? [windowWidth, windowHeight]
+    : windowWidth <= 900 ? [windowWidth, windowHeight * 0.48]
+      : [windowWidth * 0.58, windowHeight];
+  if ((treeStructData.ranking_snapshot?.metric_specs || []).length >= 2) {
+    const rows = new Map();
+    for (const [, y] of treeStructData.layout || []) rows.set(y, (rows.get(y) || 0) + 1);
+    dims[0] = Math.max(dims[0], Math.max(1, ...rows.values()) * 112 + 80);
+    dims[1] = Math.max(180, dims[1] - 16);
+  }
+  return dims;
 };
 
 const escapeHtml = (value) =>
@@ -142,6 +149,92 @@ const formatMetric = (value) => {
   if (value === null || value === undefined || value === "") return "n/a";
   const num = Number(value);
   return Number.isFinite(num) ? num.toFixed(4) : String(value);
+};
+
+const formatRank = (value) => value == null ? "n/a" : Number(value).toFixed(2);
+
+const renderMetricTable = (summary) => {
+  const specs = summary.metric_specs || [];
+  if (!specs.length) return metricLine("Validation metric", formatMetric(summary.metric));
+  return `<div class="table-scroll"><table class="ranking-table metrics-table">
+    <thead><tr><th scope="col">Metric</th><th scope="col">Value</th><th scope="col">Direction</th><th scope="col">Rank</th></tr></thead>
+    <tbody>${specs.map((spec) => `<tr>
+      <th scope="row">${escapeHtml(spec.name)}</th>
+      <td title="${escapeHtml(summary.metrics?.[spec.name] ?? "")}">${escapeHtml(formatMetric(summary.metrics?.[spec.name]))}</td>
+      <td>${spec.maximize ? "↑ Maximize" : "↓ Minimize"}</td>
+      <td>${escapeHtml(formatRank(summary.metric_ranks?.[spec.name]))}</td>
+    </tr>`).join("")}</tbody></table></div>`;
+};
+
+const renderRankingDetails = (summary) => {
+  if (!summary.node_id) return "";
+  const ranked = summary.selection_policy === "average_rank";
+  const extras = Object.entries(summary.diagnostic_metrics || {});
+  return `<h3>${ranked ? "Current ranking" : "Validation results · legacy selection"}</h3>
+    ${ranked ? `<div class="metrics-grid">
+      ${metricLine("Average rank", formatRank(summary.average_rank))}
+      ${metricLine("Worst rank", formatRank(summary.worst_rank))}
+      ${metricLine("Candidates", summary.candidate_count)}
+    </div><p class="muted">Ranks are relative to the current candidate set; lower is better.</p>` : ""}
+    ${summary.is_best ? '<p class="best-pill">Selected best node</p>' : ""}
+    <p class="muted">Status: ${escapeHtml(summary.status)} · Stage: ${escapeHtml(summary.stage || "n/a")}${ranked && summary.average_rank == null ? " · Excluded from ranking" : ""}</p>
+    ${renderMetricTable(summary)}
+    ${extras.length ? `<details class="diagnostic-metrics"><summary>Additional diagnostic metrics</summary>
+      <div class="table-scroll"><table class="ranking-table"><tbody>${extras.map(([name, value]) => `<tr><th scope="row">${escapeHtml(name)}</th><td>${escapeHtml(formatMetric(value))}</td></tr>`).join("")}</tbody></table></div></details>` : ""}`;
+};
+
+// Sorting and filtering only reorder the exported rows; they never recompute ranks.
+const candidateRowsForView = (sortName = "", query = "") => {
+  const rows = [...(treeStructData.candidates || [])];
+  const spec = (treeStructData.ranking_snapshot?.metric_specs || []).find((item) => item.name === sortName);
+  if (spec) rows.sort((a, b) => {
+    const aValue = a.metrics?.[spec.name];
+    const bValue = b.metrics?.[spec.name];
+    const aValid = aValue != null && Number.isFinite(Number(aValue));
+    const bValid = bValue != null && Number.isFinite(Number(bValue));
+    if (aValid !== bValid) return aValid ? -1 : 1;
+    return aValid ? (Number(aValue) - Number(bValue)) * (spec.maximize ? -1 : 1) : 0;
+  });
+  const normalized = query.trim().toLowerCase();
+  return rows.filter((row) => `${row.node_id} ${row.step} ${row.status}`.toLowerCase().includes(normalized));
+};
+
+const renderCandidateRows = () => {
+  const target = document.getElementById("candidate-table");
+  if (!target) return;
+  const specs = treeStructData.ranking_snapshot?.metric_specs || [];
+  const ranked = treeStructData.ranking_snapshot?.selection_policy === "average_rank";
+  const rows = candidateRowsForView(
+    document.getElementById("candidate-sort")?.value || "",
+    document.getElementById("candidate-filter")?.value || "",
+  );
+  target.innerHTML = rows.length ? `<div class="table-scroll"><table class="ranking-table candidates-table">
+    <thead><tr><th scope="col">Node</th><th scope="col">${ranked ? "Average rank" : "Validation metric"}</th>
+      ${ranked ? '<th scope="col">Worst rank</th>' : ""}
+      ${specs.map((spec) => `<th scope="col">${escapeHtml(spec.name)} ${spec.maximize ? "↑" : "↓"}</th>`).join("")}
+    </tr></thead><tbody>${rows.map((row) => `<tr data-tree-index="${row.tree_index}"${row.is_best ? ' class="best-row"' : ""}>
+      <th scope="row"><button type="button" data-tree-index="${row.tree_index}">${escapeHtml(row.step)}: ${escapeHtml(row.node_id)}${row.is_best ? ' <span class="best-tag">Best</span>' : ""}</button></th>
+      <td>${escapeHtml(ranked ? formatRank(row.average_rank) : formatMetric(row.metric))}</td>
+      ${ranked ? `<td>${escapeHtml(formatRank(row.worst_rank))}</td>` : ""}
+      ${specs.map((spec) => `<td title="${escapeHtml(row.metrics?.[spec.name] ?? "")}">${escapeHtml(formatMetric(row.metrics?.[spec.name]))}</td>`).join("")}
+    </tr>`).join("")}</tbody></table></div>` : '<p class="muted">No matching ranked candidates.</p>';
+};
+
+const initializeCandidateTable = () => {
+  const sort = document.getElementById("candidate-sort");
+  if (sort) {
+    sort.innerHTML = '<option value="">Selection order</option>' + (treeStructData.ranking_snapshot?.metric_specs || [])
+      .map((spec) => `<option value="${escapeHtml(spec.name)}">${escapeHtml(spec.name)} ${spec.maximize ? "↑" : "↓"}</option>`).join("");
+    sort.addEventListener("change", renderCandidateRows);
+  }
+  document.getElementById("candidate-filter")?.addEventListener("input", renderCandidateRows);
+  document.getElementById("candidate-table")?.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-tree-index]");
+    if (!row) return;
+    selectTreeNode(Number(row.dataset.treeIndex), { manual: true, openDrawer: isEmbeddedTree });
+    redraw();
+  });
+  renderCandidateRows();
 };
 
 const promptTokenText = (stats) => {
@@ -410,8 +503,9 @@ const setNodeDetails = (treeInd, { restoreView = false } = {}) => {
     const prompt = (treeStructData.prompts || [])[treeInd] || {};
     const stats = prompt.stats || {};
     summaryElm.innerHTML = `
+      ${renderRankingDetails(summary)}
+      <h3>Resources</h3>
       <div class="metrics-grid">
-        ${metricLine("val metric", formatMetric(summary.metric))}
         ${metricLine("llm time", formatSeconds(stats.request_time_seconds))}
         ${metricLine("execution time", summary.runtime)}
         ${metricLine("cpu usage", summary.cpu)}
@@ -421,7 +515,6 @@ const setNodeDetails = (treeInd, { restoreView = false } = {}) => {
         ${metricLine("input tokens", promptTokenText(stats))}
         ${metricLine("output tokens", formatNumber(stats.output_tokens))}
       </div>
-      ${summary.is_best ? '<p class="best-pill">best node</p>' : ""}
     `;
   }
 
@@ -476,6 +569,9 @@ const setRunSummary = () => {
   elm.innerHTML = `
     <span>${escapeHtml(s.exp_name || "BioMaker run")}</span>
     <b>best ${escapeHtml(compact(s.best_metric))}</b>
+    <span>${escapeHtml(s.metric_label || "Validation metric")}</span>
+    <span>${escapeHtml(s.candidate_count ?? 0)} candidates · ${escapeHtml(s.metric_count ?? 0)} metrics</span>
+    <span>selected ${escapeHtml(s.best_node_id || "none")}</span>
     <span>valid ${escapeHtml(s.valid ?? 0)}</span>
     <span>bug ${escapeHtml(s.bug ?? 0)}</span>
     <span>steps ${escapeHtml(s.steps ?? 0)}</span>
@@ -488,6 +584,8 @@ const setRunSummary = () => {
         s.exp_name || "BioMaker run",
       )}</strong>
       <span class="best-value">best ${escapeHtml(compact(s.best_metric))}</span>
+      <span class="metric-heading">${escapeHtml(s.metric_label || "Validation metric")}</span>
+      <span>${escapeHtml(s.candidate_count ?? 0)} candidates · ${escapeHtml(s.metric_count ?? 0)} metrics</span>
       <span>${escapeHtml(s.steps ?? 0)} steps</span>
     `;
   }
@@ -653,6 +751,13 @@ const selectTreeNode = (
   nodes.forEach((node) => {
     node.selected = node.treeInd === treeInd;
   });
+  const treePane = document.getElementById("tree-canvas");
+  if (treePane && canvas) {
+    const center = nodes[treeInd].x + width / 2;
+    if (center < treePane.scrollLeft + 60 || center > treePane.scrollLeft + treePane.clientWidth - 60) {
+      treePane.scrollLeft = Math.max(0, center - treePane.clientWidth / 2);
+    }
+  }
   manualSelection = manual;
   setNodeDetails(treeInd, { restoreView });
   if (!restoreView) {
@@ -778,6 +883,8 @@ const initializeTreeUi = () => {
 windowResized = () => {
   persistTreeUiState();
   resizeCanvas(...updateTargetDims());
+  canvas?.elt?.style.setProperty("width", `${width}px`, "important");
+  canvas?.elt?.style.setProperty("height", `${height}px`, "important");
   nodes = [];
   edges = [];
   treeInitialized = false;
@@ -816,6 +923,9 @@ let treeInitialized = false;
 
 setup = () => {
   canvas = createCanvas(...updateTargetDims());
+  canvas.parent("tree-canvas");
+  canvas.elt.style.setProperty("width", `${width}px`, "important");
+  canvas.elt.style.setProperty("height", `${height}px`, "important");
   canvas.attribute(
     "aria-label",
     "BioMaker search tree. Use arrow keys to change nodes and Enter to open details.",
@@ -828,6 +938,7 @@ setup = () => {
   document.documentElement.dataset.treeReady = "true";
   restoredUiState = readTreeUiState();
   setRunSummary();
+  initializeCandidateTable();
   initializeTreeUi();
 };
 
@@ -850,14 +961,16 @@ class Node {
   isStarred = false;
   selected = false;
   renderSize = 10;
+  renderWidth = 10;
   edges = [];
   bgCol;
 
   constructor(x, y, relSize, treeInd) {
     const nodeCount = Math.max(treeStructData.layout.length, 1);
     const crowdScale = Math.max(0.6, Math.min(1.0, 22 / nodeCount));
-    const minSize = 24 * crowdScale;
-    const maxSize = 38 * crowdScale;
+    const multi = (treeStructData.summaries?.[treeInd]?.metric_specs || []).length >= 2;
+    const minSize = multi ? 54 : 24 * crowdScale;
+    const maxSize = multi ? 54 : 38 * crowdScale;
 
     const maxColor = 10;
     const minColor = 125;
@@ -920,6 +1033,9 @@ class Node {
       }
     }
 
+    const multiMetricLabel = (treeStructData.summaries?.[this.treeInd]?.metric_specs || []).length >= 2;
+    this.renderWidth = multiMetricLabel ? this.renderSize * 1.8 : this.renderSize;
+
     fill(this.color);
     if (status === "virtual") {
       fill(rootCol);
@@ -937,9 +1053,10 @@ class Node {
       circle(this.x, this.y, Math.max(8, this.renderSize * 0.42));
       noStroke();
     } else {
-      square(
-        this.x - this.renderSize / 2,
+      rect(
+        this.x - this.renderWidth / 2,
         this.y - this.renderSize / 2,
+        this.renderWidth,
         this.renderSize,
         8,
       );
@@ -952,9 +1069,10 @@ class Node {
       if (status === "virtual") {
         circle(this.x, this.y, Math.max(14, this.renderSize * 0.7));
       } else {
-        square(
-          this.x - this.renderSize / 2 - 4,
+        rect(
+          this.x - this.renderWidth / 2 - 4,
           this.y - this.renderSize / 2 - 4,
+          this.renderWidth + 8,
           this.renderSize + 8,
           9,
         );
@@ -965,7 +1083,8 @@ class Node {
     noStroke();
     textAlign(CENTER, CENTER);
     const label = (treeStructData.display_labels || [])[this.treeInd] || "";
-    textSize(status === "virtual" ? this.renderSize / 3 : this.renderSize / 3.2);
+    textSize(multiMetricLabel ? 10 : status === "virtual" ? this.renderSize / 3 : this.renderSize / 3.2);
+    textLeading(multiMetricLabel ? 14 : this.renderSize / 2.8);
     fill(255);
     if (status !== "virtual") {
       text(label, this.x, this.y - 1);
@@ -973,7 +1092,7 @@ class Node {
     if (isBest) {
       textSize(this.renderSize / 2.2);
       fill(bestCol);
-      text("*", this.x + this.renderSize * 0.55, this.y - this.renderSize * 0.5);
+      text("*", this.x + this.renderWidth * 0.55, this.y - this.renderSize * 0.5);
     }
 
     const dotAnimThreshold = 0.85;
@@ -1120,7 +1239,8 @@ const nodeAtPointer = () => {
   return [...nodes].reverse().find(
     (node) =>
       node.animationProgress > 0 &&
-      dist(localX, localY, node.x, node.y) < node.renderSize / 1.5,
+      Math.abs(localX - node.x) <= node.renderWidth / 2 + 5 &&
+      Math.abs(localY - node.y) <= node.renderSize / 2 + 5,
   );
 };
 
@@ -1170,6 +1290,10 @@ mousePressed = (event) => {
 };
 
 mouseMoved = (event) => {
+  if (canvas?.elt) {
+    const hovered = event?.target === canvas.elt ? nodeAtPointer() : null;
+    canvas.elt.title = hovered ? (treeStructData.labels?.[hovered.treeInd] || "") : "";
+  }
   if (event?.target === canvas?.elt && animationsSettled()) redraw();
 };
 
@@ -1189,7 +1313,7 @@ draw = () => {
 
   if (!treeInitialized) {
     treeInitialized = true;
-    const nodeSafeInset = 28;
+    const nodeSafeInset = (treeStructData.ranking_snapshot?.metric_specs || []).length >= 2 ? 64 : 28;
     const toolbarBottom = document
       .getElementById("tree-toolbar")
       ?.getBoundingClientRect().bottom;
@@ -1200,9 +1324,7 @@ draw = () => {
       nodeSafeInset,
       (toolbarBottom || 0) + nodeSafeInset,
     );
-    const topInset = isEmbeddedTree
-      ? Math.min(requestedTopInset, Math.max(0, height - bottomInset))
-      : height * 0.08;
+    const topInset = Math.min(requestedTopInset, Math.max(0, height - bottomInset));
     const spacingHeight = Math.max(0, height - topInset - bottomInset);
     const spacingWidth = Math.max(0, width - nodeSafeInset * 2);
     (treeStructData.layout || []).forEach((lay, index) => {

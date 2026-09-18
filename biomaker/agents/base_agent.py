@@ -1,5 +1,6 @@
 import logging
 import json
+import copy
 from dataclasses import dataclass
 from typing import Any, Callable, cast
 
@@ -16,6 +17,7 @@ from ..utils.evaluator_setup import (
 )
 from ..utils.environment import environment_manifest_text
 from ..utils.metric import MetricValue, WorstMetricValue
+from ..utils.ranking import finite_metric, validated_metric_specs
 from ..utils.response import (
     extract_code_blocks,
     extract_text_up_to_code,
@@ -38,6 +40,7 @@ class RoundTask:
     parent: Node | None
     selection_reason: str
     draft_plan: str | None = None
+    selection_snapshot: dict[str, Any] | None = None
 
 
 def parse_factual_exec_result(
@@ -49,28 +52,73 @@ def parse_factual_exec_result(
 ) -> None:
     """Parse factual execution/evaluator output into a node."""
     node.absorb_exec_result(exec_result)
+    node.metrics = {}
+    node.metric_specs = []
     evaluator_result = (
         exec_result.evaluator_result
         if isinstance(exec_result.evaluator_result, dict)
         else None
     )
+    if evaluator_result is None:
+        logged = parse_external_validation_details(exec_result.term_out)
+        if isinstance(logged, dict) and isinstance(logged.get("metrics"), dict):
+            evaluator_result = dict(logged)
+            # The legacy EXTERNAL_VALIDATION log is emitted only after scoring
+            # succeeds. An explicit failure remains authoritative if present.
+            evaluator_result.setdefault("ok", True)
     external_metric = None
+    external_metrics = None
+    metric_specs = []
     if evaluator_result is not None:
         details = evaluator_result.get("details")
         if not isinstance(details, dict):
             details = {}
-        node.artifact_report = details.get("artifact_report")
+        node.artifact_report = details.get("artifact_report") or parse_artifact_report(
+            exec_result.term_out
+        )
         score_details = {k: v for k, v in details.items() if k != "artifact_report"}
         node.evaluator_details = {
             "metric": evaluator_result.get("metric"),
             "maximize": bool(evaluator_result.get("maximize", True)),
             "details": score_details,
         }
+        values = evaluator_result.get("metrics")
+        if not isinstance(values, dict):
+            legacy_score = score_details.get("score", {})
+            values = (
+                legacy_score.get("metrics") if isinstance(legacy_score, dict) else None
+            )
+        legacy_score = score_details.get("score", {})
+        metric_specs = (
+            evaluator_result.get("metric_specs")
+            or (
+                legacy_score.get("metric_specs")
+                if isinstance(legacy_score, dict)
+                else None
+            )
+            or []
+        )
+        if metric_specs:
+            metric_specs = validated_metric_specs(metric_specs)
+        if isinstance(values, dict):
+            # Preserve finite diagnostic values as well as declared objectives.
+            # Completeness is checked against the frozen target names below.
+            external_metrics = {
+                name: finite_metric(value) for name, value in values.items()
+            }
+            node.metrics = {
+                name: value
+                for name, value in external_metrics.items()
+                if value is not None
+            }
+            node.metric_specs = metric_specs
+            node.evaluator_details["metrics"] = node.metrics
+            node.evaluator_details["metric_specs"] = metric_specs
         metric = evaluator_result.get("metric")
         if evaluator_result.get("ok") and not isinstance(metric, bool):
             try:
                 external_metric = (
-                    float(metric),
+                    finite_metric(metric),
                     bool(evaluator_result.get("maximize", True)),
                 )
             except (TypeError, ValueError):
@@ -81,14 +129,38 @@ def parse_factual_exec_result(
         external_metric = parse_external_validation(exec_result.term_out)
 
     node.analysis = ""
-    node.is_buggy = node.exc_type is not None or external_metric is None
+    if external_metrics is not None:
+        declared_names = [spec["name"] for spec in metric_specs] or list(
+            external_metrics
+        )
+        valid_result = (
+            bool(evaluator_result.get("ok"))
+            and bool(declared_names)
+            and all(external_metrics.get(name) is not None for name in declared_names)
+        )
+    else:
+        valid_result = (
+            external_metric is not None
+            and finite_metric(external_metric[0]) is not None
+        )
+    node.is_buggy = node.exc_type is not None or not valid_result
     if node.is_buggy:
         node.metric = WorstMetricValue()
         if not record_context:
             node.outcome = "bug"
     else:
-        metric, maximize = external_metric
-        node.metric = MetricValue(metric, maximize=maximize)
+        if external_metrics is not None and len(metric_specs) == 1:
+            spec = metric_specs[0]
+            node.metric = MetricValue(
+                node.metrics[spec["name"]], maximize=spec["maximize"]
+            )
+        elif external_metrics is not None and len(metric_specs) > 1:
+            node.metric = None
+        elif external_metric is not None:
+            metric, maximize = external_metric
+            node.metric = MetricValue(metric, maximize=maximize)
+        else:
+            node.metric = None
 
     if record_context:
         node.record_experiment_context(best_node_before=best_node_before)
@@ -139,6 +211,7 @@ class BaseAgent:
         based only on completed nodes already present in the journal.
         """
         search_cfg = self.acfg.search
+        snapshot = self.journal.ranking_snapshot()
 
         def journal_child_count(node: Node) -> int:
             return sum(1 for child in self.journal.nodes if child.parent is node)
@@ -149,6 +222,7 @@ class BaseAgent:
             return [
                 RoundTask(
                     parent=None,
+                    selection_snapshot=copy.deepcopy(snapshot),
                     selection_reason=(
                         "bootstrap selected virtual root draft "
                         f"({current + idx + 1}/{search_cfg.max_children_per_node})"
@@ -160,31 +234,24 @@ class BaseAgent:
         tasks: list[RoundTask] = []
         improve_candidates = [
             n
-            for n in self.journal.good_nodes
-            if (
-                n.metric is not None
-                and journal_child_count(n) < search_cfg.max_children_per_node
-            )
+            for n in self.journal.ranked_nodes(snapshot)
+            if (journal_child_count(n) < search_cfg.max_children_per_node)
         ]
         if improve_candidates:
-            ranked_candidates = sorted(
-                improve_candidates,
-                key=lambda n: (
-                    n.metric,
-                    -(n.step if n.step is not None else 10**9),
-                ),
-                reverse=True,
-            )
+            ranked_candidates = improve_candidates
             top_candidates = ranked_candidates[: search_cfg.topk_improve]
             for selected in top_candidates:
-                rank = ranked_candidates.index(selected)
+                rank = snapshot["ordered_node_ids"].index(selected.id)
                 tasks.append(
                     RoundTask(
                         parent=selected,
+                        selection_snapshot=copy.deepcopy(snapshot),
                         selection_reason=(
                             "round global frontier selected node "
                             f"{selected.id[:8]} rank {rank + 1} "
-                            f"within top {len(top_candidates)} successful expandable nodes"
+                            f"of {snapshot['candidate_count']} valid candidates; "
+                            f"within top {len(top_candidates)} successful expandable nodes "
+                            f"(snapshot {snapshot['version']})"
                         ),
                     )
                 )
@@ -204,6 +271,7 @@ class BaseAgent:
             tasks.append(
                 RoundTask(
                     parent=selected_bug,
+                    selection_snapshot=copy.deepcopy(snapshot),
                     selection_reason=(
                         "round frontier debug selected buggy node "
                         f"(depth {selected_bug.debug_depth + 1}/"
@@ -245,16 +313,26 @@ class BaseAgent:
             "If you use PyTorch, the code must run on CPU, CUDA, and Apple MPS by selecting the available device dynamically; do not hard-code CUDA or MPS-only execution.",
             "Do not import unlisted third-party packages, and do not install packages.",
             "You may use pretrained model weights from installed libraries when useful, including downloading those weights at runtime. Do not install packages or modify the uv environment.",
-            "Use observed validation metric, runtime, and resource history when deciding training budget; if you change the budget, make it an explicit part of the proposed experiment.",
+            "Use all observed validation metrics, runtime, and resource history when deciding training budget; if you change the budget, make it an explicit part of the proposed experiment.",
             "When relevant, consider reducing execution time and improving GPU utilization while preserving validation quality.",
             f"The per-node execution timeout is {timeout_text}. This is a hard safety limit, not a target budget. Choose the experiment scale from the task, data, observed validation metric, runtime, and resource history so the full script is likely to finish well before the timeout.",
             'All the provided input data is stored in "./input" directory.',
             "When building data loading code, base it on the actual existing data files rather than relying entirely on the annotation file.",
             "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` for score-validation predictions and `./working/submission.csv`.",
             "The Experiment guide's evaluation_protocol provides the complete frozen output and metric contract, including thresholds, class order, units, crops and aggregation when applicable. Harness owns final metric calculation; your program produces predictions. Choose the model, loss, training strategy, augmentation and preprocessing yourself within the task requirements, and convert final predictions back to the declared evaluation representation.",
-            "BioMaker computes the final node score after your script exits using hidden score labels that are not available to generated code. You may call `evaluator.validate_submission()` yourself after writing the required files, but do not call `evaluator.score_val()` inside generated code because the hidden score labels are only supplied to BioMaker's external scoring process.",
+            "BioMaker computes the final validation metrics after your script exits using hidden score labels that are not available to generated code. You may call `evaluator.validate_submission()` yourself after writing the required files, but do not call `evaluator.score_val()` inside generated code because the hidden score labels are only supplied to BioMaker's external scoring process.",
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
         ]
+        if (
+            getattr(getattr(self, "journal", None), "selection_policy", None)
+            == "average_rank"
+        ):
+            impl_guideline.append(
+                "Every declared metric is an equally important objective with its own optimization direction. "
+                "BioMaker ranks all completed valid candidates independently per metric, then selects by mean rank, "
+                "worst individual rank, and earlier step. Use raw metric values to explain tradeoffs; ranks are relative "
+                "to the stated candidate population, so changes across different populations are not performance gains."
+            )
         if self.acfg.expose_prediction:
             impl_guideline.append(
                 "The implementation should include a predict() function, "
@@ -476,6 +554,9 @@ class BaseAgent:
             stage=node.node_status,
             is_buggy=node.is_buggy,
             metric=None if node.metric is None else node.metric.value,
+            metrics=node.metrics,
+            metric_specs=node.metric_specs,
+            selection_snapshot=node.selection_snapshot,
             maximize=None if node.metric is None else node.metric.maximize,
             outcome=node.outcome,
             exec_time=node.exec_time,

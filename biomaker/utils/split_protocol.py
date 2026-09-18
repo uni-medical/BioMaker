@@ -716,6 +716,8 @@ def prepare_split_protocol(
             split_plan["key_columns"] = split_manifest.get("key_columns")
         metric_contract = split_manifest.get("metric_contract")
         if isinstance(metric_contract, dict):
+            if "metrics" in metric_contract:
+                split_plan["metrics"] = metric_contract["metrics"]
             if metric_contract.get("primary_metric"):
                 split_plan["primary_metric"] = metric_contract["primary_metric"]
             if "maximize" in metric_contract:

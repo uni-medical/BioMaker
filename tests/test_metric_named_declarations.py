@@ -84,11 +84,11 @@ def test_evaluator_applies_nested_units_to_fixed_reader(tmp_path):
          "answer_columns": ["target"], "file_reference_columns": []},
         tmp_path, "", require_match=False,
     )
-    assert actual["primary_metric"] == "mae" and actual["units"] == "months"
+    assert actual["metrics"][0]["name"] == "mae" and actual["units"] == "months"
 
 
 def test_custom_named_metric_preserves_unknown_protocol_and_checks_evaluator(tmp_path):
-    contract = {"primary_metric": {"name": "research_metric", "research_protocol": {"matching": "one_to_one", "weights": [1, 2]}}}
+    contract = {"primary_metric": {"name": "research_metric", "maximize": True, "research_protocol": {"matching": "one_to_one", "weights": [1, 2]}}}
     manifest_at(tmp_path, contract)
     canonical = canonical_metric_contract(contract)
     assert canonical["research_protocol"] == contract["primary_metric"]["research_protocol"]
@@ -114,10 +114,11 @@ def test_task_metric_can_supply_alias_context_without_becoming_a_new_declaration
 
 
 def test_custom_extension_keeps_task_metric_context_after_protocol_block(tmp_path):
-    manifest_at(tmp_path, {"secondary_metrics": ["research_metric"]})
-    task = 'Primary metric: SSIM.\n```restoration-evaluation\n{"data_range": 1, "ssim_parameters": {"window_size": 7}}\n```'
+    definitions = [{"name": "ssim", "maximize": True}, {"name": "research_metric", "maximize": False}]
+    manifest_at(tmp_path, {"metrics": definitions})
+    task = '```metrics\n' + json.dumps(definitions) + '\n```\n```restoration-evaluation\n{"data_range": 1, "ssim_parameters": {"window_size": 7}}\n```'
     evaluator_setup._validate_custom_metric_contract(
-        {"primary_metric": "ssim", "secondary_metrics": ["research_metric"], "ssim_parameters": {"win_size": 7},
+        {"metrics": definitions, "ssim_parameters": {"win_size": 7},
          "restoration_evaluation": {"data_range": 1, "crop_size": None, "groups": None, "aggregation": "mean_images"}},
         tmp_path, task,
     )

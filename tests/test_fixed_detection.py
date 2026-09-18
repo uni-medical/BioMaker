@@ -131,9 +131,9 @@ def context():
 def test_admission_and_custom_protocol_fallback():
     task = "Primary evaluation metric: mAP@0.5\nSecondary evaluation metric: Recall at IoU=0.50"
     spec = fixed_detection_spec(context(), task)
-    assert spec["primary_metric"] == "ap50"
+    assert spec["metrics"][0] == {"name": "ap50", "maximize": True}
     assert spec["prediction_schema"]["box_format"] == "cxcywh"
-    assert spec["secondary_metrics"] == ["recall"]
+    assert spec["metrics"][1:] == [{"name": "recall", "maximize": True}]
     for extra in [
         "\nUse COCO interpolation.",
         "\nRecall confidence threshold: 0.2",

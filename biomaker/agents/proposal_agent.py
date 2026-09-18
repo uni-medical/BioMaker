@@ -734,6 +734,7 @@ class ProposalAgent(BaseAgent):
         return plans
 
     def _root_draft_plan_summaries(self) -> str:
+        snapshot = self.journal.ranking_snapshot()
         drafts = sorted(
             self.journal.draft_nodes,
             key=lambda node: (
@@ -760,6 +761,8 @@ class ProposalAgent(BaseAgent):
                 if node.metric is None or node.metric.value is None
                 else f"{float(node.metric.value):.4f}"
             )
+            if node.metrics:
+                metric = json.dumps(node.metrics, sort_keys=True)
             step = "not_scored" if node.step is None else str(node.step)
             lines.append(
                 "\n".join(
@@ -767,7 +770,8 @@ class ProposalAgent(BaseAgent):
                         f"- step: {step}",
                         f"  id: {node.id[:8]}",
                         f"  result: {result}",
-                        f"  validation_metric: {metric}",
+                        f"  validation_metrics: {metric}",
+                        f"  current_ranking: {json.dumps(snapshot['nodes'].get(node.id))}",
                         f"  plan: {node.plan or ''}",
                     ]
                 )
@@ -786,6 +790,7 @@ class ProposalAgent(BaseAgent):
                     f"bootstrap root draft plan {idx}/{len(tasks)}: {plans[idx - 1]}"
                 ),
                 draft_plan=plans[idx - 1],
+                selection_snapshot=task.selection_snapshot,
             )
             for idx, task in enumerate(tasks, start=1)
         ]
@@ -928,6 +933,7 @@ class ProposalAgent(BaseAgent):
             ),
             parent_id=None if parent_node is None else parent_node.id,
             selection_reason=selection_reason,
+            selection_snapshot=task.selection_snapshot,
         )
 
         if parent_node is None:
@@ -937,6 +943,7 @@ class ProposalAgent(BaseAgent):
         else:
             result_node = self._improve(parent_node)
         result_node.selection_reason = selection_reason
+        result_node.selection_snapshot = task.selection_snapshot
         return result_node
 
     def step(self, exec_callback: ExecCallbackType):

@@ -68,7 +68,7 @@ def test_group_aggregation_alignment_and_shared_splits(tmp_path,monkeypatch):
     result=m['score']('pred.csv','truth.csv','expected.csv')
     raw=(20*np.log10(255)+20*np.log10(255/3))/2
     avg=20*np.log10(255/20)
-    assert result['metric']==pytest.approx((raw+avg)/2)
+    assert result['metrics']['psnr']==pytest.approx((raw+avg)/2)
     assert result['metrics']['psnr/raw']==pytest.approx(raw)
     assert result['metrics']['psnr/avg2']==pytest.approx(avg)
     m['SPEC']['score_split']='expected.csv';m['SPEC']['validation_artifact']='pred.csv'
@@ -79,7 +79,7 @@ def test_group_aggregation_alignment_and_shared_splits(tmp_path,monkeypatch):
     e.to_csv('test.csv',index=False)
     for source,dest in [('pred.csv','test_pred.csv'),('truth.csv','test_truth.csv')]:
         d=pd.read_csv(source,dtype=str);d[d.id.isin(e.id)].to_csv(dest,index=False)
-    assert m['score']('test_pred.csv','test_truth.csv','test.csv')['metric']==pytest.approx((20*np.log10(255)+avg)/2)
+    assert m['score']('test_pred.csv','test_truth.csv','test.csv')['metrics']['psnr']==pytest.approx((20*np.log10(255)+avg)/2)
 
 
 def test_corner_mean_not_whole_image_psnr():
@@ -124,7 +124,7 @@ def test_admission_and_fmd_contract():
         c[k]=pd.DataFrame({'id':list('abcde'),'noisy_image_path':['x.png']*5,'noise_level':['raw','avg2','avg4','avg8','avg16']})
     s=fixed_restoration_spec(c,text)
     assert s['restoration_evaluation']['crop_size']==256
-    assert s['secondary_metrics']==['ssim']
+    assert s['metrics']==[{'name':'psnr','maximize':True},{'name':'ssim','maximize':True}]
 
 
 def test_frozen_writer_and_format_only_submission(tmp_path,monkeypatch):
@@ -150,11 +150,11 @@ def test_whole_image_and_image_weighting(tmp_path, monkeypatch):
     m['P']['aggregation'] = 'mean_images'
     got = m['score']('pred.csv', 'truth.csv', 'expected.csv')
     expected = np.mean([20*np.log10(255/e) for e in (1, 3, 20)])
-    assert got['metric'] == pytest.approx(expected)
+    assert got['metrics']['psnr'] == pytest.approx(expected)
     m['P']['group_column'] = None
     m['P']['groups'] = None
     ungrouped = m['score']('pred.csv', 'truth.csv', 'expected.csv')
-    assert ungrouped['metric'] == pytest.approx(expected)
+    assert ungrouped['metrics']['psnr'] == pytest.approx(expected)
     assert ungrouped['per_group'] == {}
 
 

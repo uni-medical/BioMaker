@@ -25,7 +25,7 @@ dynamic = ["dependencies"]
 biomaker = "biomaker.run:run"
 
 [tool.setuptools]
-package-data = {biomaker = ["utils/config.yaml", "utils/viz_templates/*"]}
+package-data = {biomaker = ["utils/config.yaml", "utils/viz_templates/*", "utils/_vendor/*/LICENSE", "utils/_vendor/*/PROVENANCE.md"]}
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}

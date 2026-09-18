@@ -492,7 +492,7 @@ class DeterministicEvaluatorCompilerTests(unittest.TestCase):
                     [
                         "from pathlib import Path",
                         "def prediction_spec():",
-                        "    return {'evaluator_api_version': 2, 'secondary_metrics': [], 'maximize': True, 'validation_artifact': './working/validation_predictions.csv', 'test_submission': './working/submission.csv', 'key_columns': [], 'prediction_columns': ['prob_0'], 'primary_metric': 'accuracy'}",
+                        "    return {'evaluator_api_version': 3, 'metrics': [{'name': 'accuracy', 'maximize': True}], 'validation_artifact': './working/validation_predictions.csv', 'test_submission': './working/submission.csv', 'key_columns': [], 'prediction_columns': ['prob_0']}",
                         "def score(prediction_path, truth_path, expected_path):",
                         "    return {'metric': 1.0, 'maximize': True, 'metrics': {'accuracy': 1.0}}",
                         "def score_val():",

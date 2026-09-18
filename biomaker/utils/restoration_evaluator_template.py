@@ -69,7 +69,7 @@ from PIL import Image
 
 SPEC = __BIOMAKER_SPEC__
 P = SPEC['restoration_evaluation']
-METRICS = list(dict.fromkeys([SPEC['primary_metric'], *SPEC['secondary_metrics']]))
+METRICS = [item['name'] for item in SPEC['metrics']] if 'metrics' in SPEC else list(dict.fromkeys([SPEC['primary_metric'], *SPEC['secondary_metrics']]))
 
 
 def prediction_spec():
@@ -160,7 +160,7 @@ def score(prediction_path, truth_path, expected_path):
     # Flat metric keys survive the shared private-report serialization.
     for g, values in per_group.items():
         metrics.update({m + '/' + g: v for m,v in values.items()})
-    return {'metric': metrics[SPEC['primary_metric']], 'maximize': True,
+    return {**({'metric': metrics[SPEC['primary_metric']], 'maximize': True} if 'metrics' not in SPEC else {}),
             'metrics': metrics, 'per_group': per_group, 'n': len(expected)}
 
 

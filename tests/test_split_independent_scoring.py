@@ -137,12 +137,10 @@ def test_explicit_requirements_checked(word):
     task = f"Primary {word} metric: mAP@0.5 (higher is better).\nSecondary {word} metric: Recall at IoU=0.50."
     assert requested_metrics(task) == ("ap50", ["recall"])
     spec = {
-        "evaluator_api_version": 2,
-        "primary_metric": "ap50",
-        "secondary_metrics": [],
-        "maximize": True,
+        "evaluator_api_version": 3,
+        "metrics": [{"name": "ap50", "maximize": True}],
     }
-    with pytest.raises(RuntimeError, match="secondary"):
+    with pytest.raises(RuntimeError, match="requested metric"):
         _validate_scoring_contract(spec, task)
 
 

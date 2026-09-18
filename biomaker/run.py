@@ -16,6 +16,10 @@ from threading import Event, RLock, Thread
 
 from omegaconf import OmegaConf
 from rich.live import Live
+from rich.markup import escape
+from rich.console import Group
+from rich.table import Table
+from rich.text import Text
 from rich.tree import Tree
 
 from . import backend
@@ -53,6 +57,7 @@ from .utils.execution_record import (
 )
 from .utils.exp_guide import write_exp_guide
 from .utils.experiment_contract import load_experiment_contract
+from .utils.evaluator_protocol import metric_definitions
 from .utils.final_retrain import run_final_retrain
 from .utils.private_evaluation import evaluate_private_outputs
 from .utils.run_manifest import write_run_manifest
@@ -88,17 +93,48 @@ def _interpreter_kwargs(cfg):
     return kwargs
 
 
-def _best_committed_node(nodes: list[Node]) -> Node | None:
-    candidates = [
-        node
-        for node in nodes
-        if node.step is not None and node.is_buggy is False and node.metric is not None
-    ]
-    return (
-        sorted(candidates, key=lambda node: node.metric, reverse=True)[0]
-        if candidates
-        else None
+def _display_ranking(journal):
+    if hasattr(journal, "ranking_snapshot"):
+        return journal.ranking_snapshot()
+    return Journal(nodes=journal.nodes).ranking_snapshot()
+
+
+def best_metrics_table(
+    journal: Journal, *, max_rows: int | None = None, ranking: dict | None = None
+):
+    """A narrow, vertical metric table; never substitute rank for raw scores."""
+    snapshot = _display_ranking(journal) if ranking is None else ranking
+    best_id = snapshot.get("best_node_id")
+    best = next((node for node in journal.nodes if node.id == best_id), None)
+    if best is None:
+        return Text("No valid scored candidate yet.", style="dim")
+    specs = snapshot.get("metric_specs", [])
+    ranks = snapshot.get("nodes", {}).get(best_id, {})
+    values = getattr(best, "metrics", {}) or {}
+    table = Table(
+        title=f"Current best · step {best.step} · {snapshot['candidate_count']} candidates",
+        show_edge=False,
+        pad_edge=False,
     )
+    table.add_column("Metric", overflow="fold")
+    table.add_column("Value", justify="right")
+    table.add_column("Direction", justify="center")
+    table.add_column("Rank", justify="right")
+    displayed = specs if max_rows is None else specs[:max_rows]
+    for spec in displayed:
+        value = values.get(spec["name"])
+        if value is None and len(specs) == 1 and best.metric is not None:
+            value = best.metric.value
+        rank = ranks.get("metric_ranks", {}).get(spec["name"])
+        table.add_row(
+            Text(spec["name"]),
+            "—" if value is None else f"{value:.6g}",
+            "↑" if spec["maximize"] else "↓",
+            "—" if rank is None else f"{rank:g}",
+        )
+    if len(displayed) < len(specs):
+        table.caption = f"+{len(specs) - len(displayed)} metrics · full values in HTML / results.tsv"
+    return table
 
 
 def journal_to_rich_tree(
@@ -106,6 +142,7 @@ def journal_to_rich_tree(
     mark_new: bool = True,
     title: str = "[bold blue]Solution tree",
     nodes: list[Node] | None = None,
+    ranking: dict | None = None,
 ):
     now = time.monotonic()
 
@@ -117,7 +154,31 @@ def journal_to_rich_tree(
 
     display_nodes = journal.nodes if nodes is None else nodes
     completed_nodes = [node for node in display_nodes if node.step is not None]
-    best_node = _best_committed_node(display_nodes)
+    snapshot = _display_ranking(journal) if ranking is None else ranking
+    specs = snapshot.get("metric_specs", [])
+    best_node = next(
+        (node for node in journal.nodes if node.id == snapshot.get("best_node_id")),
+        None,
+    )
+    rank_rows = snapshot.get("nodes", {})
+    multi = len(specs) > 1
+
+    def score_label(node):
+        row = rank_rows.get(node.id)
+        values = getattr(node, "metrics", {}) or {}
+        if len(specs) >= 3 and specs[0]["name"] in values:
+            name = specs[0]["name"]
+            rank_text = "pending" if row is None else f"{row['average_rank']:.2f}"
+            return f"Avg rank {rank_text} · {name} {values[name]:.4g}"
+        if len(specs) == 2 and all(item["name"] in values for item in specs):
+            return " · ".join(
+                f"{item['name']} {values[item['name']]:.4g}" for item in specs
+            )
+        value = values.get(specs[0]["name"]) if len(specs) == 1 else None
+        if value is None and node.metric is not None:
+            value = node.metric.value
+        return "n/a" if value is None else f"{value:.3f}"
+
     new_node = completed_nodes[-1] if mark_new and completed_nodes else None
     children_by_parent: dict[Node | None, list[Node]] = {}
     display_node_set = set(display_nodes)
@@ -148,33 +209,64 @@ def journal_to_rich_tree(
             )
             if status == "completed" and node.is_buggy:
                 s = f"[red]◍ {step_prefix}bug"
-            elif status == "completed" and node.metric is not None:
-                s = f"[cyan]● {step_prefix}{node.metric.value:.3f}"
-                if node is best_node:
-                    s += " (best)"
+            elif status == "completed" and (
+                node.metric is not None or getattr(node, "metrics", None)
+            ):
+                s = f"[cyan]● {step_prefix}{escape(score_label(node))} (not committed)"
             elif status == "completed":
                 s = f"[yellow]◌ {step_prefix}executed"
             else:
                 s = f"[{color}]◌ {step_prefix}{status}{elapsed}"
         elif node.is_buggy:
             s = "[red]◍ bug"
-        elif node.metric is None or node.metric.value is None:
+        elif node.id not in rank_rows:
             s = f"[yellow]◌ {node.node_status} n/a"
         else:
             style = "bold " if node is best_node else ""
             color = "blue" if node is new_node else "green"
-            s = f"[{style}{color}]● {node.metric.value:.3f}"
+            step_prefix = f"{node.step}: " if multi else ""
+            s = f"[{style}{color}]● {step_prefix}{score_label(node)}"
             if node is best_node:
                 s += " (best)"
         if node.step is not None and node is new_node:
             s += " (new)"
 
-        subtree = tree.add(s)
+        # Scores may carry user-defined names; render markup only for our prefix.
+        if node.id in rank_rows and node.step is not None:
+            style = (
+                "bold green"
+                if node is best_node
+                else "blue" if node is new_node else "green"
+            )
+            prefix = f"{node.step}: " if multi else ""
+            label = Text(f"● {prefix}{score_label(node)}", style=style)
+            if node is best_node:
+                label.append(" (best)")
+            if node is new_node:
+                label.append(" (new)")
+            subtree = tree.add(label)
+        else:
+            subtree = tree.add(s)
         children = children_by_parent.get(node, [])
         for child in children:
             append_rec(child, subtree)
 
-    tree = Tree(title)
+    if specs:
+        best_text = "none" if best_node is None else str(best_node.step)
+        detail = f"{snapshot['candidate_count']} valid · {len(specs)} metrics · best step {best_text}"
+        if len(specs) <= 2:
+            detail += " · " + " · ".join(
+                f"{item['name']} {'↑' if item['maximize'] else '↓'}" for item in specs
+            )
+        else:
+            detail += (
+                f" · display: {specs[0]['name']} {'↑' if specs[0]['maximize'] else '↓'}"
+            )
+        tree_title = Text.from_markup(title)
+        tree_title.append(f"\n{detail}", style="dim")
+    else:
+        tree_title = title
+    tree = Tree(tree_title)
     for n in children_by_parent.get(None, []):
         append_rec(n, tree)
     return tree
@@ -188,6 +280,43 @@ def _metric_payload(node: Node) -> dict:
         "value": metric.value_npsafe,
         "maximize": metric.maximize,
     }
+
+
+def _ranking_payload(
+    journal: Journal, node: Node, snapshot: dict | None = None
+) -> dict:
+    snapshot = snapshot if snapshot is not None else journal.ranking_snapshot()
+    return {
+        "selection_policy": journal.selection_policy,
+        "metrics": dict(node.metrics),
+        "metric_specs": snapshot["metric_specs"],
+        "ranking": snapshot["nodes"].get(node.id),
+        "ranking_version": snapshot["version"],
+        "candidate_count": snapshot["candidate_count"],
+        "best_node_id": snapshot["best_node_id"],
+    }
+
+
+def _sync_selected_best(cfg, journal: Journal, previous_best_id: str | None):
+    """A new candidate can promote an older node; copy the selected workspace."""
+    snapshot = journal.ranking_snapshot()
+    best = next(
+        (node for node in journal.nodes if node.id == snapshot["best_node_id"]), None
+    )
+    if best is not None and best.id != previous_best_id:
+        sync_node_working_to_run_workspace(
+            cfg,
+            Path(best.execution_workspace or cfg.workspace_dir),
+            target_name="working_best",
+        )
+        append_event(
+            cfg.log_dir,
+            "best_selection_changed",
+            previous_best_node_id=previous_best_id,
+            node_id=best.id,
+            **_ranking_payload(journal, best, snapshot),
+        )
+    return best, snapshot
 
 
 def _pending_round_node_count(round_nodes_by_round: dict) -> int:
@@ -413,7 +542,9 @@ def _run_overview_text(
     return "\n".join(lines), overview
 
 
-def _append_private_metrics_entry(cfg, entry: dict) -> None:
+def _append_private_metrics_entry(
+    cfg, entry: dict, *, ranking: dict | None = None
+) -> None:
     path = cfg.log_dir / "private_metrics.json"
     note = (
         "Private metrics are for user inspection only and are not passed to the agent."
@@ -447,7 +578,10 @@ def _append_private_metrics_entry(cfg, entry: dict) -> None:
         payload["history"] = []
     payload["history"].append(entry)
     payload["latest"] = entry
-    payload["summary"] = _private_metrics_summary(payload["history"])
+    payload["summary"] = _private_metrics_summary(payload["history"], ranking=ranking)
+    if ranking is not None:
+        payload["version"] = 2
+        payload["validation_selection"] = ranking
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -519,6 +653,9 @@ def _compact_private_summary_entry(entry: dict | None) -> dict | None:
         "is_buggy": entry.get("is_buggy"),
         "val_metric": val_value,
         "val_metric_maximize": _entry_val_metric(entry)[1],
+        "val_metrics": entry.get("metrics"),
+        "metric_specs": entry.get("metric_specs"),
+        "ranking": entry.get("ranking"),
         "private_test_metric": test_value,
         "private_test_metric_name": test_metric_name,
         "private_test_metrics": test_metrics,
@@ -527,9 +664,31 @@ def _compact_private_summary_entry(entry: dict | None) -> dict | None:
     }
 
 
-def _private_metrics_summary(history: list) -> dict:
+def _private_metrics_summary(history: list, *, ranking: dict | None = None) -> dict:
     entries = [entry for entry in history if isinstance(entry, dict)]
     eligible_entries = [entry for entry in entries if entry.get("is_buggy") is not True]
+    if ranking is not None:
+        best_id = ranking.get("best_node_id")
+        best_entry = next(
+            (
+                entry
+                for entry in reversed(eligible_entries)
+                if entry.get("node_id") == best_id
+            ),
+            None,
+        )
+        compact = _compact_private_summary_entry(best_entry)
+        if compact is not None:
+            compact["ranking"] = ranking.get("nodes", {}).get(best_id)
+        return {
+            "selection_policy": "average_rank",
+            "val_best": compact,
+            "best_node_id": best_id,
+            "ranking_version": ranking.get("version"),
+            "candidate_count": ranking.get("candidate_count"),
+            "history_count": len(entries),
+            "eligible_history_count": len(eligible_entries),
+        }
 
     def better_by_val(entry: dict):
         value, maximize = _entry_val_metric(entry)
@@ -742,7 +901,13 @@ def _run(cfg: Config) -> int:
         stage="evaluator_ready",
     )
 
-    journal = Journal()
+    declared_metrics = (
+        metric_definitions(prediction_spec)
+        if isinstance(prediction_spec, dict)
+        and ("metrics" in prediction_spec or prediction_spec.get("primary_metric"))
+        else []
+    )
+    journal = Journal(selection_policy="average_rank", metric_specs=declared_metrics)
 
     agent = BioMakerWorkflow(
         task_desc=agent_task_desc,
@@ -855,7 +1020,11 @@ def _run(cfg: Config) -> int:
             if node is not None and node.step is None
         ]
         return (
-            Journal(nodes=[*journal.nodes, *transient_nodes])
+            Journal(
+                nodes=[*journal.nodes, *transient_nodes],
+                selection_policy=journal.selection_policy,
+                metric_specs=copy.deepcopy(journal.metric_specs),
+            )
             if transient_nodes
             else journal
         )
@@ -971,7 +1140,15 @@ def _run(cfg: Config) -> int:
         return live_nodes()
 
     def live_tree_view(display_journal: Journal):
-        return journal_to_rich_tree(display_journal)
+        available_rows = max(1, min(6, getattr(SHARED_CONSOLE, "height", 24) - 12))
+        ranking = display_journal.ranking_snapshot()
+        return Group(
+            journal_to_rich_tree(display_journal, ranking=ranking),
+            best_metrics_table(
+                display_journal, max_rows=available_rows, ranking=ranking
+            ),
+            Text(f"Full metrics: {cfg.log_dir / 'tree_plot.html'}", style="dim"),
+        )
 
     def refresh_live_tree(log_tree: bool = True) -> None:
         nonlocal live_tree_display_started, live_tree_display_enabled, live_tree_journal
@@ -1071,6 +1248,7 @@ def _run(cfg: Config) -> int:
             plan="Code generation in progress.",
             parent=task.parent,
             selection_reason=task.selection_reason,
+            selection_snapshot=copy.deepcopy(task.selection_snapshot),
         )
         placeholder.agent_name = workflow_agent.name
         placeholder.assign_schedule(
@@ -1118,6 +1296,7 @@ def _run(cfg: Config) -> int:
             parent=frozen_task_parent,
             selection_reason=task.selection_reason,
             draft_plan=task.draft_plan,
+            selection_snapshot=copy.deepcopy(task.selection_snapshot),
         )
         future = generation_executor.submit(
             generate_node_in_worker,
@@ -1149,7 +1328,11 @@ def _run(cfg: Config) -> int:
         worker_agent = ProposalAgent(
             task_desc=agent_task_desc,
             cfg=cfg,
-            journal=Journal(nodes=list(journal_snapshot)),
+            journal=Journal(
+                nodes=list(journal_snapshot),
+                selection_policy=journal.selection_policy,
+                metric_specs=copy.deepcopy(journal.metric_specs),
+            ),
         )
         worker_agent.data_summary = proposal_agent.data_summary
         worker_agent.set_generation_context(
@@ -1219,6 +1402,7 @@ def _run(cfg: Config) -> int:
             node.ctime = placeholder.ctime
             node.agent_name = workflow_agent.name
             node.selection_reason = task.selection_reason
+            node.selection_snapshot = copy.deepcopy(task.selection_snapshot)
             node.assign_schedule(
                 round_index=meta["round_index"],
                 scheduled_step=meta.get("scheduled_step"),
@@ -1317,6 +1501,7 @@ def _run(cfg: Config) -> int:
         if node.id in result_appended_node_ids:
             return
         solution_workspace = Path(node.execution_workspace or cfg.workspace_dir)
+        previous_best_id = journal.ranking_snapshot()["best_node_id"]
         solution_node = agent.append_round_node(round_node)
         result_appended_node_ids.add(node.id)
         appended_node_ids_by_round.setdefault(round_node.round_index, []).append(
@@ -1328,13 +1513,7 @@ def _run(cfg: Config) -> int:
             target_name="working_latest",
         )
         sync_node_working_to_run_workspace(cfg, solution_workspace)
-        best_node = journal.get_best_node(only_good=True)
-        if node is best_node:
-            sync_node_working_to_run_workspace(
-                cfg,
-                solution_workspace,
-                target_name="working_best",
-            )
+        best_node, ranking = _sync_selected_best(cfg, journal, previous_best_id)
         if getattr(getattr(cfg, "private_evaluation", None), "per_node", True):
             private_metrics = None
             private_error = None
@@ -1359,17 +1538,23 @@ def _run(cfg: Config) -> int:
                         "workflow_step": global_step,
                         "node_step": node.step,
                         "node_id": node.id,
-                        "parent_id": node.parent.id if node.parent is not None else None,
+                        "parent_id": (
+                            node.parent.id if node.parent is not None else None
+                        ),
                         "stage": node.node_status,
                         "is_buggy": bool(node.is_buggy),
                         "outcome": node.outcome,
                         "metric": _metric_payload(node),
+                        **_ranking_payload(journal, node, ranking),
                         "is_current_best": node is best_node,
-                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "created_at": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                        ),
                         "private_metrics_available": private_metrics is not None,
                         "private_metrics": private_metrics,
                         "private_error": private_error,
                     },
+                    ranking=ranking,
                 )
         try:
             tree = journal_to_rich_tree(journal)
@@ -1392,6 +1577,7 @@ def _run(cfg: Config) -> int:
             scheduled_step=solution_node.scheduled_step,
             node_id=solution_node.id,
             best_node_id=best_node.id if best_node is not None else None,
+            ranking=ranking,
         )
         global_step += 1
 
@@ -1577,6 +1763,7 @@ def _run(cfg: Config) -> int:
                     "final_retrain" if retrain_result.ok else "final_retrain_failed"
                 ),
                 "metric": _metric_payload(best_node),
+                **_ranking_payload(journal, best_node),
                 "is_current_best": True,
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "private_metrics_available": retrain_result.private_metrics is not None,
@@ -1586,6 +1773,7 @@ def _run(cfg: Config) -> int:
                 "score_rows_added": retrain_result.score_rows_added,
                 "train_rows_after": retrain_result.train_rows_after,
             },
+            ranking=journal.ranking_snapshot(),
         )
         if not retrain_result.ok:
             raise RuntimeError(
@@ -1595,6 +1783,10 @@ def _run(cfg: Config) -> int:
     elif cfg.final_retrain.enabled and best_node is None and not end_with_exception:
         append_event(cfg.log_dir, "final_retrain_skipped", reason="no_best_node")
         raise RuntimeError("Final retrain is enabled but no valid best node exists.")
+    try:
+        SHARED_CONSOLE.print(best_metrics_table(journal))
+    except Exception as exc:
+        record_presentation_warning("final_metrics_table", exc)
     agent_loop_exit_handler(end_with_exception=end_with_exception)
     return global_step
 

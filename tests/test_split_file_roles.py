@@ -143,7 +143,10 @@ def test_answer_files_are_independent_of_input_file_declarations(package, explic
 def test_explicit_inline_answers_are_not_treated_as_files(package, metric, encoding):
     _, output = package
     declare_answer_files(output, [])
-    update_manifest(output, lambda manifest: manifest.update(metric_contract={"primary_metric": metric}))
+    contract = {"primary_metric": metric}
+    if metric == "custom_metric":
+        contract["maximize"] = True
+    update_manifest(output, lambda manifest: manifest.update(metric_contract=contract))
     for csv in ("biomaker_splits/agent_train.csv", "private_gt/score_val.csv", "private_gt/test.csv"):
         set_cell(output, csv, "reference", encoding)
     result = check(package)

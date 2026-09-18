@@ -37,8 +37,8 @@ def test_reference_prose_is_not_presented_as_settable_protocol():
 def test_agent_facing_examples_and_documentation_remain_independent_json_values():
     catalog = metric_capabilities()
     assert json.loads(json.dumps(catalog)) == catalog
-    catalog['families']['regression']['metric_contract_example']['primary_metric'] = 'custom'
+    catalog['families']['regression']['metric_contract_example']['metrics'][0]['name'] = 'custom'
     catalog['families']['segmentation']['documentation']['empty_policy'] = 'changed'
     fresh = metric_capabilities()
-    assert fresh['families']['regression']['metric_contract_example']['primary_metric'] == 'mae'
+    assert fresh['families']['regression']['metric_contract_example']['metrics'][0]['name'] == 'mae'
     assert 'Both empty:' in fresh['families']['segmentation']['documentation']['empty_policy']

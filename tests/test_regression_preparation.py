@@ -125,8 +125,8 @@ def test_rsna_months_prepares_without_generation_and_keeps_fractional_prediction
     frozen = prepared.path.read_bytes()
     declaration = json.loads(prepared.prediction_spec)
     assert declaration["task_family"] == declaration["task_type"] == "regression"
-    assert declaration["primary_metric"] == "mae"
-    assert declaration["maximize"] is False
+    assert declaration["metrics"][0]["name"] == "mae"
+    assert declaration["metrics"][0]["maximize"] is False
     assert declaration["units"] == "months"
     assert declaration["rounding"] == "none"
     assert declaration["target_shape"] == []
@@ -156,7 +156,7 @@ def test_fixed_vector_regression_freezes_uniform_reduction_and_all_requested_met
     declaration = json.loads(prepared.prediction_spec)
     assert declaration["target_shape"] == [2]
     assert declaration["multioutput"] == "uniform_average"
-    assert declaration["secondary_metrics"] == ["mse", "rmse"]
+    assert [item["name"] for item in declaration["metrics"]] == ["mae", "mse", "rmse"]
     candidate_predictions(workspace, columns, [[1, 9], [3, 3]], [[1, 1], [1, 1], [1, 1]])
     validation, test = score_both(workspace, private)
     assert validation.details["score"]["metrics"] == {"mae": 4, "mse": 25, "rmse": 5}

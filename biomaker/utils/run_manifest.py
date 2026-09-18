@@ -128,6 +128,12 @@ def write_run_manifest(
         "split_protocol": split_protocol_text,
         "split_files": _split_files(Path(cfg.workspace_dir)),
         "prediction_spec": spec,
+        "selection": {
+            "policy": "average_rank",
+            "population": "all_committed_valid_candidates",
+            "ties": "average_metric_rank_then_worst_rank_then_step_then_node_id",
+            "display_metric": "first_declared_metric",
+        },
         "config": _selected_cfg(cfg),
         "monai_rag_index": _monai_rag_index_provenance(),
         "environment": {

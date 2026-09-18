@@ -184,7 +184,7 @@ class ContextBuilder:
                 "If sibling improvements already explored a direction, state a different improvement axis or a clear factual reason for revisiting that axis.",
                 "The solution sketch should be 3-5 sentences.",
                 "Don't suggest to do EDA.",
-                "Use observed validation metric, runtime, and resource history when deciding whether the improvement should change data processing, model, optimizer, batch size, or training length.",
+                "Use all declared validation metrics and their optimization directions, runtime, and resource history when deciding whether the improvement should change data processing, model, optimizer, batch size, or training length. Explain tradeoffs using raw values, and compare rank-based improvement only within the same candidate population.",
             ],
         }
         self._finish_common(prompt)

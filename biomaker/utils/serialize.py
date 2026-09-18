@@ -21,7 +21,7 @@ def dumps_json(obj: dataclasses_json.DataClassJsonMixin):
 
     if isinstance(obj, Journal):
         obj_dict["node2parent"] = node2parent  # type: ignore
-        obj_dict["__version"] = "2"
+        obj_dict["__version"] = "3" if obj.selection_policy == "average_rank" else "2"
 
     return json.dumps(obj_dict, separators=(",", ":"))
 

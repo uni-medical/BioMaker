@@ -115,19 +115,53 @@ def strip_code_markers(code: str) -> str:
     return code
 
 
-def _node_metric(node) -> str:
-    if node.metric is None:
+def _node_metric(node, snapshot=None) -> str:
+    if node is None:
         return "n/a"
-    return str(node.metric.value_npsafe)
+    specs = (snapshot or {}).get("metric_specs", [])
+    if (snapshot or {}).get("selection_policy") == "average_rank":
+        rank = snapshot.get("nodes", {}).get(node.id, {})
+        if len(specs) == 2:
+            return " · ".join(
+                f"{spec['name']} {'↑' if spec['maximize'] else '↓'} {_raw_metric_text(node, spec['name'])}"
+                for spec in specs
+            )
+        if len(specs) > 2:
+            value = rank.get("average_rank")
+            rank_text = "n/a" if value is None else f"{value:.2f}"
+            return f"Avg rank {rank_text} · {specs[0]['name']} {_raw_metric_text(node, specs[0]['name'])}"
+        if specs:
+            value = getattr(node, "metrics", {}).get(specs[0]["name"])
+            return "n/a" if value is None else str(value)
+    metric = getattr(node, "metric", None)
+    return "n/a" if metric is None else str(metric.value_npsafe)
 
 
-def _node_metric_short(node) -> str:
-    if node is None or node.metric is None or node.metric.value is None:
-        return ""
+def _raw_metric_text(node, name, precision=4) -> str:
+    value = (getattr(node, "metrics", {}) or {}).get(name)
+    if value is None:
+        return "n/a"
     try:
-        return f"{float(node.metric.value):.3f}"
+        return f"{float(value):.{precision}g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _compact_metric_name(name, index=0) -> str:
+    # Full names and directions remain in the header, tooltip and detail table.
+    return name if len(name) <= 7 else f"M{index + 1}"
+
+
+def _node_metric_short(node, snapshot=None) -> str:
+    value = _node_metric(node, snapshot)
+    if value == "n/a":
+        return ""
+    if value.startswith("Avg rank"):
+        return value
+    try:
+        return f"{float(value):.3f}"
     except Exception:
-        return str(node.metric.value_npsafe)
+        return value
 
 
 def _display_step(node) -> int | None:
@@ -139,7 +173,7 @@ def _display_step(node) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _node_label(node) -> str:
+def _node_label(node, snapshot=None) -> str:
     if node is None:
         return ""
     display_step = _display_step(node)
@@ -148,7 +182,7 @@ def _node_label(node) -> str:
         if node.tag == "completed":
             if node.is_buggy:
                 return f"{step}: bug"
-            metric = _node_metric(node)
+            metric = _node_metric(node, snapshot)
             return (
                 f"{step}: completed {metric}"
                 if metric != "n/a"
@@ -156,12 +190,12 @@ def _node_label(node) -> str:
             )
         return f"{step}: {_transient_status(node)}"
     prefix = "bug" if node.is_buggy else node.node_status
-    metric = _node_metric(node)
+    metric = _node_metric(node, snapshot)
     step = "na" if display_step is None else str(display_step)
     return f"{step}: {prefix} {metric}"
 
 
-def _node_display_label(node) -> str:
+def _node_display_label(node, snapshot=None) -> str:
     if node is None:
         return ""
     display_step = _display_step(node)
@@ -170,12 +204,24 @@ def _node_display_label(node) -> str:
         if node.tag == "completed":
             if node.is_buggy:
                 return f"{step}\nbug"
-            metric = _node_metric_short(node)
+            metric = _node_metric_short(node, snapshot)
             return f"{step}\n{metric}" if metric else f"{step}\ncompleted"
         return f"{step}\n{_transient_status(node)}"
     if node.is_buggy:
         return f"{step}\nbug"
-    metric = _node_metric_short(node)
+    specs = (snapshot or {}).get("metric_specs", [])
+    if (snapshot or {}).get("selection_policy") == "average_rank" and len(specs) >= 2:
+        raw_lines = [
+            f"{_compact_metric_name(spec['name'], index)} {'↑' if spec['maximize'] else '↓'} {_raw_metric_text(node, spec['name'])}"
+            for index, spec in enumerate(specs if len(specs) == 2 else specs[:1])
+        ]
+        if len(specs) > 2:
+            value = snapshot.get("nodes", {}).get(node.id, {}).get("average_rank")
+            raw_lines.insert(
+                0, "Avg rank n/a" if value is None else f"Avg rank {value:.2f}"
+            )
+        return "\n".join([step, *raw_lines])
+    metric = _node_metric_short(node, snapshot)
     return f"{step}\n{metric}" if metric else step
 
 
@@ -279,7 +325,7 @@ def _transient_status(node) -> str:
         return str(node.tag or "pending")
     if node.is_buggy:
         return "bug"
-    return node.node_status
+    return "completed"
 
 
 def _node_prompt(node, cfg=None) -> dict:
@@ -345,7 +391,7 @@ def _artifact_summary(report: dict | None) -> str:
     return "\n".join(parts)
 
 
-def _node_summary(node, best_node) -> dict:
+def _node_summary(node, best_node, snapshot=None) -> dict:
     if node is None:
         return {
             "title": "Search start",
@@ -368,15 +414,32 @@ def _node_summary(node, best_node) -> dict:
         }
 
     resources = node.resource_usage or {}
-    metric = _node_metric(node)
+    snapshot = snapshot or {}
+    metric = _node_metric(node, snapshot)
+    specs = snapshot.get("metric_specs", [])
+    ranking = snapshot.get("nodes", {}).get(node.id, {})
+    raw_metrics = dict(getattr(node, "metrics", {}) or {})
+    declared = {spec["name"] for spec in specs}
     status = _transient_status(node)
     return {
-        "title": _node_label(node),
+        "title": _node_label(node, snapshot),
         "node_id": node.id[:8],
+        "full_node_id": node.id,
         "step": "" if _display_step(node) is None else str(_display_step(node)),
         "stage": node.node_status,
         "status": status,
-        "metric": "" if metric == "n/a" else metric,
+        "metric": "" if metric == "n/a" or len(specs) > 1 else metric,
+        "metrics": raw_metrics,
+        "diagnostic_metrics": {
+            name: value for name, value in raw_metrics.items() if name not in declared
+        },
+        "metric_specs": specs,
+        "metric_ranks": ranking.get("metric_ranks", {}),
+        "average_rank": ranking.get("average_rank"),
+        "worst_rank": ranking.get("worst_rank"),
+        "candidate_count": snapshot.get("candidate_count", 0),
+        "ranking_version": snapshot.get("version"),
+        "selection_policy": snapshot.get("selection_policy", "legacy_primary"),
         "runtime": _format_seconds(node.exec_time),
         "memory": _format_mb(resources.get("peak_rss_mb")),
         "gpu_memory": _format_mb(resources.get("peak_gpu_memory_mb")),
@@ -394,13 +457,13 @@ def _node_summary(node, best_node) -> dict:
     }
 
 
-def _node_plan_text(node) -> str:
+def _node_plan_text(node, snapshot=None) -> str:
     if node is None:
         return "Search start\n" "Draft nodes are direct children of this start point."
     original_lines = [
         f"node:{node.id[:8]}",
         f"stage:{node.node_status}",
-        f"metric:{_node_metric(node)}",
+        f"validation:{_node_metric(node, snapshot)}",
         f"outcome:{node.outcome}",
         f"selected:{truncate_text(str(node.selection_reason or ''), max_chars=220)}",
         f"plan:{str(node.plan or '')}",
@@ -425,17 +488,31 @@ def cfg_to_tree_struct(cfg, jou: Journal, live: bool = False):
     committed_nodes = [node for node in jou.nodes if node.step is not None]
     good_nodes = [node for node in committed_nodes if node.is_buggy is False]
     bug_nodes = [node for node in committed_nodes if node.is_buggy is True]
-    scored_good_nodes = [node for node in good_nodes if node.metric is not None]
-    best_node = (
-        sorted(scored_good_nodes, key=lambda node: node.metric, reverse=True)[0]
-        if scored_good_nodes
-        else None
+    snapshot = dict(jou.ranking_snapshot())
+    snapshot["selection_policy"] = jou.selection_policy
+    best_node = next(
+        (node for node in committed_nodes if node.id == snapshot.get("best_node_id")),
+        None,
     )
+    specs = snapshot.get("metric_specs", [])
+    summaries = [
+        _node_summary(v.source_node, best_node, snapshot) for v in visual_nodes
+    ]
+    indices = {
+        v.source_node.id: index
+        for index, v in enumerate(visual_nodes)
+        if v.source_node is not None
+    }
+    candidates = [
+        dict(summaries[indices[node_id]], tree_index=indices[node_id])
+        for node_id in snapshot.get("ordered_node_ids", [])
+        if node_id in indices
+    ]
 
     return dict(
         edges=edges,
         layout=layout,
-        plan=[_node_plan_text(v.source_node) for v in visual_nodes],
+        plan=[_node_plan_text(v.source_node, snapshot) for v in visual_nodes],
         code=[
             "" if v.source_node is None else strip_code_markers(v.source_node.code)
             for v in visual_nodes
@@ -447,9 +524,13 @@ def cfg_to_tree_struct(cfg, jou: Journal, live: bool = False):
         ],
         exp_name=cfg.exp_name,
         metrics=[0 for _ in visual_nodes],
-        labels=[_node_label(v.source_node) for v in visual_nodes],
-        display_labels=[_node_display_label(v.source_node) for v in visual_nodes],
-        summaries=[_node_summary(v.source_node, best_node) for v in visual_nodes],
+        labels=[_node_label(v.source_node, snapshot) for v in visual_nodes],
+        display_labels=[
+            _node_display_label(v.source_node, snapshot) for v in visual_nodes
+        ],
+        summaries=summaries,
+        ranking_snapshot=snapshot,
+        candidates=candidates,
         prompts=[_node_prompt(v.source_node, cfg) for v in visual_nodes],
         statuses=[_transient_status(v.source_node) for v in visual_nodes],
         is_best=[
@@ -464,8 +545,23 @@ def cfg_to_tree_struct(cfg, jou: Journal, live: bool = False):
             "exp_name": cfg.exp_name,
             "steps": len(committed_nodes),
             "valid": len(good_nodes),
+            "candidate_count": snapshot.get("candidate_count", 0),
+            "metric_count": len(specs),
+            "metric_label": (
+                " · ".join(
+                    f"{f'M{index+1} = ' if len(specs) > 1 and len(spec['name']) > 7 else ''}{spec['name']} {'↑' if spec['maximize'] else '↓'}"
+                    for index, spec in enumerate(specs[:2])
+                )
+                if 0 < len(specs) <= 2
+                else (
+                    f"Average rank · display: {'M1 = ' if len(specs[0]['name']) > 7 else ''}{specs[0]['name']} {'↑' if specs[0]['maximize'] else '↓'}"
+                    if specs
+                    else "Validation metric"
+                )
+            ),
+            "best_node_id": best_node.id[:8] if best_node else None,
             "bug": len(bug_nodes),
-            "best_metric": _node_metric_short(best_node),
+            "best_metric": _node_metric_short(best_node, snapshot),
             "live": live,
         },
     )

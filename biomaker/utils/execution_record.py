@@ -46,6 +46,8 @@ def attach_evaluator_run_result(
         "ok": evaluator_result.ok,
         "metric": evaluator_result.metric,
         "maximize": evaluator_result.maximize,
+        "metrics": evaluator_result.metrics,
+        "metric_specs": evaluator_result.metric_specs,
         "details": evaluator_result.details,
         "error": evaluator_result.error,
     }

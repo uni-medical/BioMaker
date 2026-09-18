@@ -8,6 +8,8 @@ The journal is the core datastructure in BioMaker that contains:
 """
 
 import json
+import copy
+import hashlib
 import random
 import time
 import uuid
@@ -18,6 +20,12 @@ from dataclasses_json import DataClassJsonMixin
 
 from .interpreter import ExecutionResult
 from .utils.metric import MetricValue
+from .utils.ranking import (
+    average_rank_snapshot,
+    completed_candidate,
+    finite_metric,
+    validated_metric_specs,
+)
 from .utils.response import (
     format_prompt_execution_output,
     redact_local_paths,
@@ -66,6 +74,14 @@ class Node(DataClassJsonMixin):
     # post-execution result analysis (findings/feedback)
     analysis: str = field(default=None, kw_only=True)  # type: ignore
     metric: MetricValue = field(default=None, kw_only=True)  # type: ignore
+    metrics: dict[str, float] = field(default_factory=dict, kw_only=True)
+    metric_specs: list[dict[str, Any]] = field(default_factory=list, kw_only=True)
+    ranking: dict[str, Any] | None = field(default=None, kw_only=True)
+    selection_snapshot: dict[str, Any] | None = field(default=None, kw_only=True)
+    rank_context: dict[str, Any] | None = field(default=None, kw_only=True)
+    metric_deltas: dict[str, dict[str, float]] = field(
+        default_factory=dict, kw_only=True
+    )
     parent_metric: float | None = field(default=None, kw_only=True)
     best_metric_before: float | None = field(default=None, kw_only=True)
     delta_vs_parent: float | None = field(default=None, kw_only=True)
@@ -143,6 +159,12 @@ class Node(DataClassJsonMixin):
 
     def record_experiment_context(self, best_node_before: Optional["Node"]) -> None:
         """Record simple experiment deltas after execution, before appending."""
+        if self.metrics and self.metric_specs:
+            # Population-relative comparisons belong to Journal.append, after
+            # this result and its baselines share one ranking snapshot.
+            if self.is_buggy:
+                self.outcome = "bug"
+            return
         if self.is_buggy or self.metric is None or self.metric.value is None:
             self.outcome = "bug"
             return
@@ -161,7 +183,11 @@ class Node(DataClassJsonMixin):
                 maximize=maximize,
             )
 
-        if best_node_before is not None and best_node_before.metric.value is not None:
+        if (
+            best_node_before is not None
+            and best_node_before.metric is not None
+            and best_node_before.metric.value is not None
+        ):
             self.best_metric_before = float(best_node_before.metric.value)
             self.delta_vs_best = _better_delta(
                 current=float(self.metric.value),
@@ -217,6 +243,170 @@ class Journal(DataClassJsonMixin):
     """A collection of nodes representing the solution tree."""
 
     nodes: list[Node] = field(default_factory=list)
+    metric_specs: list[dict[str, Any]] = field(default_factory=list)
+    # A missing policy in historical JSON preserves its original selection.
+    selection_policy: str = "legacy_primary"
+
+    def __post_init__(self) -> None:
+        if self.selection_policy not in {"legacy_primary", "average_rank"}:
+            raise ValueError(f"Unknown selection policy {self.selection_policy!r}")
+        if self.metric_specs:
+            self.metric_specs = validated_metric_specs(self.metric_specs)
+
+    def _prepare_metrics(self, node: Node) -> None:
+        """Bind a result to the already frozen objectives before committing."""
+        if self.selection_policy != "average_rank":
+            return
+        if node.metric_specs:
+            incoming = validated_metric_specs(node.metric_specs)
+            if not self.metric_specs:
+                self.metric_specs = copy.deepcopy(incoming)
+            elif {item["name"]: item for item in incoming} != {
+                item["name"]: item for item in self.metric_specs
+            }:
+                raise ValueError(
+                    "Candidate metrics disagree with the journal's frozen objectives"
+                )
+        if (
+            not self.metric_specs
+            and not node.metrics
+            and node.metric is not None
+            and finite_metric(node.metric.value) is not None
+        ):
+            # Compatibility for scalar-only callers without a prepared task.
+            self.metric_specs = [
+                {"name": "metric", "maximize": bool(node.metric.maximize)}
+            ]
+        if node.metric is not None and self.metric_specs == [
+            {"name": "metric", "maximize": bool(node.metric.maximize)}
+        ]:
+            if not node.metrics and finite_metric(node.metric.value) is not None:
+                node.metrics = {"metric": float(node.metric.value)}
+        if node.metrics and not self.metric_specs:
+            raise ValueError("Named candidate metrics require frozen metric directions")
+        if self.metric_specs:
+            node.metric_specs = copy.deepcopy(self.metric_specs)
+
+    def ranking_snapshot(self) -> dict[str, Any]:
+        """Return detached current ranks over all committed valid candidates."""
+        if self.selection_policy == "average_rank" and self.metric_specs:
+            snapshot = average_rank_snapshot(self.nodes, self.metric_specs)
+        elif self.selection_policy == "average_rank":
+            snapshot = {
+                "selection_policy": "average_rank",
+                "version": "unprepared",
+                "candidate_count": 0,
+                "metric_specs": [],
+                "best_node_id": None,
+                "ordered_node_ids": [],
+                "nodes": {},
+            }
+        else:
+            # Historical reports retain the original scalar ordering. Do not
+            # retrospectively fold old auxiliary scores into their selection.
+            ordered = sorted(
+                (
+                    n
+                    for n in self.good_nodes
+                    if completed_candidate(n)
+                    and n.metric is not None
+                    and finite_metric(n.metric.value) is not None
+                ),
+                key=lambda n: n.metric,
+                reverse=True,
+            )
+            records = {
+                n.id: {
+                    "metrics": copy.deepcopy(n.metrics),
+                    "metric_ranks": {},
+                    "average_rank": None,
+                    "worst_rank": None,
+                    "step": n.step,
+                    "position": index,
+                    "is_best": index == 1,
+                    "candidate_count": len(ordered),
+                }
+                for index, n in enumerate(ordered, 1)
+            }
+            revision = hashlib.sha256(
+                json.dumps([(n.id, n.step, n.metric.value) for n in ordered]).encode()
+            ).hexdigest()[:16]
+            for record in records.values():
+                record["snapshot_version"] = revision
+            snapshot = {
+                "selection_policy": "legacy_primary",
+                "version": revision,
+                "candidate_count": len(ordered),
+                "metric_specs": copy.deepcopy(self.metric_specs),
+                "best_node_id": ordered[0].id if ordered else None,
+                "ordered_node_ids": [n.id for n in ordered],
+                "nodes": records,
+            }
+        return snapshot
+
+    def _apply_ranking_snapshot(self, snapshot: dict) -> None:
+        """Refresh persisted current ranks only when the cohort is committed."""
+        for node in self.nodes:
+            node.ranking = copy.deepcopy(snapshot["nodes"].get(node.id))
+
+    def ranked_nodes(self, snapshot: dict[str, Any] | None = None) -> list[Node]:
+        """Order globally first; callers may then filter expandable nodes."""
+        ranking = snapshot if snapshot is not None else self.ranking_snapshot()
+        by_id = {node.id: node for node in self.nodes}
+        return [
+            by_id[node_id]
+            for node_id in ranking["ordered_node_ids"]
+            if node_id in by_id
+        ]
+
+    def _record_rank_context(self, node: Node, before: dict, current: dict) -> None:
+        record = current["nodes"].get(node.id)
+        best_before_id = before["best_node_id"]
+        parent_id = node.parent.id if node.parent is not None else None
+        node.rank_context = {
+            "snapshot_version": current["version"],
+            "candidate_count": current["candidate_count"],
+            "best_node_before_id": best_before_id,
+            "best_node_id": current["best_node_id"],
+            "node": copy.deepcopy(record),
+            "parent": copy.deepcopy(current["nodes"].get(parent_id)),
+            "best_before": copy.deepcopy(current["nodes"].get(best_before_id)),
+        }
+        if record is None:
+            node.outcome = "bug" if node.is_buggy else "invalid_metrics"
+            return
+        node.metric_deltas = {}
+        for relation, baseline_id in (
+            ("parent", parent_id),
+            ("best_before", best_before_id),
+        ):
+            baseline = current["nodes"].get(baseline_id)
+            if baseline is None:
+                continue
+            node.metric_deltas[relation] = {
+                name: value - baseline["metrics"][name]
+                for name, value in record["metrics"].items()
+            }
+            delta = baseline["average_rank"] - record["average_rank"]
+            if relation == "parent":
+                node.delta_vs_parent = delta
+            else:
+                node.delta_vs_best = delta
+        pair = lambda item: (item["average_rank"], item["worst_rank"])
+        parent_record = current["nodes"].get(parent_id)
+        best_record = current["nodes"].get(best_before_id)
+        if best_before_id is None:
+            node.outcome = "first_success"
+        elif current["best_node_id"] == node.id and best_before_id != node.id:
+            node.outcome = "new_best"
+        elif parent_record is not None and pair(record) < pair(parent_record):
+            node.outcome = "improved_parent"
+        elif parent_record is not None and pair(record) > pair(parent_record):
+            node.outcome = "regressed_parent"
+        elif best_record is not None and pair(record) == pair(best_record):
+            node.outcome = "matched_best"
+        else:
+            node.outcome = "valid_non_improving"
 
     def __getitem__(self, idx: int) -> Node:
         return self.nodes[idx]
@@ -227,8 +417,16 @@ class Journal(DataClassJsonMixin):
 
     def append(self, node: Node) -> None:
         """Append a new node to the journal."""
+        self._prepare_metrics(node)
+        before = (
+            self.ranking_snapshot() if self.selection_policy == "average_rank" else None
+        )
         node.step = len(self.nodes)
         self.nodes.append(node)
+        if before is not None:
+            current = self.ranking_snapshot()
+            self._apply_ranking_snapshot(current)
+            self._record_rank_context(node, before, current)
 
     def pop(self) -> Optional["Node"]:
         """
@@ -240,6 +438,8 @@ class Journal(DataClassJsonMixin):
         node = self.nodes.pop()
         if node.parent is not None:
             node.parent.children.discard(node)
+        if self.selection_policy == "average_rank":
+            self._apply_ranking_snapshot(self.ranking_snapshot())
         return node
 
     @property
@@ -260,6 +460,9 @@ class Journal(DataClassJsonMixin):
     def get_best_node(self, only_good=True, topk=1) -> None | Node:
         """Return one of the top-k best solutions found so far (randomly chosen)."""
 
+        if self.selection_policy == "average_rank":
+            top_nodes = self.ranked_nodes()[:topk]
+            return random.choice(top_nodes) if top_nodes else None
         if only_good:
             nodes = self.good_nodes
             if not nodes:
@@ -281,27 +484,35 @@ class Journal(DataClassJsonMixin):
 
     def _reference_nodes(self, topk: int) -> list[Node]:
         """Return deterministic high-scoring successful nodes for factual memory."""
-        good_nodes = sorted(self.good_nodes, key=lambda n: n.metric, reverse=True)
+        good_nodes = self.ranked_nodes()
         return good_nodes[:topk]
 
     def generate_tree_index(self) -> str:
         """Return a compact factual index of every node in the search tree."""
         if not self.nodes:
             return "No previous nodes."
+        snapshot = self.ranking_snapshot()
 
         legend = (
             "Column legend: step=completed node order; id=short node id; "
             "parent=short parent id or root; stage=draft/debug/improve; "
-            "status=execution outcome; val_metric=primary validation metric; "
+            "status=execution outcome; val_metric=current average rank (lower is better) for multiple objectives, raw validation value for one objective; "
             "delta_parent=change versus parent where positive means better; "
-            "delta_best=change versus best node before this attempt where positive means better; "
+            "delta_best=change versus best node before this attempt where positive means better; average-rank deltas compare both nodes in their shared commit-time population; "
             "runtime=execution time."
         )
         header = (
             "step | id | parent | stage | status | val_metric | "
             "delta_parent | delta_best | runtime"
         )
-        rows = [legend, header]
+        rows = [legend]
+        if self.selection_policy == "average_rank":
+            rows.append(
+                f"Current ranking snapshot {snapshot['version']}: {snapshot['candidate_count']} valid candidates; "
+                f"objectives={json_dumps_compact(snapshot['metric_specs'])}. "
+                "Raw metric deltas are current minus baseline; interpret signs using each objective's direction."
+            )
+        rows.append(header)
         for n in self.nodes:
             rows.append(
                 " | ".join(
@@ -311,7 +522,7 @@ class Journal(DataClassJsonMixin):
                         n.parent.id[:8] if n.parent is not None else "root",
                         n.node_status,
                         _node_status_text(n),
-                        _metric_text(n),
+                        _metric_text(n, snapshot),
                         _format_delta(n.delta_vs_parent),
                         _format_delta(n.delta_vs_best),
                         _format_runtime(n.exec_time),
@@ -333,6 +544,7 @@ class Journal(DataClassJsonMixin):
         repeated as a full record in multiple places.
         """
         sep = "\n\n---\n\n"
+        snapshot = self.ranking_snapshot()
         parts = [
             "Overall tree\n"
             + _format_current_target(stage, selected_parent)
@@ -355,6 +567,7 @@ class Journal(DataClassJsonMixin):
                             if node is selected_parent
                             else "root-to-parent lineage ancestor"
                         ),
+                        snapshot,
                     )
                 )
         else:
@@ -377,7 +590,11 @@ class Journal(DataClassJsonMixin):
         if completed_sibling_nodes:
             append(_tree_record_sibling_intro(stage, selected_parent))
             for node in sorted(completed_sibling_nodes, key=_node_context_sort_key):
-                append(_format_detail_record(node, _tree_record_sibling_reason(stage)))
+                append(
+                    _format_detail_record(
+                        node, _tree_record_sibling_reason(stage), snapshot
+                    )
+                )
         else:
             append(
                 _tree_record_sibling_intro(stage, selected_parent)
@@ -389,7 +606,7 @@ class Journal(DataClassJsonMixin):
             for node in sorted(pending_sibling_nodes, key=_node_context_sort_key):
                 append(
                     _format_detail_record(
-                        node, _tree_record_pending_sibling_reason(stage)
+                        node, _tree_record_pending_sibling_reason(stage), snapshot
                     )
                 )
 
@@ -424,7 +641,9 @@ class Journal(DataClassJsonMixin):
         for n in reversed(self.good_nodes):
             if len(regressions) >= max_items:
                 break
-            if n.delta_vs_parent is None or n.delta_vs_parent >= 0:
+            if n.outcome != "regressed_parent" and (
+                n.delta_vs_parent is None or n.delta_vs_parent >= 0
+            ):
                 continue
             regressions.append(
                 "- "
@@ -445,9 +664,10 @@ class Journal(DataClassJsonMixin):
     ) -> str:
         """Generate a summary of the journal for the agent."""
         summary = []
+        snapshot = self.ranking_snapshot()
         best_node = self.get_best_node(only_good=True, topk=1)
         if best_node is not None:
-            summary.append("CURRENT BEST\n" + _format_memory_node(best_node))
+            summary.append("CURRENT BEST\n" + _format_memory_node(best_node, snapshot))
 
         if include_avoid_list:
             regression_summary = self._regression_summary()
@@ -461,7 +681,7 @@ class Journal(DataClassJsonMixin):
         if candidates:
             summary.append(
                 "Other high-scoring successful nodes\n"
-                + "\n\n".join(_format_memory_node(n) for n in candidates)
+                + "\n\n".join(_format_memory_node(n, snapshot) for n in candidates)
             )
 
         if include_code:
@@ -558,6 +778,7 @@ def _is_problem_node(n: Node) -> bool:
         n.is_buggy is True
         or n.exc_type is not None
         or n.outcome == "bug"
+        or n.outcome == "regressed_parent"
         or (n.delta_vs_parent is not None and n.delta_vs_parent < 0)
     )
 
@@ -745,6 +966,22 @@ def _format_current_target(
 
 
 def _top_successful_nodes(nodes) -> list[Node]:
+    nodes = list(nodes)
+    ranked = [
+        node
+        for node in nodes
+        if node.ranking and node.ranking.get("average_rank") is not None
+    ]
+    if ranked:
+        return sorted(
+            ranked,
+            key=lambda node: (
+                node.ranking["average_rank"],
+                node.ranking["worst_rank"],
+                _node_sort_step(node),
+                node.id,
+            ),
+        )
     return sorted(
         [n for n in nodes if n.metric is not None],
         key=lambda n: n.metric,
@@ -757,7 +994,16 @@ def _best_node_deterministic(nodes) -> Node | None:
     return top_nodes[0] if top_nodes else None
 
 
-def _metric_text(n: Node) -> str:
+def _metric_text(n: Node, snapshot: dict | None = None) -> str:
+    ranking = snapshot["nodes"].get(n.id) if snapshot is not None else n.ranking
+    specs = snapshot["metric_specs"] if snapshot is not None else n.metric_specs
+    legacy = snapshot is not None and snapshot["selection_policy"] == "legacy_primary"
+    if n.metrics and not legacy:
+        if len(specs) > 1:
+            return f"Avg rank {ranking['average_rank']:.4g}" if ranking else "unranked"
+        if len(specs) == 1:
+            value = n.metrics.get(specs[0]["name"])
+            return "n/a" if value is None else f"{value:.6g}"
     metric = n.metric.value if n.metric is not None else None
     if metric is None:
         return "n/a"
@@ -856,7 +1102,7 @@ def _format_artifact_facts(
         lines.append(
             "prediction_spec: "
             f"type={spec.get('prediction_type')}, "
-            f"primary_metric={spec.get('primary_metric')}, "
+            f"metrics={spec.get('metrics', spec.get('primary_metric'))}, "
             f"prediction_columns={pred_col_count}"
         )
 
@@ -905,6 +1151,13 @@ def _format_artifact_facts(
 def _format_evaluator_details(details: dict | None) -> str:
     if not isinstance(details, dict):
         return ""
+    metrics = details.get("metrics")
+    if isinstance(metrics, dict) and metrics:
+        return ", ".join(
+            f"{name}={float(value):.6g}"
+            for name, value in metrics.items()
+            if finite_metric(value) is not None
+        )
 
     payload = details.get("details")
     if not isinstance(payload, dict):
@@ -912,6 +1165,12 @@ def _format_evaluator_details(details: dict | None) -> str:
     score = payload.get("score")
     if not isinstance(score, dict):
         return ""
+    if isinstance(score.get("metrics"), dict):
+        return ", ".join(
+            f"{name}={float(value):.6g}"
+            for name, value in score["metrics"].items()
+            if finite_metric(value) is not None
+        )
 
     parts = []
     skip_keys = {"metric", "maximize"}
@@ -1000,8 +1259,7 @@ def _format_execution_summary(n: Node, *, not_executed: bool) -> str:
         lines.append(
             "evaluator: "
             f"ok={evaluator.get('ok')}, "
-            f"metric={evaluator.get('metric')}, "
-            f"maximize={evaluator.get('maximize')}"
+            f"metrics={evaluator.get('metrics', evaluator.get('metric'))}"
         )
         if evaluator.get("error"):
             lines.append(
@@ -1017,10 +1275,13 @@ def _format_execution_summary(n: Node, *, not_executed: bool) -> str:
     return "\n".join(lines)
 
 
-def _format_node_header(n: Node) -> str:
-    metric = n.metric.value if n.metric is not None else None
-    metric_text = "n/a" if metric is None else f"{float(metric):.4f}"
-    detail_text = _format_evaluator_details(n.evaluator_details)
+def _format_node_header(n: Node, snapshot: dict | None = None) -> str:
+    metric_text = _metric_text(n, snapshot)
+    detail_text = (
+        json_dumps_compact(n.metrics)
+        if n.metrics
+        else _format_evaluator_details(n.evaluator_details)
+    )
     if detail_text:
         detail_text = f" | validation_metrics: {detail_text}"
     return (
@@ -1032,14 +1293,14 @@ def _format_node_header(n: Node) -> str:
     )
 
 
-def _format_memory_node(n: Node) -> str:
+def _format_memory_node(n: Node, snapshot: dict | None = None) -> str:
     finding_text = (
         f"\nEmpirical finding: {truncate_text(str(n.analysis), max_chars=260)}"
         if n.analysis
         else ""
     )
     return (
-        f"{_format_node_header(n)}\n"
+        f"{_format_node_header(n, snapshot)}\n"
         f"delta_vs_parent: {_format_delta(n.delta_vs_parent)} | "
         f"delta_vs_best_before: {_format_delta(n.delta_vs_best)}\n"
         f"Core idea: {truncate_text(str(n.plan), max_chars=320)}"
@@ -1050,7 +1311,9 @@ def _format_memory_node(n: Node) -> str:
 def _format_detail_record(
     n: Node,
     reason: str,
+    snapshot: dict | None = None,
 ) -> str:
+    ranking = snapshot["nodes"].get(n.id) if snapshot is not None else n.ranking
     not_executed = n.step is None or n._term_out is None
     include_output_check = bool(
         n.is_buggy
@@ -1088,7 +1351,7 @@ def _format_detail_record(
         )
     else:
         result_text = "bug" if n.is_buggy is True else "success"
-    metric_text = "unknown_not_executed" if not_executed else _metric_text(n)
+    metric_text = "unknown_not_executed" if not_executed else _metric_text(n, snapshot)
     exec_time = "unknown_not_executed" if not_executed else _format_runtime(n.exec_time)
     parent_id = n.parent.id[:8] if n.parent is not None else "root"
     display_step = _node_display_step(n)
@@ -1128,7 +1391,11 @@ def _format_detail_record(
         f"stage: {n.node_status}\n"
         f"result: {result_text}\n"
         f"val_metric: {metric_text}\n"
-        f"validation_metrics: {evaluator_details or 'n/a'}\n"
+        f"validation_metrics: {json_dumps_compact(n.metrics) if n.metrics else evaluator_details or 'n/a'}\n"
+        f"metric_definitions: {json_dumps_compact(snapshot['metric_specs'] if snapshot is not None else n.metric_specs)}\n"
+        f"current_ranking: {json_dumps_compact(ranking) if ranking else 'n/a'}\n"
+        f"commit_rank_context: {json_dumps_compact(n.rank_context) if n.rank_context else 'n/a'}\n"
+        f"metric_deltas_raw: {json_dumps_compact(n.metric_deltas)}\n"
         f"maximize: {n.metric.maximize if n.metric is not None else None}\n"
         f"delta_vs_parent: {_format_delta(n.delta_vs_parent)}\n"
         f"execution_time: {exec_time}\n"

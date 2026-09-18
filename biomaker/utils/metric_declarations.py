@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any
 
-from .evaluator_protocol import metric_name, requested_metrics
+from .evaluator_protocol import metric_name, requested_metrics, metric_definitions, requested_metric_definitions, requested_metric_contract, validate_task_metric_contract
 from .metric_registry import metric_info
 from .trusted_metrics import metric_capabilities, normalize_metric_spec
 
@@ -41,6 +41,10 @@ def canonical_metric_contract(contract: dict[str, Any], *, fallback_primary: str
         raise ValueError("metric_contract must be an object.")
     result = copy.deepcopy(contract)
     nested: dict[str, Any] = {}
+    if 'metrics' in result:
+        result['metrics'] = metric_definitions(result)
+        for key in ('primary_metric', 'secondary_metrics', 'maximize'):
+            result.pop(key, None)
     if "primary_metric" in result:
         primary = result["primary_metric"]
         if isinstance(primary, dict):
@@ -64,7 +68,7 @@ def canonical_metric_contract(contract: dict[str, Any], *, fallback_primary: str
             if not isinstance(secondary, list) or any(not isinstance(name, str) or not name.strip() for name in secondary):
                 raise ValueError("metric_contract.secondary_metrics must be a list of nonempty metric names.")
             values["secondary_metrics"] = list(dict.fromkeys(metric_name(name) for name in secondary))
-    names = [result.get("primary_metric", fallback_primary), *result.get("secondary_metrics", []), *nested.get("secondary_metrics", [])]
+    names = [result.get("primary_metric", fallback_primary), *result.get("secondary_metrics", []), *nested.get("secondary_metrics", []), *[item['name'] for item in result.get('metrics', [])]]
     families = {info.task_family for name in names if (info := metric_info(name)) is not None}
     capabilities = metric_capabilities()
     fields = dict(capabilities["common_protocol_fields"])
@@ -104,6 +108,14 @@ def canonical_metric_contract(contract: dict[str, Any], *, fallback_primary: str
 
     result = canonical_settings(result)
     _merge_settings(result, canonical_settings(nested))
+    if 'metrics' in result:
+        for item in result['metrics']:
+            settings = canonical_settings({key: value for key, value in item.items() if key not in {'name', 'maximize'}})
+            for key in list(item):
+                if key not in {'name', 'maximize'}:
+                    item.pop(key)
+            item.update(settings)
+            _merge_settings(result, settings)
     return result
 
 
@@ -124,7 +136,8 @@ def manifest_head_types(manifest: dict[str, Any]) -> set[str]:
 def manifest_primary_metric(manifest: dict[str, Any]) -> str | None:
     metric_contract = manifest.get("metric_contract")
     if isinstance(metric_contract, dict):
-        return canonical_metric_contract(metric_contract).get("primary_metric")
+        contract = canonical_metric_contract(metric_contract)
+        return contract['metrics'][0]['name'] if 'metrics' in contract else contract.get('primary_metric')
     return None
 
 
@@ -134,8 +147,18 @@ def declared_metric_names(
     """Resolve task/manifest declarations without reading private data or files."""
     primary, secondary = requested_metrics(task_text)
     contract = canonical_metric_contract(manifest.get("metric_contract", {}), fallback_primary=primary or fallback_primary)
-    manifest_primary = contract.get("primary_metric")
-    declared_secondary = contract.get("secondary_metrics", [])
+    manifest_primary = contract['metrics'][0]['name'] if 'metrics' in contract else contract.get("primary_metric")
+    declared_secondary = [item['name'] for item in contract['metrics'][1:]] if 'metrics' in contract else contract.get("secondary_metrics", [])
+    task_definitions = requested_metric_definitions(task_text)
+    if task_definitions and ('metrics' in contract or manifest_primary):
+        validate_task_metric_contract(contract, task_text)
+    if 'metrics' in contract and primary:
+        if set([primary, *secondary]) != set([manifest_primary, *declared_secondary]):
+            raise ValueError('Task and prepared metric_contract disagree on requested metrics.')
+    if manifest_primary and ('metrics' in contract or task_definitions):
+        # The modern list has no privileged first metric. Freeze presentation
+        # order from preparation while accepting equivalent reordered lists.
+        return manifest_primary, declared_secondary
     if primary and manifest_primary and metric_name(primary) != metric_name(manifest_primary):
         raise ValueError("Task and prepared metric_contract disagree on the primary metric; repair data preparation before compiling an evaluator.")
     primary = primary or manifest_primary or fallback_primary
@@ -143,18 +166,33 @@ def declared_metric_names(
     return metric_name(primary) if primary else None, secondary
 
 
+def declared_metric_definitions(manifest: dict[str, Any], task_text: str, *, fallback_primary: str | None = None) -> list[dict[str, Any]]:
+    """Resolve the objective list once, retaining task/manifest parameters."""
+    primary, secondary = declared_metric_names(manifest, task_text, fallback_primary=fallback_primary)
+    contract = canonical_metric_contract(manifest.get('metric_contract', {}), fallback_primary=primary)
+    task_definitions = requested_metric_definitions(task_text)
+    if 'metrics' in contract:
+        return contract['metrics']
+    if task_definitions:
+        return task_definitions
+    return metric_definitions({**contract, 'primary_metric': primary, 'secondary_metrics': secondary})
+
+
 def validate_declared_capabilities(manifest: dict[str, Any], task_text: str, *, fallback_primary: str | None = None) -> None:
     """Reject invalid supplied settings while leaving absent data details to adapters."""
     primary, secondary = declared_metric_names(manifest, task_text, fallback_primary=fallback_primary)
     names = [m for m in [primary, *secondary] if m]
-    if not names or any(metric_info(m) is None for m in names):
+    if not names:
+        return
+    declared_metric_definitions(manifest, task_text, fallback_primary=fallback_primary)
+    if any(metric_info(m) is None for m in names):
         return
     families = {metric_info(m).task_family for m in names}
     if len(families) != 1:
         raise ValueError("Requested standard metrics require different canonical sample families; a mixed-head evaluation protocol is not yet supported.")
     family = families.pop()
     capabilities = metric_capabilities()["families"][family]
-    contract = canonical_metric_contract(manifest.get("metric_contract", {}), fallback_primary=primary)
+    contract = {**(requested_metric_contract(task_text) or {}), **canonical_metric_contract(manifest.get("metric_contract", {}), fallback_primary=primary)}
     if family == "image_restoration":
         blocks = re.findall(r"```restoration-evaluation\s*\n(.*?)```", task_text, re.S)
         if len(blocks) > 1:
@@ -194,7 +232,8 @@ def validate_declared_capabilities(manifest: dict[str, Any], task_text: str, *, 
     # dimensions/labels are used only to validate supplied protocol settings;
     # they are never frozen or used for dataset interpretation.
     probe = {key: value for key, value in contract.items() if key not in PROTOCOL_DOCUMENTATION_FIELDS}
-    probe.update(primary_metric=primary, secondary_metrics=secondary)
+    if 'metrics' not in probe:
+        probe.update(primary_metric=primary, secondary_metrics=secondary)
     if family == "classification":
         output = manifest.get("prediction_contract", {})
         for key in ("class_labels", "positive_class"):

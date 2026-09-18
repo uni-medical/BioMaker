@@ -7,7 +7,7 @@ nodes, artifact validation, final retrain, and private evaluation all consume.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -68,9 +68,6 @@ def primary_metric_from_spec(spec: dict[str, Any]) -> str | None:
         value = container.get("primary_metric")
         if isinstance(value, str) and value.strip():
             return value.strip().lower()
-    metrics = spec.get("metrics")
-    if isinstance(metrics, list) and metrics:
-        return str(metrics[0]).strip().lower()
     return None
 
 
@@ -147,6 +144,7 @@ class PredictionContract:
     task_type: str | None
     class_labels: list[Any] | None
     positive_class: Any | None
+    metrics: list[dict[str, Any]] = field(default_factory=list)
 
 
 def load_prediction_spec(workspace_dir: Path | str) -> dict[str, Any]:

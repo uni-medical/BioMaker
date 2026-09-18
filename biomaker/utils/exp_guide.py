@@ -364,9 +364,8 @@ def build_exp_guide(
         "score_split": score_split,
     }
     metric = {
-        "primary_metric": contract.metric.primary_metric,
-        "maximize": contract.metric.maximize,
-        "secondary_metrics": contract.metric.secondary_metrics,
+        "metrics": contract.metric.metrics,
+        "selection": "average_rank",
     }
 
     dataset_report = _read_json_dict(split_dir / "dataset_report.json")

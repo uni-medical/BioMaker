@@ -336,6 +336,18 @@ def minimal_registered_case(name):
     if family == 'image_restoration':
         return restoration_spec(name, ()), dict(prediction=np.ones((8, 8)), target=np.zeros((8, 8)))
     if family == 'segmentation':
+        if name in {'cldice', 'tree_length_detected', 'branch_detected', 'betti_error',
+                    'multiclass_dice', 'multiclass_cldice', 'branch_accuracy', 'branch_f1',
+                    'subtree_consistency', 'topological_distance'}:
+            # Two connected branches with separate semantic labels. Topology
+            # kernels consume fixed references rather than inventing them.
+            target = np.zeros((3, 3, 6), dtype=np.uint8)
+            target[1, 1, 1:3] = 1
+            target[1, 1, 3:5] = 2
+            return dict(primary_metric=name), dict(
+                prediction=target.copy(), target=target,
+                skeleton=(target > 0).astype(np.uint8), parsing=target.copy(),
+                graph=np.array([[0], [1]], dtype=np.int64))
         return dict(primary_metric=name), dict(prediction=np.ones((4, 4), dtype=int), target=np.ones((4, 4), dtype=int))
     if family == 'detection':
         return dict(primary_metric=name), dict(prediction=[box(0)], target=[box(0)])

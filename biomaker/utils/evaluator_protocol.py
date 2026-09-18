@@ -3,13 +3,41 @@
 from __future__ import annotations
 
 import math
+import copy
+import json
 import re
 from typing import Any
 from pathlib import Path
 
 import pandas as pd
 
-EVALUATOR_API_VERSION = 2
+EVALUATOR_API_VERSION = 3
+
+
+def metric_definitions(spec: dict[str, Any], *, allow_legacy_unknown: bool = False) -> list[dict[str, Any]]:
+    """Return canonical, distinct objectives with explicit independent directions.
+
+    Historical v2 scoring may leave an unregistered secondary direction unknown:
+    those values remain diagnostics, never new selection objectives.
+    """
+    from .trusted_metrics import normalize_metric_definitions
+
+    if not isinstance(spec, dict):
+        raise ValueError('Metric specification must be a mapping.')
+    spec = copy.deepcopy(spec)
+    def canonical(value):
+        if isinstance(value, str):
+            return metric_name(value)
+        if isinstance(value, dict):
+            return {key: metric_name(item) if key in {'name', 'metric', 'id'} and isinstance(item, str) else item for key, item in value.items()}
+        return value
+    if 'metrics' in spec and isinstance(spec['metrics'], list):
+        spec['metrics'] = [canonical(item) for item in spec['metrics']]
+    if 'primary_metric' in spec:
+        spec['primary_metric'] = canonical(spec['primary_metric'])
+    if isinstance(spec.get('secondary_metrics'), list):
+        spec['secondary_metrics'] = [canonical(item) for item in spec['secondary_metrics']]
+    return normalize_metric_definitions(spec, allow_legacy_unknown=allow_legacy_unknown)
 
 
 def validate_scoring_rows(
@@ -50,6 +78,7 @@ def metric_name(value: str) -> str:
     from .metric_registry import metric_info
 
     name = value.strip().lower().strip("`*_ .")
+    name = _DECLARED_METRIC_NAMES.get(name, name)
     registered = metric_info(name)
     if registered is not None:
         name = registered.name
@@ -170,6 +199,10 @@ def requested_metrics(task: str) -> tuple[str | None, list[str]]:
     is excluded, while explicit secondary lists may use semicolons, commas or
     unambiguous conjunctions. Unknown names remain available to extension routing.
     """
+    structured = requested_metric_definitions(task)
+    if structured:
+        return structured[0]['name'], [item['name'] for item in structured[1:]]
+
     def parse(role: str) -> list[str]:
         matches = re.finditer(
             rf"{role}\s+(?:(?:validation|evaluation)\s+)?metrics?\s*:\s*([^\n\r]+)",
@@ -191,11 +224,76 @@ def requested_metrics(task: str) -> tuple[str | None, list[str]]:
     return (metric_name(primary[0]) if primary else None), list(dict.fromkeys(metric_name(name) for name in secondary))
 
 
+def requested_metric_contract(task: str) -> dict[str, Any] | None:
+    """Read and preserve the complete explicit metrics JSON/YAML contract.
+
+    Prose-only legacy declarations are handled by requested_metrics; directions
+    then come from the prepared contract or registered metric catalog.
+    """
+    import yaml
+    from .metric_declarations import canonical_metric_contract
+
+    declarations = []
+    for language, block in re.findall(r'```(metrics|yaml|yml|json)\s*\n(.*?)```', task, re.S | re.I):
+        try:
+            # JSON scientific notation (e.g. 1e-05 Dice smoothing) is numeric.
+            # YAML 1.1 interprets that spelling as a string; preserve JSON
+            # types before trying the more permissive YAML representation.
+            try:
+                value = json.loads(block)
+            except json.JSONDecodeError:
+                value = yaml.safe_load(block)
+        except (ValueError, yaml.YAMLError):
+            if language.lower() == 'metrics':
+                raise ValueError('The metrics block must contain valid JSON or YAML.')
+            continue
+        if language.lower() == 'metrics' or isinstance(value, dict) and 'metrics' in value:
+            declarations.append(value if isinstance(value, dict) else {'metrics': value})
+    if len(declarations) > 1:
+        raise ValueError('Declare exactly one metrics block.')
+    if declarations:
+        if 'metrics' not in declarations[0]:
+            raise ValueError('The metrics block must declare a nonempty metrics list.')
+        return canonical_metric_contract(declarations[0])
+    match = re.search(r'^metrics:\s*\n((?:[ \t]+[^\n]*\n?|\s*-\s*[^\n]*\n?)+)', task, re.M)
+    if match:
+        return canonical_metric_contract(yaml.safe_load(match[0]))
+    return None
+
+
+def requested_metric_definitions(task: str) -> list[dict[str, Any]] | None:
+    contract = requested_metric_contract(task)
+    return contract['metrics'] if contract is not None else None
+
+
+def validate_task_metric_contract(actual: dict[str, Any], task: str) -> None:
+    """Reject changed or dropped settings from an explicit task metrics block."""
+    from .metric_declarations import canonical_metric_contract
+
+    expected = requested_metric_contract(task)
+    if expected is None:
+        return
+    actual = canonical_metric_contract(actual)
+    if {item['name']: item for item in metric_definitions(actual)} != {item['name']: item for item in expected['metrics']}:
+        raise ValueError('Task and prepared metric_contract disagree on metrics, directions or parameters.')
+
+    def preserves(value, requested):
+        if isinstance(requested, dict):
+            return isinstance(value, dict) and all(key in value and preserves(value[key], item) for key, item in requested.items())
+        return value == requested
+
+    for key, value in expected.items():
+        if key not in {'metrics', 'notes', 'description'} and (key not in actual or not preserves(actual[key], value)):
+            raise ValueError('Task and prepared metric_contract disagree on metric protocol field: ' + key)
+
+
 def validate_score(score: Any, spec: dict[str, Any]) -> dict[str, Any]:
     """Reject missing metrics and silent substitutions identically for all splits."""
     if not isinstance(score, dict) or not isinstance(score.get("metrics"), dict):
         raise ValueError("score() must return a dict with a named metrics mapping.")
-    primary = metric_name(str(spec["primary_metric"]))
+    legacy = spec.get('evaluator_api_version', 2) == 2 and 'primary_metric' in spec
+    definitions = metric_definitions(spec, allow_legacy_unknown=legacy)
+    primary = metric_name(str(spec['primary_metric'])) if legacy else None
     metrics = {}
     for name, value in score["metrics"].items():
         key = metric_name(str(name))
@@ -210,13 +308,19 @@ def validate_score(score: Any, spec: dict[str, Any]) -> dict[str, Any]:
         if key in metrics and metrics[key] != float(value):
             raise ValueError(f"Conflicting values for metric {key!r}.")
         metrics[key] = float(value)
-    required = {
-        primary,
-        *(metric_name(str(m)) for m in spec.get("secondary_metrics", [])),
-    }
+    required = {item['name'] for item in definitions}
+    if legacy:
+        required.update(metric_name(str(m)) for m in spec.get('secondary_metrics', []))
     missing = required - metrics.keys()
     if missing:
         raise ValueError(f"Missing requested metrics: {sorted(missing)}")
+    if not legacy:
+        if 'rank' in score or 'average_rank' in score:
+            raise ValueError('Evaluator returns raw metrics; ranks are computed by the Journal.')
+        result = {**score, 'metrics': metrics, 'metric_specs': definitions}
+        result.pop('metric', None)
+        result.pop('maximize', None)
+        return result
     declared = score.get("metric")
     if declared is not None and (
         isinstance(declared, bool) or declared != metrics[primary]
@@ -232,4 +336,5 @@ def validate_score(score: Any, spec: dict[str, Any]) -> dict[str, Any]:
         "metric": metrics[primary],
         "maximize": maximize,
         "metrics": metrics,
+        "metric_specs": definitions,
     }

@@ -256,11 +256,28 @@ function computeWorkerLabel(value) {
     : "Auto compute";
 }
 
+function bestResultText(results) {
+  const best = results.best;
+  const specs = best?.metric_specs || [];
+  const rawText = (spec) => {
+    const value = best?.metrics?.[spec.name];
+    return `${spec.name} ${spec.maximize ? "↑" : "↓"} ${value != null && Number.isFinite(Number(value)) ? Number(value).toFixed(4) : "—"}`;
+  };
+  if (best && specs.length > 2) {
+    return `Avg rank ${best.average_rank == null ? "—" : Number(best.average_rank).toFixed(2)} · ${rawText(specs[0])}`;
+  }
+  if (best && specs.length) return specs.map(rawText).join(" · ");
+  return results.best_metric != null && Number.isFinite(Number(results.best_metric))
+    ? Number(results.best_metric).toFixed(4)
+    : null;
+}
+
 function resultPresentation(run) {
   const results = run?.observed?.results || {};
   const latest = results.latest || {};
-  if (results.best_metric != null && Number.isFinite(Number(results.best_metric))) {
-    return { text: `Best: ${Number(results.best_metric).toFixed(4)}`, kind: "good" };
+  const bestText = bestResultText(results);
+  if (bestText) {
+    return { text: `Best: ${bestText}`, kind: "good" };
   }
   const outcome = String(latest.outcome || "").trim().toLowerCase();
   if (outcome) {
@@ -1250,7 +1267,7 @@ function renderArtifacts() {
   observation.innerHTML = `
     <span>Events <strong>${escapeHtml(observed.event_count ?? 0)}</strong></span>
     <span>Nodes <strong>${escapeHtml(results.count ?? 0)}</strong></span>
-    <span>Best metric <strong>${results.best_metric == null ? "—" : escapeHtml(Number(results.best_metric).toFixed(4))}</strong></span>
+    <span>Selected best ${results.best?.node_id ? escapeHtml(results.best.node_id) : ""} <strong>${escapeHtml(bestResultText(results) || "—")}</strong></span>
     <span>Last event <strong>${escapeHtml(lastEvent)}</strong></span>`;
   if (!run.artifacts?.length) {
     list.innerHTML = emptyStateMarkup("files", "No files yet");

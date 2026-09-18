@@ -27,6 +27,7 @@ from PIL import Image
 from .. import backend
 from .environment import environment_manifest_text, validate_code_environment
 from .evaluator_adapter import ADAPTER_API, compile_adapter
+from .metric_source import frozen_metric_source, METRIC_SOURCE_FILES
 from .restoration_contract import fixed_restoration_spec
 from .restoration_evaluator_template import _RESTORATION_DATA_ADAPTER
 from .detection_contract import fixed_detection_spec
@@ -40,6 +41,10 @@ from .standard_data_adapters import (
 from .evaluator_protocol import (
     EVALUATOR_API_VERSION,
     metric_name,
+    metric_definitions,
+    requested_metric_definitions,
+    requested_metric_contract,
+    validate_task_metric_contract,
     requested_metrics,
     validate_score,
     validate_scoring_rows,
@@ -55,6 +60,7 @@ from .metric_declarations import (
     PROTOCOL_DOCUMENTATION_FIELDS as _PROTOCOL_DOCUMENTATION_FIELDS,
     canonical_metric_contract,
     declared_metric_names,
+    declared_metric_definitions,
     manifest_head_types as _manifest_head_types,
     manifest_primary_metric as _manifest_primary_metric,
     validate_declared_capabilities,
@@ -79,7 +85,7 @@ _RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
 _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 _SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
-_EVALUATOR_CACHE_VERSION = 5
+_EVALUATOR_CACHE_VERSION = 6
 
 
 class EvaluatorSetupError(RuntimeError):
@@ -101,12 +107,22 @@ class EvaluatorRunResult:
     output: str
     error: str | None = None
 
+    @property
+    def metrics(self) -> dict[str, float]:
+        return dict(self.details.get('score', {}).get('metrics', {}))
+
+    @property
+    def metric_specs(self) -> list[dict[str, Any]]:
+        return list(self.details.get('score', {}).get('metric_specs', []))
+
     def log_line(self) -> str:
         details = dict(self.details)
         details.pop("artifact_report", None)
         payload = {
             "metric": self.metric,
             "maximize": self.maximize,
+            "metrics": self.metrics,
+            "metric_specs": self.metric_specs,
             "details": details,
         }
         return EXTERNAL_VALIDATION_PREFIX + " " + json.dumps(payload, sort_keys=True)
@@ -226,9 +242,9 @@ def _evaluator_prompt(
             "Do not train a model. Do not install packages. Do not use network access.",
             "Do not use Python eval() or exec(). Parse serialized values with json.loads or ast.literal_eval.",
             "Use the Experiment guide as the source of truth for public splits, hidden answers, visibility boundaries, and output paths.",
-            "Define prediction_spec() returning a concise JSON-serializable dict with these top-level keys: validation_artifact, test_submission, key_columns, prediction_columns, primary_metric. key_columns may be [] only when row order is the contract.",
-            "Evaluator API v2: prediction_spec() must include evaluator_api_version=2, boolean maximize, and secondary_metrics as a list of metric names. Preserve all primary and secondary metric requirements from the task. Declare metric parameters (thresholds, averaging, class mapping, coordinate conventions) explicitly in the public spec; use exactly those settings on every split.",
-            "Define score(prediction_path, truth_path, expected_path). This is the ONLY scoring implementation for both validation and private test. Read predictions, hidden truth, and public expected rows from these explicit paths. Never hardcode validation filenames, row counts, or the score-validation environment variable inside score(). Never infer the split from its size. Referenced relative image/mask/annotation paths remain workspace-relative. Return {'metrics': {metric_name: finite_number, ...}, 'metric': primary_value, 'maximize': bool}. Include every requested secondary metric. For detection, explicitly freeze the confidence threshold or operating-point rule for Recall as well as IoU and box format; do not tune the rule on private test answers.",
+            "Define prediction_spec() returning a concise JSON-serializable dict with these top-level keys: validation_artifact, test_submission, key_columns, prediction_columns, metrics. key_columns may be [] only when row order is the contract.",
+            "Evaluator API v3: prediction_spec() must include evaluator_api_version=3 and a nonempty metrics list of {name, maximize} objects. Every metric has its own boolean direction; custom metrics require an explicit direction. Preserve every requested objective; there is no primary or secondary role. Declare metric parameters (thresholds, averaging, class mapping, coordinate conventions) explicitly in the public spec; use exactly those settings on every split.",
+            "Define score(prediction_path, truth_path, expected_path). This is the ONLY scoring implementation for both validation and private test. Read predictions, hidden truth, and public expected rows from these explicit paths. Never hardcode validation filenames, row counts, or the score-validation environment variable inside score(). Never infer the split from its size. Referenced relative image/mask/annotation paths remain workspace-relative. Return {'metrics': {metric_name: finite_number, ...}} and optional diagnostics. Include every declared objective. Do not return a scalar metric or any rank: the Journal computes average ranks across candidates. For detection, explicitly freeze the confidence threshold or operating-point rule for Recall as well as IoU and box format; do not tune the rule on private test answers.",
             "score_val() must only delegate to score() with the validation prediction path, os.environ['BIOMAKER_SCORE_VAL_PATH'], and the public validation CSV. Do not duplicate metric computation for different splits. validate_submission() checks format only and must not read private test answers.",
             "test_submission must be exactly './working/submission.csv'.",
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
@@ -240,12 +256,12 @@ def _evaluator_prompt(
             "For tabular validate_submission(), apply the same key-column string normalization and restrict submission data to key_columns plus prediction_columns before checking duplicates, missing keys, or shapes.",
             "For probability outputs, include class_labels when prediction_columns do not directly encode class names; for single-column binary probability outputs, include positive_class.",
             "The submission contract must preserve enough information for the requested user-only test metrics. For classification with AUC, require probabilities rather than only hard labels.",
-            f"Define score_val() with no required arguments. It must read hidden score truth from os.environ['{_SCORE_ENV_VAR}'], read the candidate validation artifact from ./working, validate the contract, and return a dict containing numeric key 'metric' and boolean key 'maximize'. Add useful extra metric keys when appropriate.",
+            f"Define score_val() with no required arguments. It must read hidden score truth from os.environ['{_SCORE_ENV_VAR}'], read the candidate validation artifact from ./working, validate the contract, and return a dict containing the complete raw metrics mapping and optional diagnostics.",
             "Define validate_submission() with no required arguments. It must validate ./working/submission.csv and any referenced files against the same contract, returning a dict or raising a clear exception.",
             "For tabular prediction artifacts, align rows by the declared key columns after normalizing keys to strings; reject missing keys, duplicate keys, extra keys, bad shapes, and invalid numeric values.",
             "For probability outputs, validate with numeric tolerance and return a clear error when rows are not valid probabilities.",
             "If any requested metric is mathematically undefined, raise a clear error naming that metric. Never substitute accuracy for AUC or silently omit a requested metric.",
-            f"Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real public score validation and agent_test split CSVs, exactly follow prediction_spec(), call score_val() with os.environ['{_SCORE_ENV_VAR}'] available, call validate_submission(), assert the returned metric is numeric, then print EVALUATOR_OK.",
+            f"Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real public score validation and agent_test split CSVs, exactly follow prediction_spec(), call score_val() with os.environ['{_SCORE_ENV_VAR}'] available, call validate_submission(), assert every declared metric is finite numeric, then print EVALUATOR_OK.",
             "self_test() MUST leave its validation/submission CSVs and ALL referenced files available after returning. Harness reads them again for a relocated-path scoring probe and owns cleanup after every preparation check finishes. Do not delete them or place referenced files in a TemporaryDirectory context that closes before returning.",
             "Keep the evaluator simple and deterministic. Implement and verify only unavailable metric definitions; reuse supplied trusted_score_samples(samples, spec) for registered metrics. Its canonical sample/parameter interface is documented below. Do not reimplement PSNR, SSIM, Dice, AJI, HD95, accuracy, AUC, AP50, or Recall.",
             "For segmentation masks, support mask files referenced from CSV. The prediction spec should make this explicit with prediction_type='mask_file_path' or file_reference_columns for the mask path column. Binary Dice should treat nonzero pixels as foreground. AJI/instance metrics should use integer connected/instance labels if the task asks for them.",
@@ -264,7 +280,7 @@ def _trusted_metric_api() -> str:
     return (
         "trusted_score_samples(samples, spec) is supplied by Harness in this standalone file. "
         "samples is an iterable of mappings with prediction, target and optional group, "
-        "input_shape, spacing, prediction_spacing. It returns metric/maximize/metrics/n. "
+        "input_shape, spacing, prediction_spacing. It returns raw metrics/n and diagnostics (never ranks). "
         "Use a spec naming only the registered metrics for that call, then combine your "
         "independently verified new metric in the final metrics mapping.\n" + METRIC_API_DESCRIPTION
     )
@@ -308,7 +324,7 @@ def _adapter_reference_example(task_desc: Any, manifest: dict[str, Any]) -> str:
     primary, _ = requested_metrics(_task_payload(task_desc))
     info = metric_info(primary or _manifest_primary_metric(manifest))
     family = info.task_family if info else "classification"
-    spec = dict(evaluator_api_version=2, key_columns=["sample_id"],
+    spec = dict(evaluator_api_version=3, key_columns=["sample_id"],
                 validation_artifact="./working/validation_predictions.csv",
                 test_submission="./working/submission.csv", maximize=True)
     if family == "regression":
@@ -326,6 +342,23 @@ def _adapter_reference_example(task_desc: Any, manifest: dict[str, Any]) -> str:
         spec.update(task_type=family, primary_metric="binary_dice", secondary_metrics=["aji"],
                     prediction_columns=["estimated_mask"], answer_columns=["reference_mask"],
                     image_column="observed_image")
+        contract = requested_metric_contract(_task_payload(task_desc)) or {}
+        if contract:
+            from .trusted_metrics import metric_capabilities
+            allowed = set(metric_capabilities()['families']['segmentation']['allowed_contract_fields'])
+            for key in ('primary_metric', 'secondary_metrics', 'maximize'):
+                spec.pop(key, None)
+            spec.update({key: value for key, value in contract.items() if key in allowed})
+            names = {item['name'] for item in metric_definitions(spec)}
+            auxiliary = {}
+            if names & {'cldice', 'multiclass_cldice', 'tree_length_detected', 'branch_detected'}:
+                auxiliary['skeleton'] = 'reference_skeleton'
+            if names & {'branch_detected', 'branch_accuracy', 'branch_f1', 'subtree_consistency', 'topological_distance'}:
+                auxiliary['parsing'] = 'reference_branches'
+            if names & {'subtree_consistency', 'topological_distance'}:
+                auxiliary['graph'] = 'reference_tree'
+            spec.update(target_column='reference_mask', auxiliary_columns=auxiliary,
+                        answer_columns=['reference_mask', *auxiliary.values()])
         template = _SEGMENTATION_DATA_ADAPTER
     elif family == "detection":
         schema = dict(class_key="category", coordinate_keys=["bbox"], box_format="xyxy")
@@ -338,6 +371,9 @@ def _adapter_reference_example(task_desc: Any, manifest: dict[str, Any]) -> str:
                     prediction_columns=["probability_no", "probability_yes"], answer_columns=["class_name"],
                     class_labels=["no", "yes"], positive_class="yes")
         template = _CLASSIFICATION_DATA_ADAPTER
+    spec['metrics'] = metric_definitions(spec)
+    for key in ('primary_metric', 'secondary_metrics', 'maximize'):
+        spec.pop(key, None)
     return template.replace("__BIOMAKER_SPEC__", repr(spec)).strip()
 
 
@@ -553,30 +589,24 @@ print('EVALUATOR_OK')
     return output
 
 
-def _validate_scoring_contract(spec: dict[str, Any], task_desc: Any = None) -> None:
-    if spec.get("evaluator_api_version") != EVALUATOR_API_VERSION:
-        raise EvaluatorSetupError(
-            "prediction_spec must declare evaluator_api_version=2."
-        )
-    if not isinstance(spec.get("maximize"), bool):
-        raise EvaluatorSetupError("prediction_spec must declare boolean maximize.")
-    secondary = spec.get("secondary_metrics")
-    if not isinstance(secondary, list) or any(
-        not isinstance(m, str) or not m.strip() for m in secondary
-    ):
-        raise EvaluatorSetupError(
-            "prediction_spec must declare secondary_metrics as a list of names."
-        )
+def _validate_scoring_contract(spec: dict[str, Any], task_desc: Any = None, *, allow_legacy: bool = False) -> None:
+    version = spec.get('evaluator_api_version')
+    if version != EVALUATOR_API_VERSION and not (allow_legacy and version == 2):
+        raise EvaluatorSetupError('prediction_spec must declare evaluator_api_version=3.')
+    if version == 3 and 'metrics' not in spec:
+        raise EvaluatorSetupError('Evaluator API v3 requires a nonempty metrics list.')
+    try:
+        definitions = metric_definitions(spec, allow_legacy_unknown=allow_legacy and version == 2)
+    except ValueError as exc:
+        raise EvaluatorSetupError(str(exc)) from exc
+    try:
+        validate_task_metric_contract(spec, _task_payload(task_desc))
+    except ValueError as exc:
+        raise EvaluatorSetupError(str(exc)) from exc
     primary, requested_secondary = requested_metrics(_task_payload(task_desc))
-    actual_primary = metric_name(str(spec.get("primary_metric", "")))
-    if primary and actual_primary != primary:
+    if primary and set([primary, *requested_secondary]) != {item['name'] for item in definitions}:
         raise EvaluatorSetupError(
-            f"Requested primary metric {primary}, evaluator declares {actual_primary}."
-        )
-    missing = set(requested_secondary) - {metric_name(m) for m in secondary}
-    if missing:
-        raise EvaluatorSetupError(
-            f"Evaluator omitted requested secondary metrics: {sorted(missing)}"
+            'Evaluator metrics must match every requested metric; objectives cannot be added or omitted.'
         )
 
 
@@ -655,7 +685,7 @@ def _primary_metric_from_raw_spec(spec: dict[str, Any]) -> str | None:
             return value.strip()
     metrics = spec.get("metrics")
     if isinstance(metrics, list) and metrics:
-        return str(metrics[0])
+        return metric_definitions(spec)[0]['name']
     return None
 
 
@@ -707,7 +737,7 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         )
     if not primary_metric:
         raise EvaluatorSetupError(
-            "prediction_spec() must declare primary_metric, such as auc, accuracy, binary_dice, or aji."
+            "prediction_spec() must declare a nonempty metrics list with metric names and directions."
         )
 
     normalized: dict[str, Any] = {
@@ -717,8 +747,13 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         "test_submission": test_submission,
         "key_columns": key_columns,
         "prediction_columns": prediction_columns,
-        "primary_metric": primary_metric,
     }
+    if spec.get('evaluator_api_version') == 3 or 'metrics' in spec:
+        normalized['metrics'] = metric_definitions(spec)
+        for key in ('primary_metric', 'secondary_metrics', 'maximize'):
+            normalized.pop(key, None)
+    else:
+        normalized['primary_metric'] = primary_metric
     if file_reference_columns:
         normalized["file_reference_columns"] = [
             column
@@ -729,14 +764,12 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
     if any(token in metric_lower for token in ["aji", "dice", "mask", "segmentation"]):
         normalized.setdefault("prediction_type", "mask_file_path")
     for optional_key in [
-        "metrics",
         "constraints",
         "notes",
         "class_labels",
         "positive_class",
         "prediction_type",
         "task_type",
-        "maximize",
         "score_split",
     ]:
         if optional_key in spec:
@@ -745,7 +778,7 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
 
 
 def _should_run_tabular_contract_test(spec: dict[str, Any]) -> bool:
-    metric = str(spec.get("primary_metric", "")).lower()
+    metric = _primary_metric_from_raw_spec(spec) or ''
     has_class_labels = isinstance(spec.get("class_labels"), list)
     tabular_metric = any(
         token in metric
@@ -1062,6 +1095,7 @@ def inspect_candidate_artifacts(
                 "key_columns",
                 "prediction_columns",
                 "primary_metric",
+                "metrics",
                 "prediction_type",
             ]
             if key in spec
@@ -1465,22 +1499,29 @@ def _load_fixed_split_context(
     split_dir = workspace_dir / "input" / "biomaker_splits"
     train_path = split_dir / "agent_train.csv"
     score_path = _score_split_path(workspace_dir)
-    test_path = split_dir / "agent_test.csv"
+    lifecycle = _bind_public_split_lifecycle({}, workspace_dir)
+    test_path = (workspace_dir / lifecycle["test_split"].removeprefix("./")
+                 if lifecycle["test_split"] is not None else None)
     if not (
         train_path.is_file()
         and score_path.is_file()
-        and test_path.is_file()
+        and (test_path is None or test_path.is_file())
         and hidden_score_path.is_file()
     ):
         return None
     train_df = pd.read_csv(train_path)
     score_df = pd.read_csv(score_path)
-    test_df = pd.read_csv(test_path)
+    # Empty schema only assists existing column inference. It is never written
+    # as a split, used as prediction rows, or supplied to a test evaluator.
+    test_df = (pd.read_csv(test_path) if test_path is not None
+               else score_df.iloc[:0].copy())
     hidden_df = pd.read_csv(hidden_score_path)
     split_plan = _json_dict(split_dir / "split_plan.json")
     split_manifest = _split_manifest(split_dir)
     return {
         "score_path": score_path,
+        "test_path": test_path,
+        "split_lifecycle": lifecycle,
         "train_df": train_df,
         "score_df": score_df,
         "test_df": test_df,
@@ -1628,7 +1669,7 @@ def _write_fixed_evaluator(
         log_dir,
         "fixed_evaluator_prepared",
         task_type=spec.get("task_type"),
-        primary_metric=spec.get("primary_metric"),
+        metric_specs=spec.get('metrics', []),
         prediction_columns=spec.get("prediction_columns"),
     )
     clean_candidate_outputs(workspace_dir)
@@ -1789,7 +1830,18 @@ def _infer_fixed_segmentation_spec(
         return None
     if not mask_candidates:
         return None
-    answer_column = mask_candidates[0]
+    declared = split_manifest.get('metric_contract', {})
+    auxiliary = declared.get('auxiliary_columns', {})
+    answer_column = declared.get('target_column')
+    if answer_column is not None:
+        if answer_column not in mask_candidates:
+            return None
+    elif len(answer_columns) == 1:
+        answer_column = mask_candidates[0]
+    else:
+        # Multiple private paths need an explicit target; never score a
+        # skeleton or branch parsing merely because its column came first.
+        return None
 
     key_columns = _manifest_key_columns(
         split_manifest
@@ -1859,7 +1911,9 @@ def _infer_fixed_segmentation_spec(
         "maximize": metric_maximize(primary_metric),
         "task_type": task_type,
         "prediction_type": "mask_file_path",
-        "answer_columns": [answer_column],
+        "answer_columns": list(answer_columns),
+        "target_column": answer_column,
+        "auxiliary_columns": auxiliary,
         "image_column": image_column,
     }
 
@@ -1986,12 +2040,14 @@ def _validate_custom_metric_contract(spec: dict[str, Any], workspace_dir: Path, 
     """Custom formulas cannot redefine the prepared protocol or outputs."""
     primary, secondary = _requested_metric_names(task_desc, workspace_dir)
     actual = _canonical_declared_settings(spec)
-    if primary and actual.get("primary_metric") != primary:
-        raise EvaluatorSetupError("Custom evaluator changed the prepared primary metric.")
-    if set(secondary) - set(actual.get("secondary_metrics", [])):
-        raise EvaluatorSetupError("Custom evaluator omitted prepared secondary metrics.")
+    actual_names = [item['name'] for item in metric_definitions(actual)]
+    if primary and set([primary, *secondary]) != set(actual_names):
+        raise EvaluatorSetupError('Custom evaluator changed prepared primary/secondary metrics or added objectives.')
     manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
-    declared = _canonical_declared_settings(manifest.get("metric_contract", {}), fallback_primary=primary)
+    declared = {**(requested_metric_contract(_task_payload(task_desc)) or {}), **_canonical_declared_settings(manifest.get("metric_contract", {}), fallback_primary=primary)}
+    expected_definitions = declared_metric_definitions(manifest, _task_payload(task_desc), fallback_primary=primary)
+    if {item['name']: item for item in metric_definitions(actual)} != {item['name']: item for item in expected_definitions}:
+        raise EvaluatorSetupError('Custom evaluator changed prepared metrics, maximize directions or metric parameters.')
     blocks = re.findall(r"```restoration-evaluation\s*\n(.*?)```", _task_payload(task_desc), re.S)
     if len(blocks) > 1:
         raise EvaluatorSetupError("Declare exactly one restoration-evaluation contract.")
@@ -2003,7 +2059,7 @@ def _validate_custom_metric_contract(spec: dict[str, Any], workspace_dir: Path, 
             return isinstance(value, dict) and all(key in value and preserves(value[key], item) for key, item in expected.items())
         return value == expected
     for key, value in declared.items():
-        if key in {"primary_metric", "secondary_metrics"} | _PROTOCOL_DOCUMENTATION_FIELDS:
+        if key in {"primary_metric", "secondary_metrics", "maximize", "metrics"} | _PROTOCOL_DOCUMENTATION_FIELDS:
             continue
         if key not in actual or not preserves(actual[key], value):
             raise EvaluatorSetupError("Custom evaluator changed or omitted prepared metric protocol field: " + key)
@@ -2021,6 +2077,44 @@ def _canonical_declared_settings(values: dict[str, Any], *, fallback_primary: st
         return canonical_metric_contract(values, fallback_primary=fallback_primary)
     except ValueError as exc:
         raise EvaluatorSetupError(str(exc)) from exc
+
+
+def _bind_public_split_lifecycle(spec: dict[str, Any], workspace_dir: Path) -> dict[str, Any]:
+    """Bind test presence from explicit prepared split declarations, never absence.
+
+    A missing test CSV remains an error for legacy/test-enabled contracts. Only
+    a manifest explicitly declaring train and score_val without test enables the
+    no-test lifecycle. Adapter-provided split claims cannot override it.
+    """
+    manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
+    declarations = []
+    for field in ("public_splits", "required_splits"):
+        if field not in manifest:
+            continue
+        roles = manifest[field]
+        if (not isinstance(roles, list) or any(not isinstance(role, str) for role in roles)
+                or len(set(roles)) != len(roles)
+                or not {"train", "score_val"}.issubset(roles)
+                or set(roles) - {"train", "score_val", "test"}):
+            raise EvaluatorSetupError(
+                "split_manifest." + field + " must explicitly list train, score_val and optionally test."
+            )
+        declarations.append(set(roles))
+    if declarations and any(roles != declarations[0] for roles in declarations[1:]):
+        raise EvaluatorSetupError("Conflicting public_splits and required_splits declarations.")
+    result = dict(spec)
+    result.pop("public_splits", None)
+    result["test_split"] = "./input/biomaker_splits/agent_test.csv"
+    if declarations:
+        public = declarations[0]
+        result["public_splits"] = [role for role in ("train", "score_val", "test") if role in public]
+        if "test" not in public:
+            for field in ("splits", "hidden_answers", "private_gt"):
+                metadata = manifest.get(field)
+                if isinstance(metadata, dict) and "test" in metadata:
+                    raise EvaluatorSetupError("No-test split declaration conflicts with split_manifest." + field + ".test.")
+            result["test_split"] = None
+    return result
 
 
 def _freeze_data_adapter(workspace_dir: Path, source: str, task_desc: Any, hidden_score_path: Path) -> None:
@@ -2052,7 +2146,7 @@ def _freeze_data_adapter(workspace_dir: Path, source: str, task_desc: Any, hidde
     if set(spec["answer_columns"]) != set(answers):
         raise EvaluatorSetupError("Adapter answer_columns must preserve the declared hidden answer schema.")
     spec["score_split"] = "./" + str(score_path.relative_to(workspace_dir))
-    spec["test_split"] = "./input/biomaker_splits/agent_test.csv"
+    spec = _bind_public_split_lifecycle(spec, workspace_dir)
 
     actual = _resolve_metric_contract(spec, workspace_dir, task_desc)
     evaluator_path.write_text(compile_adapter(source, actual), encoding="utf-8")
@@ -2072,7 +2166,21 @@ def _resolve_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_des
         for key in ("prediction_columns", "file_reference_columns", "prediction_type", "class_labels", "positive_class", "image_column"):
             if key in output:
                 spec[key] = output[key]
-    spec = normalize_metric_spec(_canonical_declared_settings(spec))
+    # Every newly prepared evaluator is v3. Historical v2 files are read only by
+    # the rescoring path and are never rewritten here.
+    spec = _canonical_declared_settings(spec)
+    if not require_match:
+        definitions = declared_metric_definitions(manifest, _task_payload(task_desc), fallback_primary=_primary_metric_from_raw_spec(spec))
+        spec['metrics'] = definitions
+        for key in ('primary_metric', 'secondary_metrics', 'maximize'):
+            spec.pop(key, None)
+    else:
+        spec['metrics'] = metric_definitions(spec)
+        for key in ('primary_metric', 'secondary_metrics', 'maximize'):
+            spec.pop(key, None)
+    spec['evaluator_api_version'] = EVALUATOR_API_VERSION
+    spec = normalize_metric_spec(spec)
+    spec = _bind_public_split_lifecycle(spec, workspace_dir)
     if not require_match:
         reader = data_adapter_capabilities()["families"][spec["task_family"]]
         if spec.get("prediction_type") not in reader["prediction_types"]:
@@ -2086,8 +2194,13 @@ def _resolve_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_des
             raise EvaluatorSetupError("File-valued predictions require a data adapter for this reader.")
     # Structured protocol declarations are authoritative. The agent may map data
     # representations, but cannot weaken the evaluation to pass preparation.
-    contract = {key: value for key, value in _canonical_declared_settings(manifest.get("metric_contract", {}), fallback_primary=spec["primary_metric"]).items()
+    declared_contract = {**(requested_metric_contract(_task_payload(task_desc)) or {}), **_canonical_declared_settings(manifest.get("metric_contract", {}), fallback_primary=spec['metrics'][0]['name'])}
+    contract = {key: value for key, value in declared_contract.items()
                 if key not in _PROTOCOL_DOCUMENTATION_FIELDS}
+    if 'primary_metric' in contract or 'metrics' in contract:
+        contract['metrics'] = declared_metric_definitions(manifest, _task_payload(task_desc), fallback_primary=spec['metrics'][0]['name'])
+        for key in ('primary_metric', 'secondary_metrics', 'maximize'):
+            contract.pop(key, None)
     supported_fields = set(metric_capabilities()["families"][spec["task_family"]]["allowed_contract_fields"])
     unknown_fields = set(contract) - supported_fields
     if unknown_fields:
@@ -2121,9 +2234,20 @@ def _resolve_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_des
         raise
     actual = normalize_metric_spec(spec)
     if not require_match:
+        if expected['task_family'] == 'segmentation':
+            auxiliary = expected.get('auxiliary_columns', {})
+            target = expected.get('target_column', expected['answer_columns'][0])
+            if (target in auxiliary.values()
+                    or set(expected['answer_columns']) != {target, *auxiliary.values()}):
+                raise EvaluatorSetupError('Mask reader requires exactly the target column and declared auxiliary columns as answers.')
         _validate_scoring_contract(expected, task_desc)
         return expected
     for key in set(contract) | ({"restoration_evaluation", "ssim_parameters"} if restoration else set()):
+        if key == 'metrics':
+            if {item['name']: item for item in actual[key]} != {item['name']: item for item in expected[key]}:
+                raise EvaluatorSetupError('Adapter changed the frozen metrics or maximize directions.')
+            actual[key] = expected[key]
+            continue
         if key in actual and actual[key] != expected[key]:
             raise EvaluatorSetupError("Adapter changed the frozen metric protocol field: " + key)
     return actual
@@ -2174,7 +2298,8 @@ def _evaluator_cache_metadata(
         "restoration_evaluator_template.py": _sha256_file(utils_dir / "restoration_evaluator_template.py"),
         "evaluator_protocol.py": _sha256_file(utils_dir / "evaluator_protocol.py"),
         "evaluator_adapter.py": _sha256_file(utils_dir / "evaluator_adapter.py"),
-        "trusted_metrics.py": _sha256_file(utils_dir / "trusted_metrics.py"),
+        **{name: _sha256_file(utils_dir / name) for name in METRIC_SOURCE_FILES},
+        "metric_source.py": _sha256_file(utils_dir / "metric_source.py"),
         "metric_declarations.py": _sha256_file(utils_dir / "metric_declarations.py"),
         "standard_data_adapters.py": _sha256_file(utils_dir / "standard_data_adapters.py"),
         "exp_guide.py": _sha256_file(utils_dir / "exp_guide.py"),
@@ -2187,6 +2312,8 @@ def _evaluator_cache_metadata(
         "scikit-learn": _package_version("scikit-learn"),
         "Pillow": _package_version("Pillow"),
         "scipy": _package_version("scipy"),
+        "scikit-image": _package_version("scikit-image"),
+        "SimpleITK": _package_version("SimpleITK"),
     }
     prompt_hash = hashlib.sha256(
         json.dumps({key: value for key, value in prompt.items() if key != "Preparation diagnostics"}, ensure_ascii=False, sort_keys=True, default=str).encode(
@@ -2526,7 +2653,7 @@ def prepare_evaluator(
                 # depending on an installed/mutable biomaker package.
                 tree = ast.parse(code)
                 tree.body = [node for node in tree.body if not (isinstance(node, ast.ImportFrom) and node.module == "__future__")]
-                kernels = Path(__file__).with_name("trusted_metrics.py").read_text(encoding="utf-8")
+                kernels = frozen_metric_source()
                 evaluator_path.write_text(
                     "from __future__ import annotations\n" + kernels
                     + "\ntrusted_score_samples = score_samples\n"
@@ -2641,7 +2768,7 @@ def score_artifacts_with_evaluator(
     workspace_dir = Path(workspace_dir)
     hidden_score_path = Path(truth_path).resolve()
     spec = load_experiment_contract(workspace_dir).prediction.raw
-    if spec.get("evaluator_api_version") != EVALUATOR_API_VERSION:
+    if spec.get("evaluator_api_version") not in (2, EVALUATOR_API_VERSION):
         return EvaluatorRunResult(
             ok=False,
             metric=None,
@@ -2652,7 +2779,7 @@ def score_artifacts_with_evaluator(
             "Start a new run to prepare a compatible evaluator; existing run artifacts were not changed.",
         )
     try:
-        _validate_scoring_contract(spec)
+        _validate_scoring_contract(spec, allow_legacy=True)
         sample_count = validate_scoring_rows(
             Path(prediction_path), hidden_score_path, Path(expected_path), spec
         )
@@ -2739,8 +2866,8 @@ def score_artifacts_with_evaluator(
             payload["score"] = score
             return EvaluatorRunResult(
                 ok=True,
-                metric=score["metric"],
-                maximize=score["maximize"],
+                metric=score.get('metric', score['metrics'][score['metric_specs'][0]['name']] if len(score['metric_specs']) == 1 else None),
+                maximize=score.get('maximize', score['metric_specs'][0]['maximize'] if len(score['metric_specs']) == 1 else True),
                 details=payload,
                 output=output_with_report,
             )

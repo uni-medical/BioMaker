@@ -104,10 +104,8 @@ __BIOMAKER_LICENSE_HIGHLIGHT__
       }
       canvas {
         display: block;
-        float: left;
-        height: 100vh !important;
-        width: 58vw !important;
       }
+      #tree-canvas { float: left; height: 100vh; overflow: auto; width: 58vw; }
       #side-panel {
         background-color: var(--panel);
         border-left: 1px solid var(--border);
@@ -213,6 +211,20 @@ __BIOMAKER_LICENSE_HIGHLIGHT__
         font-size: 13px;
         overflow-wrap: anywhere;
       }
+      .table-scroll { margin: 10px 0; max-width: 100%; overflow-x: auto; }
+      .ranking-table { border-collapse: collapse; font-size: 12px; width: 100%; }
+      .ranking-table th, .ranking-table td { border-bottom: 1px solid var(--border); padding: 9px 8px; text-align: left; vertical-align: top; }
+      .ranking-table th { font-weight: 600; max-width: 210px; min-width: 88px; overflow-wrap: anywhere; }
+      .ranking-table td { font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .ranking-table thead { background: var(--panel-muted); }
+      .ranking-table button { background: transparent; border: 0; color: var(--accent); cursor: pointer; font: inherit; text-align: left; }
+      .candidates-table tbody tr { cursor: pointer; }
+      .candidates-table tbody tr:hover { background: var(--panel-muted); }
+      .candidates-table .best-row { background: #fcf8e9; }
+      .best-tag { color: var(--best); display: inline-block; font-size: 10px; margin-left: 4px; }
+      .comparison-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+      .comparison-controls label { color: var(--muted); flex: 1 1 130px; font-size: 11px; min-width: 0; }
+      .comparison-controls input, .comparison-controls select { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text); display: block; font: inherit; font-size: 12px; margin-top: 4px; min-height: 32px; padding: 5px; width: 100%; }
       h3 {
         color: var(--text);
         font-size: 13px;
@@ -365,6 +377,8 @@ __BIOMAKER_LICENSE_HIGHLIGHT__
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      #tree-status { flex-wrap: wrap; max-width: 100%; }
+      #tree-status span { max-width: 100%; min-width: 0; overflow-wrap: anywhere; }
       #tree-status .best-value {
         color: var(--best);
         font-weight: 650;
@@ -427,9 +441,8 @@ __BIOMAKER_LICENSE_HIGHLIGHT__
 
       html[data-embed="true"] canvas {
         float: none;
-        height: 100vh !important;
-        width: 100vw !important;
       }
+      html[data-embed="true"] #tree-canvas { float: none; height: 100vh; width: 100vw; }
       html[data-embed="true"] #tree-toolbar {
         max-width: calc(100vw - 24px);
       }
@@ -491,14 +504,14 @@ __BIOMAKER_LICENSE_HIGHLIGHT__
       }
 
       @media (max-width: 900px) {
-        canvas,
+        #tree-canvas,
         #side-panel {
           float: none;
           width: 100vw;
         }
-        canvas {
-          height: 48vh !important;
-          width: 100vw !important;
+        #tree-canvas {
+          height: 48vh;
+          width: 100vw;
         }
         #side-panel {
           border-left: 0;
@@ -521,6 +534,7 @@ __BIOMAKER_LICENSE_HIGHLIGHT__
         }
       }
       @media (max-width: 600px) {
+        #tree-status .metric-heading { display: none; }
         html[data-embed="true"] #drawer-scrim {
           background: rgba(28, 28, 26, 0.08);
         }
@@ -540,6 +554,7 @@ __BIOMAKER_LICENSE_HIGHLIGHT__
     </style>
   </head>
   <body>
+    <div id="tree-canvas" aria-label="Search tree canvas; scroll to view additional nodes"></div>
     <aside id="side-panel" aria-label="Selected node details">
       <header class="panel-heading">
         <div>
@@ -552,6 +567,15 @@ __BIOMAKER_LICENSE_HIGHLIGHT__
       </header>
       <div id="run-summary"></div>
       <section id="node-summary"></section>
+      <details id="detail-candidates" open>
+        <summary>Candidate comparison · current ranking</summary>
+        <p class="muted">Default order matches selection. Sorting and filtering only change this view.</p>
+        <div class="comparison-controls">
+          <label>Sort by<select id="candidate-sort" aria-label="Sort candidates"></select></label>
+          <label>Find node<input id="candidate-filter" type="search" placeholder="Node ID, step or status" /></label>
+        </div>
+        <div id="candidate-table"></div>
+      </details>
       <details id="detail-input">
         <summary>Input Prompt</summary>
         <div id="input-prompt"></div>

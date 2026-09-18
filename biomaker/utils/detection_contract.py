@@ -4,6 +4,7 @@ import json
 import re
 
 from .evaluator_protocol import metric_name, requested_metrics
+from .metric_declarations import declared_metric_names, declared_metric_definitions, canonical_metric_contract
 
 
 def fixed_detection_spec(context, task):
@@ -12,9 +13,8 @@ def fixed_detection_spec(context, task):
     heads = [h.get("type") if isinstance(h, dict) else h for h in heads]
     if not set(heads) & {"detection", "object_detection", "detection_2d"}:
         return None
-    primary, secondary = requested_metrics(task)
-    contract = manifest.get("metric_contract", {})
-    primary = primary or metric_name(str(contract.get("primary_metric", "")))
+    primary, secondary = declared_metric_names(manifest, task)
+    contract = canonical_metric_contract(manifest.get("metric_contract", {}))
     if primary not in {"ap50", "recall"} or any(
         m not in {"ap50", "recall"} for m in secondary
     ):
@@ -105,12 +105,10 @@ def fixed_detection_spec(context, task):
         return None
     column, schema = candidates[0]
     return dict(
-        evaluator_api_version=2,
+        evaluator_api_version=3,
         task_type="detection",
         prediction_type="columns",
-        primary_metric=primary,
-        secondary_metrics=secondary,
-        maximize=True,
+        metrics=declared_metric_definitions(manifest, task),
         key_columns=keys,
         prediction_columns=[column],
         answer_columns=[column],

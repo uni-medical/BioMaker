@@ -158,7 +158,7 @@ def test_monuseg_declaration_repair_preserves_data_and_reaches_trusted_scoring(
     )
     assert scored.ok, scored.output + str(scored.error)
     # Per-image AJI: 1, 0, 0, 1, 2/6. Binary Dice: 1, 0, 0, 1, 4/8.
-    assert scored.metric == pytest.approx(7 / 15)
+    assert scored.metrics["aji"] == pytest.approx(7 / 15)
     assert scored.details["score"]["metrics"] == pytest.approx({"aji": 7 / 15, "binary_dice": 0.5})
     assert scored.details["score"]["n"] == len(cases)
     assert prepared.path.read_bytes() == frozen_code

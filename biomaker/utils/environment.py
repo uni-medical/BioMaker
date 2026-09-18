@@ -33,6 +33,7 @@ PACKAGE_SPECS = [
     PackageSpec("pandas", "pandas", "pandas"),
     PackageSpec("sklearn", "scikit-learn", "scikit-learn"),
     PackageSpec("scipy", "scipy", "scipy"),
+    PackageSpec("skimage", "scikit-image", "scikit-image", medical=True),
     PackageSpec("matplotlib", "matplotlib", "matplotlib"),
     PackageSpec("torch", "torch", "torch"),
     PackageSpec("torchvision", "torchvision", "torchvision"),
@@ -55,7 +56,6 @@ BLOCKED_EXAMPLES = [
     "tensorflow",
     "keras",
     "segmentation_models_pytorch",
-    "skimage",
 ]
 
 LOCAL_GENERATED_MODULES = {"evaluator"}

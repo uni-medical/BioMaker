@@ -135,30 +135,41 @@ def _append_artifacts(lines: list[str], guide: dict[str, Any]) -> None:
         "key_columns": prediction.get("key_columns") or [],
         "prediction_columns": prediction.get("prediction_columns") or [],
         "prediction_type": prediction.get("prediction_type") or "columns",
-        "primary_metric": metric.get("primary_metric"),
-        "maximize": metric.get("maximize"),
+        "metrics": metric.get("metrics", []),
     }
     for optional_key in ["class_labels", "positive_class", "score_split"]:
         value = prediction.get(optional_key) or metric.get(optional_key)
         if value not in (None, [], {}):
             contract[optional_key] = value
-    if metric.get("secondary_metrics"):
-        contract["secondary_metrics"] = metric.get("secondary_metrics")
+    if not metric.get("metrics") and metric.get("primary_metric"):
+        # Old saved guides remain readable; new guides only declare metrics.
+        contract.update(
+            {
+                key: metric[key]
+                for key in ("primary_metric", "secondary_metrics", "maximize")
+                if key in metric
+            }
+        )
     lines.extend(["", "Evaluator contract:"])
     lines.append("```json")
     lines.append(json.dumps(contract, ensure_ascii=False, sort_keys=True))
     lines.append("```")
     output_encoding = _as_dict(guide.get("output_encoding"))
     if output_encoding:
-        lines.extend([
-            "", "Public prediction encoding:", "```json",
-            json.dumps(output_encoding, ensure_ascii=False, sort_keys=True), "```",
-            "- Follow the declared field order, coordinate units and confidence "
-            "representation; sample key columns are separate from predictions. "
-            "Frozen output details take precedence over prepared declarations. "
-            "Consult `evaluator.prediction_spec()` and its decoder if needed; "
-            "do not infer a positional format from the prediction column name.",
-        ])
+        lines.extend(
+            [
+                "",
+                "Public prediction encoding:",
+                "```json",
+                json.dumps(output_encoding, ensure_ascii=False, sort_keys=True),
+                "```",
+                "- Follow the declared field order, coordinate units and confidence "
+                "representation; sample key columns are separate from predictions. "
+                "Frozen output details take precedence over prepared declarations. "
+                "Consult `evaluator.prediction_spec()` and its decoder if needed; "
+                "do not infer a positional format from the prediction column name.",
+            ]
+        )
     lines.extend(["", "Required evaluator artifacts:"])
     if prediction.get("validation_artifact"):
         lines.append(f"- validation predictions: `{prediction['validation_artifact']}`")
@@ -171,7 +182,18 @@ def _append_artifacts(lines: list[str], guide: dict[str, Any]) -> None:
     )
     if prediction_columns:
         lines.append(f"- prediction columns: {prediction_columns}")
-    if metric.get("primary_metric"):
+    if metric.get("metrics"):
+        names = ", ".join(
+            f"{item['name']} {'↑' if item['maximize'] else '↓'}"
+            for item in metric["metrics"]
+        )
+        lines.append(f"- validation objectives: {names}")
+        lines.append(
+            "- Selection: equal-weight mean of per-metric ranks among all completed "
+            "valid candidates; lower is better. Ties prefer the lower worst rank, "
+            "then earlier step. Rankings are relative to the current candidate set."
+        )
+    elif metric.get("primary_metric"):
         lines.append(
             f"- validation metric used for node selection: {metric['primary_metric']}"
         )
@@ -228,7 +250,6 @@ def _append_samples(lines: list[str], guide: dict[str, Any]) -> None:
                 f"- {label} sample `{column}`: {value} -> "
                 f"{status}{shape_text}{mode_text}{kind_text}{reader_text}{pixel_text}"
             )
-
 
 
 def _render_exp_guide_summary(guide: dict[str, Any], base_path: Path) -> str:

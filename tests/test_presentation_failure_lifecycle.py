@@ -9,7 +9,7 @@ import pytest
 
 import biomaker.run as run_module
 from biomaker.interpreter import ExecutionResult
-from biomaker.journal import Node
+from biomaker.journal import Journal, Node
 from biomaker.utils import config as config_module
 from biomaker.utils import final_retrain as final_retrain_module
 from biomaker.utils import tree_export
@@ -116,6 +116,7 @@ class _MinimalWorkflow:
         round_node.node.absorb_exec_result(exec_result)
         round_node.node.is_buggy = False
         round_node.node.metric = MetricValue(0.9, maximize=True)
+        round_node.node.metrics = {"accuracy": 0.9}
         round_node.node.outcome = "first_success"
 
     def append_round_node(self, round_node):
@@ -692,14 +693,6 @@ def test_save_run_downgrades_tree_html_failure_but_keeps_facts(tmp_path, monkeyp
     saved = []
     warnings = []
 
-    class EmptyJournal:
-        nodes = []
-
-        @staticmethod
-        def get_best_node(*, only_good):
-            assert only_good is True
-            return None
-
     monkeypatch.setattr(
         config_module.serialize,
         "dump_json",
@@ -708,7 +701,7 @@ def test_save_run_downgrades_tree_html_failure_but_keeps_facts(tmp_path, monkeyp
     monkeypatch.setattr(
         config_module,
         "_write_results_table",
-        lambda path, _journal: saved.append((path / "results.tsv").name),
+        lambda path, _journal, _snapshot: saved.append((path / "results.tsv").name),
     )
     monkeypatch.setattr(
         config_module.OmegaConf,
@@ -730,7 +723,7 @@ def test_save_run_downgrades_tree_html_failure_but_keeps_facts(tmp_path, monkeyp
 
     config_module.save_run(
         SimpleNamespace(log_dir=log_dir, workspace_dir=workspace_dir),
-        EmptyJournal(),
+        Journal(),
         presentation_error_handler=lambda component, exc: warnings.append(
             (component, type(exc).__name__, str(exc))
         ),

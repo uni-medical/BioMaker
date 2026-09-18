@@ -175,7 +175,7 @@ def test_json_restoration_adapter_is_frozen_and_shared_with_private_test(run_inp
     assert validation.ok, validation.output + str(validation.error)
     test = evaluate_private_outputs(workspace, private)
     assert test is not None and "error" not in test, test
-    assert validation.metric == pytest.approx(20 * np.log10(255))
+    assert validation.metrics["psnr"] == pytest.approx(20 * np.log10(255))
     assert test["results"][0]["metrics"] == pytest.approx(validation.details["score"]["metrics"])
     assert validation.details["score"]["n"] == 6
     assert test["results"][0]["n"] == 3
@@ -187,7 +187,7 @@ def test_json_restoration_adapter_is_frozen_and_shared_with_private_test(run_inp
     truth["reference_json"] = matrix(19)
     truth.to_csv(private / "test.csv", index=False)
     changed = evaluate_private_outputs(workspace, private)
-    assert changed["results"][0]["value"] == pytest.approx(20 * np.log10(255 / 2))
+    assert changed["results"][0]["metrics"]["psnr"] == pytest.approx(20 * np.log10(255 / 2))
     assert prepared.path.read_bytes() == frozen
 
 
@@ -257,8 +257,8 @@ import pandas as pd
 
 def prediction_spec():
     return {
-        'evaluator_api_version': 2, 'task_type': 'image_restoration',
-        'primary_metric': 'inverse_mae', 'secondary_metrics': [], 'maximize': True,
+        'evaluator_api_version': 3, 'task_type': 'image_restoration',
+        'metrics': [{'name': 'inverse_mae', 'maximize': True}],
         'key_columns': ['sample'], 'prediction_columns': ['result_json'],
         'validation_artifact': './working/validation_predictions.csv',
         'test_submission': './working/submission.csv',
@@ -278,7 +278,7 @@ def score(prediction_path, truth_path, expected_path):
         reference = np.asarray(json.loads(row['reference_json']))
         values.append(1.0 / (1.0 + float(np.mean(np.abs(estimate-reference)))))
     value = float(np.mean(values))
-    return {'metric': value, 'maximize': True, 'metrics': {'inverse_mae': value}, 'n': len(expected)}
+    return {'metrics': {'inverse_mae': value}, 'n': len(expected)}
 
 def score_val():
     spec = prediction_spec()
@@ -322,8 +322,8 @@ def test_unavailable_metric_uses_custom_evaluator_with_retained_probe_fixtures(r
     assert "Trusted metric API" in prompts[0]
     assert "MUST leave" in json.dumps(prompts[0]["Evaluator requirements"])
     spec = json.loads(prepared.prediction_spec)
-    assert spec["evaluator_api_version"] == 2
-    assert spec["primary_metric"] == "inverse_mae"
+    assert spec["evaluator_api_version"] == 3
+    assert spec["metrics"] == [{"name": "inverse_mae", "maximize": True}]
     assert "adapter_api_version" not in spec
     assert "trusted_score_samples" in prepared.path.read_text()
     write_candidate_predictions(workspace)
@@ -332,6 +332,32 @@ def test_unavailable_metric_uses_custom_evaluator_with_retained_probe_fixtures(r
     )
     assert result.ok, result.output + str(result.error)
     assert result.metric == pytest.approx(0.5)
+
+
+def test_multiple_custom_objectives_prepare_and_score_with_independent_directions(run_inputs, monkeypatch):
+    workspace, private = run_inputs
+    definitions = [{"name": "inverse_mae", "maximize": True}, {"name": "absolute_error", "maximize": False}]
+    path = workspace / "input/biomaker_splits/split_manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["metric_contract"] = {"metrics": definitions}
+    write_json(path, manifest)
+    source = CUSTOM_EVALUATOR.replace(
+        "[{'name': 'inverse_mae', 'maximize': True}]", repr(definitions)
+    ).replace("{'inverse_mae': value}", "{'inverse_mae': value, 'absolute_error': 1 / value - 1}")
+    backend_responses(monkeypatch, source)
+    prepared = evaluator_setup.prepare_evaluator(
+        workspace, workspace.parent / "logs", "```metrics\n" + json.dumps(definitions) + "\n```",
+        model="mock-custom-model", attempts=1, timeout=30, hidden_score_path=private / "score_val.csv",
+    )
+    spec = json.loads(prepared.prediction_spec)
+    assert spec['metrics'] == definitions
+    assert not {'primary_metric', 'secondary_metrics', 'maximize'} & spec.keys()
+    write_candidate_predictions(workspace)
+    result = evaluator_setup.score_candidate_with_evaluator(workspace, hidden_score_path=private / "score_val.csv", timeout=30)
+    assert result.ok, result.output + str(result.error)
+    assert result.metric is None
+    assert result.metrics == {'inverse_mae': .5, 'absolute_error': 1.0}
+    assert result.metric_specs == definitions
 
 
 @pytest.mark.parametrize("declaration,reason", [
@@ -399,7 +425,7 @@ def test_freeze_preserves_classification_threshold_alias(run_inputs, alias):
     frozen, score = map(json.loads, result.stdout.splitlines())
     assert frozen["threshold"] == 0.7
     assert alias not in frozen
-    assert score["metric"] == 1.0  # A silently substituted threshold of 0.5 gives zero.
+    assert score["metrics"]["accuracy"] == 1.0  # A silently substituted threshold of 0.5 gives zero.
 
 
 @pytest.mark.parametrize("alias", ["decision_threshold", "classification_threshold"])
@@ -442,7 +468,7 @@ def test_builtin_classification_prepares_common_runtime_without_generation(run_i
     assert not prompts
     assert spec["adapter_api_version"] == 1
     assert spec["scoring_backend"] == "trusted_metrics_v1"
-    assert spec["maximize"] is True
+    assert all(item["maximize"] for item in spec["metrics"])
     assert spec["threshold"] == 0.7 and alias not in spec
     assert spec["prediction_columns"] == ["score1"]
     assert spec["class_labels"] == [0, 1]
@@ -540,11 +566,11 @@ def test_builtin_restoration_prepares_bounded_common_runtime_without_generation(
         workspace, hidden_score_path=private / "score_val.csv", timeout=30,
     )
     assert validation.ok, validation.output + str(validation.error)
-    assert validation.metric == pytest.approx(20 * np.log10(255))
+    assert validation.metrics["psnr"] == pytest.approx(20 * np.log10(255))
     assert validation.details["score"]["n"] == 6
     test = evaluate_private_outputs(workspace, private)
     assert test is not None and "error" not in test, test
-    assert test["results"][0]["value"] == pytest.approx(20 * np.log10(255 / 2))
+    assert test["results"][0]["metrics"]["psnr"] == pytest.approx(20 * np.log10(255 / 2))
     assert test["results"][0]["n"] == 6
     assert prepared.path.read_bytes() == frozen
     assert not prompts

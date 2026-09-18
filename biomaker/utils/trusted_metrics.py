@@ -8,8 +8,8 @@ vectors in class_labels order; binary one-column probabilities refer to
 positive_class. Regression predictions and targets are finite numeric scalars
 or fixed-width vectors. Detection boxes are (class_id, (x1, y1, x2, y2), confidence).
 
-This module deliberately has no package imports: its source is embedded in the
-frozen evaluator, so scoring does not depend on a mutable installed package.
+This module and its segmentation dependency are bundled by metric_source into
+the frozen evaluator, so scoring does not depend on a mutable installed package.
 Only requested metrics are computed. Undefined requested metrics raise rather
 than silently changing the protocol or dropping samples.
 """
@@ -20,6 +20,8 @@ from collections.abc import Mapping
 
 import numpy as np
 from scipy import ndimage as ndi
+
+from .segmentation_metrics import segmentation_score_case, validate_tree_sample, normalize_segmentation_parameters
 
 
 class UndefinedMetricError(ValueError):
@@ -42,14 +44,14 @@ _METRIC_DEFINITIONS = {
                  description='10 log10(data_range squared / per-crop MSE); zero MSE raises.'),
     'ssim': dict(family='image_restoration', maximize=True, aliases=[],
                  description='Local SSIM, valid-interior mean, declared uniform/Gaussian window and covariance.'),
-    'ap50': dict(family='detection', maximize=True, aliases=['map@0.5'],
+    'ap50': dict(family='detection', maximize=True, aliases=['map@0.5', 'map@0.50', 'map50'],
                  description='Class-aware IoU .5 matching and VOC all-points AP, macro over ground-truth classes.'),
     'recall': dict(family='detection', maximize=True, aliases=[],
                    description='Micro detection recall at the declared confidence threshold and IoU .5.'),
     'accuracy': dict(family='classification', maximize=True, aliases=['acc'],
                      description='Mean correct single-label predictions, or mean binary decisions for multilabel.'),
     'auc': dict(family='classification', maximize=True,
-                aliases=['roc_auc', 'macro_auc', 'ovr_auc'],
+                aliases=['roc_auc', 'macro_auc', 'macro_roc_auc', 'ovr_auc'],
                 description='Binary ROC AUC, macro OVR multiclass AUC, or macro multilabel ROC AUC.'),
     'mean_roc_auc': dict(family='classification', maximize=True, aliases=[],
                          description='Macro binary ROC AUC for multilabel classification.', task_types=['multilabel']),
@@ -64,11 +66,29 @@ _METRIC_DEFINITIONS = {
     'hd95': dict(family='segmentation', maximize=False, aliases=['hausdorff95', 'hausdorff_95'],
                  description='95th percentile of concatenated bidirectional surface distances, then image mean.'),
 }
+# Metric identity describes the mathematical quantity, never a dataset.
+_SEGMENTATION_TREE_METRICS = {
+    'cldice': (True, 'Centerline Dice against a supplied target skeleton, raw prediction.'),
+    'tree_length_detected': (True, 'Fraction of target skeleton voxels covered by the prediction.'),
+    'branch_detected': (True, 'Fraction of parsed target branches meeting the skeleton coverage threshold.'),
+    'betti_error': (False, 'Absolute connected-component count difference from the target or declared one-component reference.'),
+    'multiclass_dice': (True, 'Macro Dice over nonzero classes present in the target; no target classes scores zero.'),
+    'multiclass_cldice': (True, 'Macro centerline Dice over target classes with target skeleton support; no supported classes scores zero.'),
+    'branch_accuracy': (True, 'Accuracy of majority-vote semantic labels on target branches.'),
+    'branch_f1': (True, 'Macro F1 over nonzero semantic classes present in target branches.'),
+    'subtree_consistency': (True, 'Fraction of nontrivial target subtrees assigned one consistent predicted label.'),
+    'topological_distance': (False, 'Mean nearest graph-hop distance to a target branch with the predicted semantic label.'),
+}
+for _name, (_maximize, _description) in _SEGMENTATION_TREE_METRICS.items():
+    _METRIC_DEFINITIONS[_name] = dict(family='segmentation', maximize=_maximize,
+                                     aliases=[], description=_description + ' Equal-image mean.')
+
 _COMMON_PROTOCOL_FIELDS = {
-    'primary_metric': dict(required=True, description='Canonical metric or declared alias.'),
-    'secondary_metrics': dict(default=[], description='Additional requested metrics in the same family.'),
-    'maximize': dict(derived='primary metric direction', description='Conflicting directions are rejected.'),
-    'task_family': dict(derived='primary metric family', description='An explicitly supplied family must agree.'),
+    'metrics': dict(required=True, description='Nonempty list of {name, maximize}; all objectives have equal rank weight.'),
+    'primary_metric': dict(description='Legacy first metric; converted into metrics for new runs.'),
+    'secondary_metrics': dict(default=[], description='Legacy additional metrics; all become equal objectives for new runs.'),
+    'maximize': dict(description='Legacy first metric direction. New declarations use maximize inside each metrics entry.'),
+    'task_family': dict(derived='declared metrics family', description='An explicitly supplied family must agree with all objectives.'),
     'task_type': dict(description='Family-specific task subtype; classification requires binary/multiclass/multilabel.'),
 }
 _SSIM_PROTOCOL_FIELDS = {
@@ -141,6 +161,15 @@ _FAMILY_CAPABILITIES = {
             'input_shape': 'Optional exact prediction shape.',
             'spacing': 'Optional positive spacing per array axis; default unit spacing.',
             'prediction_spacing': 'Optional spacing matching supplied target/input spacing within absolute 1e-4.',
+            'skeleton': 'Optional supplied target skeleton, required by centerline and branch-detection metrics.',
+            'parsing': 'Optional supplied target branch IDs, contiguous 1..N, zero background.',
+            'graph': 'Optional integer (2,E) directed parent-to-child tree edges, node = parsing ID - 1.',
+            'input_geometry': 'Optional original size/spacing/origin/direction in SimpleITK XYZ convention.',
+            'prediction_geometry': 'Required alongside input_geometry; must preserve the original grid.',
+            'target_geometry': 'Required when scoring with geometry metadata.',
+            'skeleton_geometry': 'Geometry of requested target skeleton when geometry is supplied.',
+            'parsing_geometry': 'Geometry of requested target branch parsing when geometry is supplied.',
+
         },
         'protocol_fields': {
             'foreground': dict(fixed='nonzero'),
@@ -150,6 +179,22 @@ _FAMILY_CAPABILITIES = {
             'hd95_connectivity': dict(fixed=1),
             'hd95_empty_policy': dict(fixed='error_if_one_empty'),
             'spacing_order': dict(fixed='array_axes'),
+            'dice_smooth': dict(default=0.0, type='finite nonnegative number', description='Add to Dice numerator and denominator, binary and multiclass.'),
+            'topology_smooth': dict(default=0.0, type='finite nonnegative number', description='Add to tree-length coverage numerator and denominator.'),
+            'branch_coverage_threshold': dict(default=0.8, type='finite number in [0,1]'),
+            'topology_component_policy': dict(default='largest', values=['largest', 'raw'], description='Applied to coverage and branch-label projection only; Dice/clDice remain raw.'),
+            'connectivity': dict(default=3, values=[1, 2, 3], description='Connectivity for components; capped by array dimension.'),
+            'betti_reference': dict(default='target', values=['target', 'one']),
+            'label_ids': dict(default=None, type='null or nonempty unique nonnegative integer labels', description='Optional declared label set; no dataset-specific upper limit.'),
+            'subtree_ignore_labels': dict(default=[], type='unique nonnegative integer labels'),
+            'missing_label_penalty': dict(default=50.0, type='finite nonnegative number'),
+            'class_aggregation': dict(fixed='gt_present'),
+            'reference_protocol': dict(type='optional nonempty reference provenance string'),
+            'image_column': dict(type='optional public image path column'),
+            'target_column': dict(type='optional private original mask column'),
+            'auxiliary_columns': dict(type='optional mapping from skeleton/parsing/graph to private answer columns'),
+            'geometry_policy': dict(default='shape_spacing', values=['shape_spacing', 'physical'], description='Built-in reader checks shape/spacing or full medical geometry, respectively.'),
+
         },
         'score_scope': 'stream samples; average per-image scores',
         'empty_policy': 'Both empty: Dice/IoU/AJI 1, HD95 0. Exactly one empty: Dice/IoU/AJI 0; requested HD95 raises.',
@@ -224,7 +269,12 @@ def metric_capabilities():
         definition['parameter_aliases'] = aliases
         definition['allowed_contract_fields'] = sorted(set(_COMMON_PROTOCOL_FIELDS) | set(definition['protocol_fields']) |
                                                        set(aliases) | set(definition.get('flattened_contract_fields', [])))
-    return dict(api_version=2, metrics=copy.deepcopy(_METRIC_DEFINITIONS),
+    for definition in families.values():
+        example = definition['metric_contract_example']
+        example['metrics'] = normalize_metric_definitions(example)
+        example.pop('primary_metric', None)
+        example.pop('secondary_metrics', None)
+    return dict(api_version=3, metrics=copy.deepcopy(_METRIC_DEFINITIONS),
                 aliases=dict(_METRIC_ALIASES), common_protocol_fields=copy.deepcopy(_COMMON_PROTOCOL_FIELDS),
                 families=families,
                 catalog_usage=[
@@ -254,8 +304,11 @@ def _fixed_protocol_values(family, task_type=None):
     return result
 
 
-METRIC_API_DESCRIPTION = """Harness metric API: prediction_spec() declares primary_metric,
-secondary_metrics (list), and family settings below. The harness canonicalizes
+METRIC_API_DESCRIPTION = """Harness metric API v3: prediction_spec() declares a nonempty
+metrics list of {name, maximize} objectives, and family settings below. All
+objectives participate equally in average-rank selection outside the evaluator.
+score() returns raw metrics and diagnostics; never ranks or a scalar aggregate.
+The harness canonicalizes
 known metric aliases and freezes all settings. load_sample returns a mapping with
 prediction and, when target_row is provided, target; optional keys are group,
 input_shape, spacing, prediction_spacing. Supply arrays/values, never metric code.
@@ -283,6 +336,22 @@ they do not compute class-wise multiclass scores. AJI uses supplied instance IDs
 matching (prediction reuse allowed). HD95 uses the 95th percentile of concatenated
 bidirectional surface distances, connectivity 1, optional spacing in array-axis
 order (default unit spacing). Both-empty Dice/IoU/AJI=1, HD95=0; one-empty HD95 raises.
+Additional segmentation metrics: cldice, multiclass_dice, multiclass_cldice,
+tree_length_detected, branch_detected, betti_error, branch_accuracy, branch_f1,
+subtree_consistency, topological_distance. All use the segmentation family;
+betti_error and topological_distance minimize. Other objectives maximize.
+Supply precomputed target skeleton/parsing/graph references only when requested;
+never build target references from predictions. Ground-truth-present classes
+have equal weight for multiclass metrics (empty class set gives zero).
+Generic parameters include dice_smooth, topology_smooth, connectivity,
+branch_coverage_threshold, topology_component_policy, betti_reference,
+subtree_ignore_labels, missing_label_penalty, and optional label_ids.
+No dataset's label range, trachea class, smoothing or reference component count
+is implicit. Protocol defaults and supported values are in metric_capabilities.
+Medical geometry metadata, when supplied, must match exactly within declared
+numeric tolerances; automatic resampling is forbidden. auxiliary_columns maps
+private skeleton/parsing/graph paths for the built-in reader. Agents implement
+readers only; all metric formulas come from trusted kernels.
 Classification: task_type binary/multiclass/multilabel. Single-label needs distinct
 class_labels in prediction-probability order; target is a scalar class label.
 Binary one-entry probability refers to positive_class (default final label).
@@ -310,6 +379,92 @@ def _metric_name(value):
     if name is None:
         raise ValueError('Unsupported trusted metric: %r' % value)
     return name
+
+
+def _canonical_metric_parameters(values, fields):
+    aliases = {alias: name for name, field in fields.items() for alias in field.get('aliases', [])}
+    result = {}
+    for key, value in values.items():
+        key = aliases.get(key, key)
+        field = fields.get(key, {})
+        if isinstance(value, str):
+            value = field.get('value_aliases', {}).get(value, value)
+        if isinstance(value, Mapping) and 'fields' in field:
+            value = _canonical_metric_parameters(value, field['fields'])
+        if key in result and result[key] != value:
+            raise ValueError('Conflicting metric protocol field: ' + key)
+        result[key] = value
+    return result
+
+
+def normalize_metric_definitions(spec, *, allow_legacy_unknown=False):
+    """Canonical objectives, shared with the portable frozen scoring runtime."""
+    if not isinstance(spec, Mapping):
+        raise ValueError('Metric specification must be a mapping.')
+    legacy = 'metrics' not in spec
+    if legacy:
+        primary = spec.get('primary_metric')
+        if isinstance(primary, Mapping):
+            primary = dict(primary)
+        else:
+            primary = {'name': primary}
+        if 'maximize' in spec:
+            if 'maximize' in primary and primary['maximize'] != spec['maximize']:
+                raise ValueError('Conflicting primary metric maximize direction.')
+            primary['maximize'] = spec['maximize']
+        secondary = spec.get('secondary_metrics', [])
+        if not isinstance(secondary, list):
+            raise ValueError('secondary_metrics must be a list.')
+        items = [primary, *secondary]
+    else:
+        items = spec['metrics']
+        if not isinstance(items, list) or not items:
+            raise ValueError('metrics must be a nonempty list (at least one metric).')
+    result = {}
+    for index, raw in enumerate(items):
+        item = {'name': raw} if isinstance(raw, str) else copy.deepcopy(raw)
+        if not isinstance(item, dict):
+            raise ValueError('Each metric must declare a nonempty name and boolean maximize.')
+        identifiers = [item.pop(key) for key in ('name', 'metric', 'id') if key in item]
+        if not identifiers or any(not isinstance(name, str) or not name.strip() for name in identifiers):
+            raise ValueError('Each metric must declare a nonempty name.')
+        names = {_METRIC_ALIASES.get(name.strip().lower().strip('`*_ .'), name.strip().lower().strip('`*_ .')) for name in identifiers}
+        if len(names) != 1:
+            raise ValueError('Conflicting metric name/metric/id aliases.')
+        name = names.pop()
+        # Preserve legacy kernel names for historical direct calls. New
+        # objective lists use the same canonical aliases as the public API.
+        if not legacy:
+            name = {'mean_roc_auc': 'auc', 'mean_binary_accuracy': 'accuracy'}.get(name, name)
+        definition = _METRIC_DEFINITIONS.get(name)
+        direction = item.get('maximize', definition['maximize'] if definition else None)
+        if type(direction) is not bool:
+            if legacy and index > 0 and allow_legacy_unknown and direction is None:
+                continue
+            raise ValueError('Metric %r must explicitly declare boolean maximize.' % name)
+        if definition and direction != definition['maximize']:
+            raise ValueError('maximize conflicts with registered direction for metric %r.' % name)
+        if definition:
+            item = _canonical_metric_parameters(item, _FAMILY_CAPABILITIES[definition['family']]['protocol_fields'])
+        item = {'name': name, **item, 'maximize': direction}
+        if name in result and result[name] != item:
+            raise ValueError('Conflicting duplicate metric declaration for %r.' % name)
+        result[name] = item
+    definitions = list(result.values())
+    families = {_METRIC_DEFINITIONS[item['name']]['family'] for item in definitions if item['name'] in _METRIC_DEFINITIONS}
+    if len(families) > 1:
+        raise ValueError('Requested metrics require different canonical sample families; metrics must belong to one task family, and mixed-head evaluation is not supported.')
+    if not legacy and 'primary_metric' in spec:
+        old = {key: value for key, value in spec.items() if key != 'metrics'}
+        old_definitions = normalize_metric_definitions(old, allow_legacy_unknown=allow_legacy_unknown)
+        if {item['name']: item['maximize'] for item in old_definitions} != {item['name']: item['maximize'] for item in definitions}:
+            raise ValueError('Legacy primary/secondary metrics disagree with metrics declarations.')
+        for old_item in old_definitions:
+            new_item = next(item for item in definitions if item['name'] == old_item['name'])
+            for key in set(old_item) & set(new_item):
+                if old_item[key] != new_item[key]:
+                    raise ValueError('Conflicting legacy and metrics parameter declarations: ' + key)
+    return definitions
 
 
 def _finite_number(value, name, positive=False):
@@ -367,23 +522,36 @@ def normalize_metric_spec(spec):
     if not isinstance(spec, Mapping):
         raise ValueError('Metric specification must be a mapping.')
     out = copy.deepcopy(dict(spec))
-    out['primary_metric'] = _metric_name(out.get('primary_metric'))
-    secondary = out.get('secondary_metrics', [])
-    if not isinstance(secondary, (list, tuple)):
-        raise ValueError('secondary_metrics must be a list.')
-    out['secondary_metrics'] = list(dict.fromkeys(
-        _metric_name(value) for value in secondary if _metric_name(value) != out['primary_metric']))
-    names = [out['primary_metric']] + out['secondary_metrics']
-    family = _METRIC_FAMILIES[out['primary_metric']]
+    definitions = normalize_metric_definitions(out)
+    names = [_metric_name(item['name']) for item in definitions]
+    legacy = 'metrics' not in out and out.get('evaluator_api_version', 2) < 3
+    if not legacy:
+        out['metrics'] = definitions
+        for key in ('primary_metric', 'secondary_metrics', 'maximize'):
+            out.pop(key, None)
+    else:
+        out['primary_metric'] = names[0]
+        out['secondary_metrics'] = names[1:]
+        out['maximize'] = definitions[0]['maximize']
+    # The existing kernels use shared family parameters. Lift per-metric
+    # settings, rejecting conflicts instead of silently ignoring parameters.
+    for item in definitions:
+        for key, value in item.items():
+            if key not in {'name', 'maximize'}:
+                if key in out and out[key] != value:
+                    raise ValueError('Conflicting metric protocol field: ' + key)
+                out[key] = copy.deepcopy(value)
+    family = _METRIC_FAMILIES[names[0]]
+    allowed_parameters = set(_FAMILY_CAPABILITIES[family]['protocol_fields']) | set(_COMMON_PROTOCOL_FIELDS)
+    for item in definitions:
+        unknown_parameters = set(item) - {'name', 'maximize'} - allowed_parameters
+        if unknown_parameters:
+            raise ValueError('Unsupported metric parameters for %s: %s' % (item['name'], ', '.join(sorted(unknown_parameters))))
     if any(_METRIC_FAMILIES[name] != family for name in names):
         raise ValueError('Requested metrics must belong to one task family.')
     if out.get('task_family', family) != family:
         raise ValueError('task_family conflicts with requested metrics.')
     out['task_family'] = family
-    maximize = _METRIC_DEFINITIONS[out['primary_metric']]['maximize']
-    if 'maximize' in out and (type(out['maximize']) is not bool or out['maximize'] != maximize):
-        raise ValueError('maximize conflicts with the primary metric direction.')
-    out['maximize'] = maximize
     if family == 'image_restoration':
         protocol = out.get('restoration_evaluation')
         required = {name for name, field in _RESTORATION_PROTOCOL_FIELDS.items() if field.get('required')}
@@ -481,6 +649,24 @@ def normalize_metric_spec(spec):
             if out.get(key, value) != value:
                 raise ValueError('Unsupported segmentation parameter %s: expected %r.' % (key, value))
             out[key] = value
+        parameters = normalize_segmentation_parameters(out)
+        out.setdefault('geometry_policy', 'shape_spacing')
+        if out['geometry_policy'] not in ('shape_spacing', 'physical'):
+            raise ValueError('geometry_policy must be shape_spacing or physical.')
+        for key in ('dice_smooth', 'topology_smooth', 'branch_coverage_threshold',
+                    'topology_component_policy', 'connectivity', 'betti_reference',
+                    'label_ids', 'subtree_ignore_labels', 'missing_label_penalty'):
+            out[key] = parameters[key]
+        for key in ('reference_protocol', 'image_column', 'target_column'):
+            if key in out and (not isinstance(out[key], str) or not out[key].strip()):
+                raise ValueError(key + ' must be a nonempty string.')
+        auxiliary = out.get('auxiliary_columns', {})
+        if not isinstance(auxiliary, Mapping) or set(auxiliary) - {'skeleton', 'parsing', 'graph'}:
+            raise ValueError('auxiliary_columns must map skeleton/parsing/graph to private columns.')
+        if any(not isinstance(value, str) or not value for value in auxiliary.values()) or len(set(auxiliary.values())) != len(auxiliary):
+            raise ValueError('Auxiliary column names must be distinct nonempty strings.')
+        if out.get('target_column') in auxiliary.values():
+            raise ValueError('Original target and auxiliary references require separate columns.')
     elif family == 'detection':
         fixed = _fixed_protocol_values(family)
         for key, value in fixed.items():
@@ -599,6 +785,17 @@ def _validate_sample(sample, spec, require_target):
         raise ValueError('Scoring sample requires a target.')
     out = dict(sample)
     family = spec['task_family']
+    if family == 'segmentation':
+        out = validate_tree_sample(out, [item['name'] for item in normalize_metric_definitions(spec)], spec,
+                                   require_target=require_target)
+        pred = out['prediction']
+        spacing = _spacing(out.get('spacing'), pred.ndim, 'spacing')
+        pred_spacing = _spacing(out.get('prediction_spacing'), pred.ndim, 'prediction_spacing')
+        if spacing is not None and pred_spacing is not None and not np.allclose(spacing, pred_spacing, rtol=0, atol=1e-4):
+            raise ValueError('Target/input and prediction spacing must match.')
+        out['spacing'] = spacing
+        return out
+
     if family == 'detection':
         out['prediction'] = _detection_boxes(out['prediction'], True)
         if require_target:
@@ -640,21 +837,13 @@ def _validate_sample(sample, spec, require_target):
         protocol = spec['restoration_evaluation']
         out['prediction'] = np.clip(pred.astype(float), 0, protocol['data_range'])
         crops = restoration_crops(pred, protocol['crop_size'], protocol.get('crop_mode'))
-        if 'ssim' in [spec['primary_metric']] + spec['secondary_metrics'] and min(crops[0].shape) < spec['ssim_parameters']['win_size']:
+        if 'ssim' in [item['name'] for item in normalize_metric_definitions(spec)] and min(crops[0].shape) < spec['ssim_parameters']['win_size']:
             raise ValueError('SSIM requires image dimensions >= win_size.')
         groups = protocol['groups']
         if groups is not None and out.get('group') not in groups:
             raise ValueError('Adapter group must be one of the declared restoration groups.')
         if groups is None and out.get('group') is not None:
             raise ValueError('Adapter returned a group but restoration groups are undeclared.')
-    elif family == 'segmentation':
-        if pred.ndim not in (2, 3) or pred.dtype.kind not in 'biu' or np.any(pred < 0):
-            raise ValueError('Segmentation requires 2D/3D nonnegative integer instance labels (zero background).')
-        spacing = _spacing(out.get('spacing'), pred.ndim, 'spacing')
-        pred_spacing = _spacing(out.get('prediction_spacing'), pred.ndim, 'prediction_spacing')
-        if spacing is not None and pred_spacing is not None and not np.allclose(spacing, pred_spacing, rtol=0, atol=1e-4):
-            raise ValueError('Target/input and prediction spacing must match.')
-        out['spacing'] = spacing
     if out.get('input_shape') is not None and tuple(out['input_shape']) != pred.shape:
         raise ValueError('Prediction and declared input_shape must match exactly.')
     if require_target:
@@ -676,10 +865,10 @@ def validate_prediction(sample, spec):
     return {'valid': True}
 
 
-def _dice(truth, prediction):
+def _dice(truth, prediction, smooth=0.0):
     truth, prediction = truth > 0, prediction > 0
     count = int(truth.sum()) + int(prediction.sum())
-    return float(2 * np.logical_and(truth, prediction).sum() / count) if count else 1.0
+    return float((2 * np.logical_and(truth, prediction).sum() + smooth) / (count + smooth)) if count + smooth else 1.0
 
 
 def _iou(truth, prediction):
@@ -885,7 +1074,8 @@ def score_samples(samples, spec):
     metric/group keys; ``n`` records the exact number of scored samples.
     """
     spec = normalize_metric_spec(spec)
-    names = [spec['primary_metric']] + spec['secondary_metrics']
+    definitions = normalize_metric_definitions(spec)
+    names = [item['name'] for item in definitions]
     family = spec['task_family']
     extras = {}
     # Image/volume adapters can stream from disk. Retain only small score records,
@@ -915,14 +1105,19 @@ def score_samples(samples, spec):
                 if protocol['groups'] is not None:
                     grouped.setdefault(sample['group'], []).append(image_scores)
             else:
-                kernels = {'binary_dice': _dice, 'binary_iou': _iou, 'aji': _aji,
+                kernels = {'binary_dice': lambda a, b: _dice(a, b, spec['dice_smooth']), 'binary_iou': _iou, 'aji': _aji,
                            'hd95': lambda a, b: _hd95(a, b, sample.get('spacing'))}
-                image_scores = {name: kernels[name](truth, pred) for name in names}
+                image_scores = {name: kernels[name](truth, pred) for name in names if name in kernels}
+                extra_names = [name for name in names if name in _SEGMENTATION_TREE_METRICS]
+                if extra_names:
+                    image_scores.update(segmentation_score_case(sample, extra_names, spec))
             per_image.append(image_scores)
         count = len(per_image)
         if not count:
             raise ValueError('Scoring requires at least one sample.')
         source = per_image
+        if family == 'segmentation':
+            extras['per_case'] = per_image
         if family == 'image_restoration':
             groups = spec['restoration_evaluation']['groups']
             if groups is not None and set(grouped) != set(groups):
@@ -937,5 +1132,7 @@ def score_samples(samples, spec):
             metrics.update({name + '/' + group: value for name, value in values.items()})
     if not all(math.isfinite(value) for value in metrics.values()):
         raise ValueError('Non-finite requested metric.')
-    return dict(metric=metrics[spec['primary_metric']], maximize=spec['maximize'],
-                metrics=metrics, n=count, **extras)
+    result = dict(metrics=metrics, n=count, **extras)
+    if 'metrics' not in spec:
+        result.update(metric=metrics[spec['primary_metric']], maximize=spec['maximize'])
+    return result

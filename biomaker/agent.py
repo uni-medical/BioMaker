@@ -1,4 +1,5 @@
 import logging
+import copy
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -50,7 +51,12 @@ class BioMakerWorkflow:
         self.cfg = cfg
 
         self.proposal_agent = ProposalAgent(
-            task_desc=task_desc, cfg=cfg, journal=Journal()
+            task_desc=task_desc,
+            cfg=cfg,
+            journal=Journal(
+                selection_policy=journal.selection_policy,
+                metric_specs=copy.deepcopy(journal.metric_specs),
+            ),
         )
         self.workflow = [
             WorkflowAgent(

@@ -7,6 +7,59 @@ metric implementations, aggregation, preparation checks, and private-answer
 access. Candidate agents remain free to choose models, losses, training,
 preprocessing, and how to produce the declared prediction artifacts.
 
+## Multiple objectives and candidate ranking
+
+New evaluators declare API v3 and a nonempty ordered objective list:
+
+```json
+{
+  "evaluator_api_version": 3,
+  "metrics": [
+    {"name": "binary_dice", "maximize": true},
+    {"name": "hd95", "maximize": false}
+  ]
+}
+```
+
+Task files may declare the same JSON array in a fenced `metrics` block. Metric
+names are canonicalized, and identical duplicate declarations are merged.
+Directions are inferred for registered names and must agree with the registry;
+custom metrics require an explicit boolean direction. Preserve metric parameters
+and the existing single-family sample contract. Arbitrary metric count does not
+add mixed task-head support.
+
+The evaluator returns raw `metrics: {name: finite_number}` and diagnostics.
+It does not select a winner or return a population-dependent ranking. Every
+declared objective must be present and finite. Additional group scores are
+diagnostics, not additional objectives.
+
+For each objective, the Journal ranks all committed, completed, valid candidates
+in the run, with 1 best and equal values receiving the mean of their occupied
+positions. It averages these ranks with equal weights. Selection sorts by lower
+average rank, then lower worst individual rank, then earlier step and node ID.
+Search first computes this global ranking and only then filters for expandable
+parents. One objective is equivalent to ordering by its raw value.
+
+Rankings are dynamic: committing another valid candidate recomputes the ranks
+of every earlier candidate and can promote an older node. Each round records its
+selection snapshot; already scheduled parents stay fixed. Current displays,
+best model artifacts and final retraining consume the current shared snapshot.
+Historical rank changes across different candidate populations are not absolute
+model improvements. Private test values never enter the ranking.
+
+Legacy `primary_metric` / `secondary_metrics` declarations remain accepted for
+new runs, with all declared metrics converted into equal objectives. Old frozen
+API-v2 evaluators remain readable and can be rescored without changing formulas.
+Historical journals lacking an average-rank policy retain their original scalar
+selection. New caches and journals record the v3 protocol and selection policy.
+
+Terminal and HTML summaries show one raw value for one objective, both raw
+values for two, and average rank plus the first objective's raw value for three
+or more. This first objective is only the display metric; declaration order
+does not affect selection. Full values, directions and individual ranks remain
+available in the detail tables and exports. Ranking snapshots include their
+candidate count and version; raw values are never overwritten by ranks.
+
 ## Three separate contracts
 
 | Contract | Authority | What it specifies |
@@ -79,7 +132,7 @@ Preparation records data semantics in `input/biomaker_splits/split_manifest.json
   input paths are allowed; private answers cannot be keys.
 - `prediction_contract` describes prediction columns, values, and referenced
   file formats. Original data column names and directory layouts are not fixed.
-- `metric_contract` records the primary and secondary metrics, direction, and
+- `metric_contract` records the `metrics` list, per-metric direction, and
   all task-specific settings, including class order, thresholds, crop rules,
   intensity ranges, grouping, and aggregation when applicable.
 - `hidden_answers` declares answer column names, without exposing answer
@@ -142,10 +195,10 @@ for decoding, without importing `evaluator` or `biomaker`, dynamic imports,
 `eval`, `exec`, package installation, network access, or training.
 
 `prediction_spec()` returns a JSON-serializable contract. It includes
-`evaluator_api_version: 2`, `task_family`, `task_type`, `validation_artifact`,
+`evaluator_api_version: 3`, `task_family`, `task_type`, `validation_artifact`,
 `test_submission: "./working/submission.csv"`, `key_columns`,
-`prediction_columns`, `answer_columns`, `primary_metric`, `secondary_metrics`,
-and boolean `maximize`. It declares metric-specific settings explicitly.
+`prediction_columns`, `answer_columns`, and a nonempty `metrics` list containing
+each name and boolean `maximize`. It declares metric-specific settings explicitly.
 `file_reference_columns` identifies prediction columns containing file paths.
 Only the private evaluator needs the answer mapping; public prompts and reports
 must not include private answer values or paths.
@@ -252,7 +305,7 @@ from pathlib import Path
 import pandas as pd
 
 ADAPTER_SPEC = {
-    "evaluator_api_version": 2,
+    "evaluator_api_version": 3,
     "task_family": "classification",
     "task_type": "binary",
     "key_columns": ["case_uid"],
@@ -260,9 +313,8 @@ ADAPTER_SPEC = {
     "answer_columns": ["diagnosis"],
     "validation_artifact": "./working/validation_predictions.csv",
     "test_submission": "./working/submission.csv",
-    "primary_metric": "auc",
-    "secondary_metrics": ["accuracy"],
-    "maximize": True,
+    "metrics": [{"name": "auc", "maximize": True},
+                {"name": "accuracy", "maximize": True}],
     "class_labels": ["normal", "lesion"],
     "positive_class": "lesion",
     "threshold": 0.5,
@@ -304,9 +356,8 @@ as its columns. Its metric declaration can use:
 
 ```json
 {
-  "primary_metric": "psnr",
-  "secondary_metrics": ["ssim"],
-  "maximize": true,
+  "metrics": [{"name": "psnr", "maximize": true},
+              {"name": "ssim", "maximize": true}],
   "input_column": "source",
   "target_column": "reference",
   "data_range": 255,
@@ -337,8 +388,8 @@ Before freezing, the Harness checks a bounded selection of real public rows,
 including declared groups, and uses their matched answers only inside the
 scoring process. It checks sample identity, decoded shapes and values,
 prediction validation without answers, and scoring with explicitly supplied
-paths. It also checks that all requested metric values are returned and agree
-with the primary metric and optimization direction.
+paths. It also checks that all declared metric values are returned and that
+their identities, settings and optimization directions match the frozen contract.
 
 Fixture creation and cleanup belong to one Harness-controlled lifecycle:
 
@@ -355,13 +406,12 @@ supported standard metric to be replaced with a generated scoring formula.
 ## Custom evaluator compatibility
 
 When no trusted implementation is available, a custom evaluator still follows
-the existing split-independent API:
+the split-independent API. New `prediction_spec()` declarations use version 3:
 
 ```python
 def score(prediction_path, truth_path, expected_path):
     # One implementation for both validation and private test.
-    return {"metrics": {"custom_metric": value},
-            "metric": value, "maximize": True}
+    return {"metrics": {"custom_metric": value}}
 ```
 
 It also defines `prediction_spec()`, `score_val()`, `validate_submission()`,
@@ -395,3 +445,132 @@ All requested metrics must be present and finite. Undefined metrics must raise
 an explicit error; they cannot be replaced with a different metric. API-v1
 evaluators require a new run instead of being silently rescored with a new
 implementation.
+
+## Segmentation overlap, centerlines, and trees
+
+These are generic registered metrics in the existing `segmentation` family.
+The names describe the quantity being measured; dataset names and anatomical
+class numbers are not part of metric identity. `accuracy`/`acc` continues to
+mean classification accuracy; `branch_accuracy` means accuracy after voting
+semantic labels on supplied target branches.
+
+| Metric | Direction | Additional per-case references |
+|---|---|---|
+| `binary_dice` (existing `dice` alias) | maximize | none |
+| `multiclass_dice` | maximize | none |
+| `cldice`, `multiclass_cldice` | maximize | `skeleton` |
+| `tree_length_detected` | maximize | `skeleton` |
+| `branch_detected` | maximize | `skeleton`, `parsing` |
+| `betti_error` | minimize | none |
+| `branch_accuracy`, `branch_f1` | maximize | `parsing` |
+| `subtree_consistency`, `topological_distance` | maximize / minimize | `parsing`, `graph` |
+
+Canonical samples use same-shape 2D/3D label arrays, with zero as background.
+Labels must be finite, nonnegative exact integers (integer-valued floats are
+accepted without truncation). There is no implicit upper class ID. `parsing`
+contains contiguous branch IDs 1..N; `graph` is an integer `(2,E)` array of
+zero-based parent-to-child node indices (`node = branch ID - 1`). It must be a
+rooted tree; a single node uses `(2,0)` edges. `skeleton` is a supplied target
+centerline contained in the original target mask. The kernels never derive
+target references from predictions.
+
+```python
+from biomaker.utils.trusted_metrics import score_samples
+
+spec = {
+    "metrics": [
+        {"name": "multiclass_dice", "maximize": True},
+        {"name": "branch_accuracy", "maximize": True},
+        {"name": "topological_distance", "maximize": False},
+    ],
+    "task_family": "segmentation",
+    "dice_smooth": 0.0,
+    "topology_component_policy": "raw",
+    "missing_label_penalty": 50.0,
+}
+# Each yielded case: prediction, target, parsing, graph arrays.
+result = score_samples(cases, spec)
+# result["metrics"]: raw equal-case means; result["per_case"]: raw case scores.
+```
+
+The capability catalog documents the frozen defaults and supported values:
+
+- `dice_smooth=0`: added to numerator and denominator of binary/multiclass
+  Dice. Existing unsmoothed binary Dice remains unchanged; both empty scores 1.
+- `class_aggregation="gt_present"`: multiclass means include nonzero classes
+  present in the target. Multiclass clDice further requires target skeleton
+  support. An empty included class set scores 0. clDice with no centerline
+  overlap scores 0 and has no additive smoothing.
+- `topology_component_policy="largest"` (`"raw"` also supported) applies only
+  to tree coverage and branch-label projection. Dice and clDice use raw
+  predictions. Betti uses raw component counts.
+- `connectivity=3`, capped by array dimension: 26-neighbor connectivity in 3D
+  and 8-neighbor connectivity in 2D. `betti_reference="target"` compares
+  connected-component counts (Betti-0); `"one"` explicitly compares to one.
+  This metric does not count tunnels or cavities.
+- `topology_smooth=0`: additive numerator/denominator smoothing for skeleton
+  voxel coverage. Empty target skeleton scores 0 with zero smoothing.
+  Tree length here counts skeleton voxels, not physical millimeters.
+- `branch_coverage_threshold=0.8`: a branch is detected at or above this
+  fraction of its target skeleton voxels. Branches follow supplied parsing.
+- Branch voting includes background; ties select the smallest semantic label.
+  Accuracy/F1 use branches with nonzero target votes; F1 is macro over target
+  branch classes. `subtree_ignore_labels=[]` excludes no anatomical class.
+  Consistency checks nontrivial descendant subtrees; background votes count,
+  and no eligible subtree scores 0. Thus consistency alone is not accuracy.
+- `missing_label_penalty=50`: topological distance uses the nearest matching
+  target label's undirected graph-hop distance; missing labels receive this
+  penalty. Finite distances are not clipped. No valid target branches scores 0.
+- `label_ids=null`: no range restriction. A dataset can declare a unique list
+  of allowed labels. `reference_protocol` is optional provenance metadata.
+
+The mask reader supports a `target_column` and an `auxiliary_columns` mapping
+from `skeleton`/`parsing`/`graph` to private CSV columns. `answer_columns` must
+contain exactly these columns. References must already exist; scoring only
+decodes them. `geometry_policy="physical"` requires medical files preserving
+input size, spacing, origin, and direction (numeric tolerance rtol 1e-5,
+atol 1e-6). The default `"shape_spacing"` preserves the previous reader contract.
+Medical input probes read headers instead of decompressing the CT. Prediction-only
+validation never accesses private target or auxiliary files.
+
+The executable registry and aggregation live in `biomaker/utils/trusted_metrics.py`;
+the extra pure kernels live in `biomaker/utils/segmentation_metrics.py`.
+`metric_source.py` bundles both into frozen evaluators, with source and dependency
+versions included in cache identity. Agents select these metrics and decode
+artifacts; they do not reimplement formulas. The adapted upstream formula
+source, commit and MIT license are recorded in the kernel module; dataset
+protocols explicitly select their parameters.
+
+## Reusable target tree preparation
+
+`biomaker.utils.airway_reference.prepare_tree_reference(label_path, output_dir,
+include_graph=True)` is a separate, deterministic preparation helper for
+airway-shaped 3D labels. It reuses the pinned ATM22 tree-parsing algorithm,
+whose unmodified source and license are under `utils/_vendor/atm22/`. It has no
+competition task ID or anatomical class limit. Work is performed on a binary
+copy; the original semantic label and all physical geometry are preserved.
+
+Run preparation once outside split generation and scoring. Returned paths
+point to cached skeleton/parsing volumes, an optional graph, and provenance.
+Cache identity includes input, builder, vendor source, geometry and dependency
+versions; output hashes are verified on reuse. Derived structures that do not
+fit the original target are rejected instead of silently changing the label.
+These are local derived references, not organizer-provided hidden annotations.
+
+The helper requires scikit-image 0.22.0 and NumPy below 2. The original parsing
+code relies on `skeletonize_3d` returning uint8 values 0/1; version 0.24 returns
+bool and changes neighborhood convolution results. This behavior is checked
+with a branching synthetic volume. Do not substitute a skeletonizer/version
+without defining and validating a new reference protocol.
+
+## Explicit validation-only protocols
+
+A prepared split manifest can explicitly declare `required_splits` or
+`public_splits` containing the roles `train` and `score_val` and excluding
+`test`. These roles refer to the existing train/validation CSVs, not extra
+datasets. The trusted adapter then freezes
+`test_split=null`: its self-test creates only validation fixtures and
+`validate_submission()` reports a skipped `no_test_split` result. It never
+creates a fake test split. Undeclared or contradictory missing-test layouts
+remain errors. Metric calculations, validation coverage and subsequent
+full-data training semantics do not change.

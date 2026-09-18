@@ -128,7 +128,7 @@ def score(prediction_path, truth_path, expected_path):
     true = _read_aligned(truth_path, expected, [tc])
     metrics, per_class = _evaluate([_parse_boxes(v) for v in true[tc]],
                                   [_parse_boxes(v, True) for v in pred[pc]])
-    return {'metric': metrics[SPEC['primary_metric']], 'maximize': True,
+    return {**({'metric': metrics[SPEC['primary_metric']], 'maximize': True} if 'metrics' not in SPEC else {}),
             'metrics': metrics, 'per_class': per_class, 'n': len(expected)}
 
 

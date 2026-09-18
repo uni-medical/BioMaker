@@ -101,13 +101,13 @@ def test_adapter_aligns_arbitrary_fields_and_uses_identical_math_on_other_split(
     paths = write_split(tmp_path)
     result = scorer["score"](*map(str, paths))
     expected = np.mean([20 * np.log10(255 / error) for error in (1, 2, 3, 4, 5)])
-    assert result["metric"] == pytest.approx(expected)
+    assert result["metrics"]["psnr"] == pytest.approx(expected)
     assert result["n"] == 45
     assert set(result["per_group"]) == {"low", "medium", "high"}
     test_paths = write_split(tmp_path, name="agent_test", count=15, first_id=100)
     monkeypatch.delenv("BIOMAKER_SCORE_VAL_PATH", raising=False)
     test_score = scorer["score"](*map(str, test_paths))
-    assert test_score["metric"] == pytest.approx(result["metric"])
+    assert test_score["metrics"]["psnr"] == pytest.approx(result["metrics"]["psnr"])
     assert test_score["n"] == 15
     assert scorer["prediction_spec"]()["ssim_parameters"]["win_size"] == 7
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -169,23 +170,66 @@ def read_results_summary(settings: Settings, run: dict[str, Any]) -> dict[str, A
     except (OSError, csv.Error):
         return {"count": 0, "best_metric": None, "latest": None}
 
-    metric_rows: list[tuple[float, dict[str, str]]] = []
-    for row in rows:
+    def number(value):
         try:
-            metric_rows.append((float(row.get("metric", "")), row))
+            result = float(value)
+            return result if math.isfinite(result) else None
         except (TypeError, ValueError):
-            continue
-    best_metric = None
-    if metric_rows:
-        maximize = str(metric_rows[-1][1].get("maximize", "true")).lower() != "false"
-        best_metric = (max if maximize else min)(value for value, _ in metric_rows)
+            return None
+
+    def json_field(row, name, default):
+        try:
+            parsed = json.loads(row.get(name) or "null")
+            return parsed if isinstance(parsed, type(default)) else default
+        except (TypeError, ValueError):
+            return default
+
+    best_row = None
+    if rows and "is_best" in rows[0]:
+        # The Journal owns selection, including ties and invalid candidates.
+        best_row = next(
+            (row for row in rows if str(row.get("is_best", "")).lower() == "true"), None
+        )
+    else:
+        # Historical TSVs predate explicit winner export and remain readable.
+        metric_rows = [(number(row.get("metric")), row) for row in rows]
+        metric_rows = [(value, row) for value, row in metric_rows if value is not None]
+        if metric_rows:
+            maximize = (
+                str(metric_rows[-1][1].get("maximize", "true")).lower() != "false"
+            )
+            best_row = (max if maximize else min)(
+                metric_rows, key=lambda item: item[0]
+            )[1]
+    best_metric = number(best_row.get("metric")) if best_row else None
+    best = None
+    if best_row:
+        best = {
+            "node_id": best_row.get("node_id"),
+            "step": best_row.get("step"),
+            "metrics": json_field(best_row, "metrics", {}),
+            "metric_specs": json_field(best_row, "metric_specs", []),
+            "metric_ranks": json_field(best_row, "metric_ranks", {}),
+            "average_rank": number(best_row.get("average_rank")),
+            "worst_rank": number(best_row.get("worst_rank")),
+            "candidate_count": number(best_row.get("candidate_count")),
+            "ranking_version": best_row.get("ranking_version"),
+            "selection_policy": best_row.get("selection_policy", "legacy_primary"),
+        }
     latest = None
     if rows:
         latest = {
             key: rows[-1].get(key)
             for key in ("step", "status", "metric", "outcome", "exc_type", "error")
         }
-    return {"count": len(rows), "best_metric": best_metric, "latest": latest}
+        latest["metrics"] = json_field(rows[-1], "metrics", {})
+        latest["average_rank"] = number(rows[-1].get("average_rank"))
+    return {
+        "count": len(rows),
+        "best_metric": best_metric,
+        "best": best,
+        "latest": latest,
+    }
 
 
 def read_manifest_summary(

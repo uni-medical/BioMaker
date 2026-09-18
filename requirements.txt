@@ -25,8 +25,10 @@ Pillow
 # Common packages available to generated solutions
 lightgbm
 matplotlib
-numpy
+numpy<2
 scikit-learn
+# Centerline metrics and reproducible tree-reference skeletonization
+scikit-image==0.22.0
 scipy
 timm
 torch

@@ -78,7 +78,7 @@ def test_reader_encoding_catalog_matches_admission_and_custom_freedom(tmp_path, 
     # Decoding is agent-owned: custom encodings keep the identical metric spec.
     resolved = _resolve_metric_contract(spec, tmp_path, "", require_match=True)
     assert resolved["prediction_type"] == "dataset_specific_archive"
-    assert resolved["primary_metric"] == primary
+    assert resolved["metrics"][0]["name"] == primary
 
 
 @pytest.mark.parametrize("multilabel", [False, True])
@@ -99,7 +99,7 @@ def test_classification_columns_align_through_shared_harness(tmp_path, monkeypat
                                  {"case": "002", "diagnosis": "diseased"}])
     predictions = [{"case": "002", "arbitrary:first": 0.1, "arbitrary:second": 0.9},
                    {"case": "001", "arbitrary:first": 0.9, "arbitrary:second": 0.1}]
-    assert scorer["score"](*write_tables(tmp_path, expected, truth, predictions))["metric"] == 1
+    assert scorer["score"](*write_tables(tmp_path, expected, truth, predictions))["metrics"]["accuracy"] == 1
     artifact = "working/relocated/probe.csv"
     scorer["write_dummy_predictions"](expected[1:], artifact)
     frame = pd.read_csv(artifact, dtype=str)
@@ -128,7 +128,7 @@ def test_mask_shape_and_instance_ids_preserved_from_public_inputs(tmp_path, monk
     sample = scorer["load_sample"](pred, truth, row)
     assert sample["input_shape"] == (7, 9)
     assert set(np.unique(sample["target"])) == {0, 451, 999}
-    assert scorer["score"](*write_tables(tmp_path, [row], [truth], [pred]))["metric"] == 1
+    assert scorer["score"](*write_tables(tmp_path, [row], [truth], [pred]))["metrics"]["aji"] == 1
     prediction_only = scorer["load_sample"](pred, None, row)
     assert "target" not in prediction_only
     scorer["validate_prediction"](prediction_only, spec)
@@ -213,7 +213,7 @@ def test_box_schema_conversion_preserves_confidence_and_class(tmp_path, monkeypa
     assert sample["prediction"] == [(17, (2., 3., 6., 9.), 0.81)]
     assert sample["target"] == [(17, (2., 3., 6., 9.), 1.0)]
     result = scorer["score"](*write_tables(tmp_path, [expected], [truth], [pred]))
-    assert result["metric"] == 1.0
+    assert result["metrics"]["ap50"] == 1.0
     artifact = "working/relocated/predictions.csv"
     scorer["write_dummy_predictions"]([expected], artifact)
     row = pd.read_csv(artifact, dtype=str).iloc[0].to_dict()
@@ -280,7 +280,7 @@ def test_detection_probe_finds_canonical_targets_without_exposing_answers(
             selected = pd.read_csv(probe["expected_path"], dtype=str)
             assert str(positive_index) in selected["case"].tolist()
             assert len(selected) == (4 if positive_index < 4 else 5)
-            assert probe["score"]["metric"] == 0
+            assert probe["score"]["metrics"]["ap50"] == 0
             monkeypatch.delenv("BIOMAKER_SCORE_VAL_PATH")
             assert scorer["score"](*(probe[key] for key in (
                 "prediction_path", "truth_path", "expected_path"))) == probe["score"]

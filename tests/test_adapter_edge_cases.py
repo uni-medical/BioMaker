@@ -90,7 +90,7 @@ def write_dummy_predictions(expected_rows, artifact_path):
     artifact = csv(tmp_path / "working/submission.csv", predictions)
     expected = str(tmp_path / "input/biomaker_splits/agent_test.csv")
     assert scorer["validate_submission"]() == {"valid": True, "n": 2}
-    assert scorer["score"](artifact, truth_path, expected)["metric"] == 1
+    assert scorer["score"](artifact, truth_path, expected)["metrics"]["ap50"] == 1
     predictions[0]["id"] = ""
     csv(Path(artifact), predictions)
     with pytest.raises(ValueError, match="empty sample keys"):
@@ -169,7 +169,7 @@ def test_undefined_dummy_hd95_is_structural_success_but_final_score_stays_strict
         predictions = pd.read_csv(probe["prediction_path"], dtype=str)
         for filename in predictions["prediction"]:
             np.save(filename, np.zeros((4, 4), dtype=np.uint8))
-        assert scorer["score"](*(probe[key] for key in ("prediction_path", "truth_path", "expected_path")))["metric"] == 0
+        assert scorer["score"](*(probe[key] for key in ("prediction_path", "truth_path", "expected_path")))["metrics"]["hd95"] == 0
     finally:
         scorer["cleanup_self_test"]()
 

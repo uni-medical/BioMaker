@@ -15,10 +15,14 @@ ADAPTER_API = """
 Return one Python file implementing exactly these three public functions:
 
 prediction_spec() -> dict
-  Declare evaluator_api_version=2, primary_metric, secondary_metrics (list),
-  maximize (bool), task_type, key_columns, prediction_columns, answer_columns,
+  Declare evaluator_api_version=3, metrics (a nonempty list of {name, maximize}
+  objects, with independent boolean directions), task_type, key_columns,
+  prediction_columns, answer_columns,
   validation_artifact='./working/validation_predictions.csv',
   test_submission='./working/submission.csv', and all metric parameters.
+  Harness binds the prepared manifest's public split lifecycle. An explicit
+  train/validation-only manifest has test_split=None: no test predictions or
+  dummy test rows are needed. Missing test files alone do not opt out of test.
   Declare file_reference_columns only for prediction cells containing file paths.
   Original column names and directory layouts are yours to interpret. Sample keys
   must agree with the prepared public splits; [] is allowed only for an explicit
@@ -115,7 +119,9 @@ def compile_adapter(source: str, frozen_spec: dict[str, Any] | None = None) -> s
         elif isinstance(node, ast.Name) and node.id == "prediction_spec":
             node.id = "_h_adapter_spec"
     source = ast.unparse(tree)
-    kernels = Path(__file__).with_name("trusted_metrics.py").read_text(encoding="utf-8")
+    from .metric_source import frozen_metric_source
+
+    kernels = frozen_metric_source()
     return (
         "from __future__ import annotations\n"
         "# Agent-owned data interpretation\n" + source + "\n"
@@ -137,7 +143,11 @@ from pathlib import Path as _h_Path
 import pandas as _h_pd
 
 _h_declared = __FROZEN_SPEC__
-_h_spec = normalize_metric_spec(_h_declared if _h_declared is not None else _h_adapter_spec())
+_h_source_spec = _h_declared if _h_declared is not None else _h_adapter_spec()
+_h_source_spec = dict(_h_source_spec, metrics=normalize_metric_definitions(_h_source_spec), evaluator_api_version=3)
+for _h_legacy_field in ('primary_metric', 'secondary_metrics', 'maximize'):
+    _h_source_spec.pop(_h_legacy_field, None)
+_h_spec = normalize_metric_spec(_h_source_spec)
 _h_spec['scoring_backend'] = 'trusted_metrics_v1'
 _h_spec['adapter_api_version'] = 1
 _h_spec.setdefault('score_split', './input/biomaker_splits/score_val.csv')
@@ -146,6 +156,13 @@ _h_probe = None
 
 
 def _h_validate_spec():
+    if _h_spec['test_split'] is None:
+        public = _h_spec.get('public_splits')
+        if (not isinstance(public, list) or any(not isinstance(role, str) for role in public)
+                or set(public) != {'train', 'score_val'} or len(public) != 2):
+            raise ValueError('test_split=None requires an explicit train/validation-only public_splits contract.')
+    elif 'public_splits' in _h_spec and 'test' not in _h_spec['public_splits']:
+        raise ValueError('test_split disagrees with the declared public_splits contract.')
     for name in ('key_columns', 'prediction_columns', 'answer_columns'):
         values = _h_spec.get(name)
         if (not isinstance(values, list) or (name != 'key_columns' and not values)
@@ -267,6 +284,8 @@ def _h_validate_submission(prediction_path, expected_path):
 
 
 def validate_submission():
+    if _h_spec['test_split'] is None:
+        return {'valid': True, 'skipped': True, 'reason': 'no_test_split', 'n': 0}
     return _h_validate_submission(_h_spec['test_submission'], _h_spec['test_split'])
 
 
@@ -372,14 +391,15 @@ def self_test():
         result = score(str(prediction_path), str(truth_path), str(expected_path))
     except UndefinedMetricError as exc:
         score_error = {'metric': exc.metric, 'reason': exc.reason}
-    test = _h_expected(_h_spec['test_split'])
-    test = test.iloc[_h_select_probe(test)]
-    test_path = root / 'test.csv'
-    test.to_csv(test_path, index=False)
-    submission = fixtures / 'submission/predictions.csv'
-    submission.parent.mkdir(parents=True, exist_ok=True)
-    _h_write_dummy(test.to_dict('records'), str(submission))
-    _h_validate_submission(submission, test_path)
+    if _h_spec['test_split'] is not None:
+        test = _h_expected(_h_spec['test_split'])
+        test = test.iloc[_h_select_probe(test)]
+        test_path = root / 'test.csv'
+        test.to_csv(test_path, index=False)
+        submission = fixtures / 'submission/predictions.csv'
+        submission.parent.mkdir(parents=True, exist_ok=True)
+        _h_write_dummy(test.to_dict('records'), str(submission))
+        _h_validate_submission(submission, test_path)
     print('EVALUATOR_OK')
     # Caller re-reads these paths for the relocated, environment-free probe.
     return {'prediction_path': str(prediction_path), 'truth_path': str(truth_path),

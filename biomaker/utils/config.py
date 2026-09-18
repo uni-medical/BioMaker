@@ -669,19 +669,11 @@ def _copy_csv_referenced_files(
         logger.debug("Failed to copy CSV-referenced files from %s: %s", csv_path, exc)
 
 
-def _copy_node_artifacts(cfg: Config, node) -> None:
-    """Persist the candidate-owned artifacts for one node before ./working changes."""
-    if node is None:
-        return
-    source_workspace = Path(node.execution_workspace or cfg.workspace_dir)
-    working_dir = source_workspace / "working"
-    if not working_dir.is_dir():
-        return
-
-    dst_dir = _node_artifact_path(cfg.log_dir, node)
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    (dst_dir / "runfile.py").write_text(node.code or "", encoding="utf-8")
-
+def _write_node_metadata(dst_dir: Path, node, snapshot=None) -> None:
+    """Refresh rank metadata without copying candidate artifacts again."""
+    snapshot = snapshot or {}
+    ranking = snapshot.get("nodes", {}).get(node.id, {})
+    specs = snapshot.get("metric_specs", [])
     metadata = {
         "node_id": node.id,
         "step": node.step,
@@ -690,12 +682,24 @@ def _copy_node_artifacts(cfg: Config, node) -> None:
         "selection_reason": node.selection_reason,
         "metric": (
             None
-            if node.metric is None
+            if node.metric is None or len(specs) > 1
             else {
                 "value": node.metric.value,
                 "maximize": node.metric.maximize,
             }
         ),
+        "metrics": dict(getattr(node, "metrics", {}) or {}),
+        "metric_specs": specs,
+        "metric_ranks": ranking.get("metric_ranks", {}),
+        "average_rank": ranking.get("average_rank"),
+        "worst_rank": ranking.get("worst_rank"),
+        "candidate_count": snapshot.get("candidate_count", 0),
+        "ranking_version": snapshot.get("version"),
+        "is_best": node.id == snapshot.get("best_node_id"),
+        "selection_policy": snapshot.get("selection_policy", "legacy_primary"),
+        "selection_snapshot": getattr(node, "selection_snapshot", None),
+        "rank_context": getattr(node, "rank_context", None),
+        "metric_deltas": getattr(node, "metric_deltas", {}),
         "outcome": node.outcome,
         "exec_time": node.exec_time,
         "resource_usage": node.resource_usage,
@@ -713,6 +717,22 @@ def _copy_node_artifacts(cfg: Config, node) -> None:
         json.dumps(metadata, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8",
     )
+
+
+def _copy_node_artifacts(cfg: Config, node, snapshot=None) -> None:
+    """Persist the candidate-owned artifacts for one node before ./working changes."""
+    if node is None:
+        return
+    source_workspace = Path(node.execution_workspace or cfg.workspace_dir)
+    working_dir = source_workspace / "working"
+    if not working_dir.is_dir():
+        return
+
+    dst_dir = _node_artifact_path(cfg.log_dir, node)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    (dst_dir / "runfile.py").write_text(node.code or "", encoding="utf-8")
+
+    _write_node_metadata(dst_dir, node, snapshot)
     if node.artifact_report:
         (dst_dir / "artifact_report.json").write_text(
             json.dumps(node.artifact_report, indent=2, ensure_ascii=False, default=str),
@@ -773,6 +793,18 @@ def _copy_best_working_outputs(cfg: Config) -> None:
     if working_dir is None:
         return
 
+    # A previous candidate may have exported artifacts the new winner omits.
+    # These three legacy aliases are owned by the selected-best export; node
+    # archives and the latest-candidate workspace must remain untouched.
+    for name in ("submission.csv", "pred_masks", "best_ckpt.pth"):
+        source = working_dir / name
+        destination = Path(cfg.log_dir) / name
+        if not source.exists():
+            if destination.is_symlink() or destination.is_file():
+                destination.unlink()
+            elif destination.is_dir():
+                shutil.rmtree(destination)
+
     submission_path = working_dir / "submission.csv"
     if submission_path.is_file():
         shutil.copy2(submission_path, cfg.log_dir / "submission.csv")
@@ -801,7 +833,9 @@ def _artifact_alignment_value(report: dict | None, key: str):
     return None
 
 
-def _write_results_table(log_dir: Path, journal) -> None:
+def _write_results_table(log_dir: Path, journal, snapshot=None) -> None:
+    snapshot = snapshot if snapshot is not None else journal.ranking_snapshot()
+    specs = snapshot.get("metric_specs", [])
     path = log_dir / "results.tsv"
     fieldnames = [
         "step",
@@ -810,6 +844,18 @@ def _write_results_table(log_dir: Path, journal) -> None:
         "status",
         "metric",
         "maximize",
+        "metrics",
+        "metric_specs",
+        "metric_ranks",
+        "average_rank",
+        "worst_rank",
+        "candidate_count",
+        "ranking_version",
+        "is_best",
+        "selection_policy",
+        "selection_snapshot",
+        "rank_context",
+        "metric_deltas",
         "outcome",
         "delta_vs_parent",
         "delta_vs_best",
@@ -832,7 +878,14 @@ def _write_results_table(log_dir: Path, journal) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
         writer.writeheader()
         for node in journal.nodes:
-            metric = node.metric.value if node.metric is not None else None
+            metric = (
+                node.metric.value
+                if node.metric is not None and len(specs) <= 1
+                else None
+            )
+            if len(specs) == 1 and journal.selection_policy == "average_rank":
+                metric = getattr(node, "metrics", {}).get(specs[0]["name"])
+            ranking = snapshot.get("nodes", {}).get(node.id, {})
             resources = node.resource_usage or {}
             report = node.artifact_report
             writer.writerow(
@@ -843,7 +896,35 @@ def _write_results_table(log_dir: Path, journal) -> None:
                     "status": node.node_status,
                     "metric": "" if metric is None else metric,
                     "maximize": (
-                        "" if node.metric is None else bool(node.metric.maximize)
+                        specs[0]["maximize"]
+                        if len(specs) == 1
+                        else (
+                            ""
+                            if node.metric is None or len(specs) > 1
+                            else bool(node.metric.maximize)
+                        )
+                    ),
+                    "metrics": json.dumps(
+                        getattr(node, "metrics", {}) or {}, ensure_ascii=False
+                    ),
+                    "metric_specs": json.dumps(specs, ensure_ascii=False),
+                    "metric_ranks": json.dumps(
+                        ranking.get("metric_ranks", {}), ensure_ascii=False
+                    ),
+                    "average_rank": ranking.get("average_rank", ""),
+                    "worst_rank": ranking.get("worst_rank", ""),
+                    "candidate_count": snapshot.get("candidate_count", 0),
+                    "ranking_version": snapshot.get("version", ""),
+                    "is_best": node.id == snapshot.get("best_node_id"),
+                    "selection_policy": journal.selection_policy,
+                    "selection_snapshot": json.dumps(
+                        getattr(node, "selection_snapshot", None), ensure_ascii=False
+                    ),
+                    "rank_context": json.dumps(
+                        getattr(node, "rank_context", None), ensure_ascii=False
+                    ),
+                    "metric_deltas": json.dumps(
+                        getattr(node, "metric_deltas", {}), ensure_ascii=False
                     ),
                     "outcome": node.outcome or "",
                     "delta_vs_parent": (
@@ -885,9 +966,11 @@ def save_run(
 ):
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # save journal
+    # All exported views use the same current candidate set and winner.
+    snapshot = dict(journal.ranking_snapshot())
+    snapshot["selection_policy"] = journal.selection_policy
     serialize.dump_json(journal, cfg.log_dir / "journal.json")
-    _write_results_table(cfg.log_dir, journal)
+    _write_results_table(cfg.log_dir, journal, snapshot)
     # save config
     OmegaConf.save(config=cfg, f=cfg.log_dir / "config.yaml")
     split_dir = Path(cfg.workspace_dir) / "input" / "biomaker_splits"
@@ -917,7 +1000,11 @@ def save_run(
 
     latest_node = journal.nodes[-1] if journal.nodes else None
     if latest_node is not None:
-        _copy_node_artifacts(cfg, latest_node)
+        _copy_node_artifacts(cfg, latest_node, snapshot)
+    for node in journal.nodes:
+        artifact_dir = _node_artifact_path(cfg.log_dir, node)
+        if artifact_dir.is_dir():
+            _write_node_metadata(artifact_dir, node, snapshot)
 
     _copy_run_working_dir(cfg, "working_latest", "working_latest")
     if best_node is not None:

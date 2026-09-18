@@ -4,11 +4,12 @@ import math
 import re
 
 from .evaluator_protocol import requested_metrics
+from .metric_declarations import declared_metric_names, declared_metric_definitions, canonical_metric_contract
 from .trusted_metrics import normalize_ssim_parameters
 
 
 def fixed_restoration_spec(context, task):
-    primary, secondary = requested_metrics(task)
+    primary, secondary = declared_metric_names(context['split_manifest'], task)
     if primary not in {'psnr', 'ssim'} or any(m not in {'psnr', 'ssim'} for m in secondary):
         return None
     blocks = re.findall(r'```restoration-evaluation\s*\n(.*?)```', task, re.S)
@@ -16,7 +17,7 @@ def fixed_restoration_spec(context, task):
         raise ValueError('Declare exactly one restoration-evaluation contract.')
     manifest = context['split_manifest']
     output = manifest.get('prediction_contract', {})
-    contract = manifest.get('metric_contract', {})
+    contract = canonical_metric_contract(manifest.get('metric_contract', {}))
     if blocks:
         protocol = json.loads(blocks[0])
     else:
@@ -27,7 +28,7 @@ def fixed_restoration_spec(context, task):
         if not isinstance(source, dict) or not settings <= source.keys():
             return None
         semantic_fields = settings | {'input_column', 'target_column', 'crop_mode', 'ssim_parameters'}
-        metadata_fields = {'primary_metric', 'secondary_metrics', 'maximize', 'task_type'}
+        metadata_fields = {'metrics', 'primary_metric', 'secondary_metrics', 'maximize', 'task_type'}
         unknown = set(source) - semantic_fields - (metadata_fields if source is contract else set())
         if source is not contract:
             unknown |= set(contract) - metadata_fields - {'restoration_evaluation', 'ssim_parameters', 'crop_mode'}
@@ -121,9 +122,8 @@ def fixed_restoration_spec(context, task):
             raise ValueError('Expected sample metadata must be complete and unique.')
         if group and set(df[group].astype(str)) != set(groups):
             raise ValueError('Each scoring split must contain every declared group.')
-    return dict(evaluator_api_version=2, task_type='image_restoration',
-                prediction_type='image_file_path', primary_metric=primary,
-                secondary_metrics=secondary, maximize=True, key_columns=keys,
+    return dict(evaluator_api_version=3, task_type='image_restoration',
+                prediction_type='image_file_path', metrics=declared_metric_definitions(manifest, task), key_columns=keys,
                 prediction_columns=[pc], answer_columns=[tc],
                 file_reference_columns=[pc],
                 restoration_evaluation=protocol,
