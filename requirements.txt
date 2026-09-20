@@ -35,7 +35,16 @@ torch
 torchvision
 xgboost
 
+# General candidate utilities (also exposed by the environment contract)
+einops
+tqdm
+networkx
+h5py
+tensorboard
+
 # Biomedical imaging packages
+connected-components-3d
+torchio<2
 lifelines
 monai==1.4.0
 nibabel
