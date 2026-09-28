@@ -185,7 +185,7 @@ def _install_minimal_run(
     events = []
     order = []
     live = _LiveThatBreaksOnStop(break_on_stop)
-    executor_count = iter(["generation", "execution"])
+    executor_count = iter(["generation", "execution", "scoring"])
     compute_pool = ComputePool((ComputeSlot(index=0, backend="cpu"),))
 
     class Executor(_ImmediateExecutor):
@@ -332,6 +332,41 @@ def _set_execution_workspace(node, workspace):
     return workspace
 
 
+@pytest.mark.parametrize("evaluator_timeout", [None, 900])
+def test_run_uses_independent_budget_for_preparation_candidate_and_private_scoring(
+    tmp_path, monkeypatch, evaluator_timeout
+):
+    cfg, events, _order, _live = _install_minimal_run(
+        monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False
+    )
+    # The candidate budget is deliberately shorter than either evaluator budget.
+    assert cfg.exec.timeout == 30
+    if evaluator_timeout is not None:
+        cfg.exec.evaluator_timeout = evaluator_timeout
+    expected = evaluator_timeout if evaluator_timeout is not None else 3600
+    observed = {}
+
+    def prepare(**kwargs):
+        observed["prepare"] = kwargs["timeout"]
+        return SimpleNamespace(prediction_spec='{"primary_metric": "accuracy"}')
+
+    def score(_workspace, **kwargs):
+        observed["candidate"] = kwargs["timeout"]
+        return SimpleNamespace(ok=True)
+
+    def private(_workspace, _hidden, **kwargs):
+        observed["private"] = kwargs["timeout"]
+        return None
+
+    monkeypatch.setattr(run_module, "prepare_evaluator", prepare)
+    monkeypatch.setattr(run_module, "score_candidate_with_evaluator", score)
+    monkeypatch.setattr(run_module, "evaluate_private_outputs", private)
+    run_module.run()
+
+    assert observed == dict(prepare=expected, candidate=expected, private=expected)
+    assert events[-1] == ("run_finished", {"completed_steps": 1})
+
+
 @pytest.mark.parametrize("per_node", [None, True, False])
 @pytest.mark.parametrize("final_retrain_enabled", [False, True])
 def test_private_evaluation_policy_preserves_search_and_controls_private_history(
@@ -410,6 +445,7 @@ def test_broken_pipe_during_final_live_stop_does_not_skip_terminal_work(
     assert order == [
         "generation_shutdown",
         "execution_shutdown",
+        "scoring_shutdown",
         "final_retrain",
         "report",
     ]
@@ -459,6 +495,7 @@ def test_arbitrary_live_stop_failure_is_only_a_presentation_warning(
     assert order == [
         "generation_shutdown",
         "execution_shutdown",
+        "scoring_shutdown",
         "final_retrain",
         "report",
     ]
@@ -495,6 +532,7 @@ def test_live_constructor_failure_does_not_start_or_skip_terminal_work(
     assert order == [
         "generation_shutdown",
         "execution_shutdown",
+        "scoring_shutdown",
         "final_retrain",
         "report",
     ]
@@ -527,6 +565,7 @@ def test_failed_presentation_warning_sink_does_not_fail_the_run(tmp_path, monkey
     assert order == [
         "generation_shutdown",
         "execution_shutdown",
+        "scoring_shutdown",
         "final_retrain",
         "report",
     ]
@@ -554,6 +593,7 @@ def test_failed_logger_warning_sink_does_not_fail_the_run(tmp_path, monkeypatch)
     assert order == [
         "generation_shutdown",
         "execution_shutdown",
+        "scoring_shutdown",
         "final_retrain",
         "report",
     ]
@@ -582,6 +622,7 @@ def test_final_live_update_failure_still_stops_display_and_finishes(
     assert order == [
         "generation_shutdown",
         "execution_shutdown",
+        "scoring_shutdown",
         "final_retrain",
         "report",
     ]
@@ -637,6 +678,7 @@ def test_failed_final_retrain_emits_run_failed_without_run_finished(
     assert order == [
         "generation_shutdown",
         "execution_shutdown",
+        "scoring_shutdown",
         "final_retrain",
     ]
     retrain_events = [
@@ -674,6 +716,7 @@ def test_step_tree_render_failure_is_only_a_presentation_warning(tmp_path, monke
     assert order == [
         "generation_shutdown",
         "execution_shutdown",
+        "scoring_shutdown",
         "final_retrain",
         "report",
     ]

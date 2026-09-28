@@ -13,8 +13,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from contextlib import ExitStack
+from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -26,7 +28,7 @@ from PIL import Image
 
 from .. import backend
 from .environment import environment_manifest_text, validate_code_environment
-from .evaluator_adapter import ADAPTER_API, compile_adapter
+from .evaluator_adapter import ADAPTER_API, compile_adapter, validate_adapter_source
 from .metric_source import frozen_metric_source, METRIC_SOURCE_FILES
 from .restoration_contract import fixed_restoration_spec
 from .restoration_evaluator_template import _RESTORATION_DATA_ADAPTER
@@ -40,6 +42,7 @@ from .standard_data_adapters import (
 )
 from .evaluator_protocol import (
     EVALUATOR_API_VERSION,
+    PredictionRowsValidationError,
     metric_name,
     metric_definitions,
     requested_metric_definitions,
@@ -55,7 +58,7 @@ from .exp_guide import (
     evaluator_exp_guide_view,
     load_exp_guide,
 )
-from .experiment_contract import load_experiment_contract
+from .experiment_contract import load_experiment_contract, _load_split_manifest as _load_contract_split_manifest
 from .metric_declarations import (
     PROTOCOL_DOCUMENTATION_FIELDS as _PROTOCOL_DOCUMENTATION_FIELDS,
     canonical_metric_contract,
@@ -84,12 +87,37 @@ EXTERNAL_VALIDATION_PREFIX = "BioMakerExternalValidation:"
 _RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
 _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
+_FAILURE_PREFIX = "EVALUATOR_FAILURE_JSON="
 _SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
-_EVALUATOR_CACHE_VERSION = 6
+_EVALUATOR_CACHE_VERSION = 7
+_PREPARATION_ENV: ContextVar[dict[str, str] | None] = ContextVar('evaluator_preparation_env', default=None)
 
 
 class EvaluatorSetupError(RuntimeError):
     """Raised when BioMaker cannot create a usable evaluator before search."""
+
+
+class EvaluatorInfrastructureError(EvaluatorSetupError):
+    """Preparation was not completed; regenerating candidate code cannot fix it."""
+
+    def __init__(self, message: str, *, failure_kind: str):
+        super().__init__(message)
+        self.failure_kind = failure_kind
+
+
+def _raise_preparation_resource_failure(exc: Exception, log_dir: Path, timeout: int) -> None:
+    """Do not turn an exhausted scoring budget into LLM adapter repair attempts."""
+    if isinstance(exc, EvaluatorInfrastructureError):
+        raise exc
+    if isinstance(exc, (subprocess.TimeoutExpired, MemoryError)):
+        kind = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "resource"
+        message = (
+            f"Evaluator preparation timed out after {timeout} seconds; "
+            "increase the scoring budget or inspect scoring performance."
+            if kind == "timeout" else "Evaluator preparation exhausted memory."
+        )
+        append_event(log_dir, "evaluator_preparation_unavailable", failure_kind=kind, reason=message)
+        raise EvaluatorInfrastructureError(message, failure_kind=kind) from exc
 
 
 @dataclass(frozen=True)
@@ -106,6 +134,9 @@ class EvaluatorRunResult:
     details: dict[str, Any]
     output: str
     error: str | None = None
+    # Only demonstrated prediction-contract violations implicate a candidate.
+    # Unknown evaluator errors remain unscored rather than model-code bugs.
+    failure_kind: str | None = None
 
     @property
     def metrics(self) -> dict[str, float]:
@@ -242,11 +273,11 @@ def _evaluator_prompt(
             "Do not train a model. Do not install packages. Do not use network access.",
             "Do not use Python eval() or exec(). Parse serialized values with json.loads or ast.literal_eval.",
             "Use the Experiment guide as the source of truth for public splits, hidden answers, visibility boundaries, and output paths.",
-            "Define prediction_spec() returning a concise JSON-serializable dict with these top-level keys: validation_artifact, test_submission, key_columns, prediction_columns, metrics. key_columns may be [] only when row order is the contract.",
+            "Define prediction_spec() returning your additional encoding and custom metric declarations. Harness injects prepared sample keys, output columns, metric semantics and prediction_jobs before freezing. key_columns may be [] only when row order is the contract.",
             "Evaluator API v3: prediction_spec() must include evaluator_api_version=3 and a nonempty metrics list of {name, maximize} objects. Every metric has its own boolean direction; custom metrics require an explicit direction. Preserve every requested objective; there is no primary or secondary role. Declare metric parameters (thresholds, averaging, class mapping, coordinate conventions) explicitly in the public spec; use exactly those settings on every split.",
             "Define score(prediction_path, truth_path, expected_path). This is the ONLY scoring implementation for both validation and private test. Read predictions, hidden truth, and public expected rows from these explicit paths. Never hardcode validation filenames, row counts, or the score-validation environment variable inside score(). Never infer the split from its size. Referenced relative image/mask/annotation paths remain workspace-relative. Return {'metrics': {metric_name: finite_number, ...}} and optional diagnostics. Include every declared objective. Do not return a scalar metric or any rank: the Journal computes average ranks across candidates. For detection, explicitly freeze the confidence threshold or operating-point rule for Recall as well as IoU and box format; do not tune the rule on private test answers.",
             "score_val() must only delegate to score() with the validation prediction path, os.environ['BIOMAKER_SCORE_VAL_PATH'], and the public validation CSV. Do not duplicate metric computation for different splits. validate_submission() checks format only and must not read private test answers.",
-            "test_submission must be exactly './working/submission.csv'.",
+            "prediction_spec()['prediction_jobs'] is the complete required output mapping: each job has expected and artifact paths. There is no test submission when no test job is declared.",
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
             "The candidate validation artifact must contain predictions for rows in the Experiment guide's score validation split, usually ./input/biomaker_splits/score_val.csv and sometimes legacy ./input/biomaker_splits/agent_val.csv.",
             "When resolving file paths from split CSVs or hidden truth, values starting with `input/` or `./input/` are already workspace-relative paths; do not prepend `./input` a second time.",
@@ -257,11 +288,11 @@ def _evaluator_prompt(
             "For probability outputs, include class_labels when prediction_columns do not directly encode class names; for single-column binary probability outputs, include positive_class.",
             "The submission contract must preserve enough information for the requested user-only test metrics. For classification with AUC, require probabilities rather than only hard labels.",
             f"Define score_val() with no required arguments. It must read hidden score truth from os.environ['{_SCORE_ENV_VAR}'], read the candidate validation artifact from ./working, validate the contract, and return a dict containing the complete raw metrics mapping and optional diagnostics.",
-            "Define validate_submission() with no required arguments. It must validate ./working/submission.csv and any referenced files against the same contract, returning a dict or raising a clear exception.",
+            "Define validate_submission() with no required arguments. Validate the non-score_val prediction_jobs and their referenced files against the same contract, returning a dict or raising a clear exception. Never infer jobs from files present on disk.",
             "For tabular prediction artifacts, align rows by the declared key columns after normalizing keys to strings; reject missing keys, duplicate keys, extra keys, bad shapes, and invalid numeric values.",
             "For probability outputs, validate with numeric tolerance and return a clear error when rows are not valid probabilities.",
             "If any requested metric is mathematically undefined, raise a clear error naming that metric. Never substitute accuracy for AUC or silently omit a requested metric.",
-            f"Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real public score validation and agent_test split CSVs, exactly follow prediction_spec(), call score_val() with os.environ['{_SCORE_ENV_VAR}'] available, call validate_submission(), assert every declared metric is finite numeric, then print EVALUATOR_OK.",
+            f"Define self_test() with no required arguments. For each prediction_spec()['prediction_jobs'] entry, read its expected CSV and write dummy predictions to its artifact path. Call score_val() with os.environ['{_SCORE_ENV_VAR}'] available, call validate_submission(), assert every declared metric is finite numeric, then print EVALUATOR_OK. Do not assume a test job exists.",
             "self_test() MUST leave its validation/submission CSVs and ALL referenced files available after returning. Harness reads them again for a relocated-path scoring probe and owns cleanup after every preparation check finishes. Do not delete them or place referenced files in a TemporaryDirectory context that closes before returning.",
             "Keep the evaluator simple and deterministic. Implement and verify only unavailable metric definitions; reuse supplied trusted_score_samples(samples, spec) for registered metrics. Its canonical sample/parameter interface is documented below. Do not reimplement PSNR, SSIM, Dice, AJI, HD95, accuracy, AUC, AP50, or Recall.",
             "For segmentation masks, support mask files referenced from CSV. The prediction spec should make this explicit with prediction_type='mask_file_path' or file_reference_columns for the mask path column. Binary Dice should treat nonzero pixels as foreground. AJI/instance metrics should use integer connected/instance labels if the task asks for them.",
@@ -384,9 +415,11 @@ def _run_python(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     run_env = None
-    if env is not None:
+    preparation_env = _PREPARATION_ENV.get()
+    if env is not None or preparation_env is not None:
         run_env = os.environ.copy()
-        run_env.update(env)
+        run_env.update(preparation_env or {})
+        run_env.update(env or {})
     command = [sys.executable, "-c", code]
     process: subprocess.Popen[str] | None = None
     process_tree: ProcessTreeTracker | None = None
@@ -703,7 +736,15 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         or spec.get("validation_predictions")
         or spec.get("val_predictions")
     )
-    test_submission = _path_from_spec_value(spec.get("test_submission"))
+    jobs = spec.get("prediction_jobs")
+    if isinstance(jobs, dict):
+        score_job = jobs.get("score_val", {})
+        validation_artifact = score_job.get("artifact")
+        test_submission = jobs.get("test", {}).get("artifact")
+        spec = {**spec, "score_split": score_job.get("expected"),
+                "test_split": jobs.get("test", {}).get("expected")}
+    else:
+        test_submission = _path_from_spec_value(spec.get("test_submission"))
     key_columns = _list_of_strings(spec.get("key_columns"))
     if not key_columns:
         key_columns = _list_of_strings(
@@ -717,11 +758,11 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
     prediction_columns = _prediction_columns_from_raw_spec(spec, key_columns)
     primary_metric = _primary_metric_from_raw_spec(spec)
 
-    if not test_submission:
+    if not test_submission and not isinstance(jobs, dict):
         raise EvaluatorSetupError(
             "prediction_spec() must declare test_submission, usually './working/submission.csv'."
         )
-    if test_submission.removeprefix("./") != "working/submission.csv":
+    if not isinstance(jobs, dict) and test_submission.removeprefix("./") != "working/submission.csv":
         raise EvaluatorSetupError(
             "prediction_spec() test_submission must be exactly './working/submission.csv'."
         )
@@ -843,11 +884,12 @@ def _run_public_artifact_contract_test(
     if not isinstance(class_labels, list):
         class_labels = None
 
-    for artifact_key in ["validation_artifact", "test_submission"]:
-        artifact_value = str(spec.get(artifact_key, "")).removeprefix("./")
+    jobs = spec.get("prediction_jobs") or load_experiment_contract(workspace_dir).public_prediction_jobs()
+    for role, job in jobs.items():
+        artifact_value = str(job["artifact"]).removeprefix("./")
         if not artifact_value.startswith("working/"):
             raise EvaluatorSetupError(
-                f"prediction_spec {artifact_key} must point under ./working for "
+                f"prediction job {role} must point under ./working for "
                 "public artifact contract tests."
             )
 
@@ -862,25 +904,13 @@ def _run_public_artifact_contract_test(
             shutil.move(str(working_dir), str(backup_working))
         working_dir.mkdir(parents=True, exist_ok=True)
 
-        score_split = workspace_dir / str(
-            spec.get("score_split", "./input/biomaker_splits/score_val.csv")
-        ).removeprefix("./")
-        _write_dummy_tabular_artifact(
-            score_split,
-            workspace_dir / str(spec["validation_artifact"]).removeprefix("./"),
-            key_columns,
-            prediction_columns,
-            class_labels,
-            include_extra_label_like_columns=True,
-        )
-        _write_dummy_tabular_artifact(
-            workspace_dir / "input" / "biomaker_splits" / "agent_test.csv",
-            workspace_dir / str(spec["test_submission"]).removeprefix("./"),
-            key_columns,
-            prediction_columns,
-            class_labels,
-            include_extra_label_like_columns=True,
-        )
+        for job in jobs.values():
+            _write_dummy_tabular_artifact(
+                workspace_dir / job["expected"].removeprefix("./"),
+                workspace_dir / job["artifact"].removeprefix("./"),
+                key_columns, prediction_columns, class_labels,
+                include_extra_label_like_columns=True,
+            )
 
         code = (
             "import evaluator\n"
@@ -1230,12 +1260,7 @@ def _json_dict(path: Path) -> dict[str, Any]:
 
 
 def _split_manifest(split_dir: Path) -> dict[str, Any]:
-    manifest = _json_dict(split_dir / "split_manifest.json")
-    if manifest:
-        return manifest
-    split_plan = _json_dict(split_dir / "split_plan.json")
-    embedded = split_plan.get("split_manifest")
-    return embedded if isinstance(embedded, dict) else {}
+    return _load_contract_split_manifest(split_dir)
 
 
 def _manifest_key_columns(manifest: dict[str, Any]) -> list[str]:
@@ -1283,14 +1308,12 @@ def _truth_answer_columns(
     hidden_score_path: Path,
     score_df: pd.DataFrame,
 ) -> list[str]:
-    try:
-        columns = load_experiment_contract(workspace_dir).hidden_answer_columns(
-            "score_val"
-        )
-        if columns:
-            return columns
-    except Exception:
-        pass
+    contract = load_experiment_contract(workspace_dir)
+    columns = contract.hidden_answer_columns("score_val")
+    if columns:
+        return columns
+    if contract.split_manifest.get("manifest_version", 1) >= 2:
+        raise EvaluatorSetupError("Prepared score_val hidden answer columns are missing from the canonical manifest.")
     hidden_answers = split_plan.get("hidden_answers") or split_plan.get("private_gt")
     if isinstance(hidden_answers, dict):
         score_meta = hidden_answers.get("score_val")
@@ -1324,16 +1347,16 @@ def _truth_answer_columns(
 
 def _infer_key_columns(
     score_df: pd.DataFrame,
-    test_df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
     hidden_df: pd.DataFrame,
     answer_columns: list[str],
 ) -> list[str]:
     excluded = set(answer_columns)
+    frames = [score_df, hidden_df] + ([test_df] if test_df is not None else [])
     common_columns = [
         str(column)
         for column in score_df.columns
-        if str(column) in set(map(str, test_df.columns))
-        and str(column) in set(map(str, hidden_df.columns))
+        if all(str(column) in set(map(str, frame.columns)) for frame in frames)
         and str(column) not in excluded
     ]
     common = [
@@ -1354,11 +1377,7 @@ def _infer_key_columns(
     for column in preferred + common:
         if column not in common:
             continue
-        if (
-            score_df[column].astype(str).is_unique
-            and test_df[column].astype(str).is_unique
-            and hidden_df[column].astype(str).is_unique
-        ):
+        if all(frame[column].astype(str).is_unique for frame in frames):
             return [column]
     path_like = [
         column
@@ -1366,23 +1385,20 @@ def _infer_key_columns(
         if "path" in column.lower() or "file" in column.lower()
     ]
     for column in path_like:
-        if (
-            score_df[column].astype(str).is_unique
-            and test_df[column].astype(str).is_unique
-            and hidden_df[column].astype(str).is_unique
-        ):
+        if all(frame[column].astype(str).is_unique for frame in frames):
             return [column]
     return []
 
 
 def _infer_segmentation_key_columns(
     score_df: pd.DataFrame,
-    test_df: pd.DataFrame,
+    test_df: pd.DataFrame | None,
     hidden_df: pd.DataFrame,
     answer_column: str,
 ) -> list[str]:
     key_columns = _infer_key_columns(score_df, test_df, hidden_df, [answer_column])
-    common = set(map(str, test_df.columns)) & set(map(str, hidden_df.columns))
+    frames = [score_df, hidden_df] + ([test_df] if test_df is not None else [])
+    common = set.intersection(*(set(map(str, frame.columns)) for frame in frames))
     metadata_columns = []
     blocked_tokens = {"path", "file", "mask", "image"}
     for column in map(str, score_df.columns):
@@ -1497,27 +1513,29 @@ def _load_fixed_split_context(
     workspace_dir: Path, hidden_score_path: Path
 ) -> dict[str, Any] | None:
     split_dir = workspace_dir / "input" / "biomaker_splits"
-    train_path = split_dir / "agent_train.csv"
-    score_path = _score_split_path(workspace_dir)
-    lifecycle = _bind_public_split_lifecycle({}, workspace_dir)
-    test_path = (workspace_dir / lifecycle["test_split"].removeprefix("./")
-                 if lifecycle["test_split"] is not None else None)
+    contract = load_experiment_contract(workspace_dir)
+    train_path = contract.split_path("train")
+    score_path = contract.split_path("score_val")
+    lifecycle = contract.evaluator_lifecycle_spec()
+    test_path = contract.split_path("test")
     if not (
-        train_path.is_file()
-        and score_path.is_file()
+        train_path is not None and train_path.is_file()
+        and score_path is not None and score_path.is_file()
         and (test_path is None or test_path.is_file())
         and hidden_score_path.is_file()
     ):
         return None
     train_df = pd.read_csv(train_path)
     score_df = pd.read_csv(score_path)
-    # Empty schema only assists existing column inference. It is never written
-    # as a split, used as prediction rows, or supplied to a test evaluator.
-    test_df = (pd.read_csv(test_path) if test_path is not None
-               else score_df.iloc[:0].copy())
+    test_df = pd.read_csv(test_path) if test_path is not None else None
+    public_frames = {"score_val": score_df}
+    if test_df is not None:
+        public_frames["test"] = test_df
     hidden_df = pd.read_csv(hidden_score_path)
     split_plan = _json_dict(split_dir / "split_plan.json")
     split_manifest = _split_manifest(split_dir)
+    if split_manifest.get("manifest_version", 1) >= 2:
+        split_plan["row_order_contract"] = split_manifest.get("row_order_contract", False)
     return {
         "score_path": score_path,
         "test_path": test_path,
@@ -1525,6 +1543,7 @@ def _load_fixed_split_context(
         "train_df": train_df,
         "score_df": score_df,
         "test_df": test_df,
+        "public_frames": public_frames,
         "hidden_df": hidden_df,
         "split_plan": split_plan,
         "split_manifest": split_manifest,
@@ -1549,6 +1568,9 @@ def _infer_fixed_classification_spec(
     split_manifest = context["split_manifest"]
     answer_columns = context["answer_columns"]
     manifest_heads = _manifest_head_types(split_manifest)
+    declared_family = split_manifest.get("metric_contract", {}).get("task_family")
+    if declared_family is not None and declared_family != "classification":
+        return None
     if manifest_heads and not (
         manifest_heads
         & {
@@ -1595,12 +1617,14 @@ def _infer_fixed_classification_spec(
         return spec
 
     label_column = answer_columns[0]
-    labels = _sort_label_values(
-        pd.concat([train_df[label_column], hidden_df[label_column]], ignore_index=True)
-        .dropna()
-        .unique()
-        .tolist()
-    )
+    labels = split_manifest.get("prediction_contract", {}).get("class_labels")
+    if labels is None:
+        labels = split_manifest.get("metric_contract", {}).get("class_labels")
+    if labels is None:
+        labels = _sort_label_values(
+            pd.concat([train_df[label_column], hidden_df[label_column]], ignore_index=True)
+            .dropna().unique().tolist()
+        )
     if not (2 <= len(labels) <= 200):
         return None
     spec["class_labels"] = labels
@@ -1855,8 +1879,8 @@ def _infer_fixed_segmentation_spec(
         raw_image_column = columns_plan.get("path") or columns_plan.get("image")
         if isinstance(raw_image_column, str):
             image_column = raw_image_column
-    public_columns = set(map(str, score_df.columns)) | set(map(str, test_df.columns))
-    public_frames = [score_df, test_df]
+    public_frames = list(context["public_frames"].values())
+    public_columns = {str(column) for frame in public_frames for column in frame.columns}
     if image_column not in public_columns or not any(
         image_column in frame.columns and _looks_like_file_values(frame[image_column])
         for frame in public_frames
@@ -1864,7 +1888,7 @@ def _infer_fixed_segmentation_spec(
         image_column = None
         candidates: list[tuple[int, int, str]] = []
         seen_columns: set[str] = set()
-        for order, column in enumerate(list(score_df.columns) + list(test_df.columns)):
+        for order, column in enumerate(column for frame in public_frames for column in frame.columns):
             column = str(column)
             if column in seen_columns:
                 continue
@@ -2079,77 +2103,126 @@ def _canonical_declared_settings(values: dict[str, Any], *, fallback_primary: st
         raise EvaluatorSetupError(str(exc)) from exc
 
 
-def _bind_public_split_lifecycle(spec: dict[str, Any], workspace_dir: Path) -> dict[str, Any]:
-    """Bind test presence from explicit prepared split declarations, never absence.
-
-    A missing test CSV remains an error for legacy/test-enabled contracts. Only
-    a manifest explicitly declaring train and score_val without test enables the
-    no-test lifecycle. Adapter-provided split claims cannot override it.
-    """
-    manifest = _split_manifest(workspace_dir / "input/biomaker_splits")
-    declarations = []
-    for field in ("public_splits", "required_splits"):
-        if field not in manifest:
-            continue
-        roles = manifest[field]
-        if (not isinstance(roles, list) or any(not isinstance(role, str) for role in roles)
-                or len(set(roles)) != len(roles)
-                or not {"train", "score_val"}.issubset(roles)
-                or set(roles) - {"train", "score_val", "test"}):
-            raise EvaluatorSetupError(
-                "split_manifest." + field + " must explicitly list train, score_val and optionally test."
-            )
-        declarations.append(set(roles))
-    if declarations and any(roles != declarations[0] for roles in declarations[1:]):
-        raise EvaluatorSetupError("Conflicting public_splits and required_splits declarations.")
+def _bind_prepared_adapter_spec(
+    spec: dict[str, Any], workspace_dir: Path, task_desc: Any,
+    hidden_score_path: Path | None = None,
+) -> dict[str, Any]:
+    """Complete a codec declaration from the authoritative prepared protocol."""
+    contract = load_experiment_contract(workspace_dir)
+    manifest = contract.split_manifest
     result = dict(spec)
-    result.pop("public_splits", None)
-    result["test_split"] = "./input/biomaker_splits/agent_test.csv"
-    if declarations:
-        public = declarations[0]
-        result["public_splits"] = [role for role in ("train", "score_val", "test") if role in public]
-        if "test" not in public:
-            for field in ("splits", "hidden_answers", "private_gt"):
-                metadata = manifest.get(field)
-                if isinstance(metadata, dict) and "test" in metadata:
-                    raise EvaluatorSetupError("No-test split declaration conflicts with split_manifest." + field + ".test.")
-            result["test_split"] = None
+    output = manifest.get("prediction_contract", {})
+    prepared = {key: output[key] for key in (
+        "prediction_columns", "file_reference_columns", "prediction_type",
+        "class_labels", "positive_class", "image_column",
+    ) if key in output}
+    keys = _manifest_key_columns(manifest)
+    if keys or manifest.get("row_order_contract"):
+        prepared["key_columns"] = keys
+    answers = contract.hidden_answer_columns("score_val")
+    if not answers and hidden_score_path is not None:
+        public = pd.read_csv(contract.split_path("score_val"), dtype=str)
+        answers = _truth_answer_columns(workspace_dir, contract.split_plan, hidden_score_path, public)
+    if answers:
+        prepared["answer_columns"] = answers
+    for key, value in prepared.items():
+        if key in result and result[key] != value:
+            if key != "answer_columns" or set(result[key]) != set(value):
+                raise EvaluatorSetupError("Adapter changed the prepared " + key + ".")
+        result[key] = value
+    # Metric semantics are supplied before normalize_metric_spec, which requires
+    # a complete class space even when the codec declaration omits it.
+    declared = {**(requested_metric_contract(_task_payload(task_desc)) or {}),
+                **_canonical_declared_settings(manifest.get("metric_contract", {}))}
+    for key, value in declared.items():
+        if key not in _PROTOCOL_DOCUMENTATION_FIELDS:
+            result.setdefault(key, value)
+    heads = _manifest_head_types(manifest)
+    head_types = heads & {"binary", "multiclass", "multilabel", "regression", "image_restoration", "detection"}
+    if len(head_types) == 1:
+        result.setdefault("task_type", next(iter(head_types)))
+    elif heads & {"segmentation", "segmentation_2d", "segmentation_3d", "semantic_segmentation", "instance_segmentation"}:
+        result.setdefault("task_type", "segmentation")
+    elif heads & {"classification", "single_label_classification", "multi_label_classification"} or result.get("task_family") == "classification":
+        labels = result.get("class_labels", [])
+        kind = ("multilabel" if "multi_label_classification" in heads
+                else "binary" if len(labels) == 2 else "multiclass")
+        result.setdefault("task_type", kind)
+    elif result.get("task_family"):
+        result.setdefault("task_type", result["task_family"])
+    result["evaluator_api_version"] = EVALUATOR_API_VERSION
+    result.update(contract.evaluator_lifecycle_spec())
     return result
 
 
 def _freeze_data_adapter(workspace_dir: Path, source: str, task_desc: Any, hidden_score_path: Path) -> None:
-    """Validate declarations against the prepared protocol, then embed constants."""
+    """Read the codec alone, bind the prepared contract, then compile once."""
+    contract = load_experiment_contract(workspace_dir)
+    lifecycle = contract.evaluator_lifecycle_spec()
+    validate_adapter_source(source)
     evaluator_path = workspace_dir / "evaluator.py"
-    evaluator_path.write_text(compile_adapter(source), encoding="utf-8")
+    evaluator_path.write_text(source, encoding="utf-8")
     completed = _run_python(
         workspace_dir,
-        "import evaluator, json\nprint('ADAPTER_SPEC_JSON=' + json.dumps(evaluator._h_spec))\n",
+        "import evaluator, json\nprint('ADAPTER_SPEC_JSON=' + json.dumps(evaluator.prediction_spec()))\n",
         timeout=30,
     )
     output = (completed.stdout or "") + (completed.stderr or "")
     values = [line.removeprefix("ADAPTER_SPEC_JSON=") for line in output.splitlines() if line.startswith("ADAPTER_SPEC_JSON=")]
     if completed.returncode != 0 or not values:
         raise EvaluatorSetupError("Adapter declaration failed.\n" + output[-4000:])
-    spec = json.loads(_normalize_prediction_spec_json(values[-1]))
-    _validate_scoring_contract(spec, task_desc)
-    split_dir = workspace_dir / "input/biomaker_splits"
-    manifest = _split_manifest(split_dir)
-    plan = _json_dict(split_dir / "split_plan.json")
-    keys = _manifest_key_columns(manifest)
-    if keys and spec["key_columns"] != keys:
-        raise EvaluatorSetupError("Adapter sample keys must preserve the prepared split manifest.")
-    if not spec["key_columns"] and not plan.get("row_order_contract", manifest.get("row_order_contract", False)):
+    declared = json.loads(values[-1])
+    if not isinstance(declared, dict):
+        raise EvaluatorSetupError("Adapter prediction_spec() must return a JSON object.")
+    spec = _bind_prepared_adapter_spec(declared, workspace_dir, task_desc, hidden_score_path)
+    spec.update(lifecycle)
+    spec = json.loads(_normalize_prediction_spec_json(json.dumps(spec)))
+    row_order = contract.split_manifest.get("row_order_contract", False)
+    if contract.split_manifest.get("manifest_version", 1) < 2:
+        row_order = contract.split_manifest.get("row_order_contract", contract.split_plan.get("row_order_contract", False))
+    if not spec["key_columns"] and not row_order:
         raise EvaluatorSetupError("Empty key_columns requires an explicit row_order_contract.")
-    score_path = _score_split_path(workspace_dir)
-    public = pd.read_csv(score_path, dtype=str)
-    answers = _truth_answer_columns(workspace_dir, plan, hidden_score_path, public)
-    if set(spec["answer_columns"]) != set(answers):
-        raise EvaluatorSetupError("Adapter answer_columns must preserve the declared hidden answer schema.")
-    spec["score_split"] = "./" + str(score_path.relative_to(workspace_dir))
-    spec = _bind_public_split_lifecycle(spec, workspace_dir)
-
     actual = _resolve_metric_contract(spec, workspace_dir, task_desc)
+    _validate_scoring_contract(actual, task_desc)
     evaluator_path.write_text(compile_adapter(source, actual), encoding="utf-8")
+
+
+def _freeze_custom_evaluator(workspace_dir: Path, source: str, task_desc: Any, hidden_score_path: Path) -> None:
+    """Freeze the same prepared lifecycle around a custom scoring extension."""
+    tree = ast.parse(source)
+    tree.body = [node for node in tree.body if not (isinstance(node, ast.ImportFrom) and node.module == "__future__")]
+    bundled = ("from __future__ import annotations\n" + frozen_metric_source()
+               + "\ntrusted_score_samples = score_samples\n" + ast.unparse(tree) + "\n")
+    path = workspace_dir / "evaluator.py"
+    path.write_text(bundled, encoding="utf-8")
+    declared = json.loads(_load_prediction_spec(workspace_dir))
+    # A custom formula still has to demonstrate its own non-Harness semantics;
+    # adding an omitted aggregation parameter cannot make arbitrary code obey it.
+    # Framework-owned identity/output fields may be omitted by the extension.
+    manifest = load_experiment_contract(workspace_dir).split_manifest
+    custom_declaration = dict(declared)
+    custom_declaration.setdefault("key_columns", _manifest_key_columns(manifest))
+    for key, value in manifest.get("prediction_contract", {}).items():
+        custom_declaration.setdefault(key, value)
+    _validate_custom_metric_contract(custom_declaration, workspace_dir, task_desc)
+    spec = _bind_prepared_adapter_spec(declared, workspace_dir, task_desc, hidden_score_path)
+    spec = json.loads(_normalize_prediction_spec_json(json.dumps(spec)))
+    _validate_custom_metric_contract(spec, workspace_dir, task_desc)
+    public = {key: value for key, value in spec.items() if key != "answer_columns"}
+    lifecycle = (
+        "\nimport copy as _h_copy\nimport os as _h_os\n"
+        "_h_custom_validate_submission = validate_submission\n"
+        f"_h_frozen_spec = {public!r}\n"
+        "def prediction_spec():\n    return _h_copy.deepcopy(_h_frozen_spec)\n"
+        "def score_val():\n"
+        "    job = _h_frozen_spec['prediction_jobs']['score_val']\n"
+        "    return score(job['artifact'], _h_os.environ['BIOMAKER_SCORE_VAL_PATH'], job['expected'])\n"
+        "def validate_submission():\n"
+        "    if not any(role != 'score_val' for role in _h_frozen_spec['prediction_jobs']):\n"
+        "        return {'valid': True, 'skipped': True, 'reason': 'no_test_split', 'n': 0}\n"
+        "    return _h_custom_validate_submission()\n"
+    )
+    path.write_text(bundled + lifecycle, encoding="utf-8")
 
 
 def _resolve_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_desc: Any, *, require_match: bool = True) -> dict[str, Any]:
@@ -2180,7 +2253,7 @@ def _resolve_metric_contract(spec: dict[str, Any], workspace_dir: Path, task_des
             spec.pop(key, None)
     spec['evaluator_api_version'] = EVALUATOR_API_VERSION
     spec = normalize_metric_spec(spec)
-    spec = _bind_public_split_lifecycle(spec, workspace_dir)
+    spec.update(load_experiment_contract(workspace_dir).evaluator_lifecycle_spec())
     if not require_match:
         reader = data_adapter_capabilities()["families"][spec["task_family"]]
         if spec.get("prediction_type") not in reader["prediction_types"]:
@@ -2268,13 +2341,11 @@ def _evaluator_input_fingerprints(
     for name in [
         "split_plan.json",
         "split_manifest.json",
-        "agent_train.csv",
-        "score_val.csv",
-        "agent_val.csv",
-        "agent_test.csv",
         "dataset_report.json",
     ]:
         fingerprints[f"input/biomaker_splits/{name}"] = _sha256_file(split_dir / name)
+    for split in load_experiment_contract(workspace_dir).splits.values():
+        fingerprints[split.public_ref.removeprefix("./")] = _sha256_file(split.path)
     if hidden_score_path is not None:
         fingerprints["hidden_score_truth"] = _sha256_file(hidden_score_path)
     return fingerprints
@@ -2298,6 +2369,8 @@ def _evaluator_cache_metadata(
         "restoration_evaluator_template.py": _sha256_file(utils_dir / "restoration_evaluator_template.py"),
         "evaluator_protocol.py": _sha256_file(utils_dir / "evaluator_protocol.py"),
         "evaluator_adapter.py": _sha256_file(utils_dir / "evaluator_adapter.py"),
+        "experiment_contract.py": _sha256_file(utils_dir / "experiment_contract.py"),
+        "split_contract.py": _sha256_file(utils_dir / "split_contract.py"),
         **{name: _sha256_file(utils_dir / name) for name in METRIC_SOURCE_FILES},
         "metric_source.py": _sha256_file(utils_dir / "metric_source.py"),
         "metric_declarations.py": _sha256_file(utils_dir / "metric_declarations.py"),
@@ -2393,6 +2466,7 @@ def _try_reuse_cached_evaluator(
             hidden_score_path=hidden_score_path,
         )
     except Exception as exc:
+        _raise_preparation_resource_failure(exc, log_dir, timeout)
         reason = _sanitize_private_paths(str(exc), hidden_score_path)
         append_event(
             log_dir,
@@ -2464,7 +2538,32 @@ def prepare_evaluator(
     model: str,
     temperature: float = 0.0,
     attempts: int = 5,
-    timeout: int = 120,
+    timeout: int = 3600,
+    cache_root: Path | str | None = None,
+    hidden_score_path: Path | str | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> PreparedEvaluator:
+    """Prepare using one scoped execution environment across fixed/cache/probes.
+
+    Context-local state avoids mutating os.environ or duplicating policy through
+    every preparation helper. It is reset on both success and failure.
+    """
+    token = _PREPARATION_ENV.set(dict(env_overrides or {}))
+    try:
+        return _prepare_evaluator(workspace_dir, log_dir, task_desc, model,
+                                  temperature, attempts, timeout, cache_root, hidden_score_path)
+    finally:
+        _PREPARATION_ENV.reset(token)
+
+
+def _prepare_evaluator(
+    workspace_dir: Path | str,
+    log_dir: Path | str,
+    task_desc: Any,
+    model: str,
+    temperature: float = 0.0,
+    attempts: int = 5,
+    timeout: int = 3600,
     cache_root: Path | str | None = None,
     hidden_score_path: Path | str | None = None,
 ) -> PreparedEvaluator:
@@ -2478,6 +2577,21 @@ def prepare_evaluator(
         else log_dir / "private_gt" / "score_val.csv"
     )
     _validate_declared_capabilities(task_desc, workspace_dir)
+    # Prepared facts are validated once before any fixed-reader fallbacks or
+    # generation retries. Regenerating codec code cannot repair missing inputs.
+    try:
+        contract = load_experiment_contract(workspace_dir)
+        if "score_val" not in contract.prediction_jobs:
+            raise ValueError("Prepared contract must declare score_val predictions.")
+        if contract.split_manifest.get("manifest_version", 1) >= 2 and not contract.hidden_answer_columns("score_val"):
+            raise ValueError("Canonical manifest must declare score_val hidden answer columns.")
+        for role, split in contract.splits.items():
+            if not split.path.is_file():
+                raise ValueError(f"Declared public split {role} is missing: {split.public_ref}")
+        if not hidden_score_path.is_file():
+            raise ValueError("Declared score-validation answers are missing.")
+    except (ValueError, OSError) as exc:
+        raise EvaluatorSetupError("Invalid prepared experiment contract: " + str(exc)) from exc
     preparation_diagnostics = []
     try:
         fixed = _write_fixed_regression_evaluator(
@@ -2486,6 +2600,7 @@ def prepare_evaluator(
         if fixed is not None:
             return fixed
     except Exception as exc:
+        _raise_preparation_resource_failure(exc, log_dir, timeout)
         reason = _sanitize_private_paths(str(exc), hidden_score_path)
         preparation_diagnostics.append({"reader": "regression", "reason": reason})
         append_event(log_dir, "fixed_regression_evaluator_failed", reason=truncate_text(reason, max_chars=1200))
@@ -2500,6 +2615,7 @@ def prepare_evaluator(
         if fixed is not None:
             return fixed
     except Exception as exc:
+        _raise_preparation_resource_failure(exc, log_dir, timeout)
         reason = _sanitize_private_paths(str(exc), hidden_score_path)
         preparation_diagnostics.append({"reader": "classification", "reason": reason})
         append_event(
@@ -2518,6 +2634,7 @@ def prepare_evaluator(
         if fixed is not None:
             return fixed
     except Exception as exc:
+        _raise_preparation_resource_failure(exc, log_dir, timeout)
         reason = _sanitize_private_paths(str(exc), hidden_score_path)
         preparation_diagnostics.append({"reader": "segmentation", "reason": reason})
         append_event(
@@ -2533,6 +2650,7 @@ def prepare_evaluator(
         if fixed is not None:
             return fixed
     except Exception as exc:
+        _raise_preparation_resource_failure(exc, log_dir, timeout)
         preparation_diagnostics.append({"reader": "detection", "reason": _sanitize_private_paths(str(exc), hidden_score_path)})
         append_event(
             log_dir,
@@ -2550,6 +2668,7 @@ def prepare_evaluator(
         if fixed is not None:
             return fixed
     except Exception as exc:
+        _raise_preparation_resource_failure(exc, log_dir, timeout)
         fixed_error = _sanitize_private_paths(str(exc), hidden_score_path)
         preparation_diagnostics.append({"reader": "image_restoration", "reason": fixed_error})
         append_event(log_dir, "fixed_restoration_evaluator_failed", reason=truncate_text(fixed_error, max_chars=1200))
@@ -2649,16 +2768,7 @@ def prepare_evaluator(
             if adapter_mode:
                 _freeze_data_adapter(workspace_dir, code, task_desc, hidden_score_path)
             else:
-                # Custom metrics can call the exact same trusted kernels without
-                # depending on an installed/mutable biomaker package.
-                tree = ast.parse(code)
-                tree.body = [node for node in tree.body if not (isinstance(node, ast.ImportFrom) and node.module == "__future__")]
-                kernels = frozen_metric_source()
-                evaluator_path.write_text(
-                    "from __future__ import annotations\n" + kernels
-                    + "\ntrusted_score_samples = score_samples\n"
-                    + ast.unparse(tree) + "\n", encoding="utf-8"
-                )
+                _freeze_custom_evaluator(workspace_dir, code, task_desc, hidden_score_path)
             _run_self_test(
                 workspace_dir,
                 timeout=timeout,
@@ -2677,6 +2787,7 @@ def prepare_evaluator(
                 hidden_score_path=hidden_score_path,
             )
         except Exception as exc:
+            _raise_preparation_resource_failure(exc, log_dir, timeout)
             reason = _sanitize_private_paths(str(exc), hidden_score_path)
             errors.append(reason)
             append_event(
@@ -2725,7 +2836,7 @@ def prepare_evaluator(
 
 def score_candidate_with_evaluator(
     workspace_dir: Path | str,
-    timeout: int = 120,
+    timeout: int = 3600,
     hidden_score_path: Path | str | None = None,
     env_overrides: dict[str, str] | None = None,
 ) -> EvaluatorRunResult:
@@ -2741,7 +2852,16 @@ def score_candidate_with_evaluator(
             {},
             "",
             "Missing score-validation split in experiment contract.",
+            failure_kind="protocol",
         )
+    # Candidate completion requires every declared output to be valid. This is
+    # a lifecycle check, separate from split-independent score(pred, truth, rows).
+    if any(role != "score_val" for role in contract.prediction_jobs):
+        submission = validate_submission_with_evaluator(
+            workspace_dir, timeout=timeout, env_overrides=env_overrides,
+        )
+        if not submission.ok:
+            return submission
     truth_path = _hidden_score_env(workspace_dir, hidden_score_path)[_SCORE_ENV_VAR]
     return score_artifacts_with_evaluator(
         workspace_dir,
@@ -2754,13 +2874,47 @@ def score_candidate_with_evaluator(
     )
 
 
+def _evaluator_process_code(code: str) -> str:
+    """Emit known process-level failures without guessing from traceback text."""
+    return (
+        "try:\n" + textwrap.indent(code, "    ")
+        + "except MemoryError:\n"
+        + f"    print('{_FAILURE_PREFIX}' + '{{\"failure_kind\": \"resource\"}}', flush=True)\n"
+        + "    raise\n"
+        + "except Exception as exc:\n"
+        + "    if isinstance(exc, getattr(globals().get('evaluator'), 'PredictionValidationError', ())):\n"
+        + f"        print('{_FAILURE_PREFIX}' + '{{\"failure_kind\": \"prediction_contract\"}}', flush=True)\n"
+        + "    raise\n"
+    )
+
+
+def _process_failure_kind(output: str, returncode: int) -> str:
+    for line in reversed(output.splitlines()):
+        if line.startswith(_FAILURE_PREFIX):
+            try:
+                kind = json.loads(line[len(_FAILURE_PREFIX):]).get("failure_kind")
+            except (ValueError, AttributeError):
+                continue
+            if kind in {"resource", "prediction_contract"}:
+                return kind
+    # A signal does not prove OOM, so keep external termination distinct.
+    return "interrupted" if returncode < 0 else "execution"
+
+
+def _captured_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
+    return "".join(
+        value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+        for value in (stdout, stderr)
+    )
+
+
 def score_artifacts_with_evaluator(
     workspace_dir: Path | str,
     prediction_path: Path | str,
     truth_path: Path | str,
     expected_path: Path | str,
     *,
-    timeout: int = 120,
+    timeout: int = 3600,
     env_overrides: dict[str, str] | None = None,
     include_artifact_report: bool = False,
 ) -> EvaluatorRunResult:
@@ -2777,9 +2931,17 @@ def score_artifacts_with_evaluator(
             output="",
             error="This frozen evaluator predates split-independent scoring API v2. "
             "Start a new run to prepare a compatible evaluator; existing run artifacts were not changed.",
+            failure_kind="protocol",
         )
     try:
         _validate_scoring_contract(spec, allow_legacy=True)
+    except Exception as exc:
+        return EvaluatorRunResult(False, None, True, {}, "",
+            _sanitize_private_paths(str(exc), hidden_score_path), failure_kind="protocol")
+    if not Path(prediction_path).is_file():
+        return EvaluatorRunResult(False, None, True, {}, "",
+            "The declared prediction artifact is missing.", failure_kind="prediction_contract")
+    try:
         sample_count = validate_scoring_rows(
             Path(prediction_path), hidden_score_path, Path(expected_path), spec
         )
@@ -2791,19 +2953,18 @@ def score_artifacts_with_evaluator(
             {},
             "",
             _sanitize_private_paths(str(exc), hidden_score_path),
+            failure_kind=(
+                "prediction_contract" if isinstance(exc, PredictionRowsValidationError)
+                else "protocol"
+            ),
         )
     code = (
         "import json, evaluator\n"
         "if not callable(getattr(evaluator, 'score', None)):\n"
         "    raise RuntimeError('Frozen evaluator must implement score(prediction_path, truth_path, expected_path)')\n"
-        "validation = None\n"
-        "if hasattr(evaluator, 'validate_submission'):\n"
-        "    validation = evaluator.validate_submission()\n"
-        "    if validation is False or (isinstance(validation, dict) and validation.get('valid') is False):\n"
-        "        raise ValueError('Submission validation rejected the predictions')\n"
         f"score = evaluator.score({str(Path(prediction_path).resolve())!r}, "
         f"{str(hidden_score_path)!r}, {str(Path(expected_path).resolve())!r})\n"
-        "payload = {'score': score, 'submission_validation': validation}\n"
+        "payload = {'score': score}\n"
         f"print('{_RESULT_PREFIX}' + json.dumps(payload, ensure_ascii=False, default=str))\n"
     )
     try:
@@ -2814,13 +2975,13 @@ def score_artifacts_with_evaluator(
             evaluator_env.update(env_overrides)
         completed = _run_python(
             workspace_dir,
-            code,
+            _evaluator_process_code(code),
             timeout=timeout,
             env=evaluator_env,
         )
     except subprocess.TimeoutExpired as exc:
         output = _sanitize_private_paths(
-            (exc.stdout or "") + (exc.stderr or ""),
+            _captured_output(exc.stdout, exc.stderr),
             hidden_score_path,
         )
         return EvaluatorRunResult(
@@ -2830,7 +2991,12 @@ def score_artifacts_with_evaluator(
             details={},
             output=output,
             error=f"Evaluator timed out after {timeout} seconds.",
+            failure_kind="timeout",
         )
+    except Exception as exc:
+        return EvaluatorRunResult(False, None, True, {}, "",
+            _sanitize_private_paths(str(exc), hidden_score_path),
+            failure_kind="resource" if isinstance(exc, MemoryError) else "execution")
 
     output = _sanitize_private_paths(
         (completed.stdout or "") + (completed.stderr or ""),
@@ -2844,6 +3010,7 @@ def score_artifacts_with_evaluator(
             details={},
             output=output,
             error=f"Evaluator exited with return code {completed.returncode}.",
+            failure_kind=_process_failure_kind(output, completed.returncode),
         )
 
     for line in output.splitlines():
@@ -2879,6 +3046,7 @@ def score_artifacts_with_evaluator(
                 details={},
                 output=output,
                 error=f"Could not parse evaluator result: {exc}",
+                failure_kind="protocol",
             )
 
     return EvaluatorRunResult(
@@ -2888,12 +3056,13 @@ def score_artifacts_with_evaluator(
         details={},
         output=output,
         error="Evaluator did not emit result JSON.",
+        failure_kind="protocol",
     )
 
 
 def validate_submission_with_evaluator(
     workspace_dir: Path | str,
-    timeout: int = 120,
+    timeout: int = 3600,
     env_overrides: dict[str, str] | None = None,
 ) -> EvaluatorRunResult:
     """Run only the frozen evaluator's public test-submission validation."""
@@ -2903,18 +3072,21 @@ def validate_submission_with_evaluator(
         "if not hasattr(evaluator, 'validate_submission'):\n"
         "    raise RuntimeError('evaluator.validate_submission() is missing')\n"
         "validation = evaluator.validate_submission()\n"
+        "if validation is False or (isinstance(validation, dict) and validation.get('valid') is False):\n"
+        f"    print('{_FAILURE_PREFIX}' + '{{\"failure_kind\": \"prediction_contract\"}}', flush=True)\n"
+        "    raise ValueError('Submission validation rejected the predictions')\n"
         "payload = {'submission_validation': validation}\n"
         f"print('{_RESULT_PREFIX}' + json.dumps(payload, ensure_ascii=False, default=str))\n"
     )
     try:
         completed = _run_python(
             workspace_dir,
-            code,
+            _evaluator_process_code(code),
             timeout=timeout,
             env=env_overrides,
         )
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
+        output = _captured_output(exc.stdout, exc.stderr)
         return EvaluatorRunResult(
             ok=False,
             metric=None,
@@ -2922,7 +3094,11 @@ def validate_submission_with_evaluator(
             details={},
             output=output,
             error=f"Evaluator submission validation timed out after {timeout} seconds.",
+            failure_kind="timeout",
         )
+    except Exception as exc:
+        return EvaluatorRunResult(False, None, True, {}, "", str(exc),
+            failure_kind="resource" if isinstance(exc, MemoryError) else "execution")
 
     output = (completed.stdout or "") + (completed.stderr or "")
     if completed.returncode != 0:
@@ -2936,6 +3112,7 @@ def validate_submission_with_evaluator(
                 "Evaluator submission validation exited with return code "
                 f"{completed.returncode}."
             ),
+            failure_kind=_process_failure_kind(output, completed.returncode),
         )
     for line in output.splitlines():
         if not line.startswith(_RESULT_PREFIX):
@@ -2950,6 +3127,7 @@ def validate_submission_with_evaluator(
                 details={},
                 output=output,
                 error=f"Could not parse evaluator validation result: {exc}",
+                failure_kind="protocol",
             )
         return EvaluatorRunResult(
             ok=True,
@@ -2965,4 +3143,5 @@ def validate_submission_with_evaluator(
         details={},
         output=output,
         error="Evaluator did not emit submission validation JSON.",
+        failure_kind="protocol",
     )

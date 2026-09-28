@@ -1,6 +1,6 @@
 """Standalone scoring: explicit file paths, no dataset-specific path inference."""
 
-from pathlib import Path
+from .metric_source import frozen_metric_source
 
 
 _RESTORATION_DATA_ADAPTER = r'''
@@ -60,7 +60,7 @@ def write_dummy_predictions(expected_rows, artifact_path):
 
 # Embed the same Harness-owned kernel used by generated data adapters. Frozen
 # evaluators run without requiring the biomaker package in candidate environments.
-_FIXED_RESTORATION_EVALUATOR = Path(__file__).with_name('trusted_metrics.py').read_text(encoding='utf-8') + '\n' + r'''
+_FIXED_RESTORATION_EVALUATOR = frozen_metric_source() + '\n' + r'''
 import os
 from pathlib import Path
 import numpy as np

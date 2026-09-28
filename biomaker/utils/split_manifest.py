@@ -9,17 +9,14 @@ from typing import Any
 
 import pandas as pd
 
-MANIFEST_VERSION = 1
+from .split_contract import MANIFEST_VERSION, SPLIT_TO_FILE, SplitContractError
+
 MANIFEST_NAME = "split_manifest.json"
-SPLIT_TO_FILE = {
-    "train": "biomaker_splits/agent_train.csv",
-    "score_val": "biomaker_splits/score_val.csv",
-    "test": "biomaker_splits/agent_test.csv",
-}
 FILE_TO_SPLIT = {value: key for key, value in SPLIT_TO_FILE.items()}
 
 
 def load_split_manifest(base_dir: Path) -> dict[str, Any]:
+    loaded: dict[str, Any] | None = None
     for path in (
         base_dir / MANIFEST_NAME,
         base_dir / "biomaker_splits" / MANIFEST_NAME,
@@ -28,10 +25,14 @@ def load_split_manifest(base_dir: Path) -> dict[str, Any]:
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        return data if isinstance(data, dict) else {}
-    return {}
+        except (OSError, ValueError) as exc:
+            raise SplitContractError(f"Cannot read split manifest {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise SplitContractError(f"Split manifest {path} must contain a JSON object.")
+        if loaded is not None and data != loaded:
+            raise SplitContractError("Conflicting root and biomaker_splits split_manifest.json copies.")
+        loaded = data
+    return loaded or {}
 
 
 def write_split_manifest(base_dir: Path, manifest: dict[str, Any]) -> None:
@@ -348,9 +349,9 @@ def validate_split_manifest(
         )
         return manifest
     version = manifest.get("manifest_version")
-    if version != MANIFEST_VERSION:
+    if version not in (1, MANIFEST_VERSION):
         errors.append(
-            f"split_manifest.json manifest_version must be {MANIFEST_VERSION}; got {version!r}."
+            f"split_manifest.json manifest_version must be 1 or {MANIFEST_VERSION}; got {version!r}."
         )
     if not isinstance(manifest.get("sample_unit"), str) or not manifest.get(
         "sample_unit"

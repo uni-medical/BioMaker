@@ -30,6 +30,13 @@ from PIL import Image
 
 from .. import backend
 from .metric_declarations import canonical_metric_contract, validate_declared_capabilities
+from .split_contract import (
+    MANIFEST_VERSION,
+    SplitContractError,
+    normalize_split_manifest,
+    resolve_public_splits,
+    validate_split_roles,
+)
 from .split_manifest import (
     file_columns_for_frame,
     legacy_manifest,
@@ -47,7 +54,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 11
+SPLIT_BUILDER_CACHE_VERSION = 12
 
 
 @dataclass(frozen=True)
@@ -293,8 +300,17 @@ def split_builder_cache_key(
     from .trusted_metrics import metric_capabilities
 
     facts = build_dataset_facts(input_dir)
+    utils_dir = Path(__file__).resolve().parent
     payload = {
         "cache_version": SPLIT_BUILDER_CACHE_VERSION,
+        "manifest_version": MANIFEST_VERSION,
+        "compiler_fingerprints": {
+            name: _file_digest(utils_dir / name)
+            for name in (
+                "agentic_data_planner.py", "split_contract.py", "split_manifest.py",
+                "split_protocol.py", "canonical_paths.py",
+            )
+        },
         "model": model,
         "temperature": temperature,
         "task_text": task_text,
@@ -328,14 +344,18 @@ def parse_split_constraints(task_text: str) -> dict[str, Any]:
         raise ValueError("Declare exactly one split-constraints JSON block.")
     value = json.loads(blocks[0])
     if not isinstance(value, dict) or set(value) - {
-        "required_splits", "required_answer_splits", "source_rules"
+        "splits", "required_splits", "required_answer_splits", "source_rules"
     }:
-        raise ValueError("split-constraints requires an object with required_splits, required_answer_splits and source_rules only.")
+        raise ValueError("split-constraints requires an object with optional splits, required_splits, required_answer_splits and source_rules only.")
+    if "splits" in value:
+        validate_split_roles(value["splits"], "split-constraints.splits")
     for key, allowed in (("required_splits", {"train", "score_val", "test"}),
                          ("required_answer_splits", {"score_val", "test"})):
         items = value.get(key, [])
         if not isinstance(items, list) or any(not isinstance(item, str) or item not in allowed for item in items):
             raise ValueError(f"split-constraints {key} must list supported split roles: {sorted(allowed)}.")
+        if "splits" in value and set(items) - set(value["splits"]):
+            raise ValueError(f"split-constraints {key} conflicts with its exact splits declaration.")
     rules = value.get("source_rules", [])
     if not isinstance(rules, list):
         raise ValueError("split-constraints source_rules must be a list.")
@@ -376,6 +396,7 @@ def _compact_split_manifest_for_prompt(manifest: Any) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for key in (
         "manifest_version",
+        "splits",
         "sample_unit",
         "key_columns",
         "task_heads",
@@ -446,12 +467,13 @@ def _builder_user_prompt(
             "biomaker_splits/agent_test.csv: public test-input rows when a test source exists; must not include private test answers.",
             "private_gt/score_val.csv: matching validation key_columns plus answer_columns. Public input/metadata columns may be omitted: Harness supplies those separately as expected_row. Row order may differ when keys are declared.",
             "private_gt/test.csv: matching test key_columns plus answer_columns when private answers exist; copying public input/metadata columns is optional. With an explicit row_order_contract and no keys, preserve public row order exactly.",
-            'private_gt/private_gt.json: hidden-answer index with keys score_val and test. Each entry must contain answer_columns, for example {"score_val":{"answer_columns":["label"]},"test":{"answer_columns":["label"]}}.',
+            'private_gt/private_gt.json: hidden-answer index containing only splits with private answer files. Each entry must contain answer_columns; for train/validation-only tasks use {"score_val":{"answer_columns":["label"]}}. Test inputs without private answers do not have a test entry.',
             "split_manifest.json: structured data contract for the prepared task.",
             "public/: optional generated agent-visible files only when a derived/converted/anonymized public artifact is truly needed; CSV paths may reference this directory.",
         ],
         "Required split_manifest.json Fields": [
-            "manifest_version: integer 1.",
+            "manifest_version: integer 2.",
+            'splits: the complete public split set as role-to-object entries with file paths, for example {"train":{"file":"biomaker_splits/agent_train.csv"},"score_val":{"file":"biomaker_splits/score_val.csv"}}. Include test with file biomaker_splits/agent_test.csv only when the task has a test split. This is an explicit protocol decision, never inferred from an accidentally missing file. Do not write public_splits or required_splits aliases in the manifest.',
             "sample_unit: what one prediction row represents, for example image, volume, patient, slide, study, encounter, window, or row.",
             "key_columns: public columns that uniquely align score/test predictions with private truth; use [] only when row order is the explicit contract.",
             "task_heads: list of task heads, each either a string or object with type such as classification, multilabel, segmentation_2d, detection, regression, survival, or segmentation_3d.",
@@ -488,7 +510,7 @@ def _builder_user_prompt(
         ],
         "Principles": [
             "Treat tables and directories as equally valid sample sources.",
-            "If Task-owned Split Constraints is nonempty, obey every required public/answer split and source rule. A source root means all original files recursively under that directory (or the exact source file); require_complete forbids omissions. Harness verifies actual source-file references across public and matching private rows. Keep nonsensitive original input references in public row metadata, including for derived inputs; retain original answer-file references only in private answers. Never expose hidden mask/target paths just to prove coverage. Do not move one original source file into multiple split roles under different sample IDs.",
+            "If Task-owned Split Constraints is nonempty, splits is the exact public role set; required_splits is only a minimum requirement and does not forbid additional roles. Obey every required public/answer split and source rule. A source root means all original files recursively under that directory (or the exact source file); require_complete forbids omissions. Harness verifies actual source-file references across public and matching private rows. Keep nonsensitive original input references in public row metadata, including for derived inputs; retain original answer-file references only in private answers. Never expose hidden mask/target paths just to prove coverage. Do not move one original source file into multiple split roles under different sample IDs.",
             "If a folder level, table column, or referenced file is evidence of an answer, keep it in agent_train.csv but hide it from score_val.csv and agent_test.csv.",
             "If an answer is stored as a file path, hide that path from public score/test files and retain it in hidden answers.",
             "If a column is computed from the answer, hide it from public score/test files too.",
@@ -619,6 +641,8 @@ def _validate_manifest(manifest: Any, errors: list[str]) -> dict[str, Any]:
             "private_gt/private_gt.json hidden-answer index must contain a JSON object."
         )
         return {}
+    if set(manifest) - {"score_val", "test"}:
+        errors.append("private_gt/private_gt.json may declare only score_val and test answer roles.")
     for key in ("score_val", "test"):
         if key not in manifest:
             continue
@@ -997,6 +1021,49 @@ def _check_truth_alignment(
             errors.append(f"private_gt/{role}.csv without keys or an explicit row_order_contract must retain all public columns; missing {missing}")
 
 
+def _check_split_lifecycle(
+    manifest: dict[str, Any],
+    frames: dict[str, pd.DataFrame | None],
+    private_index: dict[str, Any],
+    answers: dict[str, pd.DataFrame | None],
+    constraints: dict[str, Any],
+    errors: list[str],
+) -> dict[str, str] | None:
+    """Admit the declared protocol; missing files never determine its roles."""
+    try:
+        paths = resolve_public_splits(manifest, task_splits=constraints.get("splits"))
+    except SplitContractError as exc:
+        errors.append(f"Invalid split contract: {exc}")
+        return None
+    for role, frame in frames.items():
+        if role in paths and frame is None:
+            errors.append(f"Declared public split {role} is missing or unreadable: {paths[role]}")
+        elif role not in paths and frame is not None:
+            errors.append(f"Public split {role} exists outside the declared complete split set.")
+        elif role in paths and frame is not None and frame.empty:
+            errors.append(f"Declared public split {role} must contain at least one row.")
+    for role, frame in answers.items():
+        declared = role in private_index
+        if role not in paths and (declared or frame is not None):
+            errors.append(f"Private answers for {role} require a declared public {role} split.")
+        if declared and frame is None:
+            errors.append(f"Declared private answers for {role} are missing or unreadable: private_gt/{role}.csv")
+        if frame is not None and not declared:
+            errors.append(f"private_gt/{role}.csv must have a matching private_gt.json declaration.")
+    for field in ("hidden_answers", "private_gt"):
+        declared_answers = manifest.get(field)
+        if not isinstance(declared_answers, dict):
+            continue
+        if set(declared_answers) != set(private_index):
+            errors.append(f"split_manifest.{field} split roles disagree with private_gt/private_gt.json.")
+            continue
+        for role, entry in declared_answers.items():
+            if isinstance(entry, dict) and isinstance(private_index.get(role), dict):
+                if entry.get("answer_columns", []) != private_index[role].get("answer_columns", []):
+                    errors.append(f"split_manifest.{field}.{role}.answer_columns disagree with private_gt/private_gt.json.")
+    return paths
+
+
 def verify_split_package(
     output_dir: Path,
     source_input_dir: Path | None = None,
@@ -1031,13 +1098,21 @@ def verify_split_package(
         errors.append("Missing required file: private_gt/private_gt.json")
         manifest = {}
 
-    split_manifest = load_split_manifest(output_dir)
+    try:
+        split_manifest = load_split_manifest(output_dir)
+    except SplitContractError as exc:
+        errors.append(f"Invalid split manifest: {exc}")
+        split_manifest = {}
+    constraints = parse_split_constraints(task_text)
+    public_paths = _check_split_lifecycle(
+        split_manifest, {"train": train_df, "score_val": score_df, "test": test_df},
+        manifest, {"score_val": score_gt_df, "test": test_gt_df}, constraints, errors,
+    )
     file_roles = split_file_reference_roles(split_manifest, manifest, errors)
     retained_warnings = split_manifest.get("normalization_warnings", [])
     if isinstance(retained_warnings, list):
         warnings.extend(item for item in retained_warnings if isinstance(item, str))
     normalized_manifest = _normalize_prediction_columns(split_manifest, errors, warnings)
-    constraints = parse_split_constraints(task_text)
     constraint_report = _check_split_constraints(
         constraints, {"train": train_df, "score_val": score_df, "test": test_df},
         {"score_val": score_gt_df, "test": test_gt_df}, source_input_dir, output_dir, errors,
@@ -1158,7 +1233,15 @@ def verify_split_package(
         split_manifest = legacy_manifest(
             output_dir, private_gt=manifest, row_counts=row_counts
         )
-        write_split_manifest(output_dir, split_manifest)
+        # Preserve the admitted role set even if a legacy package has lost a
+        # file. Revalidating a failed package must not turn that loss into an
+        # explicit no-test protocol.
+        if public_paths is not None:
+            split_manifest["splits"] = {
+                role: {**split_manifest["splits"].get(role, {}), "file": path}
+                for role, path in public_paths.items()
+            }
+        normalized_manifest = True
     validate_split_manifest(
         split_manifest,
         output_dir=output_dir,
@@ -1176,7 +1259,19 @@ def verify_split_package(
             normalized_manifest = True
     except (ValueError, TypeError) as exc:
         metric_errors.append(f"Invalid metric_contract: {exc}")
-    if normalized_manifest:
+    if not errors and public_paths is not None:
+        prepared = normalize_split_manifest(split_manifest, task_splits=constraints.get("splits"))
+        prepared["hidden_answers"] = {
+            role: {field: entry[field] for field in ("answer_columns", "file_reference_columns") if field in entry}
+            for role, entry in manifest.items()
+        }
+        prepared.pop("private_gt", None)
+        for role, path in public_paths.items():
+            prepared["splits"][role]["row_count"] = row_counts["agent_train" if role == "train" else "agent_test" if role == "test" else role]
+            prepared["splits"][role]["sha256"] = _file_digest(output_dir / path)
+        normalized_manifest = normalized_manifest or prepared != split_manifest
+        split_manifest = prepared
+    if normalized_manifest and not errors:
         _write_prepared_manifest(output_dir, split_manifest)
     return {
         "ok": not errors and not metric_errors,

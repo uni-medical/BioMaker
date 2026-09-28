@@ -434,7 +434,10 @@ class ProposalAgent(BaseAgent):
             "Tool Observations",
         ]:
             if key in prompt:
-                context[key] = truncate_text(str(prompt[key]), max_chars=1200)
+                max_chars = (
+                    TOOL_OBSERVATION_TOTAL_CHARS if key == "Tool Observations" else 1200
+                )
+                context[key] = truncate_text(str(prompt[key]), max_chars=max_chars)
         return context
 
     def _request_node_tools(
@@ -799,57 +802,71 @@ class ProposalAgent(BaseAgent):
         records: list[dict[str, Any]] = []
         seen_requests: set[tuple[str, str, str]] = set()
         call_count = 0
-        max_calls = max(1, int(self.acfg.max_node_tool_calls))
-        requests = self._request_node_tools(stage, prompt)
-        for request in requests:
-            tool_name = str(request.get("tool", ""))
-            request_key = (
-                tool_name,
-                (
-                    ""
-                    if tool_name == "inspect_api"
-                    else str(request.get("query", "")).strip()
-                ),
-                str(request.get("code", "")).strip(),
-            )
-            if request_key in seen_requests:
-                continue
-            seen_requests.add(request_key)
+        max_calls = max(0, int(self.acfg.max_node_tool_calls))
+        if not self.acfg.enable_node_tools or max_calls == 0:
+            return
+
+        for _ in range(2):
             if call_count >= max_calls:
-                records.append(
-                    {
-                        "stage": stage,
-                        "call_index": call_count + 1,
-                        "tool": "budget",
-                        "reason": "Configured safety budget reached.",
-                        "query": "",
-                        "code": "",
-                        "result": "NodeToolBudget: stopped tool use after the configured safety budget.",
-                    }
-                )
                 break
-            call_count += 1
-            with _NODE_TOOL_SEMAPHORE:
-                result = self._execute_node_tool(request, prompt=prompt)
-            record = {
-                "stage": stage,
-                "call_index": call_count,
-                "tool": request.get("tool"),
-                "reason": request.get("reason", ""),
-                "query": (
-                    self._augment_doc_query(str(request.get("query", "")), prompt)
-                    if request.get("tool") == "search_docs"
-                    else request.get("query", "")
-                ),
-                "code": request.get("code", ""),
-                "result": result,
-            }
-            records.append(record)
-            self._write_tool_trace(record)
+            requests = self._request_node_tools(stage, prompt)
+            if not requests:
+                break
+            for request in requests:
+                tool_name = str(request.get("tool", ""))
+                request_key = (
+                    tool_name,
+                    (
+                        ""
+                        if tool_name == "inspect_api"
+                        else str(request.get("query", "")).strip()
+                    ),
+                    str(request.get("code", "")).strip(),
+                )
+                if request_key in seen_requests:
+                    continue
+                seen_requests.add(request_key)
+                if call_count >= max_calls:
+                    records.append(
+                        {
+                            "stage": stage,
+                            "call_index": call_count + 1,
+                            "tool": "budget",
+                            "reason": "Configured safety budget reached.",
+                            "query": "",
+                            "code": "",
+                            "result": "NodeToolBudget: stopped tool use after the configured safety budget.",
+                        }
+                    )
+                    break
+                call_count += 1
+                with _NODE_TOOL_SEMAPHORE:
+                    result = self._execute_node_tool(request, prompt=prompt)
+                record = {
+                    "stage": stage,
+                    "call_index": call_count,
+                    "tool": request.get("tool"),
+                    "reason": request.get("reason", ""),
+                    "query": (
+                        self._augment_doc_query(str(request.get("query", "")), prompt)
+                        if request.get("tool") == "search_docs"
+                        else request.get("query", "")
+                    ),
+                    "code": request.get("code", ""),
+                    "result": result,
+                }
+                records.append(record)
+                self._write_tool_trace(record)
+
+            if records:
+                prompt["Tool Observations"] = (
+                    f"Node tool calls used: {call_count}/{max_calls}; "
+                    f"remaining budget: {max_calls - call_count}.\n\n"
+                    + self._compact_tool_observations(records)
+                )
 
         if records:
             logger.debug("Attached %d node tool observation(s)", call_count)
-            prompt["Tool Observations"] = self._compact_tool_observations(records)
 
     def _draft(self) -> Node:
         prompt = self.context_builder.build_draft()

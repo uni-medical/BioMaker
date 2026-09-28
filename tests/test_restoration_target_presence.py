@@ -115,12 +115,20 @@ def test_complete_restoration_targets_allow_files_and_inline_encodings(package, 
     assert result["ok"], result["errors"]
 
 
-def test_optional_empty_private_test_placeholder_is_not_a_missing_target(package):
+def test_no_test_protocol_rejects_private_test_placeholder(package):
     source, output = package
     (output / "biomaker_splits/agent_test.csv").unlink()
     (output / "private_gt/test.csv").write_text("sample\n")
     hidden = {"score_val": {"answer_columns": [TARGET]}}
     (output / "private_gt/private_gt.json").write_text(json.dumps(hidden))
+    manifest_path = output / "split_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["public_splits"] = ["train", "score_val"]
+    manifest_path.write_text(json.dumps(manifest))
+    result = planner.verify_split_package(output, source_input_dir=source)
+    assert not result["ok"]
+    assert any("Private answers for test require" in error for error in result["errors"])
+    (output / "private_gt/test.csv").unlink()
     result = planner.verify_split_package(output, source_input_dir=source)
     assert result["ok"], result["errors"]
 

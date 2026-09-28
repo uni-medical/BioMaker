@@ -89,6 +89,12 @@ agent:
 exec:
   # Hard safety timeout for one generated node in seconds. This is a longest tolerated runtime, not a target budget.
   timeout: 600
+  # Trusted evaluator invocation budget in seconds (preparation, validation,
+  # candidate and private scoring). Independent of generated-code execution.
+  evaluator_timeout: 3600
+  # Maximum case-level scoring threads per evaluator. Keep bounded when
+  # multiple candidates/tasks share CPU and memory; 1 preserves serial scoring.
+  evaluator_workers: 1
   # Candidate concurrency. Auto assigns one candidate slot per visible CUDA GPU,
   # or one slot on Apple MPS / CPU. A positive integer remains a CLI override.
   parallel_workers: auto

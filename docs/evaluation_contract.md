@@ -128,6 +128,12 @@ must preserve the requested definition rather than approximate it silently.
 
 Preparation records data semantics in `input/biomaker_splits/split_manifest.json`:
 
+- Version 2 `splits` is the complete public role map. Each entry names its
+  input-relative CSV in `file`; train and score_val are required, test is optional.
+  `verify_split_package()` checks this declaration against actual tables, task
+  constraints and private-answer bindings before publishing it. A declared file
+  becoming missing is corruption, not permission to remove that role.
+
 - `key_columns` identifies each sample using public values. Composite keys and
   input paths are allowed; private answers cannot be keys.
 - `prediction_contract` describes prediction columns, values, and referenced
@@ -164,11 +170,94 @@ preparation removes those keys deterministically and records the normalization;
 the candidate artifact still contains keys followed by predicted values.
 
 The resulting `evaluator.py` and `evaluator_prediction_spec.json` are frozen
-before candidate search. Candidates write the declared validation artifact and
-`./working/submission.csv`. The Harness applies the same frozen scoring
+before candidate search. Candidates write the artifacts in `prediction_jobs`:
+each job pairs a public `expected` table with its required prediction `artifact`.
+The score_val job is always present; test is present only when declared by the
+prepared split contract. The Harness applies the same frozen scoring
 implementation to validation and private test; private test results are not
 used to guide the candidate search. Existing run artifacts are not rewritten
 when a new evaluator implementation is installed.
+
+Task `split-constraints.splits`, when supplied, is the exact role list, for
+example `["train", "score_val"]`. The older task `required_splits` field is a
+minimum requirement and does not exclude other roles. Without an exact task
+list the preparation agent submits the complete role map based on the task.
+Legacy manifest spellings (`public_splits` lists/maps and manifest-level
+`required_splits`) are imported at one boundary and checked for conflicts;
+new manifests publish only `splits`. Historical manifests without an exact
+declaration retain the original three-split requirement. A missing test file
+cannot implicitly opt them into a no-test experiment.
+
+`ExperimentContract` owns the loaded protocol. Split-plan views, experiment
+guides, candidate instructions, prediction jobs and evaluator lifecycle fields
+are projections of that contract. Public projections never include private
+answer locations. The adapter's codec declaration is read before the runtime
+is compiled; prepared sample keys, answers, metrics, label order and jobs are
+bound before full validation. Classification labels describe a probability
+axis, independently of test presence. An upstream split error exits evaluator
+preparation before any adapter generation attempts.
+
+No-test runs require neither test input nor submission artifacts. A public
+test without private test answers still requires predictions, but has no
+private scoring job. Final model retraining is controlled by the requested
+finalization settings, independently of test presence. Declared prediction
+artifacts and their sample coverage are still checked on every candidate.
+
+The shared `experiments/_shared/biomaker_prenode_smoke.py --prepare-only` workflow
+runs split preparation and production evaluator compilation/scoring probes,
+then stops before proposal generation. Metric-kernel or resource preflights are
+separate checks and do not establish that this preparation chain can complete.
+
+## Scoring execution and recovery
+
+Trusted scoring execution is Harness-owned and separate from the frozen metric
+protocol and candidate training code. `exec.evaluator_timeout` is a positive
+integer number of seconds per evaluator invocation, defaulting to 3600 (one hour). It
+applies to evaluator preparation, candidate scoring, submission validation and
+private scoring, independently of `exec.timeout`. It is not capped by the
+candidate or final-retraining execution timeout. Scoring still consumes real
+wall-clock time and remains subject to the experiment's overall deadline.
+
+`exec.evaluator_workers` is a positive integer, defaulting to 1. Segmentation
+and image-restoration scoring can use a bounded thread pool over cases; at most
+that many cases are loaded or in flight. Reduction preserves input order and
+the declared aggregation. Classification, regression and detection retain their
+split-level scoring path; AUC and AP must not be replaced by means of per-case
+scores. Allocate concurrency across all simultaneous evaluators, with CPU and
+peak-memory measurements rather than GPU counts. External runtime preflights
+must use the same timeout and worker count as the production run.
+
+Private progress records expose execution stages and timing for diagnosis,
+without answer paths, labels or metric values. They stay in Harness logs and
+are not candidate feedback. Partial progress never constitutes a valid score:
+every required case and metric must finish before a candidate is ranked.
+
+An infrastructure fault during candidate validation, including timeout or resource exhaustion,
+does not establish that the candidate's model code is wrong. The Harness saves
+the candidate as `unscored`, preserves its model and predictions, stops launching
+new work, drains already-running work and skips final retraining. Invalid
+prediction artifacts remain distinct candidate errors. After correcting the
+scoring execution problem, saved artifacts can be privately re-evaluated using
+their existing frozen evaluator without training or changing the journal:
+
+```bash
+python -m biomaker.score --workspace /absolute/run/workspace \
+  --prediction /absolute/run/workspace/working/validation_predictions.csv \
+  --truth /absolute/private/score_val.csv --expected /absolute/public/score_val.csv \
+  --timeout 3600 --workers 2 --output /absolute/private/rescore.json
+```
+
+The timeout and worker values above are examples to calibrate, not universal
+budgets. Choose a new private output path; the command preserves existing
+evidence, does not resume search and does not retrofit saved frozen evaluators
+with newer metric code. An old evaluator can use a longer outer timeout, but
+the new case concurrency and stage-level progress require an evaluator that
+already contains the updated runtime.
+
+User-only private-test failures preserve their error and failure kind and are
+never reported as available metrics. They do not alter validation ranking or
+turn a validation-successful candidate into `unscored`. Final private evaluation
+failure still prevents reporting final retraining as fully successful.
 
 ## Data adapter API
 
@@ -194,14 +283,16 @@ reserves its scoring entry points and `_h_*` namespace. Use installed packages
 for decoding, without importing `evaluator` or `biomaker`, dynamic imports,
 `eval`, `exec`, package installation, network access, or training.
 
-`prediction_spec()` returns a JSON-serializable contract. It includes
-`evaluator_api_version: 3`, `task_family`, `task_type`, `validation_artifact`,
-`test_submission: "./working/submission.csv"`, `key_columns`,
-`prediction_columns`, `answer_columns`, and a nonempty `metrics` list containing
-each name and boolean `maximize`. It declares metric-specific settings explicitly.
+The adapter's `prediction_spec()` returns a JSON-serializable declaration of
+encoding details not already supplied by the prepared contract; it may return
+`{}` when that contract is complete. Harness supplies prepared keys, output and
+answer columns, task semantics, class order, metrics, parameters and prediction
+jobs before validation. Repeated declarations must preserve those facts.
 `file_reference_columns` identifies prediction columns containing file paths.
-Only the private evaluator needs the answer mapping; public prompts and reports
-must not include private answer values or paths.
+The frozen evaluator's public `prediction_spec()` then exposes the complete
+resolved API-v3 contract, including `metrics` and `prediction_jobs`. Its legacy
+`test_split` and `test_submission` views are null when no test job exists.
+Public prompts and reports must not include private answer values or paths.
 
 `load_sample()` receives one aligned sample. `prediction_row` contains the
 declared prediction values and keys; `expected_row` contains public metadata.
@@ -470,9 +561,13 @@ Labels must be finite, nonnegative exact integers (integer-valued floats are
 accepted without truncation). There is no implicit upper class ID. `parsing`
 contains contiguous branch IDs 1..N; `graph` is an integer `(2,E)` array of
 zero-based parent-to-child node indices (`node = branch ID - 1`). It must be a
-rooted tree; a single node uses `(2,0)` edges. `skeleton` is a supplied target
-centerline contained in the original target mask. The kernels never derive
-target references from predictions.
+rooted tree; a single node uses `(2,0)` edges. `skeleton` is a separately supplied
+target centerline; preprocessing such as hole filling may place its voxels
+outside the original target mask. Its builder validates containment in the
+mask actually used for construction. Scoring retains the unchanged original
+target and checks reference geometry and positive parsing coverage for skeleton
+voxels when both references are required. The kernels never derive target
+references from predictions.
 
 ```python
 from biomaker.utils.trusted_metrics import score_samples
@@ -553,8 +648,15 @@ copy; the original semantic label and all physical geometry are preserved.
 Run preparation once outside split generation and scoring. Returned paths
 point to cached skeleton/parsing volumes, an optional graph, and provenance.
 Cache identity includes input, builder, vendor source, geometry and dependency
-versions; output hashes are verified on reuse. Derived structures that do not
-fit the original target are rejected instead of silently changing the label.
+versions; output hashes are verified on reuse. Skeleton containment is checked
+against the binary construction mask after component selection and hole filling,
+not the unchanged original target. Invalid geometry, branch coverage or tree
+structure is rejected; references and original labels are never clipped or
+rewritten to make checks pass.
+Newly prepared evaluators use this reference-validation rule; historical frozen
+evaluators retain their original checks and are not retroactively updated.
+When a reference crosses filled holes, `tree_length_detected` can be below one
+even for a prediction that perfectly matches the original mask.
 These are local derived references, not organizer-provided hidden annotations.
 
 The helper requires scikit-image 0.22.0 and NumPy below 2. The original parsing
@@ -574,3 +676,24 @@ datasets. The trusted adapter then freezes
 creates a fake test split. Undeclared or contradictory missing-test layouts
 remain errors. Metric calculations, validation coverage and subsequent
 full-data training semantics do not change.
+
+### Execution and scoring scheduling
+
+Candidate execution and validation scoring use separate bounded executors. A
+candidate's compute lease is released after its interpreter has drained the
+process tree and checked the output artifacts. Trusted scoring then runs with
+CUDA hidden; it does not hold a candidate execution slot. Its own evaluator
+timeout and per-case worker count still apply.
+
+For P effective execution workers there are P scoring workers and at most 2P
+submitted, uncommitted execution/scoring jobs combined. This allows a next wave
+of candidates to execute during scoring without an unbounded scoring backlog.
+Only fully scored results (or explicit failure outcomes) enter the journal and
+ranking. A scoring infrastructure failure stops new admission and drains work
+already admitted; reaching the search deadline also drains admitted scoring.
+Final retraining waits for that drain. Per-node private test evaluation remains
+on its existing path; it is disabled for train/validation-only ATM26 runs.
+
+`execution_finished.exec_time` now excludes Harness scoring. Separate
+`scoring_started` / `scoring_finished` events record scoring wall time. This timing
+boundary differs from historical runs whose execution time included scoring.

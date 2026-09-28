@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import Config
+from .config import Config, evaluator_timeout_seconds, evaluator_workers
 from .environment import environment_manifest_text
 
 
@@ -73,6 +73,8 @@ def _selected_cfg(cfg: Config) -> dict[str, Any]:
         "agent_steps": cfg.agent.steps,
         "total_time_limit_seconds": cfg.agent.total_time_limit,
         "per_node_timeout_seconds": cfg.exec.timeout,
+        "evaluator_timeout_seconds": evaluator_timeout_seconds(cfg),
+        "evaluator_workers": evaluator_workers(cfg),
         "parallel_workers": effective_workers or cfg.exec.parallel_workers,
         "requested_parallel_workers": requested_workers,
         "effective_parallel_workers": effective_workers,

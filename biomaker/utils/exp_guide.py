@@ -12,7 +12,7 @@ from PIL import Image
 
 from .experiment_contract import load_experiment_contract
 
-EXP_GUIDE_VERSION = 1
+EXP_GUIDE_VERSION = 2
 EXP_GUIDE_FILENAME = "exp_guide.json"
 MEDICAL_IMAGE_SUFFIXES = {".nii", ".nii.gz", ".nrrd", ".mha", ".mhd"}
 _OUTPUT_ENCODING_FIELDS = {
@@ -314,13 +314,10 @@ def build_exp_guide(
         *manifest.get("key_columns", []), *declared_prediction.get("input_columns", []),
         *declared_prediction.get("prediction_columns", []), *sorted(answer_columns), *file_columns,
     ]))
-    for split_name in ["train", "score_val", "test"]:
-        split = contract.splits.get(split_name)
-        if split is None:
-            continue
+    for split_name, split in contract.splits.items():
         profile, df = _csv_profile(split.path, workspace_dir)
         if profile is None:
-            continue
+            profile = {"path": split.public_ref, "read_error": "Declared split file is missing."}
         profile["role"] = (
             "legacy public validation" if split.legacy_alias is not None else split.role
         )
@@ -344,17 +341,13 @@ def build_exp_guide(
         if hidden.answer_columns
     }
 
-    score_split = raw_prediction_spec.get("score_split")
-    if not score_split and "score_val" in contract.splits:
-        score_split = contract.splits["score_val"].public_ref
+    jobs = contract.public_prediction_jobs()
+    score_split = jobs.get("score_val", {}).get("expected")
 
     prediction = {
-        "validation_artifact": _safe_rel(
-            prediction_contract.validation_artifact, workspace_dir
-        ),
-        "test_submission": _safe_rel(
-            prediction_contract.test_submission, workspace_dir
-        ),
+        "validation_artifact": jobs.get("score_val", {}).get("artifact"),
+        "test_submission": jobs.get("test", {}).get("artifact"),
+        "prediction_jobs": jobs,
         "key_columns": prediction_contract.key_columns,
         "prediction_columns": prediction_contract.prediction_columns,
         "file_reference_columns": prediction_contract.file_reference_columns,
@@ -395,11 +388,20 @@ def build_exp_guide(
             ),
         },
         "prediction": prediction,
+        "prediction_jobs": jobs,
         "output_encoding": output_details,
         "metric": metric,
         "evaluation_protocol": {
-            key: value for key, value in raw_prediction_spec.items()
-            if key not in {"answer_columns", "truth_schema"}
+            **{
+                key: value for key, value in raw_prediction_spec.items()
+                if key not in {"answer_columns", "truth_schema", "prediction_jobs",
+                               "validation_artifact", "test_submission", "score_split", "test_split"}
+            },
+            "prediction_jobs": jobs,
+            **({"validation_artifact": jobs["score_val"]["artifact"],
+                "score_split": jobs["score_val"]["expected"]} if "score_val" in jobs else {}),
+            **({"test_submission": jobs["test"]["artifact"],
+                "test_split": jobs["test"]["expected"]} if "test" in jobs else {}),
         },
         "data_semantics": {key: manifest[key] for key in ("data_semantics", "row_representation", "semantic_assumptions", "sample_unit", "task_heads", "input_file_reference_columns") if key in manifest},
         "visibility": {
@@ -434,6 +436,7 @@ def _guide_view(guide: dict[str, Any], *, include_samples: bool) -> dict[str, An
         "splits": guide.get("splits", {}),
         "target": guide.get("target", {}),
         "prediction": guide.get("prediction", {}),
+        "prediction_jobs": guide.get("prediction_jobs", {}),
         "output_encoding": guide.get("output_encoding", {}),
         "metric": guide.get("metric", {}),
         "data_semantics": guide.get("data_semantics", {}),
@@ -465,4 +468,4 @@ compact_exp_guide_for_prompt = node_exp_guide_view
 def load_exp_guide(workspace_dir: Path | str) -> dict[str, Any] | None:
     workspace_dir = Path(workspace_dir)
     data = _read_json_dict(workspace_dir / EXP_GUIDE_FILENAME)
-    return data or None
+    return data if data.get("version") == EXP_GUIDE_VERSION else None

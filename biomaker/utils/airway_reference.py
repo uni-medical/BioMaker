@@ -113,12 +113,17 @@ def _validate_tree(
     parsing: np.ndarray,
     parent_map: np.ndarray,
     children_map: np.ndarray,
-    original_label: np.ndarray,
+    reference_mask: np.ndarray,
     num: int,
 ) -> tuple[np.ndarray, int]:
-    """Validate final results without calling the mutating upstream predicate."""
-    if skeleton.shape != original_label.shape or parsing.shape != original_label.shape:
-        raise TreeReferenceError("Derived reference shapes differ from the original label")
+    """Validate against the processed mask used by ATM22 to derive the tree.
+
+    Hole filling can add foreground absent from the original scoring label.
+    Containment therefore applies to this working mask, not the original label.
+    Do not call the upstream refinement predicate here: it mutates parsing.
+    """
+    if skeleton.shape != reference_mask.shape or parsing.shape != reference_mask.shape:
+        raise TreeReferenceError("Derived reference shapes differ from the reference mask")
     if num < 1 or not np.any(skeleton):
         raise TreeReferenceError("ATM22 removed every branch or returned an empty skeleton")
     if not np.isin(skeleton, (0, 1)).all():
@@ -129,11 +134,8 @@ def _validate_tree(
     if np.any(parsing < 0) or not np.array_equal(actual_ids, np.arange(1, num + 1)):
         raise TreeReferenceError("Final parsing IDs must be contiguous 1..N")
     foreground_skeleton = skeleton > 0
-    if np.any(foreground_skeleton & (original_label <= 0)):
-        raise TreeReferenceError(
-            "ATM22 skeleton extends outside the ORIGINAL label (for example after hole "
-            "filling); it cannot be clipped or the original label changed silently"
-        )
+    if np.any(foreground_skeleton & (reference_mask <= 0)):
+        raise TreeReferenceError("ATM22 skeleton extends outside its processed reference mask")
     if np.any(foreground_skeleton & (parsing <= 0)):
         raise TreeReferenceError("Every full skeleton voxel must have a final parsing branch ID")
     if parent_map.shape != (num, num) or children_map.shape != (num, num):
@@ -180,7 +182,7 @@ def _derive_reference(label_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np
     if num < 1:
         raise TreeReferenceError("ATM22 short-branch filtering removed every skeleton branch")
     parsing = upstream.tree_parsing_func(skeleton_parse, binary_working_label, component_ids)
-    del skeleton_parse, component_ids, binary_working_label
+    del skeleton_parse, component_ids
     trachea = upstream.loc_trachea(parsing, num)
     adjacency = upstream.adjacent_map(parsing, num)
     parent_map, children_map, _ = upstream.parent_children_map(adjacency, trachea, num)
@@ -198,7 +200,10 @@ def _derive_reference(label_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np
         trachea = upstream.loc_trachea(parsing, num)
         adjacency = upstream.adjacent_map(parsing, num)
         parent_map, children_map, _ = upstream.parent_children_map(adjacency, trachea, num)
-    graph, root = _validate_tree(skeleton, parsing, parent_map, children_map, label_xyz, num)
+    graph, root = _validate_tree(
+        skeleton, parsing, parent_map, children_map, binary_working_label, num
+    )
+    del binary_working_label
     return skeleton, parsing, graph, {
         "node_count": num,
         "edge_count": int(graph.shape[1]),
@@ -206,6 +211,9 @@ def _derive_reference(label_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np
         "initial_branch_count": initial_count,
         "refinement_iterations": refinement_count,
         "skeleton_voxels": int(np.count_nonzero(skeleton)),
+        "skeleton_voxels_outside_original_label": int(
+            np.count_nonzero((skeleton > 0) & (label_xyz == 0))
+        ),
     }
 
 

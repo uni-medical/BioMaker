@@ -12,41 +12,52 @@ from typing import Any
 
 from .evaluator_setup import score_artifacts_with_evaluator
 from .experiment_contract import load_experiment_contract
+from .split_contract import SplitContractError
 
 
 def evaluate_private_outputs(
     workspace_dir: Path | str,
     private_dir: Path | str,
     *,
+    timeout: int = 3600,
     env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     workspace_dir, private_dir = Path(workspace_dir), Path(private_dir)
-    contract = load_experiment_contract(workspace_dir, hidden_answers_dir=private_dir)
-    hidden = contract.hidden_answers.get("test")
-    if hidden is None:
-        return None
-    submission = contract.prediction.test_submission
-    if not submission.is_file():
-        return None
     payload: dict[str, Any] = {
         "visible_to_agent": False,
         "note": "Private metrics are for user inspection only and are not passed to the agent.",
         "results": [],
     }
-    expected = contract.split_path("test")
-    if expected is None or not hidden.path.is_file():
-        payload["error"] = "Missing private test answers or public test sample list."
+    try:
+        contract = load_experiment_contract(workspace_dir, hidden_answers_dir=private_dir)
+    except SplitContractError as exc:
+        payload.update(error=str(exc), failure_kind="protocol")
+        return payload
+    job = contract.prediction_jobs.get("test")
+    if job is None:
+        return None
+    hidden = contract.hidden_answers.get("test")
+    if hidden is None:
+        return None
+    if not job.expected.is_file() or not hidden.path.is_file():
+        payload["error"] = "Missing private test answers or declared public test sample list."
+        payload["failure_kind"] = "protocol"
+        return payload
+    if not job.artifact.is_file():
+        payload["error"] = "Missing declared test prediction artifact."
+        payload["failure_kind"] = "protocol"
         return payload
     result = score_artifacts_with_evaluator(
         workspace_dir,
-        submission,
+        job.artifact,
         hidden.path,
-        expected,
-        timeout=120,
+        job.expected,
+        timeout=timeout,
         env_overrides=env_overrides,
     )
     if not result.ok:
         payload["error"] = result.error or "Frozen evaluator private scoring failed."
+        payload["failure_kind"] = result.failure_kind
         return payload
     score = result.details["score"]
     item = {

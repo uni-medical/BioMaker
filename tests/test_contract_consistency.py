@@ -1084,6 +1084,8 @@ class ContractConsistencyTests(unittest.TestCase):
             workspace = Path(tmp) / "workspace"
             split_dir = workspace / "input" / "biomaker_splits"
             working = workspace / "working"
+            _write_csv(split_dir / "agent_train.csv", [{"case_id": "train"}])
+            _write_csv(split_dir / "score_val.csv", [{"case_id": "case"}])
             _write_csv(split_dir / "agent_test.csv", [{"case_id": "case"}])
             _write_json(
                 workspace / "evaluator_prediction_spec.json",
@@ -1104,6 +1106,10 @@ class ContractConsistencyTests(unittest.TestCase):
                 working / "submission.csv",
                 [{"case_id": "case", "mask_path": str(mask_path)}],
             )
+            _write_csv(
+                working / "validation_predictions.csv",
+                [{"case_id": "case", "mask_path": str(mask_path)}],
+            )
 
             result = validate_working_outputs(workspace, "segmentation")
             self.assertTrue(result.ok, result.messages)
@@ -1113,6 +1119,8 @@ class ContractConsistencyTests(unittest.TestCase):
             workspace = Path(tmp) / "workspace"
             split_dir = workspace / "input" / "biomaker_splits"
             working = workspace / "working"
+            _write_csv(split_dir / "agent_train.csv", [{"case_id": "train"}])
+            _write_csv(split_dir / "score_val.csv", [{"case_id": "case"}])
             _write_csv(split_dir / "agent_test.csv", [{"case_id": "case"}])
             _write_json(
                 split_dir / "split_manifest.json",
@@ -1139,6 +1147,10 @@ class ContractConsistencyTests(unittest.TestCase):
             mask.write_bytes(b"not a readable mask")
             _write_csv(
                 working / "submission.csv",
+                [{"case_id": "case", "mask_path": str(mask)}],
+            )
+            _write_csv(
+                working / "validation_predictions.csv",
                 [{"case_id": "case", "mask_path": str(mask)}],
             )
 

@@ -226,7 +226,10 @@ def test_cache_reuses_frozen_adapter_and_manifest_changes_invalidate(run_inputs,
 
     manifest_path = workspace / "input/biomaker_splits/split_manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["manifest_version"] = 2
+    from biomaker.utils.split_contract import normalize_split_manifest
+    manifest = normalize_split_manifest(manifest)
+    manifest["hidden_answers"] = {role: {"answer_columns": ["reference_json"]}
+                                  for role in ("score_val", "test")}
     write_json(manifest_path, manifest)
     regenerated = prepare(run_inputs, attempts=1, cache_root=cache)
     assert len(prompts) == 2
@@ -332,6 +335,35 @@ def test_unavailable_metric_uses_custom_evaluator_with_retained_probe_fixtures(r
     )
     assert result.ok, result.output + str(result.error)
     assert result.metric == pytest.approx(0.5)
+
+
+def test_custom_evaluator_uses_frozen_jobs_without_test(run_inputs, monkeypatch):
+    workspace, private = run_inputs
+    split_dir = workspace / "input/biomaker_splits"
+    manifest_path = split_dir / "split_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update(manifest_version=2, splits={
+        "train": {"file": "biomaker_splits/agent_train.csv"},
+        "score_val": {"file": "biomaker_splits/score_val.csv"}},
+        hidden_answers={"score_val": {"answer_columns": ["reference_json"]}})
+    manifest["metric_contract"] = {"metrics": [{"name": "inverse_mae", "maximize": True}]}
+    write_json(manifest_path, manifest)
+    (split_dir / "agent_test.csv").unlink()
+    source = CUSTOM_EVALUATOR.replace(
+        "for split, artifact in [('score_val', 'validation_predictions'), ('agent_test', 'submission')]:",
+        "for job in prediction_spec()['prediction_jobs'].values():"
+    ).replace("pd.read_csv('input/biomaker_splits/' + split + '.csv', dtype=str)",
+              "pd.read_csv(job['expected'], dtype=str)").replace(
+        "rows.to_csv('working/' + artifact + '.csv', index=False)",
+        "rows.to_csv(job['artifact'], index=False)")
+    backend_responses(monkeypatch, source)
+    prepared = evaluator_setup.prepare_evaluator(workspace, workspace.parent / "logs",
+        "Primary evaluation metric: inverse_mae.", model="mock-custom", attempts=1,
+        timeout=30, hidden_score_path=private / "score_val.csv")
+    spec = json.loads(prepared.prediction_spec)
+    assert list(spec["prediction_jobs"]) == ["score_val"]
+    assert spec["test_submission"] is None
+    assert not (workspace / "working/submission.csv").exists()
 
 
 def test_multiple_custom_objectives_prepare_and_score_with_independent_directions(run_inputs, monkeypatch):

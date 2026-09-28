@@ -40,6 +40,7 @@ def package(tmp_path):
 def write_contract(root, contract):
     manifest = {
         "manifest_version": 1, "sample_unit": "image", "key_columns": ["sample"],
+        "public_splits": ["train", "score_val"],
         "task_heads": ["segmentation_2d"],
         "prediction_contract": {"prediction_columns": ["predicted_mask"]},
         "metric_contract": contract,

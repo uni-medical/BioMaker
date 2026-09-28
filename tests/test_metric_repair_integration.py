@@ -121,9 +121,11 @@ def test_monuseg_declaration_repair_preserves_data_and_reaches_trusted_scoring(
     assert len(builder_calls) == len(repair_calls) == 1
     assert [attempt["stage"] for attempt in result.plan["attempts"]] == ["data_builder", "metric_contract"]
     assert files(output) == original_files
-    assert json.loads((output / "split_manifest.json").read_text()) == {
-        **manifest, "metric_contract": repaired_contract,
+    frozen = json.loads((output / "split_manifest.json").read_text())
+    assert {key: frozen[key] for key in manifest} == {
+        **manifest, "manifest_version": 2, "metric_contract": repaired_contract,
     }
+    assert set(frozen["splits"]) == {"train", "score_val", "test"}
 
     workspace = tmp_path / "workspace"
     split_dir = workspace / "input/biomaker_splits"

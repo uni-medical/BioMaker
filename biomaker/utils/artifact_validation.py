@@ -7,13 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
-from PIL import Image
 
 from .mask_io import load_mask
-from .prediction_contract import (
-    load_prediction_contract,
-    resolve_artifact_path,
-)
+from .experiment_contract import load_experiment_contract
+from .prediction_contract import PredictionContract, resolve_artifact_path
+from .split_contract import SplitContractError
 
 
 @dataclass(frozen=True)
@@ -68,39 +66,13 @@ def _normalize_csv_path_refs(workspace_dir: Path, csv_path: Path) -> list[str]:
     ]
 
 
-def _submission_expected_rows(input_dir: Path) -> int | None:
-    for path in [input_dir / "test.csv", input_dir / "test" / "metadata.csv"]:
-        if path.is_file():
-            return len(pd.read_csv(path))
-    return None
-
-
-def _patient_image_size_map(input_dir: Path) -> dict[str, tuple[int, int]]:
-    metadata_path = input_dir / "test" / "metadata.csv"
-    if not metadata_path.is_file():
-        return {}
-
-    metadata = pd.read_csv(metadata_path)
-    if not {"patient", "image_path"}.issubset(metadata.columns):
-        return {}
-
-    sizes = {}
-    for row in metadata.itertuples(index=False):
-        image_path = input_dir / getattr(row, "image_path")
-        if not image_path.is_file():
-            continue
-        with Image.open(image_path) as image:
-            sizes[str(getattr(row, "patient"))] = image.size
-    return sizes
-
-
 def normalize_working_outputs(workspace_dir: Path | str, task_desc: str) -> list[str]:
     """Apply deterministic, task-format-only fixes to generated artifacts."""
     workspace_dir = Path(workspace_dir)
-    working_dir = workspace_dir / "working"
+    contract = load_experiment_contract(workspace_dir)
     messages: list[str] = []
-    for csv_path in sorted(working_dir.glob("*.csv")):
-        messages.extend(_normalize_csv_path_refs(workspace_dir, csv_path))
+    for job in contract.prediction_jobs.values():
+        messages.extend(_normalize_csv_path_refs(workspace_dir, job.artifact))
     return messages
 
 
@@ -109,33 +81,39 @@ def validate_working_outputs(
 ) -> ArtifactValidationResult:
     """Check common generated artifacts before the agent accepts a run."""
     workspace_dir = Path(workspace_dir)
-    input_dir = workspace_dir / "input"
-    contract = load_prediction_contract(workspace_dir)
-    submission_path = contract.test_submission
+    try:
+        contract = load_experiment_contract(workspace_dir)
+    except SplitContractError as exc:
+        return ArtifactValidationResult(ok=False, messages=["ArtifactValidationError: " + str(exc)])
     messages: list[str] = []
+    for role, job in contract.prediction_jobs.items():
+        if not job.expected.is_file():
+            messages.append(
+                f"ArtifactValidationError: declared {role} input is missing: {job.expected}."
+            )
+            continue
+        if not job.artifact.is_file():
+            messages.append(
+                f"ArtifactValidationError: declared {role} prediction artifact was not created: {job.artifact}."
+            )
+            continue
+        messages.extend(_validate_prediction_artifact(
+            workspace_dir, contract.prediction, role, job.artifact,
+            len(pd.read_csv(job.expected)),
+        ))
+    return ArtifactValidationResult(ok=not messages, messages=messages)
 
-    test_split = workspace_dir / "input" / "biomaker_splits" / "agent_test.csv"
-    expected_rows = (
-        len(pd.read_csv(test_split))
-        if test_split.is_file()
-        else _submission_expected_rows(input_dir)
-    )
-    if expected_rows is not None and not submission_path.is_file():
-        return ArtifactValidationResult(
-            ok=False,
-            messages=[
-                "ArtifactValidationError: expected test submission because test data is present, but it was not created."
-            ],
-        )
 
-    if not submission_path.is_file():
-        return ArtifactValidationResult(ok=True, messages=[])
-
+def _validate_prediction_artifact(
+    workspace_dir: Path, contract: PredictionContract, role: str,
+    submission_path: Path, expected_rows: int,
+) -> list[str]:
+    messages: list[str] = []
     submission = pd.read_csv(submission_path)
-    if expected_rows is not None and len(submission) != expected_rows:
+    if len(submission) != expected_rows:
         messages.append(
             f"ArtifactValidationError: {submission_path.name} row count "
-            f"({len(submission)}) does not match test data row count ({expected_rows})."
+            f"({len(submission)}) does not match {role} data row count ({expected_rows})."
         )
 
     required_columns = [
@@ -147,7 +125,7 @@ def validate_working_outputs(
     ]
     if missing_columns:
         messages.append(
-            "ArtifactValidationError: submission is missing required evaluator "
+            f"ArtifactValidationError: {role} predictions are missing required evaluator "
             "contract columns: " + ", ".join(missing_columns)
         )
 
@@ -167,7 +145,7 @@ def validate_working_outputs(
         )
     ]
     if not path_columns:
-        return ArtifactValidationResult(ok=not messages, messages=messages)
+        return messages
 
     missing_paths = []
     invalid_masks = []
@@ -196,10 +174,10 @@ def validate_working_outputs(
 
     if missing_paths:
         messages.append(
-            "ArtifactValidationError: submission.csv references missing artifact files: "
+            f"ArtifactValidationError: {submission_path.name} references missing artifact files: "
             + ", ".join(missing_paths[:10])
         )
     if invalid_masks:
         messages.append("ArtifactValidationError: " + "; ".join(invalid_masks[:10]))
 
-    return ArtifactValidationResult(ok=not messages, messages=messages)
+    return messages

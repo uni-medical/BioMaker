@@ -118,6 +118,11 @@ def test_required_private_test_answers_cannot_be_omitted(split_package):
 def test_unconstrained_task_still_allows_unlabeled_test(split_package):
     source, output = split_package
     (output / "private_gt/test.csv").unlink()
+    for relative in ("private_gt/private_gt.json", "split_manifest.json"):
+        path = output / relative
+        value = json.loads(path.read_text())
+        (value["hidden_answers"] if relative == "split_manifest.json" else value).pop("test")
+        write_json(path, value)
     result = verify_split_package(output, source_input_dir=source)
     assert result["ok"], result["errors"]
 
@@ -305,6 +310,10 @@ def test_source_coverage_counts_hidden_answer_files_without_public_exposure(spli
         frame.to_csv(path, index=False)
         hidden[role]["answer_columns"].append("target_mask")
     write_json(output / "private_gt/private_gt.json", hidden)
+    path = output / "split_manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["hidden_answers"] = hidden
+    write_json(path, manifest)
     contract = {**CONSTRAINTS, "source_rules": [*CONSTRAINTS["source_rules"], {
         "root": "answer_masks", "allowed_splits": ["score_val", "test"], "require_complete": True,
     }]}

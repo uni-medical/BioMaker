@@ -16,7 +16,7 @@ import pandas as pd
 from ..interpreter import ExecutionResult, Interpreter
 from ..journal import Node
 from .artifact_validation import normalize_working_outputs, validate_working_outputs
-from .config import Config
+from .config import Config, _working_copy_ignore, evaluator_timeout_seconds, evaluator_workers
 from .evaluator_setup import clean_candidate_outputs, validate_submission_with_evaluator
 from .execution_record import (
     attach_artifact_validation_result,
@@ -70,13 +70,20 @@ def _replace_path_with_symlink(link_path: Path, target: Path) -> None:
     link_path.symlink_to(target)
 
 
-def _copy_input_for_retrain(source_input: Path, retrain_input: Path) -> None:
+def _copy_input_for_retrain(
+    source_input: Path, retrain_input: Path, *, train_path: Path,
+) -> None:
     retrain_input.mkdir(parents=True, exist_ok=True)
     for child in source_input.iterdir():
         if child.name == "biomaker_splits":
+            shutil.copytree(child, retrain_input / child.name)
             continue
-        _replace_path_with_symlink(retrain_input / child.name, child)
-    shutil.copytree(source_input / "biomaker_splits", retrain_input / "biomaker_splits")
+        if child == train_path:
+            shutil.copy2(child, retrain_input / child.name)
+        elif child in train_path.parents:
+            _copy_input_for_retrain(child, retrain_input / child.name, train_path=train_path)
+        else:
+            _replace_path_with_symlink(retrain_input / child.name, child)
 
 
 def _score_answer_columns(
@@ -84,11 +91,12 @@ def _score_answer_columns(
     train_df: pd.DataFrame,
     score_visible_df: pd.DataFrame,
 ) -> list[str]:
-    answer_columns = load_experiment_contract(workspace_dir).hidden_answer_columns(
-        "score_val"
-    )
+    contract = load_experiment_contract(workspace_dir)
+    answer_columns = contract.hidden_answer_columns("score_val")
     if answer_columns:
         return answer_columns
+    if contract.split_manifest.get("manifest_version") == 2:
+        raise ValueError("Canonical final retraining requires declared score_val answer columns.")
 
     # Fallback: generated code sees score_val without answers, while train has them.
     return [col for col in train_df.columns if col not in score_visible_df.columns]
@@ -99,11 +107,23 @@ def _score_key_columns(
     score_visible_df: pd.DataFrame,
     score_gt_df: pd.DataFrame,
 ) -> list[str]:
-    keys = load_experiment_contract(workspace_dir).prediction.key_columns
+    contract = load_experiment_contract(workspace_dir)
+    keys = contract.prediction.key_columns
     if keys and all(
         col in score_visible_df.columns and col in score_gt_df.columns for col in keys
     ):
         return keys
+    if contract.split_manifest.get("manifest_version") == 2:
+        if not keys:
+            if contract.split_manifest.get("row_order_contract") is True:
+                return []
+            raise ValueError("Canonical final retraining requires declared sample key columns.")
+        missing_public = [key for key in keys if key not in score_visible_df.columns]
+        missing_hidden = [key for key in keys if key not in score_gt_df.columns]
+        raise ValueError(
+            "Declared sample key columns are missing from final retrain inputs: "
+            f"score_val={missing_public}, hidden answers={missing_hidden}."
+        )
 
     if "Id" in score_visible_df.columns and "Id" in score_gt_df.columns:
         return ["Id"]
@@ -126,9 +146,7 @@ def _merge_visible_score_with_hidden_labels(
     contract = load_experiment_contract(workspace_dir)
     score_visible_path = contract.split_path("score_val")
     if score_visible_path is None:
-        score_visible_path = (
-            workspace_dir / "input" / "biomaker_splits" / "score_val.csv"
-        )
+        raise ValueError("Final retraining requires a declared score_val split.")
     if not score_visible_path.is_file():
         raise FileNotFoundError(f"Missing visible score split: {score_visible_path}")
 
@@ -143,24 +161,35 @@ def _merge_visible_score_with_hidden_labels(
         )
 
     label_source = score_gt_df[key_columns + answer_columns].copy()
-    if label_source.duplicated(key_columns).any():
-        raise ValueError(f"Hidden score labels contain duplicate keys: {key_columns}")
-
-    merge_indicator = "__biomaker_score_label_merge"
-    score_labeled = score_visible_df.merge(
-        label_source,
-        on=key_columns,
-        how="left",
-        validate="one_to_one",
-        indicator=merge_indicator,
-    )
-    unmatched_rows = score_labeled[merge_indicator] != "both"
-    if unmatched_rows.any():
-        raise ValueError(
-            "Hidden score label merge produced unmatched score rows: "
-            f"{int(unmatched_rows.sum())}"
+    if not key_columns:
+        if len(score_visible_df) != len(label_source):
+            raise ValueError("Row-order score label merge requires equal public and private row counts.")
+        leaked_answers = set(answer_columns) & set(score_visible_df.columns)
+        if leaked_answers:
+            raise ValueError(
+                "Public score rows contain hidden answer columns: " + ", ".join(sorted(leaked_answers))
+            )
+        score_labeled = pd.concat(
+            [score_visible_df.reset_index(drop=True), label_source.reset_index(drop=True)], axis=1,
         )
-    score_labeled = score_labeled.drop(columns=[merge_indicator])
+    else:
+        if label_source.duplicated(key_columns).any():
+            raise ValueError(f"Hidden score labels contain duplicate keys: {key_columns}")
+        merge_indicator = "__biomaker_score_label_merge"
+        score_labeled = score_visible_df.merge(
+            label_source,
+            on=key_columns,
+            how="left",
+            validate="one_to_one",
+            indicator=merge_indicator,
+        )
+        unmatched_rows = score_labeled[merge_indicator] != "both"
+        if unmatched_rows.any():
+            raise ValueError(
+                "Hidden score label merge produced unmatched score rows: "
+                f"{int(unmatched_rows.sum())}"
+            )
+        score_labeled = score_labeled.drop(columns=[merge_indicator])
 
     missing_train_columns = [
         col for col in train_df.columns if col not in score_labeled.columns
@@ -177,9 +206,12 @@ def _write_retrain_training_table(
     workspace_dir: Path,
     private_dir: Path,
 ) -> tuple[int, int, int]:
-    split_dir = workspace_dir / "input" / "biomaker_splits"
-    train_path = split_dir / "agent_train.csv"
-    score_gt_path = private_dir / "score_val.csv"
+    contract = load_experiment_contract(workspace_dir, hidden_answers_dir=private_dir)
+    train_path = contract.split_path("train")
+    hidden = contract.hidden_answers.get("score_val")
+    if train_path is None or hidden is None:
+        raise ValueError("Final retraining requires declared train and score_val answers.")
+    score_gt_path = hidden.path
     if not train_path.is_file():
         raise FileNotFoundError(f"Missing training split: {train_path}")
     if not score_gt_path.is_file():
@@ -211,15 +243,18 @@ def _copy_retrain_outputs_to_log(cfg: Config, retrain_workspace: Path) -> None:
 
     working_dir = retrain_workspace / "working"
     if working_dir.is_dir():
-        shutil.copytree(working_dir, log_dir / "working", symlinks=True)
+        shutil.copytree(
+            working_dir, log_dir / "working", symlinks=True,
+            ignore=_working_copy_ignore(retrain_workspace, working_dir),
+        )
 
     runfile = retrain_workspace / cfg.exec.agent_file_name
     if runfile.is_file():
         shutil.copy2(runfile, log_dir / cfg.exec.agent_file_name)
 
-    submission = working_dir / "submission.csv"
-    if submission.is_file():
-        shutil.copy2(submission, cfg.log_dir / "final_submission.csv")
+    test_job = load_experiment_contract(retrain_workspace).prediction_jobs.get("test")
+    if test_job is not None and test_job.artifact.is_file():
+        shutil.copy2(test_job.artifact, cfg.log_dir / "final_submission.csv")
 
     for name in ["pred_masks", "best_ckpt.pth"]:
         src = working_dir / name
@@ -254,22 +289,26 @@ def prepare_final_retrain_workspace(
     retrain_workspace.mkdir(parents=True)
     (retrain_workspace / "working").mkdir()
 
-    _copy_input_for_retrain(cfg.workspace_dir / "input", retrain_workspace / "input")
+    source_contract = load_experiment_contract(cfg.workspace_dir, hidden_answers_dir=private_dir)
+    source_train = source_contract.split_path("train")
+    if source_train is None:
+        raise ValueError("Final retraining requires a declared train split.")
+    source_train.relative_to(cfg.workspace_dir / "input")
+    _copy_input_for_retrain(
+        cfg.workspace_dir / "input", retrain_workspace / "input", train_path=source_train,
+    )
     for filename in ["evaluator.py", "evaluator_prediction_spec.json"]:
         src = cfg.workspace_dir / filename
         if src.exists():
             _replace_path_with_symlink(retrain_workspace / filename, src)
 
     before, added, after = _write_retrain_training_table(retrain_workspace, private_dir)
+    retrain_contract = load_experiment_contract(retrain_workspace, hidden_answers_dir=private_dir)
     manifest = {
         "mode": "final_retrain_after_node_selection",
-        "source_train": str(
-            cfg.workspace_dir / "input" / "biomaker_splits" / "agent_train.csv"
-        ),
-        "source_score_labels": str(private_dir / "score_val.csv"),
-        "retrain_train": str(
-            retrain_workspace / "input" / "biomaker_splits" / "agent_train.csv"
-        ),
+        "source_train": str(source_train),
+        "source_score_labels": str(source_contract.hidden_answers["score_val"].path),
+        "retrain_train": str(retrain_contract.split_path("train")),
         "train_rows_before": before,
         "score_rows_added": added,
         "train_rows_after": after,
@@ -341,32 +380,38 @@ def run_final_retrain(
             result.error = "Final retrain artifacts failed validation."
             return result
 
-        submission_check = validate_submission_with_evaluator(
-            retrain_workspace,
-            timeout=min(180, timeout),
-            env_overrides=env_overrides,
-        )
-        attach_evaluator_run_result(
-            exec_result,
-            submission_check,
-            failure_phase="final_retrain_evaluator_validation",
-            failure_type="EvaluatorValidationError",
-            failure_message_prefix="FinalRetrainEvaluatorValidationError",
-            extra_details={"mode": "final_retrain_submission_validation"},
-        )
-        if not submission_check.ok:
-            result.error = (
-                "Final retrain submission failed frozen evaluator validation: "
-                + (submission_check.error or "unknown error")
+        if "test" in load_experiment_contract(retrain_workspace).prediction_jobs:
+            submission_check = validate_submission_with_evaluator(
+                retrain_workspace,
+                timeout=evaluator_timeout_seconds(cfg),
+                env_overrides=env_overrides,
             )
-            return result
+            attach_evaluator_run_result(
+                exec_result,
+                submission_check,
+                failure_phase="final_retrain_evaluator_validation",
+                failure_type="EvaluatorValidationError",
+                failure_message_prefix="FinalRetrainEvaluatorValidationError",
+                extra_details={"mode": "final_retrain_submission_validation"},
+            )
+            if not submission_check.ok:
+                result.error = (
+                    "Final retrain submission failed frozen evaluator validation: "
+                    + (submission_check.error or "unknown error")
+                )
+                return result
 
         _copy_retrain_outputs_to_log(cfg, retrain_workspace)
         try:
             result.private_metrics = evaluate_private_outputs(
                 retrain_workspace,
                 private_dir,
-                env_overrides=env_overrides,
+                timeout=evaluator_timeout_seconds(cfg),
+                env_overrides={
+                    **(env_overrides or {}),
+                    "BIOMAKER_EVALUATOR_WORKERS": str(evaluator_workers(cfg)),
+                    "BIOMAKER_EVALUATOR_PROGRESS_PATH": str(cfg.log_dir / "final-private-scoring.jsonl"),
+                },
             )
             if result.private_metrics and result.private_metrics.get("error"):
                 result.error = "Private evaluation failed after final retrain: " + str(

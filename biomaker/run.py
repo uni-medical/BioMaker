@@ -37,6 +37,8 @@ from .utils.artifact_validation import (
 from .utils.config import (
     SHARED_CONSOLE,
     Config,
+    evaluator_timeout_seconds,
+    evaluator_workers,
     load_cfg,
     load_task_desc,
     prep_agent_workspace,
@@ -46,6 +48,7 @@ from .utils.config import (
 )
 from .utils.compute import ComputePool
 from .utils.evaluator_setup import (
+    EvaluatorInfrastructureError,
     clean_candidate_outputs,
     prepare_evaluator,
     score_candidate_with_evaluator,
@@ -84,6 +87,8 @@ logger.setLevel(logging.INFO)  # set default level
 def _interpreter_kwargs(cfg):
     kwargs = dict(OmegaConf.to_container(cfg.exec))  # type: ignore
     for runtime_key in (
+        "evaluator_timeout",
+        "evaluator_workers",
         "parallel_workers",
         "requested_parallel_workers",
         "effective_parallel_workers",
@@ -786,6 +791,8 @@ def _run(cfg: Config) -> int:
         workspace_dir=cfg.workspace_dir,
         steps=cfg.agent.steps,
         per_node_timeout_seconds=cfg.exec.timeout,
+        evaluator_timeout_seconds=evaluator_timeout_seconds(cfg),
+        evaluator_workers=evaluator_workers(cfg),
         parallel_workers=parallel_workers,
         requested_parallel_workers=requested_parallel_workers,
         effective_parallel_workers=parallel_workers,
@@ -869,8 +876,12 @@ def _run(cfg: Config) -> int:
         task_desc=task_desc,
         model=cfg.agent.feedback.model,
         temperature=0.0,
-        timeout=min(180, cfg.exec.timeout),
+        timeout=evaluator_timeout_seconds(cfg),
         hidden_score_path=cfg.log_dir / "private_gt" / "score_val.csv",
+        env_overrides={
+            "BIOMAKER_EVALUATOR_WORKERS": str(evaluator_workers(cfg)),
+            "BIOMAKER_EVALUATOR_PROGRESS_PATH": str(cfg.log_dir / "evaluator-preparation.jsonl"),
+        },
         cache_root=(
             cfg.resource_dir / "evaluators" if cfg.evaluator_cache.enabled else None
         ),
@@ -972,20 +983,6 @@ def _run(cfg: Config) -> int:
                         artifact_check,
                         failure_reason="generated artifacts failed validation",
                     )
-                if res.exc_type is None:
-                    evaluator_result = score_candidate_with_evaluator(
-                        execution_workspace,
-                        timeout=min(180, cfg.exec.timeout),
-                        hidden_score_path=cfg.log_dir / "private_gt" / "score_val.csv",
-                        env_overrides=slot.env_overrides,
-                    )
-                    attach_evaluator_run_result(
-                        res,
-                        evaluator_result,
-                        failure_phase="evaluator_scoring",
-                        failure_type="EvaluatorValidationError",
-                        failure_message_prefix="EvaluatorValidationError",
-                    )
                 res.exec_time = time.monotonic() - node_start_time
                 append_event(
                     cfg.log_dir,
@@ -1012,6 +1009,39 @@ def _run(cfg: Config) -> int:
                     compute_slot=slot_payload,
                 )
                 raise
+
+    def score_callback(round_node, res):
+        """Harness scoring consumes CPU capacity, never a candidate GPU lease."""
+        node = round_node.node
+        execution_workspace = Path(node.execution_workspace or cfg.workspace_dir)
+        started = time.monotonic()
+        append_event(cfg.log_dir, "scoring_started", node_id=node.id,
+                     execution_workspace=str(execution_workspace))
+        try:
+            evaluator_result = score_candidate_with_evaluator(
+                execution_workspace,
+                timeout=evaluator_timeout_seconds(cfg),
+                hidden_score_path=cfg.log_dir / "private_gt" / "score_val.csv",
+                env_overrides={
+                    "CUDA_VISIBLE_DEVICES": "",
+                    "BIOMAKER_EVALUATOR_WORKERS": str(evaluator_workers(cfg)),
+                    "BIOMAKER_EVALUATOR_PROGRESS_PATH": str(
+                        cfg.log_dir / ("scoring-" + (node.id if node is not None else "candidate") + ".jsonl")
+                    ),
+                },
+            )
+            attach_evaluator_run_result(
+                res,
+                evaluator_result,
+                failure_phase="evaluator_scoring",
+                failure_type="EvaluatorValidationError",
+                failure_message_prefix="EvaluatorValidationError",
+            )
+            return res
+        finally:
+            append_event(cfg.log_dir, "scoring_finished", node_id=node.id,
+                         scoring_time=time.monotonic() - started,
+                         exc_type=res.exc_type)
 
     def live_display_journal(extra_nodes: list[Node] | None = None) -> Journal:
         transient_nodes = [
@@ -1100,9 +1130,12 @@ def _run(cfg: Config) -> int:
     global_step = 0
     round_index = 0
     end_with_exception = False
+    scoring_failures: list[dict] = []
+    scheduling_stopped = False
     workflow_agent: WorkflowAgent = agent.workflow[0]
     proposal_agent = agent.proposal_agent
     scheduler = SchedulerState()
+    scoring_futures = {}
     future_to_round_node = scheduler.future_to_round_node
     round_nodes_by_round = scheduler.round_nodes_by_round
     raw_exec_results = scheduler.raw_exec_results
@@ -1199,8 +1232,14 @@ def _run(cfg: Config) -> int:
         return scheduler.remaining_budget(total_steps, global_step)
 
     def submit_ready_nodes(executor: ThreadPoolExecutor) -> None:
+        if scheduling_stopped or scoring_failures or total_timer.is_timeout():
+            return
         changed = False
-        while len(future_to_round_node) < parallel_workers and pending_execution_queue:
+        # At most one extra wave can wait for scoring; reserve capacity before
+        # launching execution so a fast producer cannot build an unbounded queue.
+        while (len(future_to_round_node) < parallel_workers
+               and len(future_to_round_node) + len(scoring_futures) < 2 * parallel_workers
+               and pending_execution_queue):
             round_node = pending_execution_queue.pop(0)
             if round_node.node.step is not None:
                 continue
@@ -1241,7 +1280,7 @@ def _run(cfg: Config) -> int:
         journal_snapshot: list[Node],
         scheduled_step: int | None = None,
     ) -> bool:
-        if remaining_schedule_budget() <= 0:
+        if scheduling_stopped or scoring_failures or total_timer.is_timeout() or remaining_schedule_budget() <= 0:
             return False
         placeholder = Node(
             code="",
@@ -1450,12 +1489,14 @@ def _run(cfg: Config) -> int:
         executor: ThreadPoolExecutor,
         block: bool = False,
     ) -> None:
-        futures = [*generation_future_to_meta, *future_to_round_node]
+        futures = [*generation_future_to_meta, *future_to_round_node, *scoring_futures]
         done = [future for future in futures if future.done()]
         if block and futures and not done:
             wait(futures, return_when=FIRST_COMPLETED)
-        handle_finished_generations(executor, block=False)
+        # Inspect completed scoring before replenishing execution slots with
+        # newly generated candidates. A Harness fault stops new experiments.
         handle_finished_futures(block=False, executor=executor)
+        handle_finished_generations(executor, block=False)
         submit_ready_nodes(executor)
 
     def parse_round_node_if_ready(round_node: RoundNode) -> None:
@@ -1471,29 +1512,43 @@ def _run(cfg: Config) -> int:
         parsed_node_ids.add(round_node.node.id)
         round_node.node.mark_status("completed")
         append_result_for_round_node(round_node)
+        if round_node.node.outcome == "unscored":
+            failure = {
+                "node_id": round_node.node.id,
+                "failure_kind": (round_node.node.evaluator_details or {}).get("failure_kind"),
+                "execution_workspace": round_node.node.execution_workspace,
+            }
+            scoring_failures.append(failure)
+            append_event(cfg.log_dir, "scoring_unavailable", **failure)
         refresh_live_tree(log_tree=True)
 
     def handle_finished_futures(
         block: bool = False,
         executor: ThreadPoolExecutor | None = None,
     ) -> None:
-        futures = list(future_to_round_node)
-        if not futures:
-            return
-        done = [future for future in futures if future.done()]
-        if block and not done:
-            done, _pending = wait(futures, return_when=FIRST_COMPLETED)
-        finished_round_nodes = []
-        for future in list(done):
+        futures = [*scoring_futures, *future_to_round_node]
+        if block and futures and not any(f.done() for f in futures):
+            wait(futures, return_when=FIRST_COMPLETED)
+        # Observe Harness failures before admitting more candidate execution.
+        for future in list(scoring_futures):
+            if not future.done():
+                continue
+            round_node = scoring_futures.pop(future)
+            raw_exec_results[round_node.node.id] = future.result()
+            parse_round_node_if_ready(round_node)
+        for future in list(future_to_round_node):
+            if not future.done():
+                continue
             round_node = future_to_round_node.pop(future)
-            exec_result = future.result()
-            raw_exec_results.setdefault(round_node.node.id, exec_result)
-            round_node.node.mark_status("completed")
-            finished_round_nodes.append(round_node)
+            res = future.result()
+            if res.exc_type is None:
+                round_node.node.mark_status("scoring")
+                scoring_futures[scoring_executor.submit(score_callback, round_node, res)] = round_node
+            else:
+                raw_exec_results[round_node.node.id] = res
+                parse_round_node_if_ready(round_node)
         if executor is not None:
             submit_ready_nodes(executor)
-        for round_node in finished_round_nodes:
-            parse_round_node_if_ready(round_node)
 
     def append_result_for_round_node(round_node: RoundNode) -> None:
         nonlocal global_step
@@ -1514,19 +1569,32 @@ def _run(cfg: Config) -> int:
         )
         sync_node_working_to_run_workspace(cfg, solution_workspace)
         best_node, ranking = _sync_selected_best(cfg, journal, previous_best_id)
-        if getattr(getattr(cfg, "private_evaluation", None), "per_node", True):
+        if node.outcome != "unscored" and getattr(getattr(cfg, "private_evaluation", None), "per_node", True):
             private_metrics = None
             private_error = None
+            private_failure_kind = None
             try:
                 with compute_pool.lease() as private_slot:
                     private_metrics = evaluate_private_outputs(
                         solution_workspace,
                         private_dir,
-                        env_overrides=private_slot.env_overrides,
+                        timeout=evaluator_timeout_seconds(cfg),
+                        env_overrides={
+                            **private_slot.env_overrides,
+                            "BIOMAKER_EVALUATOR_WORKERS": str(evaluator_workers(cfg)),
+                            "BIOMAKER_EVALUATOR_PROGRESS_PATH": str(cfg.log_dir / ("private-scoring-" + node.id + ".jsonl")),
+                        },
                     )
+                if private_metrics and private_metrics.get("error"):
+                    private_error = str(private_metrics["error"])
+                    private_failure_kind = private_metrics.get("failure_kind")
             except Exception as exc:
                 logger.warning("Private evaluation failed: %s", exc)
                 private_error = str(exc)
+                private_failure_kind = getattr(exc, "failure_kind", "execution")
+            if private_error:
+                append_event(cfg.log_dir, "private_scoring_failed", node_id=node.id,
+                    failure_kind=private_failure_kind, error=private_error)
             if (
                 private_metrics
                 or private_error
@@ -1550,9 +1618,12 @@ def _run(cfg: Config) -> int:
                         "created_at": time.strftime(
                             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
                         ),
-                        "private_metrics_available": private_metrics is not None,
+                        "private_metrics_available": bool(
+                            private_metrics and not private_error and private_metrics.get("results")
+                        ),
                         "private_metrics": private_metrics,
                         "private_error": private_error,
+                        "private_failure_kind": private_failure_kind,
                     },
                     ranking=ranking,
                 )
@@ -1605,6 +1676,7 @@ def _run(cfg: Config) -> int:
 
     generation_executor = ThreadPoolExecutor(max_workers=max(1, total_steps))
     executor = ThreadPoolExecutor(max_workers=parallel_workers)
+    scoring_executor = ThreadPoolExecutor(max_workers=parallel_workers)
     live_tree_thread = None
     try:
         if live_tree_display_enabled:
@@ -1612,6 +1684,8 @@ def _run(cfg: Config) -> int:
             live_tree_thread.start()
         while global_step < total_steps and not total_timer.is_timeout():
             handle_scheduler_events(executor, block=False)
+            if scoring_failures:
+                break
             round_index += 1
             logger.info(
                 "BioMaker workflow round %d starting at step %d / %d",
@@ -1664,6 +1738,7 @@ def _run(cfg: Config) -> int:
                 while (
                     not round_ready_to_commit(round_index)
                     and not total_timer.is_timeout()
+                    and not scoring_failures
                 ):
                     submit_ready_nodes(executor)
                     handle_scheduler_events(
@@ -1686,6 +1761,12 @@ def _run(cfg: Config) -> int:
                 end_with_exception = True
                 logger.error(f"Exception during async generation/execution round: {e}")
                 raise e
+        # Every normal scheduling exit (including the overall deadline) must
+        # collect work that already started before deciding the final outcome.
+        # shutdown(wait=True) alone would silently discard late scoring failures.
+        scheduling_stopped = True
+        while future_to_round_node or generation_future_to_meta or scoring_futures:
+            handle_scheduler_events(executor, block=True)
     finally:
         live_tree_stop.set()
         if live_tree_thread is not None and live_tree_thread.ident is not None:
@@ -1713,7 +1794,24 @@ def _run(cfg: Config) -> int:
             try:
                 generation_executor.shutdown(wait=True)
             finally:
-                executor.shutdown(wait=True)
+                try:
+                    executor.shutdown(wait=True)
+                finally:
+                    scoring_executor.shutdown(wait=True)
+    if scoring_failures:
+        append_event(
+            cfg.log_dir,
+            "run_scoring_blocked",
+            completed_steps=global_step,
+            unscored_nodes=scoring_failures,
+            unstarted_node_ids=[item.node.id for item in pending_execution_queue],
+        )
+        raise EvaluatorInfrastructureError(
+            "Search stopped because trusted scoring is unavailable. "
+            "Saved models and predictions were retained for re-scoring; "
+            "no new candidates or final retraining were started after the failure.",
+            failure_kind=scoring_failures[0]["failure_kind"] or "execution",
+        )
     best_node = journal.get_best_node(only_good=True)
     if cfg.final_retrain.enabled and best_node is not None and not end_with_exception:
         retrain_timeout = _final_retrain_timeout_seconds(cfg)
@@ -1766,9 +1864,14 @@ def _run(cfg: Config) -> int:
                 **_ranking_payload(journal, best_node),
                 "is_current_best": True,
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "private_metrics_available": retrain_result.private_metrics is not None,
+                "private_metrics_available": bool(
+                    retrain_result.private_metrics
+                    and not retrain_result.private_metrics.get("error")
+                    and retrain_result.private_metrics.get("results")
+                ),
                 "private_metrics": retrain_result.private_metrics,
                 "private_error": retrain_result.error,
+                "private_failure_kind": (retrain_result.private_metrics or {}).get("failure_kind"),
                 "train_rows_before": retrain_result.train_rows_before,
                 "score_rows_added": retrain_result.score_rows_added,
                 "train_rows_after": retrain_result.train_rows_after,

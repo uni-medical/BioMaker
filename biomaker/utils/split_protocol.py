@@ -18,7 +18,8 @@ from .agentic_data_planner import (
     split_builder_cache_key,
     verify_split_package,
 )
-from .split_manifest import MANIFEST_NAME
+from .split_contract import resolve_public_splits
+from .split_manifest import MANIFEST_NAME, load_split_manifest
 
 
 @dataclass(frozen=True)
@@ -46,7 +47,7 @@ def _render_prompt(split_plan: dict[str, Any]) -> str:
         )
     if test_path:
         lines.append(
-            f"- Use `./input/{test_path}` only to generate `./working/submission.csv`; do not use it for training, model selection, debugging, or metric reporting."
+            f"- Use `./input/{test_path}` only to generate the test predictions declared by the frozen output contract; do not use it for training, model selection, debugging, or metric reporting."
         )
     score_gt = (
         hidden_answers.get("score_val") if isinstance(hidden_answers, dict) else None
@@ -655,13 +656,18 @@ def prepare_split_protocol(
             base_dir=result.output_dir,
             generated_output_dir=result.output_dir,
         )
+        result_verifier = verify_split_package(
+            result.output_dir, source_input_dir=input_dir, task_text=task_text
+        )
+        if not result_verifier.get("ok"):
+            raise RuntimeError("Normalized split package failed verification: "
+                               + "; ".join(result_verifier.get("errors", [])))
         _copytree_replace(result.split_dir, split_dir)
         _copytree_replace(result.private_gt_dir, private_dir)
         manifest_path = result.output_dir / MANIFEST_NAME
         if manifest_path.is_file():
             shutil.copy2(manifest_path, split_dir / MANIFEST_NAME)
         _copy_generated_public_assets(result.output_dir, input_dir)
-        result_verifier = result.verifier
         if cache_entry is not None:
             _store_split_package_cache(
                 cache_entry, result.output_dir, split_dir, private_dir, result_verifier
@@ -672,41 +678,23 @@ def prepare_split_protocol(
     _hide_private_file_answers(input_dir, private_dir)
     agent_visible_input = sanitize_agent_visible_input(input_dir, split_dir)
 
-    hidden_answers_plan = (
-        result_verifier.get("hidden_answers")
-        or result_verifier.get("private_gt", {})
-        or {}
-    )
-    if isinstance(hidden_answers_plan, dict):
-        if isinstance(hidden_answers_plan.get("score_val"), dict):
-            hidden_answers_plan["score_val"] = {
-                "file": "score_val.csv",
-                **hidden_answers_plan["score_val"],
-            }
-        if isinstance(hidden_answers_plan.get("test"), dict):
-            hidden_answers_plan["test"] = {
-                "file": "test.csv",
-                **hidden_answers_plan["test"],
-            }
-
+    prepared_manifest = load_split_manifest(split_dir)
+    public_splits = resolve_public_splits(prepared_manifest)
     split_plan = {
         "strategy": "agentic_builder",
-        "agent_visible": {
-            "train": "biomaker_splits/agent_train.csv",
-            "score_val": "biomaker_splits/score_val.csv",
-            "test": "biomaker_splits/agent_test.csv",
-        },
-        "hidden_answers": hidden_answers_plan,
+        "agent_visible": public_splits,
+        "hidden_answers": prepared_manifest.get("hidden_answers", {}),
         "metric_split": "score_val",
         "row_counts": result_verifier.get("row_counts", {}),
         "warnings": result_verifier.get("warnings", []),
         "cache_reused": cache_reused,
         "agent_visible_input": agent_visible_input,
     }
-    split_manifest = result_verifier.get("split_manifest")
+    split_manifest = prepared_manifest
     if isinstance(split_manifest, dict):
         split_plan["split_manifest"] = {
             "manifest_version": split_manifest.get("manifest_version"),
+            "splits": split_manifest.get("splits", {}),
             "sample_unit": split_manifest.get("sample_unit"),
             "key_columns": split_manifest.get("key_columns", []),
             "task_heads": split_manifest.get("task_heads", []),
@@ -722,8 +710,6 @@ def prepare_split_protocol(
                 split_plan["primary_metric"] = metric_contract["primary_metric"]
             if "maximize" in metric_contract:
                 split_plan["maximize"] = bool(metric_contract["maximize"])
-    if not (split_dir / "agent_test.csv").is_file():
-        split_plan["agent_visible"].pop("test", None)
     (split_dir / "split_plan.json").write_text(
         json.dumps(split_plan, indent=2, ensure_ascii=False), encoding="utf-8"
     )

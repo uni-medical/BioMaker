@@ -520,7 +520,10 @@ def test_run_manifest_records_requested_effective_workers_and_slots(
     ]
 
 
-def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monkeypatch):
+@pytest.mark.parametrize("evaluator_timeout", [None, 900])
+def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(
+    tmp_path, monkeypatch, evaluator_timeout
+):
     retrain_workspace = tmp_path / "workspace" / "final_retrain"
     retrain_workspace.mkdir(parents=True)
     (retrain_workspace / "working").mkdir()
@@ -539,8 +542,15 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monke
         ),
     )
     best_node = SimpleNamespace(code="print('retrain')")
+    if evaluator_timeout is not None:
+        cfg.exec.evaluator_timeout = evaluator_timeout
+    scoring_timeout = evaluator_timeout if evaluator_timeout is not None else 3600
     expected_env = {"CUDA_VISIBLE_DEVICES": "GPU-final"}
     calls = {}
+    monkeypatch.setattr(
+        final_retrain_module, "load_experiment_contract",
+        lambda *_a, **_kw: SimpleNamespace(prediction_jobs={"test": object()}),
+    )
 
     class FakeInterpreter:
         def __init__(self, workspace, **kwargs):
@@ -580,7 +590,7 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monke
         lambda *_a, **_k: None,
     )
 
-    def validate(workspace, *, timeout, env_overrides):
+    def validate(workspace, *, timeout, env_overrides, **_kwargs):
         calls["evaluator"] = (workspace, timeout, env_overrides)
         return SimpleNamespace(ok=True, error=None)
 
@@ -594,8 +604,8 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monke
         final_retrain_module, "_copy_retrain_outputs_to_log", lambda *_: None
     )
 
-    def private(workspace, private_path, *, env_overrides):
-        calls["private"] = (workspace, private_path, env_overrides)
+    def private(workspace, private_path, *, timeout, env_overrides, **_kwargs):
+        calls["private"] = (workspace, private_path, timeout, env_overrides)
         return {"metric": 0.9}
 
     monkeypatch.setattr(final_retrain_module, "evaluate_private_outputs", private)
@@ -621,8 +631,14 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monke
             "environment": expected_env,
         },
     )
-    assert calls["evaluator"] == (retrain_workspace, 180, expected_env)
-    assert calls["private"] == (retrain_workspace, private_dir, expected_env)
+    assert calls["evaluator"] == (retrain_workspace, scoring_timeout, expected_env)
+    assert calls["private"] == (
+        retrain_workspace, private_dir, scoring_timeout, {
+            **expected_env,
+            "BIOMAKER_EVALUATOR_WORKERS": "1",
+            "BIOMAKER_EVALUATOR_PROGRESS_PATH": str(log_dir / "final-private-scoring.jsonl"),
+        }
+    )
 
     monkeypatch.setattr(
         final_retrain_module,

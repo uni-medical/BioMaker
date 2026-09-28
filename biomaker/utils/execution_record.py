@@ -50,6 +50,7 @@ def attach_evaluator_run_result(
         "metric_specs": evaluator_result.metric_specs,
         "details": evaluator_result.details,
         "error": evaluator_result.error,
+        "failure_kind": evaluator_result.failure_kind,
     }
     if extra_details:
         details.update(extra_details)
@@ -73,12 +74,18 @@ def attach_evaluator_run_result(
         )
         return
 
-    exec_result.exc_type = failure_type
-    exec_result.exc_info = {"reason": evaluator_result.error}
+    infrastructure_failure = evaluator_result.failure_kind in {
+        "timeout", "resource", "interrupted", "execution", "protocol",
+    }
+    exec_result.exc_type = "EvaluatorInfrastructureError" if infrastructure_failure else failure_type
+    exec_result.exc_info = {
+        "reason": evaluator_result.error,
+        "failure_kind": evaluator_result.failure_kind,
+    }
     exec_result.failure_phase = failure_phase
     exec_result.append_system_output(
         failure_phase,
-        f"{failure_message_prefix}: "
+        f"{exec_result.exc_type if infrastructure_failure else failure_message_prefix}: "
         + (evaluator_result.error or "external evaluator failed"),
         details=exec_result.evaluator_result,
     )

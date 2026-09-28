@@ -9,6 +9,8 @@ import pytest
 
 from biomaker.utils import evaluator_setup
 from biomaker.utils.evaluator_adapter import compile_adapter
+from biomaker.utils.experiment_contract import load_experiment_contract
+from biomaker.utils.split_contract import SplitContractError
 
 
 SPEC = {
@@ -22,6 +24,12 @@ SPEC = {
     "test_submission": "./working/submission.csv",
 }
 TASK = '```metrics\n[{"name":"mae","maximize":false}]\n```'
+
+
+def test_legacy_adapter_import_rejects_conflicting_test_claims():
+    declared = {**SPEC, 'public_splits': ['train', 'score_val']}
+    with pytest.raises(ValueError, match='test_split disagrees'):
+        compile_adapter(source(declared), declared)
 
 
 def source(spec):
@@ -72,7 +80,7 @@ def test_explicit_no_test_adapter_scores_without_test_files(tmp_path, monkeypatc
     workspace, truth = workspace_inputs(tmp_path, declaration={field: ["train", "score_val"]})
     monkeypatch.chdir(workspace)
     monkeypatch.setenv("BIOMAKER_SCORE_VAL_PATH", str(truth))
-    frozen = evaluator_setup._bind_public_split_lifecycle(SPEC, workspace)
+    frozen = {**SPEC, **load_experiment_contract(workspace).evaluator_lifecycle_spec()}
     namespace = {}
     exec(compile_adapter(source(SPEC), frozen), namespace)
     real_read = pd.read_csv
@@ -101,10 +109,10 @@ def test_missing_test_without_explicit_contract_is_not_silently_skipped(tmp_path
     monkeypatch.chdir(workspace)
     monkeypatch.setenv("BIOMAKER_SCORE_VAL_PATH", str(truth))
     assert evaluator_setup._load_fixed_split_context(workspace, truth) is None
-    bound = evaluator_setup._bind_public_split_lifecycle({**SPEC, "test_split": None,
-                                                       "public_splits": ["train", "score_val"]}, workspace)
+    bound = {**SPEC, "test_split": None, "public_splits": ["train", "score_val"],
+             **load_experiment_contract(workspace).evaluator_lifecycle_spec()}
     assert bound["test_split"] == "./input/biomaker_splits/agent_test.csv"
-    assert "public_splits" not in bound
+    assert bound["public_splits"] == ["train", "score_val", "test"]
     namespace = {}
     exec(compile_adapter(source(SPEC), bound), namespace)
     try:
@@ -116,7 +124,7 @@ def test_missing_test_without_explicit_contract_is_not_silently_skipped(tmp_path
 
 def test_null_test_path_requires_frozen_explicit_split_contract(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(ValueError, match="explicit train/validation-only"):
+    with pytest.raises(ValueError, match="explicit prediction_jobs"):
         exec(compile_adapter(source(SPEC), {**SPEC, "test_split": None}), {})
 
 
@@ -129,20 +137,20 @@ def test_null_test_path_requires_frozen_explicit_split_contract(tmp_path, monkey
 ])
 def test_inconsistent_no_test_declarations_are_rejected(tmp_path, declaration):
     workspace, _ = workspace_inputs(tmp_path, declaration=declaration)
-    with pytest.raises(evaluator_setup.EvaluatorSetupError):
-        evaluator_setup._bind_public_split_lifecycle(SPEC, workspace)
+    with pytest.raises(SplitContractError):
+        load_experiment_contract(workspace)
 
 
 def test_existing_test_lifecycle_is_preserved(tmp_path, monkeypatch):
     workspace, truth = workspace_inputs(tmp_path, test=True)
     monkeypatch.chdir(workspace)
     monkeypatch.setenv("BIOMAKER_SCORE_VAL_PATH", str(truth))
-    frozen = evaluator_setup._bind_public_split_lifecycle(SPEC, workspace)
+    frozen = {**SPEC, **load_experiment_contract(workspace).evaluator_lifecycle_spec()}
     namespace = {}
     exec(compile_adapter(source(SPEC), frozen), namespace)
     try:
         assert namespace["self_test"]()["score"]["metrics"] == {"mae": 2.0}
-        assert (workspace / "working/.adapter_probe/submission/predictions.csv").is_file()
+        assert (workspace / "working/.adapter_probe/test/predictions.csv").is_file()
         assert namespace["prediction_spec"]()["test_split"].endswith("agent_test.csv")
     finally:
         namespace["cleanup_self_test"]()
@@ -162,6 +170,96 @@ def test_generated_adapter_freezes_no_test_from_manifest(tmp_path):
     assert validation["skipped"] is True
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_object_split_contract_prepares_without_llm(tmp_path, monkeypatch, version):
+    roles = {"train": {"file": "biomaker_splits/agent_train.csv"},
+             "score_val": {"file": "biomaker_splits/score_val.csv"}}
+    field = "splits" if version == 2 else "public_splits"
+    workspace, truth = workspace_inputs(tmp_path, declaration={"manifest_version": version, field: roles})
+    monkeypatch.setattr(evaluator_setup.backend, "query", lambda **kwargs: pytest.fail("Known codec needs no generation"))
+    prepared = evaluator_setup.prepare_evaluator(workspace, tmp_path / "logs", TASK,
+        model="unused", hidden_score_path=truth, timeout=30)
+    spec = json.loads(prepared.prediction_spec)
+    assert list(spec["prediction_jobs"]) == ["score_val"]
+    assert spec["test_submission"] is None
+
+
+def test_framework_binds_class_space_before_compiling_thin_codec(tmp_path):
+    workspace, truth = workspace_inputs(tmp_path, declaration={
+        "manifest_version": 2, "splits": {
+            "train": {"file": "biomaker_splits/agent_train.csv"},
+            "score_val": {"file": "biomaker_splits/score_val.csv"}},
+        "task_heads": [{"type": "binary"}],
+        "prediction_contract": {"prediction_columns": ["estimate"],
+            "class_labels": ["positive", "negative"], "positive_class": "positive"},
+        "metric_contract": {"metrics": [{"name": "accuracy", "maximize": True}]},
+    })
+    pd.DataFrame([{"case": "validation", "answer": "positive"}]).to_csv(truth, index=False)
+    codec = source({}).replace("float(target_row['answer'])", "target_row['answer']").replace(
+        "{'prediction': float(prediction_row['estimate'])}",
+        "{'prediction': [float(prediction_row['estimate'])]}")
+    task = '```metrics\n[{"name":"accuracy","maximize":true}]\n```'
+    evaluator_setup._freeze_data_adapter(workspace, codec, task, truth)
+    evaluator_setup._run_self_test(workspace, timeout=30, hidden_score_path=truth)
+    spec = json.loads(evaluator_setup._load_prediction_spec(workspace))
+    assert spec["class_labels"] == ["positive", "negative"]
+    assert spec["positive_class"] == "positive"
+    assert spec["task_type"] == "binary"
+    assert spec["test_submission"] is None
+
+
+def test_missing_declared_split_fails_before_codec_generation(tmp_path, monkeypatch):
+    workspace, truth = workspace_inputs(tmp_path)
+    monkeypatch.setattr(evaluator_setup.backend, "query", lambda **kwargs: pytest.fail("Contract errors are not codec retries"))
+    with pytest.raises(evaluator_setup.EvaluatorSetupError, match="Declared public split test is missing"):
+        evaluator_setup.prepare_evaluator(workspace, tmp_path / "logs", TASK,
+            model="unused", hidden_score_path=truth, timeout=30)
+
+
+def test_canonical_missing_answer_schema_cannot_fall_back_to_stale_plan(tmp_path, monkeypatch):
+    workspace, truth = workspace_inputs(tmp_path, declaration={
+        "manifest_version": 2, "splits": {
+            "train": {"file": "biomaker_splits/agent_train.csv"},
+            "score_val": {"file": "biomaker_splits/score_val.csv"}},
+        "hidden_answers": {},
+    })
+    monkeypatch.setattr(evaluator_setup.backend, "query", lambda **kwargs: pytest.fail("Contract errors are not codec retries"))
+    with pytest.raises(evaluator_setup.EvaluatorSetupError, match="hidden answer columns"):
+        evaluator_setup.prepare_evaluator(workspace, tmp_path / "logs", TASK,
+            model="unused", hidden_score_path=truth, timeout=30)
+
+
+def test_no_test_cache_identity_never_reads_stale_test_table(tmp_path, monkeypatch):
+    workspace, truth = workspace_inputs(tmp_path, declaration={"public_splits": {
+        "train": {"file": "biomaker_splits/agent_train.csv"},
+        "score_val": {"file": "biomaker_splits/score_val.csv"}}})
+    stale = workspace / "input/biomaker_splits/agent_test.csv"
+    stale.write_text("case\nstale\n")
+    hashed = []
+    original = evaluator_setup._sha256_file
+    def record(path):
+        hashed.append(path)
+        return original(path)
+    monkeypatch.setattr(evaluator_setup, "_sha256_file", record)
+    evaluator_setup._evaluator_input_fingerprints(workspace, truth)
+    assert stale not in hashed
+
+
+def test_explicit_artifact_scoring_does_not_require_default_submission(tmp_path):
+    workspace, truth = workspace_inputs(tmp_path, test=True)
+    evaluator_setup._freeze_data_adapter(workspace, source(SPEC), TASK, truth)
+    frozen = evaluator_setup._load_prediction_spec(workspace)
+    (workspace / "evaluator_prediction_spec.json").write_text(frozen)
+    (workspace / "working").mkdir(exist_ok=True)
+    predictions = workspace / "working/validation_predictions.csv"
+    pd.DataFrame([{"case": "validation", "estimate": 2.0}]).to_csv(predictions, index=False)
+    result = evaluator_setup.score_artifacts_with_evaluator(workspace, predictions, truth,
+        workspace / "input/biomaker_splits/score_val.csv", timeout=30)
+    assert result.ok, result.error
+    assert result.metrics == {"mae": 0.0}
+    assert not (workspace / "working/submission.csv").exists()
+
+
 def test_builtin_standard_reader_prepares_without_llm_or_test(tmp_path, monkeypatch):
     workspace, truth = workspace_inputs(tmp_path, declaration={"required_splits": ["train", "score_val"]})
 
@@ -170,7 +268,8 @@ def test_builtin_standard_reader_prepares_without_llm_or_test(tmp_path, monkeypa
 
     monkeypatch.setattr(evaluator_setup.backend, "query", unexpected_llm)
     context = evaluator_setup._load_fixed_split_context(workspace, truth)
-    assert context is not None and context["test_path"] is None and context["test_df"].empty
+    assert context is not None and context["test_path"] is None and context["test_df"] is None
+    assert list(context["public_frames"]) == ["score_val"]
     prepared = evaluator_setup.prepare_evaluator(
         workspace, tmp_path / "logs", TASK, model="unused", attempts=1,
         hidden_score_path=truth, timeout=30,

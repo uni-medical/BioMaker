@@ -47,9 +47,10 @@ def fixed_detection_spec(context, task):
     ):
         return None
     keys = manifest.get("key_columns", [])
-    if not keys or any(
-        k not in context["score_df"] or k not in context["test_df"] for k in keys
-    ):
+    frames = context.get("public_frames")
+    if frames is None:  # Historical direct reader API.
+        frames = {name: context[name] for name in ("score_df", "test_df") if context.get(name) is not None}
+    if not keys or any(k not in frame for frame in frames.values() for k in keys):
         return None
     output = manifest.get("prediction_contract", {})
     coordinate_text = str(

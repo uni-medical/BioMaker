@@ -177,6 +177,8 @@ class DeterministicEvaluatorCompilerTests(unittest.TestCase):
                 "\n".join(
                     [
                         "import os",
+                        "def validate_submission():",
+                        "    return {'valid': True}",
                         "def score(prediction_path, path, expected_path):",
                         "    print('BIOMAKER_SCORE_VAL_PATH=' + path)",
                         "    raise RuntimeError('hidden path: ' + path)",

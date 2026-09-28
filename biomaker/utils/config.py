@@ -25,6 +25,7 @@ from rich.tree import Tree
 
 from . import copytree, preproc_data, serialize
 from .env import load_local_env
+from .experiment_contract import load_experiment_contract
 from .response import truncate_text
 
 try:
@@ -119,6 +120,8 @@ class ExecConfig:
     format_tb_ipython: bool
     enforce_environment: bool
     include_medical_packages: bool
+    evaluator_timeout: int = 3600
+    evaluator_workers: int = 1
     requested_parallel_workers: int | str | None = None
     effective_parallel_workers: int | None = None
     compute_slots: list[dict[str, Any]] | None = None
@@ -201,6 +204,8 @@ def _validate_exec_config(cfg: Config) -> None:
         value = getattr(exec_cfg, name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"exec.{name} must be an integer >= 1, got {value!r}.")
+    evaluator_timeout_seconds(cfg)
+    evaluator_workers(cfg)
     workers = exec_cfg.parallel_workers
     if workers != "auto" and (
         isinstance(workers, bool) or not isinstance(workers, int) or workers < 1
@@ -252,6 +257,32 @@ def _validate_exec_config(cfg: Config) -> None:
             "agent.knowledge_base.topk must be an integer >= 1, "
             f"got {knowledge_cfg.topk!r}."
         )
+
+
+def evaluator_timeout_seconds(cfg: Config) -> int:
+    """Return the trusted evaluator budget, independent of candidate execution.
+
+    Older saved configuration objects may lack the setting. Their evaluator
+    budget defaults to 3600 seconds; a short training budget must not truncate it.
+    """
+    value = getattr(cfg.exec, "evaluator_timeout", 3600)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            "exec.evaluator_timeout must be an integer >= 1, "
+            f"got {value!r}."
+        )
+    return value
+
+
+def evaluator_workers(cfg: Config) -> int:
+    """Return bounded case-level scoring concurrency (serial for old configs)."""
+    value = getattr(cfg.exec, "evaluator_workers", 1)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            "exec.evaluator_workers must be an integer >= 1, "
+            f"got {value!r}."
+        )
+    return value
 
 
 def load_cfg(path: Path = Path(__file__).parent / "config.yaml") -> Config:
@@ -547,7 +578,21 @@ def prepare_node_workspace(cfg: Config, node) -> Path:
     return node_dir
 
 
-def _replace_tree(src: Path, dst: Path) -> None:
+def _working_copy_ignore(workspace_dir: Path, working_dir: Path):
+    """Exclude the reserved default submission unless a prediction job owns it."""
+    contract = load_experiment_contract(workspace_dir)
+    default_submission = workspace_dir / "working/submission.csv"
+    requested = any(job.artifact == default_submission for job in contract.prediction_jobs.values())
+
+    def ignore(directory, names):
+        if Path(directory) == working_dir and not requested and "submission.csv" in names:
+            return {"submission.csv"}
+        return set()
+
+    return ignore
+
+
+def _replace_tree(src: Path, dst: Path, *, ignore=None) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() or dst.is_symlink():
         if not dst.is_symlink() and dst.is_dir():
@@ -556,7 +601,7 @@ def _replace_tree(src: Path, dst: Path) -> None:
             dst.unlink()
     if dst.exists():
         shutil.rmtree(dst)
-    shutil.copytree(src, dst, symlinks=True)
+    shutil.copytree(src, dst, symlinks=True, ignore=ignore)
 
 
 def sync_node_working_to_run_workspace(
@@ -570,7 +615,7 @@ def sync_node_working_to_run_workspace(
     dst = cfg.workspace_dir / target_name
     if not src.is_dir():
         return
-    _replace_tree(src, dst)
+    _replace_tree(src, dst, ignore=_working_copy_ignore(node_workspace, src))
 
 
 def _copy_submission_artifacts(
@@ -739,26 +784,12 @@ def _copy_node_artifacts(cfg: Config, node, snapshot=None) -> None:
             encoding="utf-8",
         )
 
+    contract = load_experiment_contract(source_workspace)
     spec_path = Path(cfg.workspace_dir) / "evaluator_prediction_spec.json"
     if spec_path.is_file():
         shutil.copy2(spec_path, dst_dir / "evaluator_prediction_spec.json")
-        try:
-            spec = json.loads(spec_path.read_text(encoding="utf-8"))
-        except Exception:
-            spec = {}
-    else:
-        spec = {}
-
-    prediction_columns = {
-        str(column)
-        for column in spec.get("prediction_columns", [])
-        if isinstance(column, str)
-    }
-    file_reference_columns = {
-        str(column)
-        for column in spec.get("file_reference_columns", [])
-        if isinstance(column, str)
-    }
+    prediction_columns = set(contract.prediction.prediction_columns)
+    file_reference_columns = set(contract.prediction.file_reference_columns)
     prediction_file_columns = {
         column
         for column in prediction_columns | file_reference_columns
@@ -767,15 +798,20 @@ def _copy_node_artifacts(cfg: Config, node, snapshot=None) -> None:
     if not prediction_file_columns and not prediction_columns:
         prediction_file_columns = set()
 
-    for csv_path in sorted(working_dir.glob("*.csv")):
-        dst = dst_dir / csv_path.name
+    ignored = _working_copy_ignore(source_workspace, working_dir)(working_dir, ["submission.csv"])
+    artifacts = {job.artifact for job in contract.prediction_jobs.values()}
+    csv_paths = set(working_dir.glob("*.csv")) | {path for path in artifacts if path.is_file()}
+    for csv_path in sorted(csv_paths):
+        if csv_path == working_dir / "submission.csv" and csv_path.name in ignored:
+            continue
+        dst = dst_dir / csv_path.relative_to(working_dir)
+        dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(csv_path, dst)
-        _copy_csv_referenced_files(
-            csv_path,
-            source_workspace,
-            dst_dir,
-            file_columns=prediction_file_columns or None,
-        )
+        if csv_path in artifacts:
+            _copy_csv_referenced_files(
+                csv_path, source_workspace, dst_dir,
+                file_columns=prediction_file_columns or None,
+            )
 
 
 def _copy_run_working_dir(cfg: Config, source_name: str, log_name: str) -> Path | None:
@@ -783,7 +819,7 @@ def _copy_run_working_dir(cfg: Config, source_name: str, log_name: str) -> Path 
     if not src.is_dir():
         return None
     dst = Path(cfg.log_dir) / log_name
-    _replace_tree(src, dst)
+    _replace_tree(src, dst, ignore=_working_copy_ignore(Path(cfg.workspace_dir), src))
     return src
 
 
@@ -792,12 +828,18 @@ def _copy_best_working_outputs(cfg: Config) -> None:
     working_dir = _copy_run_working_dir(cfg, "working_best", "working_best")
     if working_dir is None:
         return
+    contract = load_experiment_contract(cfg.workspace_dir)
+    test_job = contract.prediction_jobs.get("test")
+    submission_path = (
+        working_dir / test_job.artifact.relative_to(Path(cfg.workspace_dir) / "working")
+        if test_job is not None else None
+    )
 
     # A previous candidate may have exported artifacts the new winner omits.
     # These three legacy aliases are owned by the selected-best export; node
     # archives and the latest-candidate workspace must remain untouched.
-    for name in ("submission.csv", "pred_masks", "best_ckpt.pth"):
-        source = working_dir / name
+    for name in ("pred_masks", "best_ckpt.pth", *(["submission.csv"] if test_job is not None else [])):
+        source = submission_path if name == "submission.csv" else working_dir / name
         destination = Path(cfg.log_dir) / name
         if not source.exists():
             if destination.is_symlink() or destination.is_file():
@@ -805,8 +847,7 @@ def _copy_best_working_outputs(cfg: Config) -> None:
             elif destination.is_dir():
                 shutil.rmtree(destination)
 
-    submission_path = working_dir / "submission.csv"
-    if submission_path.is_file():
+    if submission_path is not None and submission_path.is_file():
         shutil.copy2(submission_path, cfg.log_dir / "submission.csv")
         _copy_submission_artifacts(
             submission_path,

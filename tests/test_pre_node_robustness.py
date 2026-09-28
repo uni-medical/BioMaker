@@ -63,11 +63,20 @@ def _materialize_source_dataset_links(
     source_files = split_plan.get("source_files")
     if not isinstance(source_files, dict):
         return
+    # Historical split plans retain their original dataset paths. Resolve the
+    # workspace's renamed storage without changing those frozen artifacts.
+    resolver_path = workspace_root / "experiments" / "_shared" / "dataset_paths.py"
+    relocate = lambda value: value
+    if resolver_path.is_file():
+        spec = importlib.util.spec_from_file_location("workspace_dataset_paths", resolver_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        relocate = lambda value: module.relocate_dataset_path(value, workspace_root)
     input_dir = workspace / "input"
     for value in source_files.values():
         if not isinstance(value, str):
             continue
-        path = workspace_root / value
+        path = workspace_root / relocate(value)
         dataset_dirs = []
         parts = path.parts
         if "datasets" in parts:
@@ -501,6 +510,7 @@ class PreNodeRobustnessTests(unittest.TestCase):
                     "manifest_version": 1,
                     "sample_unit": "row",
                     "key_columns": ["case_id"],
+                    "public_splits": ["train", "score_val"],
                     "task_heads": ["classification"],
                     "hidden_answers": {"score_val": {"answer_columns": ["label"]}},
                     "prediction_contract": {},
@@ -537,6 +547,7 @@ class PreNodeRobustnessTests(unittest.TestCase):
                     "manifest_version": 1,
                     "sample_unit": "volume",
                     "key_columns": ["case_id"],
+                    "public_splits": ["train", "score_val"],
                     "task_heads": ["classification"],
                     "sample_universe": [
                         {"sample_id": 0, "split": "train", "source_paths": []},

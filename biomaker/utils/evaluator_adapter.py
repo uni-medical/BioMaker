@@ -7,6 +7,7 @@ aggregation, submission validation, or the lifetime of preparation probes.
 from __future__ import annotations
 
 import ast
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -15,14 +16,11 @@ ADAPTER_API = """
 Return one Python file implementing exactly these three public functions:
 
 prediction_spec() -> dict
-  Declare evaluator_api_version=3, metrics (a nonempty list of {name, maximize}
-  objects, with independent boolean directions), task_type, key_columns,
-  prediction_columns, answer_columns,
-  validation_artifact='./working/validation_predictions.csv',
-  test_submission='./working/submission.csv', and all metric parameters.
-  Harness binds the prepared manifest's public split lifecycle. An explicit
-  train/validation-only manifest has test_split=None: no test predictions or
-  dummy test rows are needed. Missing test files alone do not opt out of test.
+  Declare only data encoding details not already present in the prepared
+  contract. Harness injects prepared keys, answer/output columns, task semantics,
+  class order, metrics, prediction jobs and artifact paths before validation.
+  You may repeat those declarations only with identical values. Never decide
+  whether test exists: Harness runs the prepared prediction_jobs only.
   Declare file_reference_columns only for prediction cells containing file paths.
   Original column names and directory layouts are yours to interpret. Sample keys
   must agree with the prepared public splits; [] is allowed only for an explicit
@@ -107,6 +105,31 @@ def validate_adapter_source(source: str) -> None:
         raise ValueError("Missing adapter functions: " + ", ".join(sorted(required - found)))
 
 
+def _legacy_adapter_spec(spec):
+    """Import the standalone adapter-v1 declaration API at compilation only."""
+    spec = dict(spec)
+    if 'prediction_jobs' not in spec:
+        roles = spec.get('public_splits')
+        if spec.get('test_split', True) is None:
+            if not isinstance(roles, list) or set(roles) != {'train', 'score_val'} or len(roles) != 2:
+                raise ValueError('An explicit prediction_jobs contract or legacy train/validation-only declaration is required.')
+        elif roles is not None and (
+            not isinstance(roles, list) or len(roles) != 3
+            or set(roles) != {'train', 'score_val', 'test'}
+        ):
+            raise ValueError('Legacy test_split disagrees with public_splits.')
+        spec['prediction_jobs'] = {
+            'score_val': {'expected': spec.get('score_split', './input/biomaker_splits/score_val.csv'),
+                          'artifact': spec.get('validation_artifact', './working/validation_predictions.csv')},
+        }
+        if spec.get('test_split', True) is not None:
+            spec['prediction_jobs']['test'] = {
+                'expected': spec.get('test_split', './input/biomaker_splits/agent_test.csv'),
+                'artifact': spec.get('test_submission', './working/submission.csv'),
+            }
+    return spec
+
+
 def compile_adapter(source: str, frozen_spec: dict[str, Any] | None = None) -> str:
     """Bundle trusted kernels and adapter into one portable, frozen Python file."""
     validate_adapter_source(source)
@@ -122,13 +145,24 @@ def compile_adapter(source: str, frozen_spec: dict[str, Any] | None = None) -> s
     from .metric_source import frozen_metric_source
 
     kernels = frozen_metric_source()
+    compatibility = ""
+    if frozen_spec is None:
+        # Historical standalone callers have no prepared ExperimentContract.
+        # Resolve their declaration at this explicit API compatibility boundary.
+        compatibility = inspect.getsource(_legacy_adapter_spec).replace(
+            'def _legacy_adapter_spec(', 'def _h_legacy_adapter_spec('
+        ) + "\n_h_compiled_spec = _h_legacy_adapter_spec(_h_adapter_spec())\n"
+        spec_expression = "_h_compiled_spec"
+    else:
+        spec_expression = repr(_legacy_adapter_spec(frozen_spec))
     return (
         "from __future__ import annotations\n"
         "# Agent-owned data interpretation\n" + source + "\n"
         "_h_load_sample = load_sample\n"
         "_h_write_dummy = write_dummy_predictions\n"
-        "# Harness-owned metric implementations (frozen source)\n" + kernels + "\n"
-        + _RUNTIME.replace("__FROZEN_SPEC__", repr(frozen_spec))
+        + compatibility
+        + "# Harness-owned metric implementations (frozen source)\n" + kernels + "\n"
+        + _RUNTIME.replace("__FROZEN_SPEC__", spec_expression)
     )
 
 
@@ -139,30 +173,37 @@ import json as _h_json
 import os as _h_os
 import shutil as _h_shutil
 import tempfile as _h_tempfile
+import time as _h_time
+import threading as _h_threading
 from pathlib import Path as _h_Path
 import pandas as _h_pd
 
 _h_declared = __FROZEN_SPEC__
-_h_source_spec = _h_declared if _h_declared is not None else _h_adapter_spec()
+_h_source_spec = _h_declared
 _h_source_spec = dict(_h_source_spec, metrics=normalize_metric_definitions(_h_source_spec), evaluator_api_version=3)
 for _h_legacy_field in ('primary_metric', 'secondary_metrics', 'maximize'):
     _h_source_spec.pop(_h_legacy_field, None)
 _h_spec = normalize_metric_spec(_h_source_spec)
 _h_spec['scoring_backend'] = 'trusted_metrics_v1'
 _h_spec['adapter_api_version'] = 1
-_h_spec.setdefault('score_split', './input/biomaker_splits/score_val.csv')
-_h_spec.setdefault('test_split', './input/biomaker_splits/agent_test.csv')
+_h_jobs = _h_spec['prediction_jobs']
+_h_spec['score_split'] = _h_jobs['score_val']['expected']
+_h_spec['validation_artifact'] = _h_jobs['score_val']['artifact']
+_h_spec['test_split'] = _h_jobs.get('test', {}).get('expected')
+_h_spec['test_submission'] = _h_jobs.get('test', {}).get('artifact')
+_h_spec['public_splits'] = ['train', *_h_jobs]
 _h_probe = None
 
 
 def _h_validate_spec():
-    if _h_spec['test_split'] is None:
-        public = _h_spec.get('public_splits')
-        if (not isinstance(public, list) or any(not isinstance(role, str) for role in public)
-                or set(public) != {'train', 'score_val'} or len(public) != 2):
-            raise ValueError('test_split=None requires an explicit train/validation-only public_splits contract.')
-    elif 'public_splits' in _h_spec and 'test' not in _h_spec['public_splits']:
-        raise ValueError('test_split disagrees with the declared public_splits contract.')
+    if not isinstance(_h_jobs, dict) or 'score_val' not in _h_jobs:
+        raise ValueError('prediction_jobs must declare the score_val prediction job.')
+    for role, job in _h_jobs.items():
+        if not isinstance(job, dict) or not all(isinstance(job.get(key), str) and job[key] for key in ('expected', 'artifact')):
+            raise ValueError('Each prediction job requires expected and artifact paths: ' + role)
+        path = _h_Path(job['artifact']).resolve()
+        if not path.is_relative_to(_h_Path('working').resolve()):
+            raise ValueError('Prediction artifacts must be under working/.')
     for name in ('key_columns', 'prediction_columns', 'answer_columns'):
         values = _h_spec.get(name)
         if (not isinstance(values, list) or (name != 'key_columns' and not values)
@@ -171,12 +212,6 @@ def _h_validate_spec():
             raise ValueError('Adapter spec requires distinct column names in ' + name)
     if set(_h_spec['key_columns']) & (set(_h_spec['prediction_columns']) | set(_h_spec['answer_columns'])):
         raise ValueError('Sample keys cannot be predictions or hidden answers.')
-    for name in ('validation_artifact', 'test_submission'):
-        path = _h_Path(_h_spec[name]).resolve()
-        if not path.is_relative_to(_h_Path('working').resolve()):
-            raise ValueError('Prediction artifacts must be under working/.')
-    if _h_Path(_h_spec['test_submission']) != _h_Path('working/submission.csv'):
-        raise ValueError('test_submission must be ./working/submission.csv')
     protocol = _h_spec.get('restoration_evaluation', {})
     if protocol.get('groups') is not None and not protocol.get('group_column'):
         raise ValueError('Grouped adapters must declare a public group_column for representative probes.')
@@ -213,13 +248,14 @@ def _h_expected(path):
 def _h_align(path, expected, columns, label):
     keys = _h_spec['key_columns']
     frame = _h_read(path)
+    error_type = PredictionValidationError if label == 'Predictions' else ValueError
     required = keys + columns
     if any(c not in frame for c in required):
-        raise ValueError(label + ' missing declared columns.')
+        raise error_type(label + ' missing declared columns.')
     if len(frame) != len(expected):
-        raise ValueError(label + ' missing rows.')
+        raise error_type(label + ' missing rows.')
     if keys and (frame[keys] == '').any().any():
-        raise ValueError(label + ' contains empty sample keys.')
+        raise error_type(label + ' contains empty sample keys.')
     # Empty encoded values can mean a valid negative image (boxes/RLE), or a
     # dataset-defined missing value. The adapter interprets cells; canonical
     # sample validation determines whether the decoded values are admissible.
@@ -227,9 +263,9 @@ def _h_align(path, expected, columns, label):
     if not keys:
         return frame.reset_index(drop=True)
     if frame.duplicated(keys).any():
-        raise ValueError(label + ' contains duplicate sample keys.')
+        raise error_type(label + ' contains duplicate sample keys.')
     if set(map(tuple, frame[keys].values)) != set(map(tuple, expected[keys].values)):
-        raise ValueError(label + ' sample keys differ from expected rows.')
+        raise error_type(label + ' sample keys differ from expected rows.')
     return expected[keys].merge(frame, on=keys, sort=False, validate='one_to_one')
 
 
@@ -260,19 +296,41 @@ def _h_samples(predictions, targets, expected):
                 raise ValueError('Data adapter failed for aligned sample index %d (%s); check load_sample and declared columns.' % (index, type(exc).__name__)) from None
             raise
         yield sample
+        # Release the generator's reference before decoding the next volume.
+        # Completed workers must not leave an extra case live during loading.
+        del sample
 
 
 def score(prediction_path, truth_path, expected_path):
     expected = _h_expected(expected_path)
     predictions = _h_align(prediction_path, expected, _h_spec['prediction_columns'], 'Predictions')
     targets = _h_align(truth_path, expected, _h_spec['answer_columns'], 'Answers')
-    result = score_samples(_h_samples(predictions, targets, expected), _h_spec)
+    # Execution policy is supplied by Harness, separate from the frozen metric
+    # protocol. Split-level metrics such as AUC/AP keep their original reduction.
+    workers = int(_h_os.environ.get('BIOMAKER_EVALUATOR_WORKERS', '1'))
+    if workers < 1:
+        raise ValueError('BIOMAKER_EVALUATOR_WORKERS must be positive')
+    if _h_spec['task_family'] not in ('segmentation', 'image_restoration'):
+        workers = 1
+    progress_path = _h_os.environ.get('BIOMAKER_EVALUATOR_PROGRESS_PATH')
+    lock = _h_threading.Lock()
+
+    def report(event):
+        # Only execution metadata: no private paths, labels or metric values.
+        if progress_path:
+            with lock, open(progress_path, 'a', encoding='utf-8') as output:
+                output.write(_h_json.dumps(dict(event, monotonic_seconds=_h_time.monotonic())) + '\n')
+
+    result = score_samples(_h_samples(predictions, targets, expected), _h_spec,
+                           progress_callback=report if progress_path else None,
+                           workers=workers)
     result['n'] = len(expected)
     return result
 
 
 def score_val():
-    return score(_h_spec['validation_artifact'], _h_os.environ['BIOMAKER_SCORE_VAL_PATH'], _h_spec['score_split'])
+    job = _h_jobs['score_val']
+    return score(job['artifact'], _h_os.environ['BIOMAKER_SCORE_VAL_PATH'], job['expected'])
 
 
 def _h_validate_submission(prediction_path, expected_path):
@@ -284,9 +342,11 @@ def _h_validate_submission(prediction_path, expected_path):
 
 
 def validate_submission():
-    if _h_spec['test_split'] is None:
+    jobs = {role: job for role, job in _h_jobs.items() if role != 'score_val'}
+    if not jobs:
         return {'valid': True, 'skipped': True, 'reason': 'no_test_split', 'n': 0}
-    return _h_validate_submission(_h_spec['test_submission'], _h_spec['test_split'])
+    results = [_h_validate_submission(job['artifact'], job['expected']) for job in jobs.values()]
+    return {'valid': True, 'n': sum(result['n'] for result in results)}
 
 
 def _h_detection_probe_target(frame, truth):
@@ -391,12 +451,14 @@ def self_test():
         result = score(str(prediction_path), str(truth_path), str(expected_path))
     except UndefinedMetricError as exc:
         score_error = {'metric': exc.metric, 'reason': exc.reason}
-    if _h_spec['test_split'] is not None:
-        test = _h_expected(_h_spec['test_split'])
+    for role, job in _h_jobs.items():
+        if role == 'score_val':
+            continue
+        test = _h_expected(job['expected'])
         test = test.iloc[_h_select_probe(test)]
-        test_path = root / 'test.csv'
+        test_path = root / (role + '.csv')
         test.to_csv(test_path, index=False)
-        submission = fixtures / 'submission/predictions.csv'
+        submission = fixtures / role / 'predictions.csv'
         submission.parent.mkdir(parents=True, exist_ok=True)
         _h_write_dummy(test.to_dict('records'), str(submission))
         _h_validate_submission(submission, test_path)

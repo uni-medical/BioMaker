@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from .metric_registry import metric_maximize
 from .evaluator_protocol import metric_definitions
+from .split_contract import SplitContractError, resolve_public_splits
 from .prediction_contract import (
     PredictionContract,
     artifact_path_from_spec,
@@ -34,6 +35,15 @@ class HiddenAnswerContract:
     split: str
     path: Path
     answer_columns: list[str]
+
+
+@dataclass(frozen=True)
+class PredictionJob:
+    """A declared output and the public sample table it must cover."""
+
+    role: str
+    expected: Path
+    artifact: Path
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,45 @@ class ExperimentContract:
     prediction: PredictionContract
     metric: MetricContract
 
+    @property
+    def prediction_jobs(self) -> dict[str, PredictionJob]:
+        artifacts = {
+            "score_val": self.prediction.validation_artifact,
+            "test": self.prediction.test_submission,
+        }
+        return {
+            role: PredictionJob(role, self.splits[role].path, artifact)
+            for role, artifact in artifacts.items()
+            if role in self.splits and artifact is not None
+        }
+
+    def public_prediction_jobs(self) -> dict[str, dict[str, str]]:
+        return {
+            role: {
+                "expected": _public_ref(self.workspace_dir, job.expected),
+                "artifact": _public_ref(self.workspace_dir, job.artifact),
+            }
+            for role, job in self.prediction_jobs.items()
+        }
+
+    def evaluator_lifecycle_spec(self) -> dict[str, Any]:
+        """Export jobs plus derived fields for callers of the historical API.
+
+        These compatibility fields are views, never a second split declaration.
+        No private answer location is included in the public evaluator spec.
+        """
+        jobs = self.public_prediction_jobs()
+        score = jobs.get("score_val", {})
+        test = jobs.get("test", {})
+        return {
+            "prediction_jobs": jobs,
+            "public_splits": list(self.splits),
+            "score_split": score.get("expected"),
+            "test_split": test.get("expected"),
+            "validation_artifact": score.get("artifact"),
+            "test_submission": test.get("artifact"),
+        }
+
     def split_path(self, name: str) -> Path | None:
         split = self.splits.get(name)
         return split.path if split is not None else None
@@ -83,9 +132,11 @@ def _read_json_dict(path: Path) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+    except (ValueError, OSError) as exc:
+        raise SplitContractError(f"Cannot read contract JSON: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SplitContractError(f"Contract JSON must contain an object: {path}")
+    return data
 
 
 def _nested_dict(value: Any, key: str) -> dict[str, Any]:
@@ -103,8 +154,11 @@ def _public_ref(workspace_dir: Path, path: Path) -> str:
 
 
 def _load_split_manifest(split_dir: Path) -> dict[str, Any]:
-    manifest = _read_json_dict(split_dir / "split_manifest.json")
-    if manifest:
+    path = split_dir / "split_manifest.json"
+    if path.is_file():
+        manifest = _read_json_dict(path)
+        if not manifest:
+            raise SplitContractError(f"Prepared split manifest is empty: {path}")
         return manifest
     embedded = _nested_dict(
         _read_json_dict(split_dir / "split_plan.json"), "split_manifest"
@@ -147,36 +201,36 @@ def _load_splits(
     workspace_dir: Path,
     split_dir: Path,
     split_plan: dict[str, Any],
+    split_manifest: dict[str, Any],
 ) -> dict[str, SplitContract]:
-    specs = [
-        ("train", "training", "agent_train.csv", None),
-        ("score_val", "score validation", "score_val.csv", "agent_val.csv"),
-        ("test", "test prediction", "agent_test.csv", None),
-    ]
+    declared = resolve_public_splits(split_manifest)
+    canonical = split_manifest.get("manifest_version") == 2
+    roles = {"train": "training", "score_val": "score validation", "test": "test prediction"}
     splits: dict[str, SplitContract] = {}
-    for name, role, default_file, legacy_file in specs:
-        path, legacy_alias = _split_path_from_plan(
-            workspace_dir,
-            split_dir,
-            split_plan,
-            name,
-            default_file,
-            legacy_file=legacy_file,
-        )
-        if path.is_file():
-            splits[name] = SplitContract(
-                name=name,
-                path=path,
-                public_ref=_public_ref(workspace_dir, path),
-                role=role,
-                legacy_alias=legacy_alias,
+    for name, relative_path in declared.items():
+        if canonical:
+            path, legacy_alias = workspace_dir / "input" / relative_path, None
+            if not path.is_file():
+                raise SplitContractError(f"Declared {name} split file is missing: {path}")
+        else:
+            # Historical path spellings are resolved only at this import boundary.
+            # Missing files never change the declared role set.
+            path, legacy_alias = _split_path_from_plan(
+                workspace_dir, split_dir, split_plan, name, Path(relative_path).name,
+                legacy_file="agent_val.csv" if name == "score_val" else None,
             )
+        splits[name] = SplitContract(
+            name=name, path=path, public_ref=_public_ref(workspace_dir, path),
+            role=roles[name], legacy_alias=legacy_alias,
+        )
     return splits
 
 
 def _hidden_answer_source(
     split_plan: dict[str, Any], split_manifest: dict[str, Any]
 ) -> dict[str, Any]:
+    if split_manifest.get("manifest_version") == 2:
+        return _nested_dict(split_manifest, "hidden_answers")
     for source in (
         split_manifest.get("hidden_answers"),
         split_manifest.get("private_gt"),
@@ -196,7 +250,7 @@ def _load_hidden_answers(
 ) -> dict[str, HiddenAnswerContract]:
     source = _hidden_answer_source(split_plan, split_manifest)
     private_dir = hidden_answers_dir or workspace_dir.parent / "private_gt"
-    if not source:
+    if not source and split_manifest.get("manifest_version") != 2:
         source = _read_json_dict(private_dir / "private_gt.json")
     result: dict[str, HiddenAnswerContract] = {}
     for split in ("score_val", "test"):
@@ -227,6 +281,8 @@ def _manifest_maximize(
     split_manifest: dict[str, Any], primary_metric: str | None
 ) -> bool:
     metric_contract = _nested_dict(split_manifest, "metric_contract")
+    if split_manifest.get("manifest_version") == 2 and metric_contract.get("metrics"):
+        return bool(metric_definitions(metric_contract)[0]["maximize"])
     if isinstance(metric_contract.get("maximize"), bool):
         return bool(metric_contract["maximize"])
     return metric_maximize(primary_metric)
@@ -237,9 +293,28 @@ def _build_prediction_contract(
     split_plan: dict[str, Any],
     split_manifest: dict[str, Any],
     spec: dict[str, Any],
+    *,
+    has_test: bool,
 ) -> PredictionContract:
     manifest_contract = _nested_dict(split_manifest, "prediction_contract")
     manifest_metric = _nested_dict(split_manifest, "metric_contract")
+    if split_manifest.get("manifest_version") == 2:
+        # Prepared protocol is authoritative. The evaluator may add codec
+        # metadata, but cannot change already prepared facts on a later load.
+        spec = {**spec, **manifest_metric, **manifest_contract}
+        if "metrics" in manifest_metric:
+            for field_name in ("primary_metric", "secondary_metrics", "maximize"):
+                spec.pop(field_name, None)
+        spec["validation_artifact"] = manifest_contract.get(
+            "validation_artifact", "./working/validation_predictions.csv"
+        )
+        spec["test_submission"] = (
+            manifest_contract.get("test_submission", "./working/submission.csv")
+            if has_test else None
+        )
+        if "key_columns" in split_manifest:
+            spec["key_columns"] = split_manifest["key_columns"]
+    definitions = _metric_definitions_from_sources(spec, manifest_metric, split_plan)
     validation_artifact = spec.get("validation_artifact") or manifest_contract.get(
         "validation_artifact"
     )
@@ -251,6 +326,8 @@ def _build_prediction_contract(
         or list_of_strings(split_manifest.get("key_columns"))
         or list_of_strings(manifest_contract.get("key_columns"))
     )
+    if split_manifest.get("manifest_version") == 2:
+        key_columns = list_of_strings(split_manifest.get("key_columns"))
     file_reference_columns = file_reference_columns_from_spec(spec) or list_of_strings(
         manifest_contract.get("file_reference_columns")
     )
@@ -283,12 +360,14 @@ def _build_prediction_contract(
             workspace_dir,
             test_submission,
             workspace_dir / "working" / "submission.csv",
-        ),
+        ) if has_test else None,
         key_columns=key_columns,
         prediction_columns=prediction_columns,
         file_reference_columns=file_reference_columns,
         primary_metric=primary_metric,
-        maximize=bool(
+        maximize=bool(definitions[0]["maximize"]) if (
+            split_manifest.get("manifest_version") == 2 and definitions
+        ) else bool(
             spec.get(
                 "maximize",
                 manifest_metric.get("maximize", metric_maximize(primary_metric)),
@@ -330,7 +409,7 @@ def _build_prediction_contract(
             else None
         ),
         positive_class=spec.get("positive_class"),
-        metrics=_metric_definitions_from_sources(spec, manifest_metric, split_plan),
+        metrics=definitions,
     )
 
 
@@ -345,8 +424,9 @@ def load_experiment_contract(
     split_plan = _read_json_dict(split_dir / "split_plan.json")
     split_manifest = _load_split_manifest(split_dir)
     prediction_spec = _load_prediction_spec(workspace_dir)
+    splits = _load_splits(workspace_dir, split_dir, split_plan, split_manifest)
     prediction = _build_prediction_contract(
-        workspace_dir, split_plan, split_manifest, prediction_spec
+        workspace_dir, split_plan, split_manifest, prediction_spec, has_test="test" in splits
     )
     primary_metric = prediction.primary_metric or _manifest_primary_metric(
         split_manifest
@@ -358,18 +438,25 @@ def load_experiment_contract(
             if prediction.primary_metric
             else _manifest_maximize(split_manifest, primary_metric)
         ),
-        secondary_metrics=list_of_strings(prediction_spec.get("secondary_metrics")),
+        secondary_metrics=list_of_strings(prediction.raw.get("secondary_metrics")),
         metrics=prediction.metrics,
     )
-    return ExperimentContract(
+    hidden_answers = _load_hidden_answers(
+        workspace_dir, split_plan, split_manifest, hidden_answers_path
+    )
+    if any(role not in splits for role in hidden_answers):
+        raise SplitContractError("Private answers reference an undeclared public split.")
+    contract = ExperimentContract(
         workspace_dir=workspace_dir,
         split_dir=split_dir,
         split_plan=split_plan,
         split_manifest=split_manifest,
-        splits=_load_splits(workspace_dir, split_dir, split_plan),
-        hidden_answers=_load_hidden_answers(
-            workspace_dir, split_plan, split_manifest, hidden_answers_path
-        ),
+        splits=splits,
+        hidden_answers=hidden_answers,
         prediction=prediction,
         metric=metric,
+    )
+    return replace(
+        contract,
+        prediction=replace(prediction, raw={**prediction.raw, **contract.evaluator_lifecycle_spec()}),
     )

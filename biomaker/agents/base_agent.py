@@ -81,6 +81,8 @@ def parse_factual_exec_result(
             "metric": evaluator_result.get("metric"),
             "maximize": bool(evaluator_result.get("maximize", True)),
             "details": score_details,
+            "failure_kind": evaluator_result.get("failure_kind"),
+            "error": evaluator_result.get("error"),
         }
         values = evaluator_result.get("metrics")
         if not isinstance(values, dict):
@@ -129,6 +131,24 @@ def parse_factual_exec_result(
         external_metric = parse_external_validation(exec_result.term_out)
 
     node.analysis = ""
+    if (
+        evaluator_result is not None
+        and not evaluator_result.get("ok")
+        and evaluator_result.get("failure_kind") in {
+            "timeout", "resource", "interrupted", "execution", "protocol",
+        }
+        and exec_result.candidate_exc_type is None
+        and exec_result.candidate_returncode in (None, 0)
+        and (exec_result.artifact_validation or {}).get("ok", True)
+    ):
+        # No official score exists, and there is no demonstrated candidate bug.
+        # Keep its saved outputs for re-scoring; do not offer it for debugging
+        # or rank a partial metric vector as a completed experiment.
+        node.is_buggy = None
+        node.outcome = "unscored"
+        node.metric = None
+        node.metrics = {}
+        return
     if external_metrics is not None:
         declared_names = [spec["name"] for spec in metric_specs] or list(
             external_metrics
@@ -318,9 +338,9 @@ class BaseAgent:
             f"The per-node execution timeout is {timeout_text}. This is a hard safety limit, not a target budget. Choose the experiment scale from the task, data, observed validation metric, runtime, and resource history so the full script is likely to finish well before the timeout.",
             'All the provided input data is stored in "./input" directory.',
             "When building data loading code, base it on the actual existing data files rather than relying entirely on the annotation file.",
-            "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` for score-validation predictions and `./working/submission.csv`.",
+            "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` and the Experiment guide's prediction_jobs. Write the artifact for each declared prediction job using exactly its expected sample list.",
             "The Experiment guide's evaluation_protocol provides the complete frozen output and metric contract, including thresholds, class order, units, crops and aggregation when applicable. Harness owns final metric calculation; your program produces predictions. Choose the model, loss, training strategy, augmentation and preprocessing yourself within the task requirements, and convert final predictions back to the declared evaluation representation.",
-            "BioMaker computes the final validation metrics after your script exits using hidden score labels that are not available to generated code. You may call `evaluator.validate_submission()` yourself after writing the required files, but do not call `evaluator.score_val()` inside generated code because the hidden score labels are only supplied to BioMaker's external scoring process.",
+            "BioMaker computes the final validation metrics after your script exits using hidden score labels that are not available to generated code. For a declared test prediction job, you may call `evaluator.validate_submission()` after writing its artifact. Do not call `evaluator.score_val()` inside generated code because the hidden score labels are only supplied to BioMaker's external scoring process.",
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
         ]
         if (

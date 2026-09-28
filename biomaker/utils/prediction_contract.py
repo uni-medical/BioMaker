@@ -53,13 +53,9 @@ def _read_json_dict(path: Path) -> dict[str, Any]:
 
 
 def load_split_manifest_for_workspace(workspace_dir: Path | str) -> dict[str, Any]:
-    split_dir = Path(workspace_dir) / "input" / "biomaker_splits"
-    manifest = _read_json_dict(split_dir / "split_manifest.json")
-    if manifest:
-        return manifest
-    split_plan = _read_json_dict(split_dir / "split_plan.json")
-    embedded = split_plan.get("split_manifest")
-    return embedded if isinstance(embedded, dict) else {}
+    from .experiment_contract import _load_split_manifest
+
+    return _load_split_manifest(Path(workspace_dir) / "input" / "biomaker_splits")
 
 
 def primary_metric_from_spec(spec: dict[str, Any]) -> str | None:
@@ -134,7 +130,7 @@ def resolve_artifact_path(workspace_dir: Path, value: str) -> Path:
 class PredictionContract:
     raw: dict[str, Any]
     validation_artifact: Path
-    test_submission: Path
+    test_submission: Path | None
     key_columns: list[str]
     prediction_columns: list[str]
     file_reference_columns: list[str]

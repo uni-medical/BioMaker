@@ -19,6 +19,7 @@ from biomaker.utils.airway_reference import (
     _validate_tree,
     prepare_tree_reference,
 )
+from biomaker.utils.trusted_metrics import score_samples
 
 
 @pytest.fixture
@@ -172,29 +173,82 @@ def test_refinement_preserves_the_original_full_skeleton(reference_dependencies)
     assert graph.shape == (2, 0)
 
 
-def test_hole_filling_cannot_silently_change_ground_truth(reference_dependencies):
-    label = np.zeros((9, 11, 31), dtype=np.uint8)
-    label[3:6, 4:7, 3:28] = 1
+def test_hole_filled_reference_preserves_original_label(reference_dependencies, tmp_path):
+    sitk = reference_dependencies
+    reference_mask = np.zeros((9, 11, 31), dtype=np.uint8)
+    reference_mask[3:6, 4:7, 3:28] = 1
+    label = reference_mask.copy()
     label[4, 5, 15] = 0
-    with pytest.raises(TreeReferenceError, match="ORIGINAL"):
-        _derive_reference(label)
+    label[0, 0, 0] = 37  # The separate component remains in the original label.
+    original = label.copy()
+    label_path = tmp_path / "label_with_hole.mha"
+    write_label(sitk, label_path, label)
+    original_bytes = label_path.read_bytes()
+
+    # Exercise the unchanged ATM22 preprocessing and full derivation, using an
+    # independently specified mask: largest component retained, one hole filled.
+    upstream = _load_upstream()
+    np.testing.assert_array_equal(
+        upstream.large_connected_domain((label > 0).astype(np.uint8)), reference_mask
+    )
+    skeleton, parsing, graph, metadata = _derive_reference(label)
+    assert skeleton[4, 5, 15] == 1
+    assert np.count_nonzero((skeleton > 0) & (original == 0)) == 1
+    assert np.all(reference_mask[skeleton > 0] == 1)
+    assert np.all(parsing[skeleton > 0] == 1)
+    assert metadata["node_count"] == 1
+    assert metadata["skeleton_voxels_outside_original_label"] == 1
+    assert graph.shape == (2, 0)
+    np.testing.assert_array_equal(label, original)
+
+    # Feed the actual generated references through the registered scorer. A
+    # perfect raw-label prediction omits the filled hole, so TLD is below one.
+    # The separate original component makes raw Betti error one.
+    names = ["binary_dice", "cldice", "tree_length_detected", "branch_detected", "betti_error"]
+    spec = {
+        "metrics": [{"name": name, "maximize": name != "betti_error"} for name in names],
+        "dice_smooth": 1e-5, "topology_smooth": 1e-5, "betti_reference": "one",
+    }
+    count = np.count_nonzero(skeleton)
+    expected = dict(zip(names, [1.0, 2 * (count - 1) / (2 * count - 1),
+                               (count - 1 + 1e-5) / (count + 1e-5), 1.0, 1.0]))
+    scores = score_samples([dict(prediction=label.copy(), target=label,
+                                 skeleton=skeleton, parsing=parsing)], spec)
+    assert scores["metrics"] == pytest.approx(expected, abs=1e-12)
+    np.testing.assert_array_equal(label, original)
+
+    result = prepare_tree_reference(label_path, tmp_path / "references", include_graph=False)
+    for key, expected in (("skeleton_path", skeleton), ("parsing_path", parsing)):
+        actual = sitk.GetArrayFromImage(sitk.ReadImage(result[key])).transpose(2, 1, 0)
+        np.testing.assert_array_equal(actual, expected)
+    assert label_path.read_bytes() == original_bytes
+    saved_label = sitk.GetArrayFromImage(sitk.ReadImage(str(label_path))).transpose(2, 1, 0)
+    np.testing.assert_array_equal(saved_label, original)
+    metadata = json.loads(Path(result["metadata_path"]).read_text())
+    assert metadata["identity"]["input_sha256"] == hashlib.sha256(original_bytes).hexdigest()
+    assert metadata["tree"]["skeleton_voxels_outside_original_label"] == 1
 
 
-def test_original_label_containment_and_disconnected_graph_rejected():
-    label = np.ones((3, 3, 3), dtype=np.uint8)
-    skeleton = label.copy()
-    parsing = label.copy()
-    label[0, 0, 0] = 0
-    with pytest.raises(TreeReferenceError, match="ORIGINAL"):
-        _validate_tree(skeleton, parsing, np.ones((1, 1)), np.zeros((1, 1)), label, 1)
+def test_reference_mask_containment_and_disconnected_graph_rejected():
+    reference_mask = np.ones((3, 3, 3), dtype=np.uint8)
+    skeleton = reference_mask.copy()
+    parsing = reference_mask.copy()
+    reference_mask[0, 0, 0] = 0
+    with pytest.raises(TreeReferenceError, match="reference|processed"):
+        _validate_tree(skeleton, parsing, np.ones((1, 1)), np.zeros((1, 1)), reference_mask, 1)
+
+    reference_mask[:] = 1
+    parsing[0, 0, 0] = 0
+    with pytest.raises(TreeReferenceError, match="parsing branch ID"):
+        _validate_tree(skeleton, parsing, np.ones((1, 1)), np.zeros((1, 1)), reference_mask, 1)
+    parsing[:] = 1
 
     # An isolated root plus a disconnected 2-cycle meets the simple N-1 edge
     # count and per-node indegree conditions; reachability must reject it.
-    label[:] = 1
     parsing[1] = 2
     parsing[2] = 3
     children = np.array([[0, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=np.uint8)
     parent = children.T.copy()
     parent[0, 0] = 1
     with pytest.raises(TreeReferenceError, match="not fully reachable"):
-        _validate_tree(skeleton, parsing, parent, children, label, 3)
+        _validate_tree(skeleton, parsing, parent, children, reference_mask, 3)

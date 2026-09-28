@@ -113,8 +113,10 @@ def fixed_restoration_spec(context, task):
         raise ValueError('Hidden target and prediction columns cannot be sample keys.')
     if tc not in context['answer_columns'] or tc not in context['hidden_df']:
         raise ValueError('Target path must be a declared hidden answer.')
-    for name in ('score_df', 'test_df'):
-        df = context[name]
+    frames = context.get('public_frames')
+    if frames is None:  # Historical direct reader API.
+        frames = {name: context[name] for name in ('score_df', 'test_df') if context.get(name) is not None}
+    for df in frames.values():
         cols = list(dict.fromkeys(keys + [ic] + ([group] if group else [])))
         if any(c not in df for c in cols) or tc in df:
             raise ValueError('Expected rows must expose input/group metadata and hide targets.')

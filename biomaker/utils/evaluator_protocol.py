@@ -14,6 +14,10 @@ import pandas as pd
 EVALUATOR_API_VERSION = 3
 
 
+class PredictionRowsValidationError(ValueError):
+    """A prediction-row violation established against the public expected rows."""
+
+
 def metric_definitions(spec: dict[str, Any], *, allow_legacy_unknown: bool = False) -> list[dict[str, Any]]:
     """Return canonical, distinct objectives with explicit independent directions.
 
@@ -53,23 +57,21 @@ def validate_scoring_rows(
     if not len(expected):
         raise ValueError("Cannot score an empty split.")
     for label, frame in zip(("predictions", "answers", "expected rows"), frames):
+        error_type = PredictionRowsValidationError if label == "predictions" else ValueError
         if len(frame) != len(expected):
-            raise ValueError(f"{label} row count does not match the scoring split.")
+            raise error_type(f"{label} row count does not match the scoring split.")
         if any(key not in frame.columns for key in keys):
-            raise ValueError(f"{label} missing sample key columns.")
+            raise error_type(f"{label} missing sample key columns.")
         if keys and (frame[keys].isna().any().any() or frame.duplicated(keys).any()):
-            raise ValueError(f"{label} has missing or duplicate sample keys.")
+            raise error_type(f"{label} has missing or duplicate sample keys.")
     if keys:
         expected_keys = set(expected[keys].itertuples(index=False, name=None))
-        if any(
-            set(frame[keys].itertuples(index=False, name=None)) != expected_keys
-            for frame in (pred, truth)
-        ):
-            raise ValueError(
-                "Predictions or answers do not match the scoring sample keys."
-            )
+        for label, frame in (("predictions", pred), ("answers", truth)):
+            if set(frame[keys].itertuples(index=False, name=None)) != expected_keys:
+                error_type = PredictionRowsValidationError if label == "predictions" else ValueError
+                raise error_type(f"{label} do not match the scoring sample keys.")
     if any(column not in pred.columns for column in spec["prediction_columns"]):
-        raise ValueError("Predictions missing declared output columns.")
+        raise PredictionRowsValidationError("Predictions missing declared output columns.")
     return len(expected)
 
 

@@ -129,9 +129,9 @@ def _append_hidden_answers(lines: list[str], guide: dict[str, Any]) -> None:
 def _append_artifacts(lines: list[str], guide: dict[str, Any]) -> None:
     prediction = _as_dict(guide.get("prediction"))
     metric = _as_dict(guide.get("metric"))
+    jobs = _as_dict(guide.get("prediction_jobs"))
     contract = {
-        "validation_artifact": prediction.get("validation_artifact"),
-        "test_submission": prediction.get("test_submission"),
+        "prediction_jobs": jobs,
         "key_columns": prediction.get("key_columns") or [],
         "prediction_columns": prediction.get("prediction_columns") or [],
         "prediction_type": prediction.get("prediction_type") or "columns",
@@ -171,10 +171,8 @@ def _append_artifacts(lines: list[str], guide: dict[str, Any]) -> None:
             ]
         )
     lines.extend(["", "Required evaluator artifacts:"])
-    if prediction.get("validation_artifact"):
-        lines.append(f"- validation predictions: `{prediction['validation_artifact']}`")
-    if prediction.get("test_submission"):
-        lines.append(f"- test submission: `{prediction['test_submission']}`")
+    for role, job in jobs.items():
+        lines.append(f"- {role} predictions: `{job['artifact']}` for samples in `{job['expected']}`")
     if "key_columns" in prediction:
         lines.append(f"- key columns: {_list_text(prediction.get('key_columns'))}")
     prediction_columns = prediction.get("prediction_columns") or prediction.get(

@@ -19,7 +19,8 @@ def frozen_metric_source() -> str:
     imports = [node for node in ast.parse(source).body
                if isinstance(node, ast.ImportFrom) and node.level == 1
                and node.module == 'segmentation_metrics']
-    expected = {'segmentation_score_case', 'validate_tree_sample', 'normalize_segmentation_parameters'}
+    expected = {'segmentation_score_case', 'validate_tree_sample', 'normalize_segmentation_parameters',
+                '_seg_score_validated_case'}
     if (len(imports) != 1 or {item.name for item in imports[0].names} != expected
             or any(item.asname is not None for item in imports[0].names)):
         raise RuntimeError("Trusted segmentation dependency binding changed; update source bundling.")

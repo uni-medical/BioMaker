@@ -112,6 +112,46 @@ def test_t1_largest_component_branch_threshold_and_raw_dice():
                                   parsing=parsing, skeleton=target), [T1[3]])[T1[3]] == 0
 
 
+def cavity_reference():
+    """A supplied five-voxel centerline crossing one enclosed raw-label hole."""
+    parsing = np.zeros((5, 5, 7), dtype=np.uint8)
+    parsing[1:4, 1:4, 1:6] = 1
+    target = parsing.copy()
+    target[2, 2, 3] = 0
+    skeleton = np.zeros_like(target)
+    skeleton[2, 2, 1:6] = 1
+    return dict(prediction=skeleton & target, target=target,
+                skeleton=skeleton, parsing=parsing)
+
+
+def test_t1_supplied_skeleton_may_cross_raw_target_hole_without_repair():
+    sample = cavity_reference()
+    before = {key: value.copy() for key, value in sample.items()}
+    for value in sample.values():
+        value.flags.writeable = False
+    # Raw target: 44 voxels; prediction: four, split into two equal components.
+    # clDice sensitivity=4/5 and precision=1. TLD retains two of five reference
+    # voxels, BD sees 40% coverage, and raw prediction Betti is |2-1|.
+    expected = dict(zip(T1, [(8 + 1e-5) / (48 + 1e-5), 8 / 9,
+                             (2 + 1e-5) / (5 + 1e-5), 0.0, 1.0]))
+    assert case_scores(sample, T1) == pytest.approx(expected, abs=1e-12)
+    for key, value in sample.items():
+        assert np.array_equal(value, before[key])
+
+
+@pytest.mark.parametrize("missing", [True, False], ids=["missing_parsing", "zero_on_hole"])
+def test_outside_target_skeleton_still_requires_positive_parsing(missing):
+    sample = cavity_reference()
+    if missing:
+        sample.pop("parsing")
+        message = "require parsing"
+    else:
+        sample["parsing"][2, 2, 3] = 0
+        message = "every skeleton voxel must have a positive parsing branch ID"
+    with pytest.raises(ValueError, match=message):
+        validate(sample, T1)
+
+
 def test_t1_betti_uses_26_connectivity_and_fixed_one_not_gt_components():
     prediction = np.zeros((5, 5, 5), dtype=np.uint8)
     prediction[1, 1, 1] = prediction[2, 2, 2] = 1
@@ -301,22 +341,34 @@ def test_generic_single_branch_tree_has_empty_edges_but_valid_graph_metrics():
 
 
 @pytest.mark.parametrize("field,change", [
-    ("skeleton", "outside"), ("skeleton", "fractional"),
+    ("skeleton", "outside_parsing"), ("skeleton", "fractional"),
     ("parsing", "fractional"), ("parsing", "missing_id"),
     ("parsing", "zero_on_skeleton"),
+    ("skeleton", "nonfinite"), ("parsing", "nonfinite"),
+    ("skeleton", "shape"), ("parsing", "shape"),
 ])
 def test_reference_arrays_are_validated_without_silent_repair(field, change):
     sample = anatomical_line()
-    if change == "outside":
+    if change == "outside_parsing":
         sample[field][0, 0, 0] = 1
-    elif change == "fractional":
+    elif change in ("fractional", "nonfinite"):
         sample[field] = sample[field].astype(float)
-        sample[field][2, 2, 1] = 0.5
+        sample[field][2, 2, 1] = 0.5 if change == "fractional" else np.nan
+    elif change == "shape":
+        sample[field] = sample[field][:-1]
     elif change == "missing_id":
         sample[field][sample[field] == 2] = 4
     else:
         sample[field][2, 2, 1] = 0
-    with pytest.raises(ValueError):
+    message = {
+        "outside_parsing": "positive parsing branch ID",
+        "fractional": "exact integer labels",
+        "nonfinite": "non-finite values",
+        "shape": "shapes must match",
+        "missing_id": "contiguous",
+        "zero_on_skeleton": "positive parsing branch ID",
+    }[change]
+    with pytest.raises(ValueError, match=message):
         validate(sample, [T1[3]])
 
 
@@ -326,13 +378,14 @@ def geometry(shape):
 
 
 @pytest.mark.parametrize("field", ["size", "spacing", "origin", "direction"])
-def test_optional_geometry_catches_original_grid_mismatches(field):
+@pytest.mark.parametrize("array", ["prediction", "target", "skeleton", "parsing"])
+def test_optional_geometry_catches_original_grid_mismatches(array, field):
     sample = anatomical_line()
     reference = geometry(sample["target"].shape)
     sample.update({key + "_geometry": copy.deepcopy(reference)
                    for key in ("input", "prediction", "target", "skeleton", "parsing")})
     validate(sample, T1[1:])
-    sample["prediction_geometry"][field][0] += 1
+    sample[array + "_geometry"][field][0] += 1
     with pytest.raises(ValueError):
         validate(sample, T1[1:])
 

@@ -16,12 +16,20 @@ than silently changing the protocol or dropping samples.
 
 import copy
 import math
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from threading import Lock
+from time import perf_counter
 from collections.abc import Mapping
 
 import numpy as np
 from scipy import ndimage as ndi
 
-from .segmentation_metrics import segmentation_score_case, validate_tree_sample, normalize_segmentation_parameters
+from .segmentation_metrics import (segmentation_score_case, validate_tree_sample,
+                                   normalize_segmentation_parameters, _seg_score_validated_case)
+
+
+class PredictionValidationError(ValueError):
+    """A violation demonstrated using only public prediction/input fields."""
 
 
 class UndefinedMetricError(ValueError):
@@ -779,6 +787,25 @@ def _detection_boxes(value, prediction):
 
 
 def _validate_sample(sample, spec, require_target):
+    """Attribute only demonstrable public input violations to the candidate.
+
+    Normal scoring validates once. If validation fails, retry the public-only
+    check to distinguish a malformed prediction from private truth/reference
+    problems; exception wording is never used to make that classification.
+    """
+    try:
+        return _validate_sample_impl(sample, spec, require_target)
+    except ValueError as exc:
+        if not require_target:
+            raise PredictionValidationError(str(exc)) from exc
+        try:
+            _validate_sample_impl(sample, spec, require_target=False)
+        except ValueError as prediction_exc:
+            raise PredictionValidationError(str(prediction_exc)) from prediction_exc
+        raise
+
+
+def _validate_sample_impl(sample, spec, require_target):
     if not isinstance(sample, Mapping) or 'prediction' not in sample:
         raise ValueError('Adapter must return a sample mapping containing prediction.')
     if require_target and ('target' not in sample or sample['target'] is None):
@@ -1064,75 +1091,221 @@ def _detection_scores(samples, spec, names):
     return result, per_class
 
 
-def score_samples(samples, spec):
+def _score_timed_call(callback, stage, operation, metric_names=()):
+    if callback is None:
+        return operation()
+    context = {'stage': stage, 'metric_names': list(metric_names)}
+    callback(dict(context, event='started'))
+    started = perf_counter()
+    try:
+        result = operation()
+    except Exception as exc:
+        callback(dict(context, event='failed', elapsed_seconds=perf_counter() - started,
+                      error_type=type(exc).__name__))
+        raise
+    callback(dict(context, event='finished', elapsed_seconds=perf_counter() - started))
+    return result
+
+
+def _score_image_case(case_index, raw_sample, spec, names, callback):
+    """Validate and score one independent image; return only small score data."""
+    def emit(event):
+        callback(dict(event, case_index=case_index))
+
+    report = emit if callback is not None else None
+
+    def calculate():
+        sample = _score_timed_call(report, 'validate',
+                                   lambda: _validate_sample(raw_sample, spec, require_target=True))
+        truth, pred = sample['target'], sample['prediction']
+        if spec['task_family'] == 'image_restoration':
+            protocol = spec['restoration_evaluation']
+            def restoration():
+                values = [restoration_metrics(a, b, protocol['data_range'], spec['ssim_parameters'], names)
+                          for a, b in zip(restoration_crops(truth, protocol['crop_size']),
+                                          restoration_crops(pred, protocol['crop_size']))]
+                return {name: float(np.mean([value[name] for value in values])) for name in names}
+            image_scores = _score_timed_call(report, 'metric', restoration, names)
+            group = sample['group'] if protocol['groups'] is not None else None
+        else:
+            kernels = {'binary_dice': lambda a, b: _dice(a, b, spec['dice_smooth']), 'binary_iou': _iou,
+                       'aji': _aji, 'hd95': lambda a, b: _hd95(a, b, sample.get('spacing'))}
+            image_scores = {name: _score_timed_call(report, 'metric',
+                            lambda: kernels[name](truth, pred), (name,)) for name in names if name in kernels}
+            extra_names = [name for name in names if name in _SEGMENTATION_TREE_METRICS]
+            if extra_names:
+                # _validate_sample already validated all requested tree inputs.
+                # Never allow a sample/spec flag to opt out of that validation.
+                image_scores.update(_seg_score_validated_case(sample, extra_names, spec, report))
+            group = None
+        return image_scores, group
+
+    return _score_timed_call(report, 'case', calculate, names)
+
+
+def _image_score_records(samples, spec, names, callback, workers):
+    """Bound loaded/in-flight cases and emit results in input order.
+
+    Threads share arrays without pickling full CT volumes. This is deliberately
+    a per-invocation bound, not a machine-wide resource scheduler. Harness callers
+    must allocate workers with concurrent evaluators and memory limits in mind.
+    """
+    iterator = iter(samples)
+    exhausted = object()
+
+    def load(case_index):
+        started = perf_counter()
+        if callback is not None:
+            callback(dict(stage='load', event='started', case_index=case_index, metric_names=[]))
+        try:
+            raw_sample = next(iterator)
+        except StopIteration:
+            raw_sample = exhausted
+        except Exception as exc:
+            if callback is not None:
+                callback(dict(stage='load', event='failed', case_index=case_index, metric_names=[],
+                              elapsed_seconds=perf_counter() - started, error_type=type(exc).__name__))
+            raise
+        if callback is not None:
+            callback(dict(stage='load', event='exhausted' if raw_sample is exhausted else 'finished',
+                          case_index=case_index, metric_names=[], elapsed_seconds=perf_counter() - started))
+        return raw_sample
+
+    case_index = 0
+    if workers == 1:
+        while True:
+            raw_sample = load(case_index)
+            if raw_sample is exhausted:
+                return
+            record = _score_image_case(case_index, raw_sample, spec, names, callback)
+            del raw_sample
+            yield record
+            case_index += 1
+    else:
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='trusted-score')
+        pending = {}
+        completed = {}
+        next_result = 0
+        input_exhausted = False
+        try:
+            while not input_exhausted or pending:
+                # Only live work retains volumes. Completed records are small
+                # score dictionaries, so a slow early case cannot idle workers
+                # or force later completed arrays to remain resident.
+                while not input_exhausted and len(pending) < workers:
+                    raw_sample = load(case_index)
+                    if raw_sample is exhausted:
+                        input_exhausted = True
+                        break
+                    future = pool.submit(_score_image_case, case_index, raw_sample, spec, names, callback)
+                    pending[future] = case_index
+                    del raw_sample
+                    case_index += 1
+                if not pending:
+                    break
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                # Observe every available failure before loading further cases.
+                for future in sorted(done, key=pending.get):
+                    index = pending.pop(future)
+                    completed[index] = future.result()
+                del done, future
+                while next_result in completed:
+                    yield completed.pop(next_result)
+                    next_result += 1
+        finally:
+            for future in pending:
+                future.cancel()
+            # Active native calls cannot be killed safely as individual threads.
+            # The enclosing evaluator subprocess owns the hard timeout/cleanup.
+            pool.shutdown(wait=True, cancel_futures=True)
+
+
+def score_samples(samples, spec, progress_callback=None, workers=1):
     """Score canonical samples under one normalized and frozen metric protocol.
 
     Restoration averages corners within images, then images or declared groups.
     Segmentation averages images. Regression averages samples and outputs;
     classification and detection score the entire split. Returned metrics
-    contain only requested names, plus restoration
-    metric/group keys; ``n`` records the exact number of scored samples.
+    contain only requested names, plus restoration metric/group keys; ``n``
+    records the exact number of scored samples.
+
+    ``workers`` is a positive integer execution setting, separate from the frozen
+    mathematical protocol. Segmentation/restoration may use bounded case threads;
+    other families require workers=1. Reduction always follows input order.
+    At most ``workers`` cases are loaded/in-flight, never the whole volume split.
+
+    ``progress_callback(event)`` optionally receives dictionaries with ``stage``,
+    ``event`` (started/finished/failed; load also exhausted), and ``metric_names``.
+    Completed/failed operations include ``elapsed_seconds``; image stages also
+    include a zero-based ``case_index``. Metric events may repeat for individual
+    classes or share names when computation is shared; their times are inclusive
+    inside case/score times and must not be added twice. No paths, arrays, label
+    values or scores are emitted. Callbacks are serialized across case threads.
+    Callback exceptions propagate; returned score payloads are unchanged.
     """
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError('Scoring workers must be a positive integer.')
+    if progress_callback is not None and not callable(progress_callback):
+        raise ValueError('progress_callback must be callable or None.')
     spec = normalize_metric_spec(spec)
     definitions = normalize_metric_definitions(spec)
     names = [item['name'] for item in definitions]
     family = spec['task_family']
-    extras = {}
-    # Image/volume adapters can stream from disk. Retain only small score records,
-    # never all prediction and target arrays for a split.
-    if family in ('classification', 'detection'):
-        samples = [_validate_sample(sample, spec, require_target=True) for sample in samples]
-        if not samples:
-            raise ValueError('Scoring requires at least one sample.')
-        count = len(samples)
-    if family == 'classification':
-        metrics = _classification_scores(samples, spec, names)
-    elif family == 'regression':
-        metrics, count = _regression_scores(samples, spec, names)
-    elif family == 'detection':
-        metrics, extras['per_class'] = _detection_scores(samples, spec, names)
-    else:
-        per_image = []
-        grouped = {}
-        for raw_sample in samples:
-            sample = _validate_sample(raw_sample, spec, require_target=True)
-            truth, pred = sample['target'], sample['prediction']
+    if workers != 1 and family not in ('segmentation', 'image_restoration'):
+        raise ValueError('Parallel case scoring supports segmentation and image_restoration only.')
+    lock = Lock()
+
+    def emit(event):
+        with lock:
+            progress_callback(event)
+
+    callback = emit if progress_callback is not None else None
+
+    def score_split():
+        nonlocal samples
+        extras = {}
+        # Whole-split metrics retain their existing mathematical aggregation.
+        if family in ('classification', 'detection'):
+            samples = [_validate_sample(sample, spec, require_target=True) for sample in samples]
+            if not samples:
+                raise ValueError('Scoring requires at least one sample.')
+            count = len(samples)
+        if family == 'classification':
+            metrics = _classification_scores(samples, spec, names)
+        elif family == 'regression':
+            metrics, count = _regression_scores(samples, spec, names)
+        elif family == 'detection':
+            metrics, extras['per_class'] = _detection_scores(samples, spec, names)
+        else:
+            per_image = []
+            grouped = {}
+            for image_scores, group in _image_score_records(samples, spec, names, callback, workers):
+                per_image.append(image_scores)
+                if family == 'image_restoration' and spec['restoration_evaluation']['groups'] is not None:
+                    grouped.setdefault(group, []).append(image_scores)
+            count = len(per_image)
+            if not count:
+                raise ValueError('Scoring requires at least one sample.')
+            source = per_image
+            if family == 'segmentation':
+                extras['per_case'] = per_image
             if family == 'image_restoration':
-                protocol = spec['restoration_evaluation']
-                values = [restoration_metrics(a, b, protocol['data_range'], spec['ssim_parameters'], names)
-                          for a, b in zip(restoration_crops(truth, protocol['crop_size']), restoration_crops(pred, protocol['crop_size']))]
-                image_scores = {name: float(np.mean([value[name] for value in values])) for name in names}
-                if protocol['groups'] is not None:
-                    grouped.setdefault(sample['group'], []).append(image_scores)
-            else:
-                kernels = {'binary_dice': lambda a, b: _dice(a, b, spec['dice_smooth']), 'binary_iou': _iou, 'aji': _aji,
-                           'hd95': lambda a, b: _hd95(a, b, sample.get('spacing'))}
-                image_scores = {name: kernels[name](truth, pred) for name in names if name in kernels}
-                extra_names = [name for name in names if name in _SEGMENTATION_TREE_METRICS]
-                if extra_names:
-                    image_scores.update(segmentation_score_case(sample, extra_names, spec))
-            per_image.append(image_scores)
-        count = len(per_image)
-        if not count:
-            raise ValueError('Scoring requires at least one sample.')
-        source = per_image
-        if family == 'segmentation':
-            extras['per_case'] = per_image
-        if family == 'image_restoration':
-            groups = spec['restoration_evaluation']['groups']
-            if groups is not None and set(grouped) != set(groups):
-                raise ValueError('Scoring samples must contain all and only the declared groups.')
-            per_group = {group: {name: float(np.mean([value[name] for value in rows])) for name in names}
-                         for group, rows in grouped.items()}
-            if spec['restoration_evaluation']['aggregation'] == 'mean_groups':
-                source = list(per_group.values())
-            extras['per_group'] = per_group
-        metrics = {name: float(np.mean([value[name] for value in source])) for name in names}
-        for group, values in extras.get('per_group', {}).items():
-            metrics.update({name + '/' + group: value for name, value in values.items()})
-    if not all(math.isfinite(value) for value in metrics.values()):
-        raise ValueError('Non-finite requested metric.')
-    result = dict(metrics=metrics, n=count, **extras)
-    if 'metrics' not in spec:
-        result.update(metric=metrics[spec['primary_metric']], maximize=spec['maximize'])
-    return result
+                groups = spec['restoration_evaluation']['groups']
+                if groups is not None and set(grouped) != set(groups):
+                    raise ValueError('Scoring samples must contain all and only the declared groups.')
+                per_group = {group: {name: float(np.mean([value[name] for value in rows])) for name in names}
+                             for group, rows in grouped.items()}
+                if spec['restoration_evaluation']['aggregation'] == 'mean_groups':
+                    source = list(per_group.values())
+                extras['per_group'] = per_group
+            metrics = {name: float(np.mean([value[name] for value in source])) for name in names}
+            for group, values in extras.get('per_group', {}).items():
+                metrics.update({name + '/' + group: value for name, value in values.items()})
+        if not all(math.isfinite(value) for value in metrics.values()):
+            raise ValueError('Non-finite requested metric.')
+        result = dict(metrics=metrics, n=count, **extras)
+        if 'metrics' not in spec:
+            result.update(metric=metrics[spec['primary_metric']], maximize=spec['maximize'])
+        return result
+
+    return _score_timed_call(callback, 'score', score_split, names)

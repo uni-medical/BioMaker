@@ -27,6 +27,7 @@ from .utils.ranking import (
     validated_metric_specs,
 )
 from .utils.response import (
+    format_human_execution_output,
     format_prompt_execution_output,
     redact_local_paths,
     trim_execution_output,
@@ -87,9 +88,8 @@ class Node(DataClassJsonMixin):
     delta_vs_parent: float | None = field(default=None, kw_only=True)
     delta_vs_best: float | None = field(default=None, kw_only=True)
     outcome: str | None = field(default=None, kw_only=True)
-    # whether the agent decided that the code is buggy
-    # -> always True if exc_type is not None or no valid metric
-    is_buggy: bool = field(default=None, kw_only=True)  # type: ignore
+    # None means no conclusion (including unavailable Harness scoring).
+    is_buggy: bool | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.parent is not None:
@@ -159,6 +159,8 @@ class Node(DataClassJsonMixin):
 
     def record_experiment_context(self, best_node_before: Optional["Node"]) -> None:
         """Record simple experiment deltas after execution, before appending."""
+        if self.outcome == "unscored":
+            return
         if self.metrics and self.metric_specs:
             # Population-relative comparisons belong to Journal.append, after
             # this result and its baselines share one ranking snapshot.
@@ -373,7 +375,8 @@ class Journal(DataClassJsonMixin):
             "best_before": copy.deepcopy(current["nodes"].get(best_before_id)),
         }
         if record is None:
-            node.outcome = "bug" if node.is_buggy else "invalid_metrics"
+            if node.outcome != "unscored":
+                node.outcome = "bug" if node.is_buggy else "invalid_metrics"
             return
         node.metric_deltas = {}
         for relation, baseline_id in (
@@ -559,17 +562,41 @@ class Journal(DataClassJsonMixin):
         if lineage:
             append(_tree_record_lineage_intro(stage, selected_parent))
             for node in lineage:
-                append(
-                    _format_detail_record(
-                        node,
-                        (
-                            "root-to-parent lineage; selected parent"
-                            if node is selected_parent
-                            else "root-to-parent lineage ancestor"
-                        ),
-                        snapshot,
-                    )
+                record = _format_detail_record(
+                    node,
+                    (
+                        "root-to-parent lineage; selected parent"
+                        if node is selected_parent
+                        else "root-to-parent lineage ancestor"
+                    ),
+                    snapshot,
                 )
+                if (
+                    node is selected_parent
+                    and node.is_buggy is False
+                    and node.step is not None
+                    and node._term_out is not None
+                ):
+                    candidate = _execution_dict(node).get("candidate")
+                    if isinstance(candidate, dict):
+                        candidate_text = str(candidate.get("output") or "")
+                        if not candidate_text.strip():
+                            candidate_text = str(candidate.get("stdout") or "") + str(
+                                candidate.get("stderr") or ""
+                            )
+                    else:
+                        candidate_text = _candidate_execution_text(node)
+                    output = format_human_execution_output(
+                        candidate_text, max_chars=4000
+                    )
+                    output = truncate_text(redact_local_paths(output), max_chars=4000)
+                    if output:
+                        record += (
+                            "\n\nCandidate Execution Observations "
+                            "(not official validation metrics):\n"
+                            f"```\n{output}\n```"
+                        )
+                append(record)
         else:
             append(_tree_record_lineage_intro(stage, selected_parent))
 
@@ -1225,7 +1252,9 @@ def _format_execution_summary(n: Node, *, not_executed: bool) -> str:
 
     execution = _execution_dict(n)
     lines = [
-        "execution_status: " + ("bug" if n.is_buggy is True else "success"),
+        "execution_status: " + (
+            "unscored" if n.outcome == "unscored" else "bug" if n.is_buggy is True else "success"
+        ),
         f"failure: {_format_failure(execution.get('final_failure'))}",
     ]
 
@@ -1350,7 +1379,7 @@ def _format_detail_record(
             else "generation_in_progress"
         )
     else:
-        result_text = "bug" if n.is_buggy is True else "success"
+        result_text = "unscored" if n.outcome == "unscored" else "bug" if n.is_buggy is True else "success"
     metric_text = "unknown_not_executed" if not_executed else _metric_text(n, snapshot)
     exec_time = "unknown_not_executed" if not_executed else _format_runtime(n.exec_time)
     parent_id = n.parent.id[:8] if n.parent is not None else "root"

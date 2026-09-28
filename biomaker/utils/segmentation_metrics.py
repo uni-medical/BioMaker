@@ -40,6 +40,7 @@ SOFTWARE.
 """
 
 from collections.abc import Mapping as _SEG_Mapping
+from time import perf_counter as _seg_perf_counter
 
 import numpy as np
 from scipy import ndimage as _seg_ndi
@@ -269,6 +270,9 @@ def validate_tree_sample(sample, names, spec=None, require_target=True):
     geometry. It deliberately does not inspect any supplied private target or
     reference fields, so submission validation cannot use hidden ground truth.
     This function does not mutate arrays or construct derived references.
+    Supplied references may be derived from a preprocessed target (e.g. hole
+    filling), so skeleton containment in the unprocessed target is not required.
+    The reference builder validates containment in its own construction mask.
     """
     names = _seg_names(names, allow_traditional=True, allow_empty=True)
     if not isinstance(sample, _SEG_Mapping):
@@ -294,12 +298,10 @@ def validate_tree_sample(sample, names, spec=None, require_target=True):
             if result[key].shape != result['prediction'].shape:
                 raise ValueError('%s and prediction shapes must match' % key)
             array_keys.append(key)
-        if 'skeleton' in required:
+        if 'skeleton' in required and 'parsing' in required:
             for start in range(0, result['skeleton'].shape[0], 16):
                 skel = result['skeleton'][start:start + 16] > 0
-                if np.any(skel & (result['target'][start:start + 16] <= 0)):
-                    raise ValueError('every skeleton voxel must lie inside the target labeled airway')
-                if 'parsing' in required and np.any(skel & (result['parsing'][start:start + 16] <= 0)):
+                if np.any(skel & (result['parsing'][start:start + 16] <= 0)):
                     raise ValueError('every skeleton voxel must have a positive parsing branch ID')
         if 'parsing' in required:
             node_count = _seg_parsing_nodes(result['parsing'])
@@ -311,8 +313,9 @@ def validate_tree_sample(sample, names, spec=None, require_target=True):
     return result
 
 
-def _seg_largest_component(seg, connectivity):
-    components, count = _seg_ndi.label(seg > 0, structure=_seg_structure(seg.ndim, connectivity))
+def _seg_largest_component(seg, connectivity, labeled=None):
+    components, count = (labeled if labeled is not None else
+                         _seg_ndi.label(seg > 0, structure=_seg_structure(seg.ndim, connectivity)))
     if count <= 1:
         return seg
     sizes = np.bincount(components.ravel())
@@ -440,7 +443,24 @@ def _seg_td(gt, pred, valid, edges, missing_label_penalty):
 
 
 
-def segmentation_score_case(sample, names, spec=None):
+def _seg_timed_call(callback, stage, operation, metric_names=()):
+    """Emit path-free progress around one operation; leave its result unchanged."""
+    if callback is None:
+        return operation()
+    context = {'stage': stage, 'metric_names': list(metric_names)}
+    callback(dict(context, event='started'))
+    started = _seg_perf_counter()
+    try:
+        result = operation()
+    except Exception as exc:
+        callback(dict(context, event='failed', elapsed_seconds=_seg_perf_counter() - started,
+                      error_type=type(exc).__name__))
+        raise
+    callback(dict(context, event='finished', elapsed_seconds=_seg_perf_counter() - started))
+    return result
+
+
+def segmentation_score_case(sample, names, spec=None, progress_callback=None):
     """Return requested topology/multi-class segmentation scores for one case.
 
     Component filtering applies only to centerline/branch coverage and branch
@@ -448,47 +468,88 @@ def segmentation_score_case(sample, names, spec=None):
     prediction. Betti-0 compares raw connected-component counts against the target
     count, or one when explicitly configured. Multi-class means include nonzero
     GT-present labels only; clDice further excludes classes without GT centerline.
+    The optional progress callback receives stage/metric timing events, never
+    sample arrays, paths, labels or score values. The return value is unchanged.
     """
     names = _seg_names(names)
     parameters = normalize_segmentation_parameters(spec)
-    sample = validate_tree_sample(sample, names, spec=parameters)
+    sample = _seg_timed_call(progress_callback, 'validate',
+                             lambda: validate_tree_sample(sample, names, spec=parameters))
+    return _seg_score_validated_case(sample, names, parameters, progress_callback)
+
+
+def _seg_score_validated_case(sample, names, parameters, progress_callback=None):
+    """Internal kernel: caller must already have validated all requested inputs.
+
+    Keep this separate from the public validating API: a flag in an adapter's
+    sample or metric spec must never permit bypassing trusted input validation.
+    """
     requested, scores = set(names), {}
     prediction, target = sample['prediction'], sample['target']
+
+    def timed(stage, operation, metric_names=()):
+        return _seg_timed_call(progress_callback, stage, operation, metric_names)
+
+    def metric(name, operation):
+        return timed('metric', operation, (name,))
+
     if 'cldice' in requested:
-        scores['cldice'] = _seg_cldice(prediction > 0, target > 0, sample['skeleton'] > 0)
-    if requested & {'tree_length_detected', 'branch_detected'} or requested & _SEG_BRANCH_NAMES:
-        selected = (_seg_largest_component(prediction, parameters['connectivity'])
-                    if parameters['topology_component_policy'] == 'largest' else prediction)
+        scores['cldice'] = metric('cldice', lambda: _seg_cldice(
+            prediction > 0, target > 0, sample['skeleton'] > 0))
+    needs_selected = bool(requested & {'tree_length_detected', 'branch_detected'} or
+                          requested & _SEG_BRANCH_NAMES)
+    needs_largest = needs_selected and parameters['topology_component_policy'] == 'largest'
+    count = None
+    if needs_largest or 'betti_error' in requested:
+        # The very same raw prediction labeling supplies largest-component
+        # filtering and Betti-0. Release its volume as soon as selection is done.
+        structure = _seg_structure(prediction.ndim, parameters['connectivity'])
+        labeled = timed('components', lambda: _seg_ndi.label(prediction > 0, structure=structure))
+        count = labeled[1]
+        if needs_largest:
+            selected = timed('component_selection', lambda: _seg_largest_component(
+                prediction, parameters['connectivity'], labeled=labeled))
+        del labeled
+    if needs_selected and not needs_largest:
+        selected = prediction
     if requested & {'tree_length_detected', 'branch_detected'}:
         selected_foreground, skeleton = selected > 0, sample['skeleton'] > 0
         if 'tree_length_detected' in requested:
-            smooth = parameters['topology_smooth']
-            denominator = np.count_nonzero(skeleton) + smooth
-            scores['tree_length_detected'] = float((np.count_nonzero(selected_foreground & skeleton) + smooth) /
-                                                   denominator) if denominator else 0.0
+            def length_detected():
+                smooth = parameters['topology_smooth']
+                denominator = np.count_nonzero(skeleton) + smooth
+                return float((np.count_nonzero(selected_foreground & skeleton) + smooth) /
+                             denominator) if denominator else 0.0
+            scores['tree_length_detected'] = metric('tree_length_detected', length_detected)
         if 'branch_detected' in requested:
-            scores['branch_detected'] = _seg_bd(selected_foreground, sample['parsing'], skeleton,
-                                                parameters['branch_coverage_threshold'])
+            scores['branch_detected'] = metric('branch_detected', lambda: _seg_bd(
+                selected_foreground, sample['parsing'], skeleton, parameters['branch_coverage_threshold']))
     if 'betti_error' in requested:
-        structure = _seg_structure(prediction.ndim, parameters['connectivity'])
-        _, count = _seg_ndi.label(prediction > 0, structure=structure)
-        expected = 1
-        if parameters['betti_reference'] == 'target':
-            _, expected = _seg_ndi.label(target > 0, structure=structure)
-        scores['betti_error'] = float(abs(count - expected))
+        def betti_error():
+            expected = 1
+            if parameters['betti_reference'] == 'target':
+                _, expected = _seg_ndi.label(target > 0, structure=structure)
+            return float(abs(count - expected))
+        scores['betti_error'] = metric('betti_error', betti_error)
     if requested & {'multiclass_dice', 'multiclass_cldice'}:
-        classes = [label for label in np.unique(target) if label != 0]
+        classes = timed('target_classes', lambda: [label for label in np.unique(target) if label != 0])
         dice_scores, cldice_scores = [], []
         skeleton = sample['skeleton'] > 0 if 'multiclass_cldice' in requested else None
         for label in classes:
-            target_class, prediction_class = target == label, prediction == label
+            target_class, prediction_class = timed('class_masks', lambda: (target == label, prediction == label))
             if 'multiclass_dice' in requested:
-                dice_scores.append(_seg_dice(prediction_class, target_class, parameters['dice_smooth']))
+                dice_scores.append(metric('multiclass_dice', lambda: _seg_dice(
+                    prediction_class, target_class, parameters['dice_smooth'])))
             if 'multiclass_cldice' in requested:
-                class_skeleton = skeleton & target_class
-                if class_skeleton.any():
-                    cldice_scores.append(_seg_cldice(prediction_class, target_class, class_skeleton)
-                                         if prediction_class.any() else 0.0)
+                def class_cldice():
+                    class_skeleton = skeleton & target_class
+                    if class_skeleton.any():
+                        return (_seg_cldice(prediction_class, target_class, class_skeleton)
+                                if prediction_class.any() else 0.0)
+                    return None
+                value = metric('multiclass_cldice', class_cldice)
+                if value is not None:
+                    cldice_scores.append(value)
         if 'multiclass_dice' in requested:
             scores['multiclass_dice'] = float(np.mean(dice_scores)) if dice_scores else 0.0
         if 'multiclass_cldice' in requested:
@@ -496,18 +557,21 @@ def segmentation_score_case(sample, names, spec=None):
     if requested & _SEG_BRANCH_NAMES:
         parsing = sample['parsing']
         node_count = int(parsing.max())
-        actual = _seg_project_nodes(target, parsing, node_count)
-        predicted = _seg_project_nodes(selected, parsing, node_count)
+        actual = timed('target_projection', lambda: _seg_project_nodes(target, parsing, node_count))
+        predicted = timed('prediction_projection', lambda: _seg_project_nodes(selected, parsing, node_count))
         valid = actual != 0
         if requested & {'branch_accuracy', 'branch_f1'}:
-            acc, f1 = _seg_acc_f1(actual, predicted, valid, 'branch_f1' in requested)
+            shared_names = [name for name in names if name in ('branch_accuracy', 'branch_f1')]
+            acc, f1 = timed('metric', lambda: _seg_acc_f1(
+                actual, predicted, valid, 'branch_f1' in requested), shared_names)
             if 'branch_accuracy' in requested:
                 scores['branch_accuracy'] = acc
             if 'branch_f1' in requested:
                 scores['branch_f1'] = f1
         if 'subtree_consistency' in requested:
-            scores['subtree_consistency'] = _seg_sc(predicted, sample['graph'], parameters['subtree_ignore_labels'])
+            scores['subtree_consistency'] = metric('subtree_consistency', lambda: _seg_sc(
+                predicted, sample['graph'], parameters['subtree_ignore_labels']))
         if 'topological_distance' in requested:
-            scores['topological_distance'] = _seg_td(actual, predicted, valid, sample['graph'],
-                                                    parameters['missing_label_penalty'])
+            scores['topological_distance'] = metric('topological_distance', lambda: _seg_td(
+                actual, predicted, valid, sample['graph'], parameters['missing_label_penalty']))
     return {name: scores[name] for name in names}
