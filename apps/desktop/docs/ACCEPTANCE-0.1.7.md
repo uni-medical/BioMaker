@@ -1,13 +1,15 @@
 # BioMaker Desktop 0.1.7 acceptance
 
 Date: 2026-10-09. Host: macOS, Apple silicon / arm64.
-Release source commit: **Pending**.
+Release source commit: `9f19afba2686b1919b1e5cb10eb9043ebbd3e1c8`, clean checkout
+used for the package.
 
-Source validation, the development UI workflow and the initial real-engine
-health and repair acceptance passed. Final packaged health acceptance, packaging,
-installation and the installed training workflow remain **Pending**.
+Source validation, development and packaged UI workflows, real packaged-engine
+health and repair acceptance, artifact verification, installation and the
+installed synthetic training workflow passed. Post-workflow verification also
+passed.
 
-## Changes under acceptance
+## Verified changes
 
 - Users can check an installed runtime separately from installing or repairing
   it. The check runs the existing verification script with the engine's Python
@@ -104,10 +106,11 @@ renderer errors or forbidden requests were observed.
 
 ## Real-engine health and repair acceptance
 
-The initial development offline harness passed **4 of 4 checks in 104.605
-seconds**, before the final failure-marker hardening. It used isolated APFS
-clones of the installed engine and populated package cache. An OS policy denied
-outbound networking and writes to the original engine and cache.
+The final packaged service at `Contents/Resources/service` passed **4 of 4
+checks in 102.394 seconds**, including the failure-marker changes. The offline
+harness used isolated APFS clones of the installed engine and populated package
+cache. An OS policy denied outbound networking and writes to the original engine
+and cache.
 
 The initial healthy check ran real imports and the fixed CPU self-test without
 invoking uv. Removing the cloned MONAI package caused a real failed check, removed
@@ -117,55 +120,125 @@ native runtime and completed full verification. A second check passed without
 invoking uv.
 
 Complete before/after fingerprints of the source installed engine and original
-cache matched. These results are recorded separately from the synthetic Electron
-UI fixture and do not establish packaged or installed 0.1.7 acceptance.
+cache matched, and the health-QA processes were confirmed gone. The final
+acceptance receipt, repaired installation receipt and empty cleared failure
+marker are preserved under `output/qa/engine-health-0.1.7/`.
 
-**Pending.** Run the complete real-engine harness again against the final packaged
-0.1.7 service, including the durable failure-marker changes. The initial
-development result above does not establish that final packaged result.
+An earlier development run passed the same four scenarios in 104.605 seconds
+before marker hardening. The packaged result above validates the final service;
+it is separate from synthetic UI acceptance and from the complete installed
+training workflow below.
 
 ## Packaged executable acceptance
 
-**Pending.** Record the final clean source commit and run the packaged
-runtime-health UI acceptance plus the existing recovery, close protection,
-history import, organization, reuse and general Electron regression workflows.
-Preserve the distinction between synthetic UI states and real-engine checks.
+The packaged 0.1.7 executable passed all seven workflows with isolated synthetic
+profiles:
+
+| Workflow | Passed checks |
+| --- | --- |
+| Runtime-health UI | 9 / 9 |
+| Native-close protection | 6 / 6 |
+| Run organization | 8 / 8 |
+| Experiment reuse | 8 / 8 |
+| History import | 10 / 10 |
+| Service recovery | 7 / 7 |
+| General Electron acceptance | 22 / 22 |
+
+The packaged runtime-health workflow verified busy-state gating, cancellation,
+repair confirmation, retry after an error, draft preservation, external-worker
+and disk-access states, and rejection of a delayed older ready response. Engine
+states were synthetic: this UI harness performed no real engine check, install
+or repair and sent no provider requests or run mutations.
+
+Regression workflows preserved native-close safeguards, history-import
+exclusions and original files, revision-aware organization and explicit draft
+replacement. Real service failures retained the window, draft and native
+diagnostic export; retry preserved unsaved provider fields. General acceptance
+covered the real sidecar, renderer sandbox, IPC boundaries, settings, onboarding,
+theme, language, restart, artifacts, compact layout and notification interactions.
+No renderer errors were observed. Notification display was intercepted in QA;
+actual OS banner delivery is not established by these checks.
 
 ## Installation and final artifact verification
 
-**Pending.** Record final DMG and ZIP hashes, read-only DMG mount verification,
-Applications shortcut, bundled version and source identity, complete bundle
-comparison and final signature verification after packaged QA.
+The DMG was mounted read-only and its Applications shortcut resolved correctly.
+Deep strict signature verification passed on the unpacked application, DMG
+application and extracted ZIP application. Their complete 2,809-file bundle
+fingerprints, including symlink targets, matched. The bundled manifest recorded
+version 0.1.7 and the clean source commit above.
 
-**Pending.** Record installation at `/Applications/BioMaker.app`, the previous
-application backup, actual-profile configuration and run-record preservation,
-and the installed engine selection result. Earlier releases do not establish
-these results for 0.1.7.
+The upgrade is installed at `/Applications/BioMaker.app`. The previous app is
+preserved under `release/installed-backups/BioMaker-0.1.6-20261009-010900.app`.
+The actual user profile opened with its existing engine ready and requested no
+installation. Its configuration file and complete run records matched the
+pre-upgrade snapshot, and no synthetic fixtures were imported into that profile.
+This is a configuration-and-record preservation check, not a claim that every
+profile file is unchanged: 0.1.7 initializes a generated empty maintenance lock
+in the reused engine, and browser/cache metadata can change during ordinary use.
+
+Engine selection reported `reused=true`, and the installed application confirmed
+reuse. The engine source SHA-256 remains
+`56d274eec3df1d02eefb52dbe5cc894ff4a5eabe066f483046462e4e021e9fa2`.
+The verified package bundle fingerprint is
+`1fe485c5eb24191d2a33ac87d967ff3802ca32249b0cd1f895b33408bbcc4cd9`.
+
+After the complete installed training workflow, installed and packaged
+signatures passed again. The installed application's complete bundle fingerprint
+matched the verified package. The normal installed application was reopened and
+left open; its UI showed version 0.1.7, the local runtime ready, no experiments in
+the actual profile and a model still awaiting configuration.
 
 ## Installed desktop workflow
 
-**Pending.** Exercise the installed 0.1.7 application through UI submission,
-durable queue execution, actual CPU training, frozen evaluation, result
-inspection and native report export. Record elapsed time, terminal status, exit
-code, renderer errors, fixture/provider behavior, installed fingerprints and
-final process cleanup. Health checks and dependency repair alone do not
-establish this complete workflow.
+The installed 0.1.7 executable completed UI submission, durable queue execution,
+actual CPU training, frozen evaluation, result inspection and native report
+export in **16.305 seconds**. The run reached `succeeded` with exit code 0 and
+cleanup complete. No renderer or fixture errors were observed. A scikit-learn
+logistic regression model was fitted on synthetic data using the reused installed
+engine, with no installed-source override. Five model requests went to a
+deterministic localhost fixture; there were no external provider calls. Final
+retraining was disabled.
+
+The test-only spawn wrapper restricted the Python sidecar and its queue, uv and
+training descendants to localhost. Only the exact `/bin/ps` executable was exempt
+for read-only process identity inspection. The candidate confirmed that an
+external-address connection was denied with `EPERM`. The production Chromium
+sandbox and source were unchanged.
+
+Installed-file fingerprints remained unchanged during the workflow. The actual
+user configuration and complete run records were unchanged after QA, and no
+matching QA processes remained. Durable synthetic evidence is saved under
+`output/qa/desktop-workflow-0.1.7/`. This verifies the installed software workflow;
+it does not measure external-provider quality, multi-round biomedical search or
+scientific model performance.
 
 ## Artifacts and evidence
 
 | Artifact | SHA-256 |
 | --- | --- |
-| BioMaker-0.1.7-mac-arm64.dmg | **Pending** |
-| BioMaker-0.1.7-mac-arm64.zip | **Pending** |
+| BioMaker-0.1.7-mac-arm64.dmg | `efc1253d4f1fce5cae170ffdcd110a70c4b10b20997c10e0eb8a1221c578a976` |
+| BioMaker-0.1.7-mac-arm64.zip | `552fdabf2a11269051c11fe91d2b2634df87eae74a189a9e89499904a65cde29` |
 
-Completed development receipts under `apps/desktop/output/`:
+Completed receipts and durable evidence under `apps/desktop/output/`:
 
 - `runtime-health-ui/acceptance.json` (nine synthetic engine-state UI checks)
 - `engine-health-real-0.1.7.json` (initial development run before marker hardening)
-
-Final packaged health, packaged UI, installation and installed-training receipts:
-**Pending**.
-Add the exact completed receipt and durable evidence paths after verification.
+- `runtime-health-ui-packaged-0.1.7/acceptance.json`
+- `native-close-packaged-0.1.7/acceptance.json`
+- `run-organization-packaged-0.1.7/acceptance.json`
+- `experiment-reuse-packaged-0.1.7/acceptance.json`
+- `history-import-packaged-0.1.7/acceptance.json`
+- `service-recovery-packaged-0.1.7/acceptance.json`
+- `electron-packaged-0.1.7/acceptance.json`
+- `engine-health-packaged-0.1.7.json`
+- `qa/engine-health-0.1.7/`
+- `package-verification-0.1.7.json`
+- `package-installation-0.1.7.json`
+- `engine-upgrade-0.1.7.json`
+- `installed-engine-acceptance-0.1.7.json`
+- `desktop-workflow-acceptance-0.1.7.json`
+- `post-workflow-verification-0.1.7.json`
+- `qa/desktop-workflow-0.1.7/` (durable fixture, logs, screenshots and outputs)
 
 ## Boundaries
 
