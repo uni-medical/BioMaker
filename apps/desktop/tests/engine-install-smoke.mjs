@@ -1,4 +1,5 @@
-// Real dependency installation + import acceptance. Does not call a model provider.
+// Real dependency installation, imports and synthetic CPU LightGBM acceptance.
+// Does not call a model provider or run a biomedical experiment.
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { cp, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
@@ -44,7 +45,7 @@ try {
     const status = await call('/api/desktop/status');
     if (status.engine.log !== lastLog) { lastLog = status.engine.log; console.log(lastLog.split('\n').slice(-3).join('\n')); }
     if (!status.engine.installing) {
-      const report = { passed: status.engine.ready, home, engine, status, verified: 'Real bundled uv installation and isolated engine imports; no model provider calls or training runs.' };
+      const report = { passed: status.engine.ready, home, engine, status, verified: 'Real bundled uv installation, isolated engine imports, and synthetic CPU LightGBM calculation; no model provider calls or biomedical experiment.' };
       const output = path.join(root, 'output', 'engine-acceptance.json');
       await mkdir(path.dirname(output), { recursive: true }); await writeFile(output, JSON.stringify(report, null, 2));
       if (!report.passed) throw new Error(status.engine.error || 'Runtime did not become ready');

@@ -11,6 +11,11 @@
   queue state, reconnect, failure recovery, keyboard navigation, themes and layout.
 - Test the packaged `.app`, not only the Vite development window. Verify that it
   starts with a minimal PATH and does not depend on the source checkout or system Python.
+- On macOS, verify native dependencies with `tests/native-portability-smoke.py`
+  against an installed engine. This denies Homebrew/MacPorts library paths and
+  tests an isolated copy; it supplements, rather than replaces, separate-hardware
+  acceptance. Use `tests/queue-lifecycle-smoke.py` for no-provider quit/reconnect/stop
+  verification through the real supervisor.
 - Mount the DMG, check its Applications shortcut and app bundle, then generate
   SHA-256 checksums for the final artifacts.
 - For a public release, apply Developer ID signing and Apple notarization. Keep
