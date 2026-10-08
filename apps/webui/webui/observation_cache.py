@@ -1,9 +1,12 @@
 """Process-owned, byte-bounded caches of file observations, never live ledger state.
 
-Every cache hit validates metadata again. Any changed file is read in full;
-this module makes no append-only assumption. Cold reads and API responses keep
-the existing parser's semantics, including its potentially large record size.
-The limits below bound retained cache data, not all transient response memory.
+Every cache hit validates metadata again. Changed files reload the observation
+from the current source without assuming append-only writes. Catalog event tails
+may stop early; exact event counts still scan the initial file extent in full.
+Successful legacy event values are preserved; malformed JSON, including decoder
+integer-limit or recursion failures, is counted but skipped. Large records still
+require proportional memory. The limits below bound retained cache data, not all
+transient response memory.
 """
 from __future__ import annotations
 

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .artifacts import read_events
+from .artifacts import read_event_tail
 from .settings import Settings
 
 MAX_MANIFEST_BYTES = 5_000_000
@@ -102,8 +102,7 @@ def run_from_log_dir(settings: Settings, log_dir: Path, *, strict: bool = False)
         return None
 
     run_stub = {"id": resolved.name, "log_dir": str(resolved)}
-    event_response = read_events(settings, run_stub, tail=5_000, strict=strict)
-    events = event_response["events"]
+    events = read_event_tail(settings, run_stub, tail=5_000, strict=strict)
     started = _event_value(events, "run_started")
     terminal_event = next(
         (

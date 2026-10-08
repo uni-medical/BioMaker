@@ -5,11 +5,11 @@ import hashlib
 import json
 import math
 import stat as stat_module
-from collections import deque
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from .event_reader import read_event_window
 from .settings import Settings
 
 
@@ -134,16 +134,6 @@ def artifact_revision(
     return file_revision(path)
 
 
-def _event_float(value: str) -> float | str:
-    """Keep undefined event numbers explicit without breaking HTTP JSON.
-
-    Python's engine event writer permits NaN/Infinity; very large exponents can
-    also overflow during parsing. These are diagnostic strings, not scores.
-    """
-    number = float(value)
-    return number if math.isfinite(number) else ("Infinity" if number > 0 else "-Infinity")
-
-
 def _observation_artifact(settings: Settings, run: dict[str, Any], name: str,
                           strict: bool) -> Path | None:
     if not strict:
@@ -166,67 +156,66 @@ def _observation_artifact(settings: Settings, run: dict[str, Any], name: str,
     return candidate
 
 
-def read_events(
-    settings: Settings, run: dict[str, Any], *, tail: int = 200, strict: bool = False
-) -> dict[str, Any]:
+def _read_event_window(
+    settings: Settings, run: dict[str, Any], *, tail: int, count_all: bool, strict: bool
+) -> tuple[int | None, list[dict[str, Any]]]:
     path = _observation_artifact(settings, run, "events.jsonl", strict)
     if path is None:
-        return {"count": 0, "events": []}
-    parsed: deque[dict[str, Any]] = deque(maxlen=max(0, tail))
-    count = 0
+        return (0 if count_all else None), []
     try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                count += 1
-                try:
-                    event = json.loads(line, parse_constant=str, parse_float=_event_float)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(event, dict):
-                    parsed.append(event)
+        return read_event_window(path, tail=tail, count_all=count_all)
     except OSError:
         if strict:
             raise
-        return {"count": 0, "events": []}
-    return {"count": count, "events": list(parsed)}
+        return (0 if count_all else None), []
+
+
+def read_events(
+    settings: Settings, run: dict[str, Any], *, tail: int = 200, strict: bool = False
+) -> dict[str, Any]:
+    count, events = _read_event_window(settings, run, tail=tail, count_all=True, strict=strict)
+    return {"count": count, "events": events}
+
+
+def read_event_tail(
+    settings: Settings, run: dict[str, Any], *, tail: int = 200, strict: bool = False
+) -> list[dict[str, Any]]:
+    """Read only the needed valid-object suffix when a total count is unused."""
+    return _read_event_window(settings, run, tail=tail, count_all=False, strict=strict)[1]
 
 
 def read_results_summary(settings: Settings, run: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:
     path = _observation_artifact(settings, run, "results.tsv", strict)
     if path is None:
         return {"count": 0, "best_metric": None, "latest": None}
-    rows: list[dict[str, str]] = []
+    count = 0
+    minimum = maximum = None
+    maximize = True
+    latest_row = None
     try:
         with path.open(encoding="utf-8", errors="replace", newline="") as handle:
-            rows = list(csv.DictReader(handle, delimiter="\t"))
+            for row in csv.DictReader(handle, delimiter="\t"):
+                count += 1
+                latest_row = row
+                try:
+                    metric = float(row.get("metric", ""))
+                except (TypeError, ValueError):
+                    continue
+                # Preserve the historical rule: the last finite score's row
+                # chooses the direction, even if later rows have no score.
+                if math.isfinite(metric):
+                    minimum = metric if minimum is None else min(minimum, metric)
+                    maximum = metric if maximum is None else max(maximum, metric)
+                    maximize = str(row.get("maximize", "true")).lower() != "false"
     except (OSError, csv.Error):
         if strict:
             raise
         return {"count": 0, "best_metric": None, "latest": None}
-
-    metric_rows: list[tuple[float, dict[str, str]]] = []
-    for row in rows:
-        try:
-            metric = float(row.get("metric", ""))
-        except (TypeError, ValueError):
-            continue
-        # Undefined evaluator scores can appear in historical result tables.
-        # They are not comparable and cannot be serialized as HTTP JSON.
-        if math.isfinite(metric):
-            metric_rows.append((metric, row))
-    best_metric = None
-    if metric_rows:
-        maximize = str(metric_rows[-1][1].get("maximize", "true")).lower() != "false"
-        best_metric = (max if maximize else min)(value for value, _ in metric_rows)
-    latest = None
-    if rows:
-        latest = {
-            key: rows[-1].get(key)
-            for key in ("step", "status", "metric", "outcome", "exc_type", "error")
-        }
-    return {"count": len(rows), "best_metric": best_metric, "latest": latest}
+    latest = (
+        {key: latest_row.get(key) for key in ("step", "status", "metric", "outcome", "exc_type", "error")}
+        if latest_row is not None else None
+    )
+    return {"count": count, "best_metric": maximum if maximize else minimum, "latest": latest}
 
 
 def read_manifest_summary(

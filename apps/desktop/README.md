@@ -173,3 +173,13 @@ including same-size/same-mtime replacements. In the isolated 100-run benchmark,
 warm list reads fell from 257 ms to 6.7 ms and warm detail reads from 259 ms to
 0.25 ms. These are instrumented endpoint timings; first reads and changed
 histories can still scan full files.
+
+Version 0.1.15 further reduces cold history reads by reading only the event tail
+needed for catalog discovery, skipping JSON parsing of discarded events during
+exact counts, and streaming result-table summaries. In an isolated 25-run sample
+with 100,000 events per run, standalone discovery fell from 5.94 seconds to
+0.20 seconds. These are instrumented backend measurements; they are not complete
+app-startup timings. Exact counts and result summaries still scan their source
+files, and unusually large records still require proportional memory. The
+[0.1.15 acceptance record](docs/ACCEPTANCE-0.1.15.md) tracks source, packaged and
+installed verification separately.

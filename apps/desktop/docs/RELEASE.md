@@ -2,6 +2,13 @@
 
 ## Release gates
 
+- Run `tests/long-history-smoke.mjs` against the built source and packaged app.
+  Use isolated large histories to verify cold startup discovery, exact counts,
+  last-5,000-valid-object catalog observations, ledger-owned lifecycle/actions,
+  event/result appends, bounded activity/console and honest Results read limits.
+  Repeat a complete native relaunch with the same QA profile. Record timings as
+  fixture-specific evidence, not a guarantee for arbitrary history sizes. Keep
+  the native 30-second startup timeout unchanged.
 - Run `tests/drafts-smoke.mjs` with the real native draft store and repeat against
   the packaged executable. Verify independent draft identities, autosave, search,
   rename, duplicate, delete, restart, legacy migration and edits without a live
@@ -300,3 +307,28 @@ Package equality/signatures, actual installation, independent engine setup,
 retained-profile verification, installed synthetic CPU training and normal
 native launch passed. See [ACCEPTANCE-0.1.14.md](ACCEPTANCE-0.1.14.md) for measured
 costs, cold-read limitations, source-bound checksums and acceptance receipts.
+
+## Long-history readers for 0.1.15
+
+Catalog discovery reads event files backward in blocks, stopping after the last
+5,000 valid dictionary events. Detail counts still scan the initial file extent
+and count decoded nonempty lines, including malformed and non-object JSON, but
+avoid parsing discarded events. Pathological JSON integer/nesting errors are
+counted and skipped. Complete final objects need no trailing newline in the
+shared reader; the desktop activity stream retains its separate committed-line
+contract. Pin one descriptor and initial extent for each shared event read;
+appends cannot extend it and replacements cannot switch sources. Short reads
+fail through the existing strict/fallback policy. In-place mutation is not an
+atomic snapshot; observation publication still checks source metadata.
+
+The results summary streams rows and retains only the last row and finite metric
+extrema. The last finite-score row determines metric direction across all scores;
+the last row supplies the latest fields even without a valid metric. A failed
+read discards the partial summary. This reduces allocation without changing the
+need to scan every result row.
+
+Neither reader promises constant memory or an absolute IO bound: records may be
+arbitrarily large, malformed suffixes may require a full scan, and exact event
+counts read every initial byte. Desktop Results retains its independent byte and
+record caps and must report incomplete evidence honestly. See
+[ACCEPTANCE-0.1.15.md](ACCEPTANCE-0.1.15.md) for current verification status.
