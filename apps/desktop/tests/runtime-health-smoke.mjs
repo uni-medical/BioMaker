@@ -15,6 +15,7 @@ const dataset = path.join(temporary, 'synthetic-dataset');
 const output = process.env.BIOMAKER_QA_OUTPUT || path.join(root, 'output/runtime-health-ui');
 const executablePath = process.env.BIOMAKER_QA_EXECUTABLE;
 for (const directory of [profile, dataset, output]) await mkdir(directory, { recursive: true });
+await writeFile(path.join(dataset, 'synthetic-metadata-fixture.txt'), 'Synthetic runtime UI fixture; never used for training.\n');
 await writeFile(path.join(profile, 'desktop-preferences.json'), JSON.stringify({ language: 'zh', theme: 'light', notifications: false, directories: [] }));
 const env = { ...process.env, BIOMAKER_DESKTOP_USER_DATA: profile, BIOMAKER_DESKTOP_HOME: profile, PYTHONDONTWRITEBYTECODE: '1' };
 for (const key of ['ELECTRON_RUN_AS_NODE', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'SERPER_API_KEY', 'JINA_API_KEY']) delete env[key];
@@ -146,6 +147,8 @@ try {
     return draft.task === task && draft.name === 'qa-runtime-health-draft' && draft.options?.agent_steps === 9;
   }, 'The synthetic draft was not persisted');
   draftRaw = await storedDraft();
+  await until(async () => await page.locator('.dataset-overview').getAttribute('data-code') === 'ok' &&
+    await page.locator('.dataset-overview').getAttribute('data-state') === 'ready', 'The real dataset metadata fixture did not become ready');
   await until(async () => await page.locator('.submit-button').isEnabled() && await page.locator('.submit-button').getAttribute('aria-label') === '开始实验', 'Fixture setup did not enable the baseline experiment control');
 
   await openRuntime();

@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -151,9 +151,9 @@ try {
   const actual = await page.evaluate(async () => ({ status: await window.biomaker.request('/api/desktop/status'), env: await window.biomaker.request('/api/env') }));
   assert.equal(actual.status.engine.ready, false);
   assert.equal(actual.env.values.OPENAI_API_KEY.configured, false);
-  await application.evaluate((_electron, bases) => {
+  await application.evaluate((_electron, fixture) => {
     const originalFetch = globalThis.fetch;
-    globalThis.__providerQA = { originalFetch, operations: [], forbidden: [], allowSave: false, bases };
+    globalThis.__providerQA = { originalFetch, operations: [], forbidden: [], allowSave: false, bases: fixture.bases, dataset: fixture.dataset };
     globalThis.fetch = async (input, options) => {
       const f = globalThis.__providerQA;
       const url = new URL(String(input));
@@ -161,7 +161,8 @@ try {
       const providerAction = method === 'POST' && ['/api/desktop/provider/check', '/api/models/discover'].includes(url.pathname);
       const body = options?.body ? JSON.parse(options.body) : null;
       const safeProvider = providerAction && f.bases.includes(body?.base_url);
-      if (url.hostname !== '127.0.0.1' || (!['GET', 'HEAD'].includes(method) && !safeProvider && !(f.allowSave && method === 'PUT' && url.pathname === '/api/env'))) {
+      const metadataRead = method === 'POST' && url.pathname === '/api/desktop/dataset/inspect' && body?.path === f.dataset;
+      if (url.hostname !== '127.0.0.1' || (!['GET', 'HEAD'].includes(method) && !safeProvider && !metadataRead && !(f.allowSave && method === 'PUT' && url.pathname === '/api/env'))) {
         f.forbidden.push({ path: url.pathname, method });
         throw new Error('Provider QA blocked an unplanned destination or mutation');
       }
@@ -180,7 +181,7 @@ try {
         return response;
       } finally { if (operation) operation.done = true; }
     };
-  }, [providerBase, alternativeBase]);
+  }, { bases: [providerBase, alternativeBase], dataset: await realpath(dataset) });
 
   await page.getByLabel('实验任务', { exact: true }).fill(privateTask);
   await application.evaluate(({ dialog }, directory) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] }); }, dataset);
