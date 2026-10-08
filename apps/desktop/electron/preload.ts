@@ -8,7 +8,7 @@ contextBridge.exposeInMainWorld('biomaker', Object.freeze({
   saveArtifact: (artifact: { runId: string; name: string }) => invoke('biomaker:save-artifact', artifact),
   getAppInfo: () => invoke('biomaker:app-info'),
   getPreferences: () => invoke('biomaker:get-preferences'),
-  setPreferences: (preferences: { theme: 'system' | 'light' | 'dark' }) => invoke('biomaker:set-preferences', preferences),
+  setPreferences: (preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en' }) => invoke('biomaker:set-preferences', preferences),
   openExternal: (url: string) => invoke('biomaker:open-external', url),
   onMenuAction: (callback: (action: string) => void) => {
     if (typeof callback !== 'function') throw new TypeError('Expected a callback');

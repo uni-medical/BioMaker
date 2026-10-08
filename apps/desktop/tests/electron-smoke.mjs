@@ -46,9 +46,22 @@ try {
   await assert.rejects(page.evaluate(() => window.biomaker.request('/api/runs', { method: 'POST', body: { experiment: { dataset_path: '/tmp', task_body: 'QA must not start without setup' } } })), /environment|runtime|install|环境|engine/i);
   await page.screenshot({ path: path.join(output, '01-first-launch.png') });
 
-  await page.locator('.sidebar-settings').click();
+  const draftTask = 'Synthetic onboarding draft. Never submit or call a provider.';
+  const draftDataset = path.join(profile, 'workspace', 'datasets', 'desktop-qa-fixture');
+  await mkdir(draftDataset, { recursive: true });
+  await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, draftDataset);
+  await page.getByLabel('实验任务', { exact: true }).fill(draftTask);
+  await page.locator('.dataset-button').click();
+  await page.getByRole('button', { name: '准备运行环境', exact: true }).click();
+  await page.getByRole('dialog').waitFor();
+  await page.keyboard.press('Escape');
+  await page.locator('.composer-meta button').click();
   await page.getByLabel('API 地址', { exact: false }).fill('http://127.0.0.1:9/v1');
   await page.getByLabel('API Key', { exact: false }).first().fill('desktop-qa-fake-key-never-sent');
+  await page.getByRole('button', { name: '保存配置', exact: true }).click();
+  await page.getByText('所有更改已保存', { exact: true }).waitFor();
+  assert((await page.locator('.provider-readiness').innerText()).includes('还差一步'));
+  assert.equal(await page.getByRole('button', { name: '返回实验', exact: true }).count(), 0);
   await page.getByLabel('默认模型', { exact: true }).fill('desktop-qa-model');
   await page.getByRole('button', { name: '保存配置', exact: true }).click();
   await page.getByText('所有更改已保存', { exact: true }).waitFor();
@@ -57,13 +70,26 @@ try {
   assert(!JSON.stringify(saved).includes('desktop-qa-fake-key-never-sent'));
   assert(!(await page.evaluate(() => JSON.stringify(localStorage))).includes('desktop-qa-fake-key-never-sent'));
   await page.screenshot({ path: path.join(output, '02-provider-settings.png') });
+  await page.getByRole('button', { name: '返回实验', exact: true }).click();
+  await page.getByRole('dialog').waitFor({ state: 'hidden' });
+  assert.equal(await page.getByLabel('实验任务', { exact: true }).inputValue(), draftTask);
+  assert.deepEqual(await page.evaluate(() => window.biomaker.request('/api/runs')), []);
+  await page.locator('.sidebar-settings').click();
   await page.getByRole('button', { name: '通用', exact: true }).click();
   await page.getByRole('button', { name: '深色', exact: true }).click();
   assert.equal((await page.evaluate(() => window.biomaker.getPreferences())).theme, 'dark');
   await page.getByLabel('界面语言', { exact: true }).selectOption('en');
   await page.getByText('Make BioMaker your own', { exact: true }).waitFor();
+  await page.waitForFunction(async () => (await window.biomaker.getPreferences()).language === 'en');
+  const englishMenu = await app.evaluate(({ Menu }) => Menu.getApplicationMenu().items.map(item => item.label));
+  assert(englishMenu.includes('File') && englishMenu.includes('View'));
+  await assert.rejects(page.evaluate(() => window.biomaker.setPreferences({ language: '../invalid' })), /Invalid language/);
+  await assert.rejects(page.evaluate(() => window.biomaker.setPreferences({ directories: ['/'] })), /Invalid preferences/);
+  assert.equal((await page.evaluate(() => window.biomaker.getPreferences())).theme, 'dark');
   await page.screenshot({ path: path.join(output, '03-dark-english.png') });
   await page.getByLabel('Interface language', { exact: true }).selectOption('zh');
+  await page.waitForFunction(async () => (await window.biomaker.getPreferences()).language === 'zh');
+  assert((await app.evaluate(({ Menu }) => Menu.getApplicationMenu().items.map(item => item.label))).includes('文件'));
   await page.getByRole('button', { name: '浅色', exact: true }).click();
   await page.keyboard.press('Escape');
   await page.getByRole('dialog').waitFor({ state: 'hidden' });
@@ -85,6 +111,7 @@ try {
   await writeFile(path.join(logdir, 'results.tsv'), 'step\tmetric\tmaximize\tstatus\n0\tnan\ttrue\tfailed\n1\t0.7\ttrue\tsucceeded\n');
   await writeFile(path.join(logdir, 'desktop-acceptance-fixture.log'), 'Desktop acceptance fixture log. No model was trained.\n');
   app = await launch(); page = await ready();
+  assert.deepEqual(await page.evaluate(() => window.biomaker.getPreferences()), { theme: 'light', language: 'zh' });
   const records = await page.evaluate(() => window.biomaker.request('/api/runs'));
   assert.equal(records.length, 1); assert.equal(records[0].status, 'complete');
   const detail = await page.evaluate(id => window.biomaker.request(`/api/runs/${id}`), records[0].id);
@@ -112,7 +139,7 @@ try {
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
   await page.screenshot({ path: path.join(output, '06-compact.png') });
   assert.deepEqual(errors, []);
-  const report = { passed: true, executablePath: executablePath || 'development Electron', platform: process.platform, arch: process.arch, profile, output, checks: ['real-sidecar', 'isolated-profile', 'renderer-sandbox', 'IPC-path-boundaries', 'missing-engine-preflight', 'settings-persistence', 'secret-masking', 'theme', 'language', 'restart', 'history-import', 'candidates-and-nonfinite-metrics', 'native-artifact-export', 'console', 'compact-layout', 'no-renderer-errors'] };
+  const report = { passed: true, executablePath: executablePath || 'development Electron', platform: process.platform, arch: process.arch, profile, output, checks: ['real-sidecar', 'isolated-profile', 'renderer-sandbox', 'IPC-path-boundaries', 'missing-engine-preflight', 'settings-persistence', 'partial-provider-guidance', 'onboarding-draft-preservation', 'secret-masking', 'theme', 'language-and-native-menus', 'preference-validation', 'restart', 'history-import', 'candidates-and-nonfinite-metrics', 'native-artifact-export', 'console', 'compact-layout', 'no-renderer-errors'] };
   await writeFile(path.join(output, 'electron-acceptance.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {

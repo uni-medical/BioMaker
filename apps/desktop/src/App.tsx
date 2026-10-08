@@ -16,6 +16,7 @@ import {
   FolderOpen,
   History,
   Layers3,
+  KeyRound,
   MoreHorizontal,
   PanelLeft,
   PanelRight,
@@ -109,13 +110,13 @@ const exampleTasks = [
     id: "baseline",
     zh: "快速基线",
     en: "Quick baseline",
-    hintZh: "3 步探索，30 分钟预算",
-    hintEn: "3 steps, 30-minute budget",
+    hintZh: "3 步，探索预算 30 分钟",
+    hintEn: "3 steps, 30 min exploration",
     Icon: Cpu,
     promptZh:
-      "在 30 分钟预算内，为这个数据集建立一个可复现的快速基线模型。先检查数据结构、标签和已有的训练与验证划分，选择符合任务类型的评估指标。优先使用适合当前电脑资源的简单模型和较短的训练流程，最多探索 3 步，不进行最终重训。不使用保留测试集调参。保留实验代码、配置与真实验证指标，说明本次预算内尚未完成的部分。",
+      "为这个数据集建立一个可复现的快速基线模型，探索阶段预算为 30 分钟（不含数据准备和报告，单次请求可能延后结束）。先检查数据结构、标签和已有的训练与验证划分，选择符合任务类型的评估指标。优先使用适合当前电脑资源的简单模型和较短的训练流程，最多探索 3 步，不进行最终重训。不使用保留测试集调参。保留实验代码、配置与真实验证指标，说明本次预算内尚未完成的部分。",
     promptEn:
-      "Build a reproducible baseline model for this dataset within a 30-minute budget. Inspect the data structure, labels, and existing training and validation splits, then choose a metric appropriate for the task. Prefer a simple model and short training schedule suitable for this computer. Use at most 3 exploration steps and skip final retraining. Do not tune on the held-out test set. Keep the code, configuration, and actual validation metrics, and report any work not completed within the budget.",
+      "Build a reproducible baseline model for this dataset with a 30-minute exploration budget. Data preparation and reporting are outside this budget, and an in-flight request may finish after the limit. Inspect the data structure, labels, and existing training and validation splits, then choose a metric appropriate for the task. Prefer a simple model and short training schedule suitable for this computer. Use at most 3 exploration steps and skip final retraining. Do not tune on the held-out test set. Keep the code, configuration, and actual validation metrics, and report any work not completed within the budget.",
   },
 ];
 
@@ -150,7 +151,7 @@ export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [resources, setResources] = useState<Resources | null>(null);
   const [templates, setTemplates] = useState<Template[]>([]);
-  const [version, setVersion] = useState("0.1.0");
+  const [version, setVersion] = useState("…");
   const [loading, setLoading] = useState(true);
   const [connectionError, setConnectionError] = useState("");
   const [submitError, setSubmitError] = useState("");
@@ -164,6 +165,8 @@ export default function App() {
   const [settings, setSettings] = useState<
     "provider" | "runtime" | "appearance" | null
   >(null);
+  const [settingsReturnToExperiment, setSettingsReturnToExperiment] =
+    useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [templatesOpen, setTemplatesOpen] = useState(false);
@@ -187,6 +190,7 @@ export default function App() {
   const pollState = useRef({ active: false, failures: 0 });
   const configLoaded = useRef({ env: false, templates: false });
   const themeEdited = useRef(false);
+  const languageEdited = useRef(false);
   const alive = useRef(true);
   const toast = useCallback((message: string) => setToastMessage(message), []);
 
@@ -203,12 +207,26 @@ export default function App() {
       .getPreferences?.()
       .then((preferences) => {
         if (valid && !themeEdited.current) setTheme(preferences.theme);
+        if (valid && !languageEdited.current) {
+          if (preferences.language) setLang(preferences.language);
+          else
+            void window.biomaker
+              .setPreferences?.({ language: lang })
+              .catch(() => {});
+        }
       })
       .catch(() => {});
     return () => {
       valid = false;
     };
   }, []);
+  const changeLanguage = (value: Language) => {
+    languageEdited.current = true;
+    setLang(value);
+    void window.biomaker
+      .setPreferences?.({ language: value })
+      .catch((e) => toast(errorMessage(e)));
+  };
   const changeTheme = (value: Theme) => {
     themeEdited.current = true;
     setTheme(value);
@@ -509,6 +527,19 @@ export default function App() {
     };
   }, [startNew, openSearch, refresh, settings, searchOpen, templatesOpen]);
 
+  const openTaskSettings = (section: "provider" | "runtime") => {
+    setSettingsReturnToExperiment(true);
+    setSettings(section);
+  };
+  const closeSettings = () => {
+    setSettings(null);
+    setSettingsReturnToExperiment(false);
+  };
+  const returnToExperiment = () => {
+    closeSettings();
+    if (!selectedId && !history)
+      requestAnimationFrame(() => textarea.current?.focus());
+  };
   const updateDraft = (value: Partial<Draft>) => {
     setDraft((d) => ({ ...d, ...value }));
     setSubmitError("");
@@ -541,14 +572,16 @@ export default function App() {
   const modelReady = !!(
     draft.options.model_for_all_agents || env?.values.BIOMAKER_MAIN_MODEL?.value
   );
-  const canSubmit =
-    engineReady &&
-    keyReady &&
-    modelReady &&
-    !!draft.dataset &&
-    !!draft.task.trim() &&
-    !busy &&
-    !connectionError;
+  const providerReady = keyReady && modelReady;
+  const draftReady = !!draft.task.trim() && !!draft.dataset;
+  const preparation = !engineReady
+    ? "runtime"
+    : !providerReady
+      ? "provider"
+      : null;
+  const primaryNeedsSetup = draftReady && !!preparation;
+  const canContinue = draftReady && !busy && !loading && !connectionError;
+  const canSubmit = canContinue && !preparation;
   const selectedRun =
     detail?.id === selectedId
       ? detail
@@ -612,11 +645,11 @@ export default function App() {
       return;
     }
     if (!engineReady) {
-      setSettings("runtime");
+      openTaskSettings("runtime");
       return;
     }
     if (!keyReady || !modelReady) {
-      setSettings("provider");
+      openTaskSettings("provider");
       return;
     }
     const {
@@ -642,8 +675,8 @@ export default function App() {
     ) {
       setSubmitError(
         t(
-          "请检查高级设置中的范围：步数 1–1000，单次执行 1–86400 秒，总时长最多 720 小时，并发数 1–64。",
-          "Check advanced settings: 1–1000 steps, 1–86400 seconds per execution, up to 720 total hours, and 1–64 workers.",
+          "请检查高级设置中的范围：步数 1–1000，单次执行 1–86400 秒，探索时长最多 720 小时，并发数 1–64。",
+          "Check advanced settings: 1–1000 steps, 1–86400 seconds per execution, up to 720 exploration hours, and 1–64 workers.",
         ),
       );
       setAdvanced(true);
@@ -703,6 +736,23 @@ export default function App() {
     confirmed = false,
   ) {
     if (busy) return;
+    if (action === "requeue") {
+      if (!engineReady) {
+        openTaskSettings("runtime");
+        return;
+      }
+      if (
+        !keyReady ||
+        !(
+          run.options?.model_for_all_agents ||
+          run.options?.main_model ||
+          env?.values.BIOMAKER_MAIN_MODEL?.value
+        )
+      ) {
+        openTaskSettings("provider");
+        return;
+      }
+    }
     if ((action === "stop" || action === "cancel") && !confirmed) {
       setConfirmation({ action, run });
       return;
@@ -1246,8 +1296,17 @@ export default function App() {
                       </button>
                       <button
                         type="submit"
-                        className="submit-button"
-                        aria-label={t("开始实验", "Start experiment")}
+                        className={`submit-button ${primaryNeedsSetup ? "setup-submit" : ""}`}
+                        aria-label={
+                          primaryNeedsSetup
+                            ? preparation === "provider"
+                              ? t(
+                                  "配置模型并继续",
+                                  "Configure model to continue",
+                                )
+                              : t("准备运行环境", "Set up runtime")
+                            : t("开始实验", "Start experiment")
+                        }
                         title={
                           canSubmit
                             ? t("开始实验 ⌘ ↵", "Start experiment ⌘ ↵")
@@ -1270,10 +1329,23 @@ export default function App() {
                                       )
                                     : t("开始实验", "Start experiment")
                         }
-                        disabled={!canSubmit}
+                        disabled={!canContinue}
                       >
                         {busy === "submit" ? (
                           <Spinner size={19} />
+                        ) : primaryNeedsSetup ? (
+                          <>
+                            {preparation === "provider" ? (
+                              <KeyRound size={15} />
+                            ) : (
+                              <Cpu size={15} />
+                            )}
+                            <span>
+                              {preparation === "provider"
+                                ? t("配置模型并继续", "Configure model")
+                                : t("准备运行环境", "Set up runtime")}
+                            </span>
+                          </>
                         ) : (
                           <ArrowUp size={20} />
                         )}
@@ -1282,7 +1354,10 @@ export default function App() {
                   </div>
                 </div>
                 <div className="composer-meta">
-                  <button type="button" onClick={() => setSettings("provider")}>
+                  <button
+                    type="button"
+                    onClick={() => openTaskSettings("provider")}
+                  >
                     <span
                       className={`model-dot ${keyReady && modelReady ? "ready" : ""}`}
                     />
@@ -1299,7 +1374,7 @@ export default function App() {
                     ).toLocaleString(lang === "zh" ? "zh-CN" : "en-US", {
                       maximumFractionDigits: 2,
                     })}{" "}
-                    {t("小时上限", "hour limit")}
+                    {t("小时探索上限", "h exploration limit")}
                   </span>
                 </div>
                 {advanced && (
@@ -1361,7 +1436,10 @@ export default function App() {
                       </label>
                       <label className="field">
                         <span>
-                          {t("总时长上限（小时）", "Total time limit (hours)")}
+                          {t(
+                            "探索时长上限（小时）",
+                            "Exploration time limit (hours)",
+                          )}
                         </span>
                         <input
                           type="number"
@@ -1387,6 +1465,12 @@ export default function App() {
                             })
                           }
                         />
+                        <small>
+                          {t(
+                            "不含数据准备、最终重训与报告；单次请求可能延后结束。",
+                            "Excludes data preparation, final retraining, and reporting; an in-flight request may finish later.",
+                          )}
+                        </small>
                       </label>
                       <label className="field">
                         <span>
@@ -1508,7 +1592,7 @@ export default function App() {
                           ? t("查看", "View")
                           : t("安装", "Install")
                     }
-                    onClick={() => setSettings("runtime")}
+                    onClick={() => openTaskSettings("runtime")}
                   />
                   <CheckItem
                     done={keyReady && modelReady}
@@ -1522,7 +1606,7 @@ export default function App() {
                         ? t("就绪", "Ready")
                         : t("配置", "Configure")
                     }
-                    onClick={() => setSettings("provider")}
+                    onClick={() => openTaskSettings("provider")}
                   />
                 </section>
               )}
@@ -1612,9 +1696,11 @@ export default function App() {
                 )
               : loading
                 ? t("连接中", "Connecting")
-                : engineReady
-                  ? t("就绪", "Ready")
-                  : t("等待配置", "Setup needed")}
+                : !engineReady
+                  ? t("等待运行环境", "Runtime needed")
+                  : !providerReady
+                    ? t("等待配置模型", "Model setup needed")
+                    : t("就绪", "Ready")}
             {(health?.queue.queued || 0) > 0 &&
               ` · ${health?.queue.queued} ${t("排队中", "queued")}`}
           </span>
@@ -1693,7 +1779,7 @@ export default function App() {
                   <dd>{inspectedOptions?.agent_steps ?? "—"}</dd>
                 </div>
                 <div>
-                  <dt>{t("总时长上限", "Time limit")}</dt>
+                  <dt>{t("探索时长上限", "Exploration time limit")}</dt>
                   <dd>
                     {inspectedOptions?.agent_total_time_limit != null
                       ? `${Math.round((inspectedOptions.agent_total_time_limit / 3600) * 100) / 100} ${t("小时", "hours")}`
@@ -1760,14 +1846,24 @@ export default function App() {
         <Settings
           t={t}
           lang={lang}
-          setLang={setLang}
+          setLang={changeLanguage}
           theme={theme}
           setTheme={changeTheme}
           engine={engine}
           env={env}
           version={version}
           initialSection={settings}
-          onClose={() => setSettings(null)}
+          onClose={closeSettings}
+          onReturnToExperiment={
+            settingsReturnToExperiment ? returnToExperiment : undefined
+          }
+          modelOverride={
+            settingsReturnToExperiment
+              ? selectedRun?.options?.model_for_all_agents ||
+                selectedRun?.options?.main_model ||
+                (!selectedId ? draft.options.model_for_all_agents : null)
+              : null
+          }
           onSaved={(value) => {
             setEnv(value);
             configLoaded.current.env = true;

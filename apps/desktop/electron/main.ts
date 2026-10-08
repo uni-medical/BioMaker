@@ -18,7 +18,8 @@ let mainWindow: BrowserWindow | null = null;
 let sidecar: Sidecar | null = null;
 let quitting = false;
 let serviceReady = false;
-let preferences: { theme: 'system' | 'light' | 'dark'; directories: string[]; bounds?: Electron.Rectangle } = { theme: 'system', directories: [] };
+let preferences: { theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; directories: string[]; bounds?: Electron.Rectangle } = { theme: 'system', directories: [] };
+const t = (zh: string, en: string) => preferences.language === 'en' ? en : zh;
 const desktopRoot = path.resolve(__dirname, '..');
 const indexPath = path.join(desktopRoot, 'dist', 'index.html');
 const devURL = !app.isPackaged && process.env.BIOMAKER_DESKTOP_DEV_URL === 'http://127.0.0.1:5173' ? process.env.BIOMAKER_DESKTOP_DEV_URL : null;
@@ -41,51 +42,59 @@ function action(name: string) { mainWindow?.webContents.send('biomaker:menu-acti
 function showWindow() { if (!app.isReady()) { app.once('ready', showWindow); return; } if (!mainWindow) void createWindow(); else { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.show(); mainWindow.focus(); } }
 function installMenu() {
   const template: MenuItemConstructorOptions[] = [
-    ...(process.platform === 'darwin' ? [{ label: 'BioMaker', submenu: [{ role: 'about' }, { type: 'separator' }, { label: '设置…', accelerator: 'CmdOrCtrl+,', click: () => action('settings') }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }, { role: 'quit' }] } as MenuItemConstructorOptions] : []),
-    { label: '文件', submenu: [{ label: '新建实验', accelerator: 'CmdOrCtrl+N', click: () => action('new-experiment') }, { label: '搜索实验…', accelerator: 'CmdOrCtrl+K', click: () => action('search') }, { type: 'separator' }, { label: '打开工作目录', click: () => { void shell.openPath(path.join(app.getPath('userData'), 'workspace')); } }, { type: 'separator' }, { role: process.platform === 'darwin' ? 'close' : 'quit' }] },
-    { label: '编辑', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
-    { label: '显示', submenu: [{ label: '切换侧边栏', accelerator: 'CmdOrCtrl+B', click: () => action('toggle-sidebar') }, { label: '刷新数据', accelerator: 'CmdOrCtrl+R', click: () => action('refresh') }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }, ...(!app.isPackaged ? [{ role: 'toggleDevTools' } as MenuItemConstructorOptions] : [])] },
-    { label: '窗口', submenu: [{ role: 'minimize' }, { role: 'zoom' }, { label: '显示 BioMaker', click: showWindow }] },
-    { label: '帮助', submenu: [{ label: 'BioMaker 使用文档', click: () => { void shell.openExternal('https://github.com/uni-medical/BioMaker'); } }, { label: '打开诊断日志', click: () => { void shell.openPath(path.join(app.getPath('userData'), 'logs')); } }, ...(process.platform !== 'darwin' ? [{ role: 'about' } as MenuItemConstructorOptions] : [])] },
+    ...(process.platform === 'darwin' ? [{ label: 'BioMaker', submenu: [{ role: 'about', label: t('关于 BioMaker', 'About BioMaker') }, { type: 'separator' }, { label: t('设置…', 'Settings…'), accelerator: 'CmdOrCtrl+,', click: () => action('settings') }, { type: 'separator' }, { role: 'hide', label: t('隐藏 BioMaker', 'Hide BioMaker') }, { role: 'hideOthers', label: t('隐藏其它应用', 'Hide Others') }, { role: 'unhide', label: t('显示全部', 'Show All') }, { type: 'separator' }, { role: 'quit', label: t('退出 BioMaker', 'Quit BioMaker') }] } as MenuItemConstructorOptions] : []),
+    { label: t('文件', 'File'), submenu: [{ label: t('新建实验', 'New experiment'), accelerator: 'CmdOrCtrl+N', click: () => action('new-experiment') }, { label: t('搜索实验…', 'Search experiments…'), accelerator: 'CmdOrCtrl+K', click: () => action('search') }, { type: 'separator' }, { label: t('打开工作目录', 'Open workspace'), click: () => { void shell.openPath(path.join(app.getPath('userData'), 'workspace')); } }, { type: 'separator' }, { role: process.platform === 'darwin' ? 'close' : 'quit', label: process.platform === 'darwin' ? t('关闭窗口', 'Close Window') : t('退出', 'Quit') }] },
+    { label: t('编辑', 'Edit'), submenu: [{ role: 'undo', label: t('撤销', 'Undo') }, { role: 'redo', label: t('重做', 'Redo') }, { type: 'separator' }, { role: 'cut', label: t('剪切', 'Cut') }, { role: 'copy', label: t('复制', 'Copy') }, { role: 'paste', label: t('粘贴', 'Paste') }, { role: 'selectAll', label: t('全选', 'Select All') }] },
+    { label: t('显示', 'View'), submenu: [{ label: t('切换侧边栏', 'Toggle sidebar'), accelerator: 'CmdOrCtrl+B', click: () => action('toggle-sidebar') }, { label: t('刷新数据', 'Refresh data'), accelerator: 'CmdOrCtrl+R', click: () => action('refresh') }, { type: 'separator' }, { role: 'resetZoom', label: t('实际大小', 'Actual Size') }, { role: 'zoomIn', label: t('放大', 'Zoom In') }, { role: 'zoomOut', label: t('缩小', 'Zoom Out') }, { type: 'separator' }, { role: 'togglefullscreen', label: t('切换全屏', 'Toggle Full Screen') }, ...(!app.isPackaged ? [{ role: 'toggleDevTools', label: t('开发者工具', 'Developer Tools') } as MenuItemConstructorOptions] : [])] },
+    { label: t('窗口', 'Window'), submenu: [{ role: 'minimize', label: t('最小化', 'Minimize') }, { role: 'zoom', label: t('缩放窗口', 'Zoom') }, { label: t('显示 BioMaker', 'Show BioMaker'), click: showWindow }] },
+    { label: t('帮助', 'Help'), submenu: [{ label: t('BioMaker 使用文档', 'BioMaker documentation'), click: () => { void shell.openExternal('https://github.com/uni-medical/BioMaker'); } }, { label: t('打开诊断日志', 'Open diagnostic logs'), click: () => { void shell.openPath(path.join(app.getPath('userData'), 'logs')); } }, ...(process.platform !== 'darwin' ? [{ role: 'about', label: t('关于 BioMaker', 'About BioMaker') } as MenuItemConstructorOptions] : [])] },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 function setupIPC() {
   handle('biomaker:request', async (rawPath, options) => {
     const request = validateRequest(rawPath, options);
-    if (!sidecar || !serviceReady) throw new Error('BioMaker 服务正在启动，请稍后重试。');
+    if (!sidecar || !serviceReady) throw new Error(t('BioMaker 服务正在启动，请稍后重试。', 'BioMaker is starting. Please try again shortly.'));
     const response = await fetch(`${sidecar.origin}${request.path}`, { method: request.method, body: request.body, headers: { Authorization: `Bearer ${sidecar.token}`, ...(request.body === undefined ? {} : { 'Content-Type': 'application/json' }) }, redirect: 'error', signal: AbortSignal.timeout(45_000) });
     return readResponse(response, request.path.startsWith('/api/'));
   });
   handle('biomaker:choose-directory', async () => {
-    const result = await dialog.showOpenDialog(mainWindow!, { title: '选择数据目录', properties: ['openDirectory', 'createDirectory'], buttonLabel: '选择此目录' });
+    const result = await dialog.showOpenDialog(mainWindow!, { title: t('选择数据目录', 'Choose a dataset folder'), properties: ['openDirectory', 'createDirectory'], buttonLabel: t('选择此目录', 'Choose folder') });
     if (result.canceled || !result.filePaths[0]) return null;
     const selected = realpathSync(result.filePaths[0]);
     preferences.directories = [...new Set([...preferences.directories, selected])].slice(-100); savePreferences();
     return selected;
   });
   handle('biomaker:open-path', async (candidate) => {
-    if (typeof candidate !== 'string' || !path.isAbsolute(candidate) || !existsSync(candidate)) throw new Error('目录不存在。');
+    if (typeof candidate !== 'string' || !path.isAbsolute(candidate) || !existsSync(candidate)) throw new Error(t('目录不存在。', 'The folder does not exist.'));
     const resolved = realpathSync(candidate);
-    if (!statSync(resolved).isDirectory() || /\.(?:app|workflow|bundle|plugin)$/i.test(resolved)) throw new Error('此操作只允许打开普通目录。');
+    if (!statSync(resolved).isDirectory() || /\.(?:app|workflow|bundle|plugin)$/i.test(resolved)) throw new Error(t('此操作只允许打开普通目录。', 'Only regular folders can be opened.'));
     const roots = [app.getPath('userData'), ...preferences.directories].filter(existsSync).map(value => realpathSync(value));
-    if (!roots.some(root => isWithin(resolved, root))) throw new Error('请先通过目录选择器授权访问此位置。');
+    if (!roots.some(root => isWithin(resolved, root))) throw new Error(t('请先通过目录选择器授权访问此位置。', 'Choose this location using the folder picker to grant access first.'));
     const error = await shell.openPath(resolved); if (error) throw new Error(error);
   });
   handle('biomaker:save-artifact', async (artifact) => {
     const { runId, name } = validateArtifact(artifact?.runId, artifact?.name);
-    if (!sidecar) throw new Error('本地服务不可用。');
-    const result = await dialog.showSaveDialog(mainWindow!, { title: '导出实验产物', defaultPath: path.join(app.getPath('downloads'), name), buttonLabel: '导出' });
+    if (!sidecar) throw new Error(t('本地服务不可用。', 'The local service is unavailable.'));
+    const result = await dialog.showSaveDialog(mainWindow!, { title: t('导出实验产物', 'Export experiment output'), defaultPath: path.join(app.getPath('downloads'), name), buttonLabel: t('导出', 'Export') });
     if (result.canceled || !result.filePath) return null;
     const response = await fetch(`${sidecar.origin}/artifacts/runs/${encodeURIComponent(runId)}/${encodeURIComponent(name)}`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(300_000) });
-    if (!response.ok || !response.body) throw new Error(`导出失败（${response.status}）。`);
+    if (!response.ok || !response.body) throw new Error(`${t('导出失败', 'Export failed')} (${response.status}).`);
     const temporary = `${result.filePath}.biomaker-${process.pid}.part`;
     try { await pipeline(Readable.fromWeb(response.body as any), createWriteStream(temporary, { flags: 'wx', mode: 0o600 })); renameSync(temporary, result.filePath); } catch (error) { rmSync(temporary, { force: true }); throw error; }
     return result.filePath;
   });
   handle('biomaker:app-info', () => ({ version: app.getVersion(), platform: process.platform }));
-  handle('biomaker:get-preferences', () => ({ theme: preferences.theme }));
-  handle('biomaker:set-preferences', (value) => { if (!validTheme(value?.theme)) throw new Error('Invalid theme'); preferences.theme = value.theme; nativeTheme.themeSource = value.theme; savePreferences(); return { theme: preferences.theme }; });
+  handle('biomaker:get-preferences', () => ({ theme: preferences.theme, language: preferences.language }));
+  handle('biomaker:set-preferences', (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['theme', 'language'].includes(key))) throw new Error('Invalid preferences');
+    if ('theme' in value && !validTheme(value.theme)) throw new Error('Invalid theme');
+    if ('language' in value && value.language !== 'zh' && value.language !== 'en') throw new Error('Invalid language');
+    if ('theme' in value) { preferences.theme = value.theme; nativeTheme.themeSource = value.theme; }
+    if ('language' in value) preferences.language = value.language;
+    savePreferences(); installMenu();
+    return { theme: preferences.theme, language: preferences.language };
+  });
   handle('biomaker:open-external', (url) => shell.openExternal(externalURL(url)));
 }
 async function createWindow() {
@@ -113,7 +122,7 @@ app.on('before-quit', event => {
 });
 if (locked) void app.whenReady().then(async () => {
   mkdirSync(app.getPath('userData'), { recursive: true, mode: 0o700 });
-  try { const saved = JSON.parse(readFileSync(preferencesPath(), 'utf8')); preferences = { theme: validTheme(saved?.theme) ? saved.theme : 'system', directories: Array.isArray(saved?.directories) ? saved.directories.filter((item: unknown) => typeof item === 'string' && path.isAbsolute(item)).slice(-100) : [], bounds: saved?.bounds && ['x', 'y', 'width', 'height'].every(key => Number.isFinite(saved.bounds[key])) ? saved.bounds : undefined }; } catch { /* Fresh profile. */ }
+  try { const saved = JSON.parse(readFileSync(preferencesPath(), 'utf8')); preferences = { theme: validTheme(saved?.theme) ? saved.theme : 'system', language: saved?.language === 'en' || saved?.language === 'zh' ? saved.language : undefined, directories: Array.isArray(saved?.directories) ? saved.directories.filter((item: unknown) => typeof item === 'string' && path.isAbsolute(item)).slice(-100) : [], bounds: saved?.bounds && ['x', 'y', 'width', 'height'].every(key => Number.isFinite(saved.bounds[key])) ? saved.bounds : undefined }; } catch { /* Fresh profile. */ }
   nativeTheme.themeSource = preferences.theme;
   app.setAboutPanelOptions({ applicationName: 'BioMaker', applicationVersion: app.getVersion(), copyright: 'BioMaker · Biomedical AI research workspace', website: 'https://github.com/uni-medical/BioMaker' });
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
@@ -130,11 +139,11 @@ if (locked) void app.whenReady().then(async () => {
   });
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => callback({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [CSP], 'X-Content-Type-Options': ['nosniff'] } }));
   installMenu(); setupIPC();
-  sidecar = new Sidecar({ runtime: app.isPackaged ? path.join(process.resourcesPath, 'runtime') : path.join(desktopRoot, 'build', 'runtime'), service: app.isPackaged ? path.join(process.resourcesPath, 'service', 'main.py') : path.join(desktopRoot, 'service', 'main.py'), data: app.getPath('userData'), version: app.getVersion(), onFailure: message => { serviceReady = false; void dialog.showMessageBox({ type: 'error', title: 'BioMaker 服务', message, buttons: ['重新启动', '打开诊断日志', '稍后'], defaultId: 0, cancelId: 2 }).then(async result => { if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) await shell.openPath(path.join(app.getPath('userData'), 'logs')); }); } });
+  sidecar = new Sidecar({ runtime: app.isPackaged ? path.join(process.resourcesPath, 'runtime') : path.join(desktopRoot, 'build', 'runtime'), service: app.isPackaged ? path.join(process.resourcesPath, 'service', 'main.py') : path.join(desktopRoot, 'service', 'main.py'), data: app.getPath('userData'), version: app.getVersion(), onFailure: message => { serviceReady = false; void dialog.showMessageBox({ type: 'error', title: t('BioMaker 服务', 'BioMaker service'), message, buttons: [t('重新启动', 'Restart'), t('打开诊断日志', 'Open diagnostic logs'), t('稍后', 'Later')], defaultId: 0, cancelId: 2 }).then(async result => { if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) await shell.openPath(path.join(app.getPath('userData'), 'logs')); }); } });
   // Render early so users see progress while the bundled service initializes.
   await createWindow();
   try { await sidecar.start(); serviceReady = true; action('refresh'); } catch (error) {
-    const result = await dialog.showMessageBox(mainWindow!, { type: 'error', title: 'BioMaker 启动失败', message: String(error), detail: '你的实验数据保存在应用工作目录中。可以重试启动，或打开诊断日志。', buttons: ['重试', '打开日志', '退出'], defaultId: 0, cancelId: 2 });
+    const result = await dialog.showMessageBox(mainWindow!, { type: 'error', title: t('BioMaker 启动失败', 'BioMaker could not start'), message: String(error), detail: t('你的实验数据保存在应用工作目录中。可以重试启动，或打开诊断日志。', 'Your experiments are saved in the application workspace. Retry or open the diagnostic logs.'), buttons: [t('重试', 'Retry'), t('打开日志', 'Open logs'), t('退出', 'Quit')], defaultId: 0, cancelId: 2 });
     if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) { await shell.openPath(path.join(app.getPath('userData'), 'logs')); } else app.quit();
   }
-}).catch(error => { dialog.showErrorBox('BioMaker 无法启动', String(error)); app.quit(); });
+}).catch(error => { dialog.showErrorBox(t('BioMaker 无法启动', 'BioMaker could not start'), String(error)); app.quit(); });

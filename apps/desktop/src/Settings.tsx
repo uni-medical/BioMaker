@@ -38,6 +38,8 @@ export default function Settings({
   initialSection,
   onClose,
   onSaved,
+  onReturnToExperiment,
+  modelOverride,
   onRefresh,
   toast,
 }: {
@@ -52,6 +54,8 @@ export default function Settings({
   initialSection?: Section;
   onClose: () => void;
   onSaved: (config: EnvConfig) => void;
+  onReturnToExperiment?: () => void;
+  modelOverride?: string | null;
   onRefresh: () => Promise<void>;
   toast: (s: string) => void;
 }) {
@@ -73,6 +77,10 @@ export default function Settings({
   const [optional, setOptional] = useState(false);
   const [confirmClose, setConfirmClose] = useState(false);
   const configured = !!env?.values.OPENAI_API_KEY?.configured;
+  const effectiveKey = !!key.trim() || (configured && !removeKey);
+  const effectiveModel = !!model.trim() || !!modelOverride;
+  const savedProviderReady =
+    configured && !!(env?.values.BIOMAKER_MAIN_MODEL?.value || modelOverride);
   const changed = () => {
     setDirty(true);
     setSaved(false);
@@ -123,7 +131,19 @@ export default function Settings({
       setRemoveKey(false);
       setDirty(false);
       setSaved(true);
-      toast(t("模型配置已保存", "Model settings saved"));
+      toast(
+        !result.values.OPENAI_API_KEY?.configured
+          ? t(
+              "配置已保存；添加 API Key 后才能运行实验",
+              "Settings saved. Add an API key before running an experiment.",
+            )
+          : !(result.values.BIOMAKER_MAIN_MODEL?.value || modelOverride)
+            ? t(
+                "配置已保存；还需填写默认模型",
+                "Settings saved. A default model is still needed.",
+              )
+            : t("模型配置已保存", "Model settings saved"),
+      );
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -373,6 +393,39 @@ export default function Settings({
                   ))}
                 </select>
               )}
+              {env && (
+                <div
+                  className={`provider-readiness ${effectiveKey && effectiveModel ? "complete" : ""}`}
+                  role="status"
+                >
+                  {effectiveKey && effectiveModel ? (
+                    <Check size={14} />
+                  ) : (
+                    <KeyRound size={14} />
+                  )}
+                  <span>
+                    {!effectiveKey
+                      ? t(
+                          "添加 API Key 后，再填写或获取模型名称。",
+                          "Add an API key, then enter or discover a model name.",
+                        )
+                      : !effectiveModel
+                        ? t(
+                            "还差一步：填写默认模型，或点击“连接并获取模型”选择。",
+                            "One more step: enter a default model, or use “Connect & find models”.",
+                          )
+                        : dirty
+                          ? t(
+                              "配置已填写完整，保存后继续。",
+                              "The required settings are filled in. Save to continue.",
+                            )
+                          : t(
+                              "模型配置完整，可以返回实验。",
+                              "Model settings are complete. You can return to your experiment.",
+                            )}
+                  </span>
+                </div>
+              )}
               {discovery && (
                 <p className="success-text">
                   <Check size={14} />
@@ -453,6 +506,14 @@ export default function Settings({
                       ? t("有未保存的更改", "Unsaved changes")
                       : ""}
                 </span>
+                {onReturnToExperiment && !dirty && savedProviderReady && (
+                  <button
+                    className="secondary-button"
+                    onClick={onReturnToExperiment}
+                  >
+                    {t("返回实验", "Return to experiment")}
+                  </button>
+                )}
                 <button
                   className="primary-button"
                   disabled={!!pending || !dirty || !env}

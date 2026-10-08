@@ -53,6 +53,14 @@ then verifies imports and the installed BioMaker CLI entrypoint. Success is
 recorded against dependency-file content, OS, and architecture. Cancellation
 terminates either the download/install process or the verification process.
 
+On macOS, installation relocates LightGBM's OpenMP search paths to the runtime
+already included by PyTorch. A bounded Mach-O edit and the system `codesign`
+utility operate on a private copy before atomic replacement; global libraries
+and the package cache stay intact. License notices remain with both installed
+packages. The receipt records native-library hashes and a provisioning revision.
+Verification imports LightGBM before Torch, performs a tiny synthetic CPU fit,
+and checks that loaded OpenMP libraries come from the engine environment.
+
 Run creation and requeue require a ready engine, an API key, and an explicitly
 selected or saved model. Existing run/queue/settings/artifact APIs retain their
 WebUI schemas. Closing the desktop stops installation and the HTTP service;

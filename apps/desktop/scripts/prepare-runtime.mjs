@@ -72,7 +72,7 @@ try {
   const version = JSON.parse(readFileSync(path.join(desktop, 'package.json'), 'utf8')).version;
   const pythonBuild = readFileSync(path.join(stage, 'python/BUILD'), 'utf8').trim();
   if (!/^\d{8}$/.test(pythonBuild)) throw new Error('Python standalone build tag is missing or invalid.');
-  const manifest = { schema: 1, applicationVersion: version, builtAt: new Date().toISOString(), target: `${process.platform}-${process.arch}`, pythonVersion, pythonBuild, pythonDistribution: 'python-build-standalone, installed by uv', uvVersion, uvSha256: sha(uv), serviceLockSha256: sha(path.join(desktop, 'service/requirements.txt')), ...engineOverlay, engineSha256: digestTree(engine), sourceCommit: run('git', ['rev-parse', 'HEAD']), sourceFilesMayIncludeUncommittedChanges: true };
+  const manifest = { schema: 1, applicationVersion: version, builtAt: new Date().toISOString(), target: `${process.platform}-${process.arch}`, pythonVersion, pythonBuild, pythonDistribution: 'python-build-standalone, installed by uv', uvVersion, uvSha256: sha(uv), serviceLockSha256: sha(path.join(desktop, 'service/requirements.txt')), ...engineOverlay, engineSha256: digestTree(engine), sourceCommit: run('git', ['rev-parse', 'HEAD']), sourceFilesMayIncludeUncommittedChanges: Boolean(run('git', ['status', '--porcelain', '--untracked-files=normal'])) };
   writeFileSync(path.join(stage, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
   const licenseDir = path.join(stage, 'licenses'); mkdirSync(licenseDir);
   cpSync(path.join(repo, 'LICENSE'), path.join(licenseDir, 'BioMaker-LICENSE.txt'));
@@ -86,19 +86,24 @@ try {
   }
   // install_only Python distributions omit some dependency notices. Retain the
   // matching python-build-standalone release's complete license collection.
-  const treeResponse = await fetch(`https://api.github.com/repos/astral-sh/python-build-standalone/git/trees/${pythonBuild}?recursive=1`, { signal: AbortSignal.timeout(30000) });
-  if (!treeResponse.ok) throw new Error(`Cannot retrieve Python native dependency notices (${treeResponse.status})`);
-  const tree = await treeResponse.json();
-  const notices = tree.tree.filter(entry => entry.type === 'blob' && /^LICENSE(?:\.[A-Za-z0-9.-]+)?$/.test(entry.path));
-  if (!notices.length || notices.length > 64) throw new Error('Unexpected Python license collection.');
+  // A single source archive avoids unauthenticated GitHub API rate limits.
+  // Read only bounded, regular LICENSE files; never extract or execute the archive.
+  const archiveResponse = await fetch(`https://codeload.github.com/astral-sh/python-build-standalone/tar.gz/refs/tags/${pythonBuild}`, { signal: AbortSignal.timeout(60000) });
+  if (!archiveResponse.ok || !archiveResponse.body) throw new Error(`Cannot retrieve Python native dependency notices (${archiveResponse.status})`);
+  const chunks = []; let archiveBytes = 0;
+  for await (const chunk of archiveResponse.body) {
+    archiveBytes += chunk.length;
+    if (archiveBytes > 32 * 1024 * 1024) throw new Error('Unexpected Python notice archive size.');
+    chunks.push(chunk);
+  }
+  const archive = path.join(stage, 'python-source-notices.tar.gz');
+  writeFileSync(archive, Buffer.concat(chunks));
   const pythonNotices = path.join(licenseDir, 'python-build-standalone'); mkdirSync(pythonNotices);
-  await Promise.all(notices.map(async entry => {
-    const response = await fetch(`https://raw.githubusercontent.com/astral-sh/python-build-standalone/${pythonBuild}/${entry.path}`, { signal: AbortSignal.timeout(30000) });
-    if (!response.ok) throw new Error(`Cannot retrieve Python notice ${entry.path}`);
-    const text = await response.text();
-    if (Buffer.byteLength(text) > 1024 * 1024) throw new Error('Unexpected Python notice size.');
-    writeFileSync(path.join(pythonNotices, entry.path), text);
-  }));
+  const extractNotices = `import pathlib,re,sys,tarfile\nroot=pathlib.Path(sys.argv[2]); count=0\nwith tarfile.open(sys.argv[1], 'r|gz') as archive:\n for entry in archive:\n  parts=entry.name.split('/')\n  if len(parts)!=2 or not re.fullmatch(r'LICENSE(?:\\.[A-Za-z0-9.-]+)?',parts[1]): continue\n  if not entry.isfile() or entry.size>1024*1024: raise ValueError('Invalid license entry')\n  count+=1\n  if count>64: raise ValueError('Too many license entries')\n  target=root/parts[1]\n  with target.open('xb') as output: output.write(archive.extractfile(entry).read())\nif not count: raise ValueError('No Python license notices found')\nprint(f'Retained {count} Python native dependency notices')`;
+  run(python, ['-c', extractNotices, archive, pythonNotices], { stdio: 'inherit' });
+  manifest.pythonNoticeArchiveSha256 = sha(archive);
+  writeFileSync(path.join(stage, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+  rmSync(archive);
   const metadataScript = `import importlib.metadata as m,json,sys\nitems=[]\nfor d in sorted(m.distributions(path=[sys.argv[1]]),key=lambda x:x.metadata['Name'].lower()):\n items.append({'name':d.metadata['Name'],'version':d.version,'license':d.metadata.get('License-Expression') or d.metadata.get('License','See distribution metadata and license files'),'homepage':d.metadata.get('Home-page',''),'notice_directory':str(d._path).replace(sys.argv[1],'site-packages')})\nprint(json.dumps(items,indent=2))`;
   writeFileSync(path.join(licenseDir, 'python-packages.json'), run(python, ['-c', metadataScript, path.join(stage, 'site-packages')]) + '\n');
   writeFileSync(path.join(stage, 'THIRD_PARTY_NOTICES.md'), `# BioMaker desktop portable runtime\n\nTarget: ${manifest.target}. CPython ${pythonVersion} from python-build-standalone via uv. uv: ${uvVersion}.\n\nBioMaker is MIT licensed (licenses/BioMaker-LICENSE.txt). uv is dual MIT/Apache-2.0 (licenses/uv-LICENSE-*). CPython's license is retained in python/lib/python3.12/LICENSE.txt; the complete matching python-build-standalone native dependency notice collection is in licenses/python-build-standalone/. Python service dependency metadata and notices remain in site-packages/*.dist-info; licenses/python-packages.json indexes them. Electron, Chromium, and Node notices are included by Electron in the application bundle.\n\nThe service requirements are pinned with hashes in apps/desktop/service/requirements.txt. manifest.json records source hashes and runtime provenance. The engine source snapshot intentionally excludes .env, virtual environments, datasets, logs, and experiments. ML dependencies are downloaded into the user's application support directory only after the user chooses to install the engine. Their dependency licenses accompany that installation.\n\nNo code-signing or notarization claim is made by this preparation step. A public release requires release-owner signing credentials and notarization. Windows and Linux must be built and verified on their native runners.\n`);

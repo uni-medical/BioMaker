@@ -24,8 +24,9 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, provision_native_runtime
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,7 @@ class EngineInstaller:
                 digest.update(path.read_bytes())
         digest.update(platform.machine().encode())
         digest.update(sys.platform.encode())
+        digest.update(NATIVE_RUNTIME_REVISION.encode())
         return digest.hexdigest()
 
     def _has_receipt(self) -> bool:
@@ -181,6 +183,7 @@ class EngineInstaller:
             return (
                 self.interpreter.is_file()
                 and receipt.get("fingerprint") == self._fingerprint()
+                and native_receipt_is_current(self.config.engine_root, receipt.get("native_runtime"))
             )
         except (OSError, ValueError):
             return False
@@ -304,16 +307,12 @@ class EngineInstaller:
                     "Setup did not create the engine Python environment."
                 )
             self._append("Verifying the BioMaker engine and scientific packages…")
+            native_runtime = provision_native_runtime(self.config.engine_root, run=lambda command: self._run(command, environment))
             self._run(
                 [
                     str(self.interpreter),
                     "-I",
-                    "-c",
-                    "import biomaker.run; import torch; import monai; "
-                    "from importlib.metadata import entry_points; "
-                    "assert any(e.name == 'biomaker' and e.value == 'biomaker.run:run' "
-                    "for e in entry_points(group='console_scripts')), 'BioMaker CLI entrypoint is missing'; "
-                    "print('BioMaker engine is ready.')",
+                    str(Path(__file__).with_name("verify_engine.py")),
                 ],
                 environment,
             )
@@ -325,7 +324,7 @@ class EngineInstaller:
             try:
                 with os.fdopen(fd, "w") as handle:
                     json.dump(
-                        {"version": VERSION, "fingerprint": self._fingerprint()}, handle
+                        {"version": VERSION, "fingerprint": self._fingerprint(), "native_runtime": native_runtime}, handle
                     )
                     handle.flush()
                     os.fsync(handle.fileno())

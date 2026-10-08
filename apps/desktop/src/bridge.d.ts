@@ -8,8 +8,8 @@ declare global {
       openPath(path: string): Promise<void>;
       saveArtifact(artifact: { runId: string; name: string }): Promise<string | null>;
       getAppInfo(): Promise<{ version: string; platform: string }>;
-      getPreferences(): Promise<{ theme: 'system' | 'light' | 'dark' }>;
-      setPreferences(preferences: { theme: 'system' | 'light' | 'dark' }): Promise<{ theme: 'system' | 'light' | 'dark' }>;
+      getPreferences(): Promise<{ theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en' }>;
+      setPreferences(preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en' }): Promise<{ theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en' }>;
       openExternal(url: string): Promise<void>;
       onMenuAction(callback: (action: string) => void): () => void;
     };

@@ -17,6 +17,7 @@ REPOSITORY = SERVICE.parents[2]
 sys.path.insert(0, str(SERVICE))
 
 from desktop_service import DesktopConfig, EngineInstaller, create_desktop_app
+import desktop_service
 
 TOKEN = "desktop-test-session-token-" + "x" * 32
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -24,6 +25,10 @@ AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 @pytest.fixture
 def config(tmp_path, monkeypatch):
+    # These tests exercise the installer state machine with a fake interpreter;
+    # native Mach-O editing and real library execution have dedicated tests.
+    monkeypatch.setattr(desktop_service, "provision_native_runtime", lambda *_args, **_kwargs: {"test_native_verified": True})
+    monkeypatch.setattr(desktop_service, "native_receipt_is_current", lambda _root, receipt: receipt == {"test_native_verified": True})
     engine = tmp_path / "engine"
     engine.mkdir()
     (engine / "pyproject.toml").write_text(
@@ -58,7 +63,7 @@ def ready_installer(config):
     engine.interpreter.parent.mkdir(parents=True)
     engine.interpreter.write_text("#!/bin/sh\nexit 0\n")
     engine.interpreter.chmod(0o755)
-    engine.receipt.write_text(json.dumps({"fingerprint": engine._fingerprint()}))
+    engine.receipt.write_text(json.dumps({"fingerprint": engine._fingerprint(), "native_runtime": {"test_native_verified": True}}))
     return EngineInstaller(config)
 
 
@@ -236,6 +241,15 @@ def test_failed_installation_reports_redacted_log_and_can_retry(config):
         assert EngineInstaller(config).snapshot()["ready"] is False
     finally:
         engine.close()
+
+
+def test_older_receipt_without_native_acceptance_requires_setup(config):
+    engine = ready_installer(config)
+    assert engine.snapshot()["ready"]
+    receipt = json.loads(engine.receipt.read_text())
+    receipt.pop("native_runtime")
+    engine.receipt.write_text(json.dumps(receipt))
+    assert not EngineInstaller(config).snapshot()["ready"]
 
 
 def test_install_cancellation_terminates_real_child_and_preserves_retry(config):
