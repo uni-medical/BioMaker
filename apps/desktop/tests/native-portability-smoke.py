@@ -39,7 +39,7 @@ def main() -> None:
     env = {"HOME": str(Path.home()), "PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"}
     try:
         subprocess.run(["/bin/cp", "-cR", str(source / ".venv"), str(temporary / ".venv")], check=True)
-        command = ["/usr/bin/sandbox-exec", "-p", profile, str(temporary / ".venv/bin/python"), "-I", str(ROOT / "service/verify_engine.py")]
+        command = ["/usr/bin/sandbox-exec", "-p", profile, str(temporary / ".venv/bin/python"), "-I", "-B", str(ROOT / "service/verify_engine.py")]
         baseline = subprocess.run(command + ["--lightgbm-only"], env=env, capture_output=True, text=True, timeout=90)
         receipt = provision_native_runtime(temporary)
         assert native_receipt_is_current(temporary, receipt)

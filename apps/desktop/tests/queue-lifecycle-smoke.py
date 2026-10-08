@@ -49,7 +49,7 @@ log.mkdir(parents=True, exist_ok=True); work.mkdir(parents=True, exist_ok=True)
     'config': {'agent_steps': 1}
 }))
 (log / 'events.jsonl').write_text(json.dumps({'event': 'run_started'}) + '\n')
-child = subprocess.Popen([sys.executable, str(home / 'worker.py'), str(home / 'heartbeat.json')], process_group=0)
+child = subprocess.Popen([sys.executable, '-B', str(home / 'worker.py'), str(home / 'heartbeat.json')], process_group=0)
 (home / 'owned-child.json').write_text(json.dumps({'pid': child.pid, 'leader': os.getpid()}))
 print('Synthetic NumPy worker is running; no model provider is involved.', flush=True)
 while child.poll() is None:
@@ -103,6 +103,9 @@ class Client:
             BIOMAKER_WEBUI_STATE_DIR=str(home / "state"),
             BIOMAKER_ENV_FILE=str(home / "config.env"),
             BIOMAKER_WEBUI_UV=str(runtime / "bin" / "uv"),
+            # QA may use a sealed application runtime. Descendants must not
+            # create caches in that runtime or the supplied engine source.
+            PYTHONDONTWRITEBYTECODE="1",
             PYTHONPATH=os.pathsep.join(
                 [
                     str(runtime / "site-packages"),
@@ -117,6 +120,7 @@ class Client:
         self.process = subprocess.Popen(
             [
                 str(self.runtime / "python" / "bin" / "python3"),
+                "-B",
                 "-u",
                 str(DESKTOP / "service" / "main.py"),
             ],
@@ -194,7 +198,7 @@ from webui.runner import RunManager
 settings = Settings.default()
 manager = RunManager(settings)
 record = manager.enqueue_command(
-    [sys.executable, str(Path(sys.argv[1]) / 'launcher.py'), sys.argv[1]],
+    [sys.executable, '-B', str(Path(sys.argv[1]) / 'launcher.py'), sys.argv[1]],
     cwd=settings.method_root,
     project_snapshot={'dataset_path': str(Path(sys.argv[1])/'dataset'), 'task_body': 'Synthetic desktop lifecycle check; no AI task.'},
     requested_exp_name='synthetic-desktop-lifecycle',
@@ -204,7 +208,7 @@ print(json.dumps({'id': record['id']}))
         environment = dict(client.environment)
         environment.pop("BIOMAKER_DESKTOP_TOKEN", None)
         submitted = subprocess.run(
-            [str(engine / ".venv" / "bin" / "python"), "-c", launch_code, str(home)],
+            [str(engine / ".venv" / "bin" / "python"), "-B", "-c", launch_code, str(home)],
             cwd=engine,
             env=environment,
             capture_output=True,
@@ -262,6 +266,7 @@ print(json.dumps({'id': record['id']}))
         child_check = subprocess.run(
             [
                 str(engine / ".venv" / "bin" / "python"),
+                "-B",
                 "-c",
                 "import psutil,sys; p=int(sys.argv[1]); print(not psutil.pid_exists(p) or psutil.Process(p).status()==psutil.STATUS_ZOMBIE)",
                 str(first["pid"]),

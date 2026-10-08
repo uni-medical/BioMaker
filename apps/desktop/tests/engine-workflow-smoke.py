@@ -321,6 +321,9 @@ def environment(home: Path, port: int, source: Path) -> dict[str, str]:
             "PYTHONPATH": os.pathsep.join([str(guard), str(source)]),
             "PYTHONUNBUFFERED": "1",
             "PYTHONNOUSERSITE": "1",
+            # Retain this explicitly: the credential allowlist above drops
+            # ambient Python settings, and child tools must preserve QA sources.
+            "PYTHONDONTWRITEBYTECODE": "1",
             "BIOMAKER_ENV_FILE": str(home / "empty.env"),
             "BIOMAKER_QUEUE_DIRECT": "1",
             "OPENAI_API_KEY": SYNTHETIC_KEY,
@@ -521,6 +524,7 @@ def main() -> None:
     }
     command = [
         str(python),
+        "-B",
         "-m",
         "biomaker.run",
         f"data_dir={dataset}",

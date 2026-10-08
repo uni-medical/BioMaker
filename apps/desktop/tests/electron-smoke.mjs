@@ -146,8 +146,9 @@ try {
     // Only this synthetic QA ledger is mutated. No engine task is launched.
     // Intercept native show() to verify dispatch/click without sending test banners.
     const python = executablePath ? path.resolve(path.dirname(executablePath), '../Resources/runtime/python/bin/python3') : path.join(root, 'build/runtime/python/bin/python3');
+    // -I ignores PYTHONDONTWRITEBYTECODE; -B keeps the signed bundle immutable.
     const fixtureStatus = (value) => {
-      const result = spawnSync(python, ['-I', '-c', `import json,sqlite3,sys\nc=sqlite3.connect(sys.argv[1])\nwith c:\n q=json.loads(c.execute('SELECT record_json FROM queue_control WHERE singleton=1').fetchone()[0]);q['paused']=True;q['reason']='Synthetic notification acceptance'\n c.execute('UPDATE queue_control SET record_json=? WHERE singleton=1',(json.dumps(q),))\n r=json.loads(c.execute('SELECT record_json FROM runs WHERE run_id=?',(sys.argv[2],)).fetchone()[0]);r.update(status=sys.argv[3],detailed_status=sys.argv[3],read_only=True)\n c.execute('UPDATE runs SET record_json=? WHERE run_id=?',(json.dumps(r),sys.argv[2]))`, path.join(profile, 'state/runs.sqlite3'), records[0].id, value], { encoding: 'utf8' });
+      const result = spawnSync(python, ['-I', '-B', '-c', `import json,sqlite3,sys\nc=sqlite3.connect(sys.argv[1])\nwith c:\n q=json.loads(c.execute('SELECT record_json FROM queue_control WHERE singleton=1').fetchone()[0]);q['paused']=True;q['reason']='Synthetic notification acceptance'\n c.execute('UPDATE queue_control SET record_json=? WHERE singleton=1',(json.dumps(q),))\n r=json.loads(c.execute('SELECT record_json FROM runs WHERE run_id=?',(sys.argv[2],)).fetchone()[0]);r.update(status=sys.argv[3],detailed_status=sys.argv[3],read_only=True)\n c.execute('UPDATE runs SET record_json=? WHERE run_id=?',(json.dumps(r),sys.argv[2]))`, path.join(profile, 'state/runs.sqlite3'), records[0].id, value], { encoding: 'utf8' });
       assert.equal(result.status, 0, result.stderr);
     };
     await app.evaluate(({ Notification, BrowserWindow }) => {

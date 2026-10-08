@@ -1,6 +1,7 @@
 # BioMaker Desktop 0.1.4 acceptance
 
 Date: 2026-10-08. Host: macOS, Apple silicon / arm64.
+Packaged source: `43b3998ccddfba4e5580d65cad078688ce6cb6b3`, clean checkout.
 
 ## Verified changes
 
@@ -47,11 +48,69 @@ sidecar termination and recovery, with controlled delays/failures to expose
 startup and stale-response races. These instrumented source checks are distinct
 from packaged-executable acceptance.
 
+The import recovery harness also passed transient progress-query failure with
+preserved job ID, modal reopening, global interruption counts, missing-job
+recovery and expired-preview rejection without a repeated submission.
+
 ## Release acceptance
 
-Package, installed-upgrade and full installed-workflow receipts will be recorded
-after validating the final 0.1.4 artifacts. The source checks above do not by
-themselves establish successful installation or engine execution.
+The packaged executable passed the history-import workflow, native-close checks
+and existing general Electron acceptance, all with isolated synthetic profiles
+and a system-only PATH. No renderer errors were observed. Native notification
+display was intercepted in QA; actual OS banner delivery is not established.
+
+The final DMG was mounted read-only. Its application archive matched the tested
+bundle, its version was 0.1.4 and its Applications shortcut resolved correctly.
+Deep strict ad-hoc signature verification passed, including after the corrected
+packaged acceptance. The QA ledger helper now uses Python `-B` with `-I`: isolated
+mode ignores the environment's bytecode setting and otherwise writes cache files
+inside the signed bundle. The initial unpacked QA copy was restored from the
+unchanged DMG before retesting; the user's previous application was preserved.
+
+The upgrade is installed at `/Applications/BioMaker.app`. The previous app is
+backed up under `release/installed-backups/BioMaker-0.1.3-20261008-231613.app`.
+The actual user profile started with its existing engine ready, without requesting
+installation. Its configuration file state and complete run records matched the
+pre-upgrade snapshot. No research histories or QA records were added to that
+profile. The engine source SHA-256 remains
+`56d274eec3df1d02eefb52dbe5cc894ff4a5eabe066f483046462e4e021e9fa2`.
+
+## Installed desktop workflow
+
+The installed 0.1.4 executable completed UI submission, durable queue execution,
+actual CPU training, frozen evaluation, result inspection and native report
+export in **15.888 seconds**. It reached `succeeded` with exit code 0 and zero
+renderer errors. The engine fitted a scikit-learn classifier on synthetic data;
+five model requests went to a deterministic localhost fixture. Final retraining
+was disabled. This verifies software behavior, not external-provider quality,
+multi-round biomedical search or scientific model performance.
+
+The harness restricted the Python sidecar and training descendants to localhost;
+only the exact `/bin/ps` executable was exempt for process identity inspection.
+The candidate confirmed an external-address connection was denied with `EPERM`.
+Installed engine/runtime fingerprints remained unchanged, and the QA profile's
+processes were confirmed stopped afterward.
+
+## Artifacts and evidence
+
+| Artifact | SHA-256 |
+| --- | --- |
+| BioMaker-0.1.4-mac-arm64.dmg | `979ecbd43dee8a1c1e766e71913e071dc9356f58372ac8cadd08c0760b5274ae` |
+| BioMaker-0.1.4-mac-arm64.zip | `0abd70509ee6878a8f428ac42eb919aac573400db1eb6e8e98b9ad8f2457c9ab` |
+
+Machine-readable receipts under `apps/desktop/output/`:
+
+- `engine-upgrade-0.1.4.json`
+- `installed-engine-acceptance-0.1.4.json`
+- `history-import-packaged-0.1.4/acceptance.json`
+- `native-close-packaged-0.1.4/acceptance.json`
+- `native-service-state/acceptance.json`
+- `service-ui/acceptance.json`
+- `history-import-recovery/acceptance.json`
+- `package-installation-0.1.4.json`
+- `playwright/electron-acceptance.json`
+- `desktop-workflow-acceptance-0.1.4.json`
+- `qa/desktop-workflow-0.1.4/` (durable fixture, logs, screenshots and outputs)
 
 ## Boundaries
 
