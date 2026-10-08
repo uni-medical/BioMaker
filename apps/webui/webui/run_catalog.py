@@ -25,7 +25,7 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_manifest(log_dir: Path) -> dict[str, Any] | None:
+def _read_manifest(log_dir: Path, *, strict: bool = False) -> dict[str, Any] | None:
     path = log_dir / "run_manifest.json"
     try:
         if (
@@ -35,7 +35,11 @@ def _read_manifest(log_dir: Path) -> dict[str, Any] | None:
         ):
             return None
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError:
+        if strict:
+            raise
+        return None
+    except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
 
@@ -55,7 +59,7 @@ def _event_value(events: list[dict[str, Any]], name: str, *, reverse: bool = Fal
     return next((event for event in values if event.get("event") == name), None)
 
 
-def _console_log(log_dir: Path) -> Path | None:
+def _console_log(log_dir: Path, *, strict: bool = False) -> Path | None:
     exact = log_dir / f"{log_dir.name}.log"
     if exact.is_file() and not exact.is_symlink():
         return exact
@@ -65,11 +69,15 @@ def _console_log(log_dir: Path) -> Path | None:
             for path in sorted(log_dir.glob("*.log"))
             if path.is_file() and not path.is_symlink() and path.parent == log_dir
         )
-    except (OSError, StopIteration):
+    except OSError:
+        if strict:
+            raise
+        return None
+    except StopIteration:
         return None
 
 
-def run_from_log_dir(settings: Settings, log_dir: Path) -> dict[str, Any] | None:
+def run_from_log_dir(settings: Settings, log_dir: Path, *, strict: bool = False) -> dict[str, Any] | None:
     root = settings.logs_root.resolve()
     try:
         if log_dir.is_symlink() or not log_dir.is_dir():
@@ -77,10 +85,12 @@ def run_from_log_dir(settings: Settings, log_dir: Path) -> dict[str, Any] | None
         resolved = log_dir.resolve()
         if not _inside(resolved, root) or resolved.parent != root:
             return None
-        manifest = _read_manifest(resolved)
+        manifest = _read_manifest(resolved, strict=strict)
         if manifest is None:
             return None
     except OSError:
+        if strict:
+            raise
         return None
 
     data_dir_value = manifest.get("data_dir")
@@ -92,7 +102,7 @@ def run_from_log_dir(settings: Settings, log_dir: Path) -> dict[str, Any] | None
         return None
 
     run_stub = {"id": resolved.name, "log_dir": str(resolved)}
-    event_response = read_events(settings, run_stub, tail=5_000)
+    event_response = read_events(settings, run_stub, tail=5_000, strict=strict)
     events = event_response["events"]
     started = _event_value(events, "run_started")
     terminal_event = next(
@@ -150,10 +160,12 @@ def run_from_log_dir(settings: Settings, log_dir: Path) -> dict[str, Any] | None
     try:
         modified_at = resolved.stat().st_mtime
     except OSError:
+        if strict:
+            raise
         modified_at = 0.0
     created_at = (started or {}).get("ts") or manifest.get("created_at")
     finished_at = (terminal_event or {}).get("ts")
-    console = _console_log(resolved)
+    console = _console_log(resolved, strict=strict)
     workspace_dir = manifest.get("workspace_dir")
 
     return {

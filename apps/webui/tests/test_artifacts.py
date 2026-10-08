@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import pytest
 from webui.artifacts import (
     ArtifactError,
     artifact_collection_revision,
+    file_revision,
     list_artifacts,
     read_events,
     read_results_summary,
@@ -149,3 +151,18 @@ def test_event_and_detail_http_responses_preserve_nonfinite_failure_record(setti
         assert event["metric"] == "NaN"
         assert event["resource_usage"] == {"memory": "Infinity", "score": "-Infinity"}
     assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_file_revision_detects_same_size_restored_mtime_changes(tmp_path, replace):
+    path = tmp_path / "event.log"
+    path.write_bytes(b"before")
+    before = path.stat()
+    revision = file_revision(path)
+    target = tmp_path / "replacement" if replace else path
+    target.write_bytes(b"after!")
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    if replace:
+        os.replace(target, path)
+    assert path.stat().st_size == before.st_size and path.stat().st_mtime_ns == before.st_mtime_ns
+    assert file_revision(path) != revision

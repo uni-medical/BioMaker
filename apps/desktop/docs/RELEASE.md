@@ -193,8 +193,8 @@ scope of each check and the remaining distribution and platform boundaries.
 
 ## Next workflow improvements
 
-- Cache historical catalog observations with explicit invalidation so long event
-  histories do not require repeated full scans for experiment lists and details.
+- Reduce first-read and actively changing history costs after validating the
+  observation cache. Cache hits do not establish bounded IO for changed files.
 
 ## Multiple-draft implementation for 0.1.12
 
@@ -267,3 +267,29 @@ Package verification, actual installation with independent engine setup, origina
 profile preservation, installed synthetic workflow and normal launch passed.
 See [ACCEPTANCE-0.1.13.md](ACCEPTANCE-0.1.13.md) for exact receipts, source-bound
 package checksums, known boundaries and preserved harness failures.
+
+## Observation caching for 0.1.14
+
+Individual run routes use an indexed ledger lookup. List and detail observations
+may be reused only after rechecking their filesystem dependencies. Lifecycle
+status, ownership and available actions must come from the current ledger record;
+the cache must never make an experiment controllable or change its queue state.
+
+The cache belongs to one service instance and retains bounded serialized
+summaries. File replacement, in-place rewrite, truncation, deletion, manifest and
+result changes, directory substitution and service restart require fresh reads.
+Revision signals must also detect replacement or rewrites when size and mtime
+are retained, so the renderer knows to request the new detail. Transient read
+failures and changing observations must not become persistent cached fallbacks.
+
+Run `tests/catalog-refresh-smoke.mjs` against the built source and packaged
+executable in isolated synthetic profiles. Verify file changes reach the real UI,
+restart and cross-run navigation preserve reading state, and no model request,
+engine setup or experiment submission occurs. Keep performance measurements
+separate: report cold versus repeated calls, fixture sizes and logical file bytes,
+without interpreting instrumented endpoint timings as physical disk or UI latency.
+
+First reads, changed files, oversized uncached summaries and cache eviction can
+still require full history parsing. The cache payload limit is not a bound on
+transient parser memory, total service memory or total request IO. Preserve the
+existing event-count and last-5,000-valid-event catalog semantics.

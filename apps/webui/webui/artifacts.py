@@ -4,6 +4,8 @@ import csv
 import hashlib
 import json
 import math
+import stat as stat_module
+from collections import deque
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -38,7 +40,9 @@ def file_revision(path: Path) -> str | None:
             return None
     except OSError:
         return None
-    return opaque_revision({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    return opaque_revision({"dev": stat.st_dev, "ino": stat.st_ino, "mode": stat.st_mode,
+                            "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                            "ctime_ns": stat.st_ctime_ns})
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -140,14 +144,35 @@ def _event_float(value: str) -> float | str:
     return number if math.isfinite(number) else ("Infinity" if number > 0 else "-Infinity")
 
 
-def read_events(
-    settings: Settings, run: dict[str, Any], *, tail: int = 200
-) -> dict[str, Any]:
+def _observation_artifact(settings: Settings, run: dict[str, Any], name: str,
+                          strict: bool) -> Path | None:
+    if not strict:
+        try:
+            return resolve_artifact(settings, run, name)
+        except ArtifactError:
+            return None
+    directory = resolve_run_log_dir(settings, run)
+    candidate = (directory / name).resolve()
+    if not _inside(candidate, directory) or candidate.parent != directory:
+        raise ArtifactError("Artifact path escapes the run log directory")
     try:
-        path = resolve_artifact(settings, run, "events.jsonl")
-    except ArtifactError:
+        info = candidate.stat()
+    except FileNotFoundError:
+        # A confirmed missing file is different from an I/O failure. The cache
+        # records missing dependency metadata and invalidates on its creation.
+        return None
+    if not stat_module.S_ISREG(info.st_mode):
+        raise ArtifactError("Artifact is not a regular file")
+    return candidate
+
+
+def read_events(
+    settings: Settings, run: dict[str, Any], *, tail: int = 200, strict: bool = False
+) -> dict[str, Any]:
+    path = _observation_artifact(settings, run, "events.jsonl", strict)
+    if path is None:
         return {"count": 0, "events": []}
-    parsed: list[dict[str, Any]] = []
+    parsed: deque[dict[str, Any]] = deque(maxlen=max(0, tail))
     count = 0
     try:
         with path.open(encoding="utf-8", errors="replace") as handle:
@@ -161,23 +186,24 @@ def read_events(
                     continue
                 if isinstance(event, dict):
                     parsed.append(event)
-                    if len(parsed) > tail:
-                        parsed.pop(0)
     except OSError:
+        if strict:
+            raise
         return {"count": 0, "events": []}
-    return {"count": count, "events": parsed}
+    return {"count": count, "events": list(parsed)}
 
 
-def read_results_summary(settings: Settings, run: dict[str, Any]) -> dict[str, Any]:
-    try:
-        path = resolve_artifact(settings, run, "results.tsv")
-    except ArtifactError:
+def read_results_summary(settings: Settings, run: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:
+    path = _observation_artifact(settings, run, "results.tsv", strict)
+    if path is None:
         return {"count": 0, "best_metric": None, "latest": None}
     rows: list[dict[str, str]] = []
     try:
         with path.open(encoding="utf-8", errors="replace", newline="") as handle:
             rows = list(csv.DictReader(handle, delimiter="\t"))
     except (OSError, csv.Error):
+        if strict:
+            raise
         return {"count": 0, "best_metric": None, "latest": None}
 
     metric_rows: list[tuple[float, dict[str, str]]] = []
@@ -204,17 +230,20 @@ def read_results_summary(settings: Settings, run: dict[str, Any]) -> dict[str, A
 
 
 def read_manifest_summary(
-    settings: Settings, run: dict[str, Any]
+    settings: Settings, run: dict[str, Any], *, strict: bool = False
 ) -> dict[str, Any] | None:
-    try:
-        path = resolve_artifact(settings, run, "run_manifest.json")
-    except ArtifactError:
+    path = _observation_artifact(settings, run, "run_manifest.json", strict)
+    if path is None:
         return None
     try:
         if path.stat().st_size > 5_000_000:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError:
+        if strict:
+            raise
+        return None
+    except json.JSONDecodeError:
         return None
     if not isinstance(data, dict):
         return None
@@ -224,15 +253,19 @@ def read_manifest_summary(
     }
 
 
-def detailed_run(settings: Settings, run: dict[str, Any]) -> dict[str, Any]:
-    result = dict(run)
-    events = read_events(settings, run, tail=1)
-    result["observed"] = {
+def read_observed_summary(settings: Settings, run: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:
+    events = read_events(settings, run, tail=1, strict=strict)
+    return {
         "event_count": events["count"],
         "last_event": events["events"][-1] if events["events"] else None,
-        "results": read_results_summary(settings, run),
-        "manifest": read_manifest_summary(settings, run),
+        "results": read_results_summary(settings, run, strict=strict),
+        "manifest": read_manifest_summary(settings, run, strict=strict),
     }
+
+
+def detailed_run(settings: Settings, run: dict[str, Any]) -> dict[str, Any]:
+    result = dict(run)
+    result["observed"] = read_observed_summary(settings, run)
     result["artifacts"] = list_artifacts(settings, run)
     return result
 

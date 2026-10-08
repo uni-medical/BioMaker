@@ -1,8 +1,8 @@
 {
   "name": "biomaker-desktop",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "private": true,
-  "description": "BioMaker \u2014 a desktop workspace for biomedical model development",
+  "description": "BioMaker — a desktop workspace for biomedical model development",
   "author": "BioMaker contributors",
   "license": "MIT",
   "type": "module",

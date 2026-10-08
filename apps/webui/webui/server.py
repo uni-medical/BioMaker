@@ -16,7 +16,6 @@ from fastapi.staticfiles import StaticFiles
 from .artifacts import (
     ArtifactError,
     artifact_collection_revision,
-    detailed_run,
     file_revision,
     list_artifacts,
     opaque_revision,
@@ -42,7 +41,8 @@ from .models import (
     QueueResumeRequest,
     RunCreate,
 )
-from .run_catalog import list_log_runs, run_from_log_dir
+from .observation_cache import ObservationCache
+from .run_catalog import list_log_runs
 from .run_store import SQLiteRunStore
 from .runner import TERMINAL_STATUSES, RunManager
 from .settings import Settings
@@ -235,13 +235,19 @@ def create_app(
     app_settings.ensure_directories()
     run_store = SQLiteRunStore(app_settings.state_dir / "runs.sqlite3")
     manager = RunManager(app_settings, run_store, process_factory=process_factory)
+    observations = ObservationCache(app_settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         manager.import_history(list_log_runs(app_settings))
         manager.start()
-        yield
-        manager.shutdown()
+        try:
+            yield
+        finally:
+            try:
+                manager.shutdown()
+            finally:
+                observations.clear()
 
     app = FastAPI(
         title="BioMaker WebUI",
@@ -253,6 +259,7 @@ def create_app(
     app.state.settings = app_settings
     app.state.run_store = run_store
     app.state.manager = manager
+    app.state.observations = observations
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.middleware("http")
@@ -411,37 +418,32 @@ def create_app(
         result["controllable"] = bool(actions)
         return result
 
+    def enrich_run(raw_session: dict[str, Any]) -> dict[str, Any]:
+        current = session_run(raw_session)
+        raw_log_dir = current.get("log_dir")
+        base = observations.catalog(Path(str(raw_log_dir))) if raw_log_dir else None
+        if base is None:
+            return current
+        # The ledger owns lifecycle state. Reuse only log observations; apply
+        # them to a fresh ledger record on every list and individual request.
+        for key in (
+            "progress",
+            "project_snapshot",
+            "dataset_path",
+            "dataset_name",
+            "actual_exp_name",
+            "options",
+            "log_modified_at",
+            "terminal_event",
+        ):
+            if base.get(key) is not None:
+                current[key] = base[key]
+        if not current.get("status_reason") and base.get("status_reason"):
+            current["status_reason"] = base["status_reason"]
+        return current
+
     def all_runs() -> list[dict[str, Any]]:
-        merged: list[dict[str, Any]] = []
-        for raw_session in run_store.list_records("runs"):
-            current = session_run(raw_session)
-            raw_log_dir = current.get("log_dir")
-            base = (
-                run_from_log_dir(app_settings, Path(str(raw_log_dir)))
-                if raw_log_dir
-                else None
-            )
-            if base is not None:
-                combined = dict(current)
-                # The ledger owns lifecycle state. Manifest/events enrich only
-                # immutable run metadata and observable progress.
-                for key in (
-                    "progress",
-                    "project_snapshot",
-                    "dataset_path",
-                    "dataset_name",
-                    "actual_exp_name",
-                    "options",
-                    "log_modified_at",
-                    "terminal_event",
-                ):
-                    if base.get(key) is not None:
-                        combined[key] = base[key]
-                if not combined.get("status_reason") and base.get("status_reason"):
-                    combined["status_reason"] = base["status_reason"]
-                merged.append(combined)
-            else:
-                merged.append(current)
+        merged = [enrich_run(record) for record in run_store.list_records("runs")]
         return sorted(
             merged,
             key=lambda item: (
@@ -455,7 +457,8 @@ def create_app(
         )
 
     def find_run(run_id: str) -> dict[str, Any] | None:
-        return next((run for run in all_runs() if run.get("id") == run_id), None)
+        record = run_store.get_record("runs", run_id)
+        return enrich_run(record) if record is not None else None
 
     @app.get("/api/runs")
     def list_runs() -> list[dict[str, Any]]:
@@ -466,7 +469,7 @@ def create_app(
         run = find_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
-        return detailed_run(app_settings, run)
+        return observations.detail(run)
 
     @app.get("/api/runs/{run_id}/updates")
     def run_updates(run_id: str) -> dict[str, Any]:
