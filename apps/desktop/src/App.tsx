@@ -1341,7 +1341,7 @@ export default function App() {
         {drafts.error && <div className="draft-save-error" role="alert">
           <p>{drafts.error}</p>
           <div>
-            <button className="secondary-button" disabled={drafts.saving || drafts.operating} onClick={() => void drafts.retry()}>{t('重试草稿保存', 'Retry drafts')}</button>
+            <button className="secondary-button" disabled={drafts.saving || drafts.operating || busy === 'submit'} onClick={() => { if (!submitInFlight.current) void drafts.retry(); }}>{t('重试草稿保存', 'Retry drafts')}</button>
             {drafts.dirty && <button className="secondary-button" disabled={drafts.saving || drafts.operating || busy === 'submit'} onClick={() => {
               changeDraftContext();
               const navigation = ++navigationEpoch.current;
