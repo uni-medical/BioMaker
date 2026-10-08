@@ -57,6 +57,8 @@ import {
   readStored,
   request,
   runTitle,
+  isRuntimeBusy,
+  runtimeOperationLabel,
   serviceStatusLabel,
   statusLabel,
   type EngineStatus,
@@ -148,6 +150,11 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
   const [engine, setEngine] = useState<EngineStatus | null>(null);
+  const engineEpoch = useRef(0);
+  const applyEngineSnapshot = useCallback((snapshot: EngineStatus["engine"]) => {
+    engineEpoch.current += 1;
+    setEngine(current => current ? { ...current, engine: snapshot } : current);
+  }, []);
   const [env, setEnv] = useState<EnvConfig | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [resources, setResources] = useState<Resources | null>(null);
@@ -408,6 +415,7 @@ export default function App() {
     if (serviceRef.current.status !== "ready") return Promise.resolve();
     if (refreshPromise.current) return refreshPromise.current;
     const serviceRevision = serviceRef.current.revision;
+    const requestedEngineEpoch = engineEpoch.current;
     const current = () => alive.current && serviceRef.current.status === "ready" && serviceRef.current.revision === serviceRevision;
     const task = (async () => {
       const result = await Promise.allSettled([
@@ -420,7 +428,7 @@ export default function App() {
       if (!current()) return;
       if (result[0].status === "fulfilled") setRuns(result[0].value);
       if (result[1].status === "fulfilled") setHealth(result[1].value);
-      if (result[2].status === "fulfilled") setEngine(result[2].value);
+      if (result[2].status === "fulfilled" && requestedEngineEpoch === engineEpoch.current) setEngine(result[2].value);
       if (result[3].status === "fulfilled") setResources(result[3].value);
       if (result[4].status === "fulfilled") {
         const rows = result[4].value.items;
@@ -440,7 +448,8 @@ export default function App() {
       }
       pollState.current.active =
         (result[0].status === "fulfilled" && result[0].value.some(isActive)) ||
-        (result[2].status === "fulfilled" && result[2].value.engine.installing);
+        (result[2].status === "fulfilled" && isRuntimeBusy(result[2].value.engine)) ||
+        requestedEngineEpoch !== engineEpoch.current;
       if (
         result[1].status === "fulfilled" &&
         (!configLoaded.current.env || !configLoaded.current.templates)
@@ -513,7 +522,7 @@ export default function App() {
     return () => { stopped = true; unsubscribe(); };
   }, [receiveServiceState]);
 
-  const activelyPolling = !!engine?.engine.installing || runs.some(isActive);
+  const activelyPolling = isRuntimeBusy(engine?.engine) || runs.some(isActive);
   useEffect(() => {
     if (!window.biomaker) {
       setLoading(false);
@@ -682,7 +691,7 @@ export default function App() {
       toast(errorMessage(e));
     }
   };
-  const engineReady = !!engine?.engine.ready;
+  const engineReady = !!engine?.engine.ready && !isRuntimeBusy(engine?.engine);
   const keyReady = !!env?.values.OPENAI_API_KEY?.configured;
   const modelReady = !!(
     draft.options.model_for_all_agents || env?.values.BIOMAKER_MAIN_MODEL?.value
@@ -1073,15 +1082,15 @@ export default function App() {
               onClick={() => setSettings("runtime")}
             >
               <span
-                className={`connection-dot ${serviceState.status === "failed" ? "error" : !serviceReady ? "installing" : engineReady ? "ready" : engine?.engine.installing ? "installing" : ""}`}
+                className={`connection-dot ${serviceState.status === "failed" ? "error" : !serviceReady ? "installing" : engineReady ? "ready" : isRuntimeBusy(engine?.engine) ? "installing" : ""}`}
               />
               <span>
                 {!serviceReady
                   ? serviceStatusLabel(serviceState, t)
                   : !engine
                     ? t("正在读取运行环境…", "Loading runtime status…")
-                  : engine?.engine.installing
-                    ? t("正在安装运行环境", "Installing runtime")
+                  : isRuntimeBusy(engine?.engine)
+                    ? runtimeOperationLabel(engine?.engine, t)
                     : engineReady
                       ? t("本地运行环境已就绪", "Local runtime ready")
                       : t("设置运行环境", "Set up runtime")}
@@ -1709,10 +1718,10 @@ export default function App() {
                     done={engineReady}
                     title={t("准备本地运行环境", "Prepare the local runtime")}
                     detail={
-                      engine?.engine.installing
+                      isRuntimeBusy(engine?.engine)
                         ? t(
-                            "依赖正在下载，打开可查看进度。",
-                            "Dependencies are downloading. Open to see progress.",
+                            "运行环境正在维护，打开可查看进度。",
+                            "Runtime maintenance is in progress. Open to view progress.",
                           )
                         : t(
                             "为实验安装独立的 Python 环境。",
@@ -1722,7 +1731,7 @@ export default function App() {
                     label={
                       engineReady
                         ? t("就绪", "Ready")
-                        : engine?.engine.installing
+                        : isRuntimeBusy(engine?.engine)
                           ? t("查看", "View")
                           : t("安装", "Install")
                     }
@@ -2011,6 +2020,7 @@ export default function App() {
             configLoaded.current.env = true;
           }}
           onRefresh={refreshAll}
+          onEngineChanged={applyEngineSnapshot}
           toast={toast}
         />
       )}

@@ -85,7 +85,7 @@ async function launch() {
       const url = new URL(String(input));
       const method = String(options?.method || 'GET').toUpperCase();
       const mutatingRun = method !== 'GET' && /^\/api\/runs(?:\/|$)/.test(url.pathname);
-      const installOrProvider = /^\/api\/(?:desktop\/engine\/(?:install|cancel)|models\/discover|env(?:\/|$))/.test(url.pathname) && method !== 'GET';
+      const installOrProvider = /^\/api\/(?:desktop\/engine\/(?:install|cancel|check|repair)|models\/discover|env(?:\/|$))/.test(url.pathname) && method !== 'GET';
       if (url.hostname !== '127.0.0.1' || mutatingRun || installOrProvider) {
         globalThis.__reuseForbiddenRequests.push({ method, path: url.pathname });
         throw new Error('Reuse QA blocked a run mutation, installation, or provider operation');

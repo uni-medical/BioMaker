@@ -16,6 +16,19 @@ test('renderer cannot supply headers, alter credentials, or mutate artifacts', (
   assert.throws(() => validateRequest('/artifacts/runs/abc/report.html', { method: 'POST' }));
   assert.throws(() => validateRequest('/api/runs', { method: 'POST', body: 'x'.repeat(2_100_000) }));
 });
+test('engine checks and repairs use the same bounded native request contract as installation', () => {
+  for (const action of ['install', 'cancel', 'check', 'repair']) {
+    const endpoint = `/api/desktop/engine/${action}`;
+    assert.deepEqual(validateRequest(endpoint, { method: 'post' }), { path: endpoint, method: 'POST', body: undefined });
+    assert.throws(() => validateRequest(endpoint, { method: 'POST', headers: { Authorization: 'renderer-token' } }));
+    assert.throws(() => validateRequest(endpoint, { method: 'POST', credentials: 'include' }));
+    assert.throws(() => validateRequest(endpoint, { method: 'TRACE' }));
+    assert.throws(() => validateRequest(endpoint, { method: 'POST', body: 'x'.repeat(2_100_000) }));
+    assert.throws(() => validateRequest(`https://example.test${endpoint}`, { method: 'POST' }));
+    assert.throws(() => validateRequest(`/api/desktop/engine/%2e%2e/${action}`, { method: 'POST' }));
+    assert.throws(() => validateRequest(`/api/desktop/engine%2f${action}`, { method: 'POST' }));
+  }
+});
 test('artifact names cannot escape a run directory', () => {
   for (const name of ['../key', '/etc/passwd', '..', '.env', 'a\\b', 'a\0b']) assert.throws(() => validateArtifact('abc', name));
   assert.throws(() => validateArtifact('../abc', 'report.html'));

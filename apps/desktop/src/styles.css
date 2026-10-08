@@ -2056,9 +2056,15 @@ kbd {
 }
 .runtime-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   margin: 15px 0;
 }
+.runtime-checked-at { margin: -8px 0 20px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.runtime-repair-confirmation { margin-top: 18px; padding: 16px; border: 1px solid var(--border); border-radius: 9px; background: var(--sidebar); }
+.runtime-repair-confirmation h4 { margin: 0 0 8px; font-size: 13px; font-weight: 550; }
+.runtime-repair-confirmation p { font-size: 12px; color: var(--muted); line-height: 1.8; }
+.runtime-confirm-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .install-log {
   margin: 25px 0;
 }

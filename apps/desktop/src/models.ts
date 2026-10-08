@@ -102,6 +102,12 @@ export interface EngineStatus {
   engine: {
     ready: boolean;
     installing: boolean;
+    operation?: "install" | "check" | "repair" | null;
+    checking?: boolean;
+    busy_external?: boolean;
+    maintenance_unavailable?: boolean;
+    health?: "unknown" | "healthy" | "failed";
+    checked_at?: string | null;
     error: string | null;
     log: string;
   };
@@ -111,6 +117,19 @@ export interface EngineStatus {
     platform?: string;
     background_runs?: boolean;
   };
+}
+export function runtimeOperation(engine?: EngineStatus["engine"]): "install" | "check" | "repair" | null {
+  return engine?.operation || (engine?.checking ? "check" : engine?.installing ? "install" : null);
+}
+export function isRuntimeBusy(engine?: EngineStatus["engine"]): boolean {
+  return !!engine?.busy_external || !!runtimeOperation(engine);
+}
+export function runtimeOperationLabel(engine: EngineStatus["engine"] | undefined, t: Translate): string {
+  if (engine?.busy_external) return t("另一进程正在维护运行环境", "Another process is maintaining the runtime");
+  const operation = runtimeOperation(engine);
+  return operation === "check" ? t("正在检查运行环境", "Checking runtime")
+    : operation === "repair" ? t("正在修复运行环境", "Repairing runtime")
+      : t("正在安装运行环境", "Installing runtime");
 }
 export interface EnvConfig {
   values: Record<

@@ -2,6 +2,13 @@
 
 ## Release gates
 
+- Run `tests/runtime-health-smoke.mjs` for runtime maintenance UI and admission
+  feedback, reporting its synthetic backend responses explicitly. Separately run
+  `tests/engine-health-smoke.py` with bundled Python `-I -B` inside a network-denying
+  macOS sandbox. It clones the installed engine and package cache with APFS,
+  removes a real dependency only in the clone, checks failure persistence, then
+  performs a real offline locked reinstall and verifies recovery. Original engine
+  and cache fingerprints must remain identical. Never damage the actual profile.
 - Build from the dedicated desktop branch, preserving the research checkout.
 - Pin JS dependencies with `package-lock.json`, record portable runtime provenance,
   and include upstream license notices in the bundle.

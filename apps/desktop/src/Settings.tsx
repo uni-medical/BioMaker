@@ -13,6 +13,7 @@ import {
   Sun,
   Terminal,
   Trash2,
+  Wrench,
 } from "lucide-react";
 import { Modal, Notice, SettingRow, Spinner } from "./components";
 import type { ServiceState } from "./bridge";
@@ -21,6 +22,9 @@ import {
   errorMessage,
   request,
   serviceStatusLabel,
+  runtimeOperation,
+  runtimeOperationLabel,
+  isRuntimeBusy,
   type EngineStatus,
   type EnvConfig,
   type Language,
@@ -48,6 +52,7 @@ export default function Settings({
   onReturnToExperiment,
   modelOverride,
   onRefresh,
+  onEngineChanged,
   toast,
 }: {
   t: Translate;
@@ -68,6 +73,7 @@ export default function Settings({
   onReturnToExperiment?: () => void;
   modelOverride?: string | null;
   onRefresh: () => Promise<void>;
+  onEngineChanged: (engine: EngineStatus["engine"]) => void;
   toast: (s: string) => void;
 }) {
   const [section, setSection] = useState<Section>(initialSection || "provider");
@@ -87,9 +93,22 @@ export default function Settings({
   const [removeKey, setRemoveKey] = useState(false);
   const [optional, setOptional] = useState(false);
   const [confirmClose, setConfirmClose] = useState(false);
+  const [confirmRepair, setConfirmRepair] = useState(false);
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const runtimeRequest = useRef(false);
+  const repairCancel = useRef<HTMLButtonElement>(null);
+  const repairButton = useRef<HTMLButtonElement>(null);
+  const currentService = useRef(serviceState);
+  currentService.current = serviceState;
   const closeState = useRef({ dirty: false, saving: false });
   const saving = pending === "save";
   const serviceReady = serviceState.status === "ready";
+  const operation = runtimeOperation(engine?.engine);
+  const runtimeBusy = isRuntimeBusy(engine?.engine);
+  const externalBusy = !!engine?.engine.busy_external;
+  const runtimeCancelled = /^(Installation|Engine check|Engine repair) cancelled\.$/.test(engine?.engine.error || "");
+  const checkedAt = engine?.engine.checked_at && Number.isFinite(Date.parse(engine.engine.checked_at))
+    ? new Date(engine.engine.checked_at).toLocaleString(lang === "zh" ? "zh-CN" : "en-US") : null;
   const configured = !!env?.values.OPENAI_API_KEY?.configured;
   const effectiveKey = !!key.trim() || (configured && !removeKey);
   const effectiveModel = !!model.trim() || !!modelOverride;
@@ -102,6 +121,7 @@ export default function Settings({
     setError("");
   };
   const close = () => {
+    if (confirmRepair) { setConfirmRepair(false); repairButton.current?.focus(); return; }
     if (closeState.current.saving) {
       toast(t("配置正在保存，请稍候。", "Settings are being saved. Please wait."));
       return;
@@ -127,8 +147,17 @@ export default function Settings({
     }
   }, [env, dirty]);
   useEffect(() => {
-    if (engine?.engine.installing) setSection("runtime");
+    if (runtimeBusy) setSection("runtime");
   }, []);
+  useEffect(() => {
+    if (!operation) setCancelRequested(false);
+  }, [operation]);
+  useEffect(() => {
+    if (section !== "runtime" || runtimeBusy || !serviceReady) setConfirmRepair(false);
+  }, [section, runtimeBusy, serviceReady]);
+  useEffect(() => {
+    if (confirmRepair) repairCancel.current?.focus();
+  }, [confirmRepair]);
 
   async function save() {
     if (pending || !env || !serviceReady) return;
@@ -220,16 +249,29 @@ export default function Settings({
       setPending("");
     }
   }
-  async function engineAction(action: "install" | "cancel") {
-    if (!serviceReady || pending) return;
+  async function engineAction(action: "install" | "check" | "repair" | "cancel") {
+    if (!serviceReady || pending || runtimeRequest.current || externalBusy || (action !== "cancel" && runtimeBusy)) return;
+    runtimeRequest.current = true;
     setPending(action);
     setError("");
+    setConfirmRepair(false);
+    const revision = serviceState.revision;
+    const current = () => currentService.current.status === "ready" && currentService.current.revision === revision;
     try {
-      await request(`/api/desktop/engine/${action}`, "POST");
+      const snapshot = await request<EngineStatus["engine"]>(`/api/desktop/engine/${action}`, "POST");
+      if (!current()) return;
+      onEngineChanged(snapshot);
+      if (action === "cancel" && runtimeOperation(snapshot)) setCancelRequested(true);
       await onRefresh();
     } catch (e) {
-      setError(errorMessage(e));
+      if (current()) {
+        const message = errorMessage(e);
+        setError(message.includes("The engine operation lock is unavailable.")
+          ? t("本机磁盘访问异常，暂时无法检查或修复运行环境。请检查访问权限后重试。", "Local disk access prevents runtime checks or repairs. Check access permissions, then try again.")
+          : message);
+      }
     } finally {
+      runtimeRequest.current = false;
       setPending("");
     }
   }
@@ -582,14 +624,16 @@ export default function Settings({
               </p>
               <div className="runtime-state">
                 <span
-                  className={`runtime-icon ${engine?.engine.ready ? "ready" : ""}`}
+                  className={`runtime-icon ${engine?.engine.health === "healthy" && !runtimeBusy ? "ready" : ""}`}
                 >
                   {!serviceReady || !engine ? (
                     serviceState.status === "failed" ? <Terminal size={23} /> : <Spinner size={23} />
-                  ) : engine?.engine.installing ? (
+                  ) : runtimeBusy ? (
                     <Spinner size={23} />
-                  ) : engine?.engine.ready ? (
+                  ) : engine?.engine.health === "healthy" ? (
                     <Check size={23} />
+                  ) : engine?.engine.ready ? (
+                    <Terminal size={23} />
                   ) : (
                     <Download size={23} />
                   )}
@@ -600,10 +644,18 @@ export default function Settings({
                       ? serviceStatusLabel(serviceState, t)
                       : !engine
                         ? t("正在读取运行环境…", "Loading runtime status…")
-                        : engine?.engine.installing
-                      ? t("正在安装运行环境", "Installing runtime")
+                        : runtimeBusy
+                      ? cancelRequested && !externalBusy ? t("正在取消操作…", "Cancelling operation…") : runtimeOperationLabel(engine.engine, t)
+                      : runtimeCancelled
+                        ? t("操作已取消", "Operation cancelled")
+                        : engine?.engine.maintenance_unavailable
+                          ? t("运行环境暂时无法维护", "Runtime maintenance is unavailable")
+                        : engine?.engine.health === "failed"
+                          ? t("运行环境需要修复", "Runtime needs attention")
                       : engine?.engine.ready
-                        ? t("运行环境已就绪", "Runtime ready")
+                        ? engine.engine.health === "healthy"
+                          ? t("运行环境检查通过", "Runtime check passed")
+                          : t("运行环境已安装", "Runtime installed")
                         : t(
                             "安装实验所需环境",
                             "Install the experiment runtime",
@@ -612,11 +664,22 @@ export default function Settings({
                   <p>
                     {!serviceReady || !engine
                       ? t("连接就绪后将更新运行环境状态。", "Runtime status will update when the service is ready.")
+                      : externalBusy
+                        ? t("另一进程正在维护运行环境，请稍后重试。可以刷新以查看最新状态。", "Another process is maintaining the runtime. Please try again later, or refresh to see the latest status.")
+                      : runtimeBusy
+                        ? operation === "check"
+                          ? t("正在检查依赖并执行固定的 CPU 自检。完成后会显示结果。", "Checking dependencies and running a fixed CPU self-test. Results appear when it finishes.")
+                          : t("正在下载和验证依赖，进度会显示在下方。", "Downloading and checking dependencies. Progress appears below.")
+                      : runtimeCancelled
+                        ? t("操作已停止。可以重新检查运行环境，或修复后再试。", "The operation stopped. Check the runtime again, or repair it and retry.")
+                      : engine?.engine.maintenance_unavailable
+                        ? t("无法准备运行环境维护。请检查本机磁盘访问权限后重试。", "Runtime maintenance could not be prepared. Check local disk access, then try again.")
+                      : engine?.engine.health === "failed"
+                        ? t("运行环境检查或维护未通过。查看下方详细信息后重试或修复。", "A runtime check or maintenance operation failed. Review the details below, then retry or repair the runtime.")
                       : engine?.engine.ready
-                      ? t(
-                          "可以在此电脑创建和运行实验。",
-                          "Ready to create and run experiments on this computer.",
-                        )
+                        ? engine.engine.health === "healthy"
+                          ? t("依赖和固定 CPU 自检已通过。实验会按任务与预算单独运行。", "Dependencies and the fixed CPU self-test passed. Experiments run separately with their own tasks and budgets.")
+                          : t("已检测到此前安装的环境。可运行检查，确认依赖与固定 CPU 自检是否通过。", "A previously installed runtime was found. Run a check to verify dependencies and a fixed CPU self-test.")
                       : t(
                           "下载通常需要几分钟，进度会显示在下方。",
                           "The download may take several minutes. Progress appears below.",
@@ -624,20 +687,24 @@ export default function Settings({
                   </p>
                 </div>
               </div>
+              {checkedAt && <p className="runtime-checked-at">{t("最近检查或维护：", "Latest check or maintenance: ")}<time dateTime={engine?.engine.checked_at || undefined}>{checkedAt}</time></p>}
               <div className="runtime-actions">
-                {engine?.engine.installing ? (
+                {externalBusy ? <>
+                  <button className="secondary-button" disabled><Check size={14} />{t("检查运行环境", "Check runtime")}</button>
+                  <button className="secondary-button" disabled><Wrench size={14} />{t("修复运行环境", "Repair runtime")}</button>
+                </> : runtimeBusy ? (
                   <button
                     className="secondary-button"
-                    disabled={!!pending || !serviceReady}
+                    disabled={!!pending || !serviceReady || cancelRequested}
                     onClick={() => engineAction("cancel")}
                   >
                     {pending === "cancel" && <Spinner />}
-                    {t("取消安装", "Cancel installation")}
+                    {operation === "check" ? t("取消检查", "Cancel check") : operation === "repair" ? t("取消修复", "Cancel repair") : t("取消安装", "Cancel installation")}
                   </button>
-                ) : (
+                ) : !engine?.engine.ready && engine?.engine.health !== "failed" && !runtimeCancelled ? (
                   <button
                     className="primary-button"
-                    disabled={!!pending || !serviceReady || !engine || !!engine?.engine.ready}
+                    disabled={!!pending || !serviceReady || !engine}
                     onClick={() => engineAction("install")}
                   >
                     {pending === "install" ? (
@@ -647,13 +714,21 @@ export default function Settings({
                     )}
                     {!serviceReady || !engine
                       ? t("等待本地服务", "Waiting for the local service")
-                      : engine?.engine.ready
-                      ? t("已安装", "Installed")
                       : engine?.engine.error
                         ? t("重新安装", "Retry installation")
                         : t("安装运行环境", "Install runtime")}
                   </button>
-                )}
+                ) : null}
+                {!runtimeBusy && !!engine && (engine.engine.ready || engine.engine.health === "failed" || runtimeCancelled) && <>
+                  <button className="secondary-button" disabled={!!pending || !serviceReady} onClick={() => void engineAction("check")}>
+                    {pending === "check" ? <Spinner size={14} /> : <Check size={14} />}
+                    {t("检查运行环境", "Check runtime")}
+                  </button>
+                  <button ref={repairButton} className="secondary-button" disabled={!!pending || !serviceReady} onClick={() => { setConfirmRepair(true); setError(""); }}>
+                    {pending === "repair" ? <Spinner size={14} /> : <Wrench size={14} />}
+                    {t("修复运行环境", "Repair runtime")}
+                  </button>
+                </>}
                 <button
                   className="secondary-button"
                   disabled={!serviceReady}
@@ -665,20 +740,28 @@ export default function Settings({
                   {t("刷新", "Refresh")}
                 </button>
               </div>
+              {confirmRepair && <section className="runtime-repair-confirmation" role="group" aria-label={t("修复运行环境？", "Repair the runtime?")}>
+                <h4>{t("修复运行环境？", "Repair the runtime?")}</h4>
+                <p>{t("将重新下载并安装实验依赖，然后执行固定的 CPU 自检，可能需要几分钟。已有实验、日志、数据和模型服务设置会保留。", "Dependencies will be downloaded and installed again, followed by a fixed CPU self-test. This may take several minutes. Existing experiments, logs, data, and model provider settings are kept.")}</p>
+                <div className="runtime-confirm-actions">
+                  <button ref={repairCancel} className="secondary-button" onClick={() => { setConfirmRepair(false); repairButton.current?.focus(); }}>{t("取消返回", "Go back")}</button>
+                  <button className="primary-button" disabled={!!pending || !serviceReady || runtimeBusy} onClick={() => void engineAction("repair")}>{t("开始修复", "Start repair")}</button>
+                </div>
+              </section>}
               <section className="runtime-diagnostics" aria-label={t("本地服务诊断", "Local service diagnostics")}>
                 <h4>{t("本地服务诊断", "Local service diagnostics")}</h4>
                 <ServiceRecovery state={serviceState} onState={onServiceState} t={t} toast={toast} />
                 {serviceState.status === "failed" && serviceState.message && <details className="service-local-details"><summary>{t("本地错误详情", "Local error details")}</summary><p>{serviceState.message}</p></details>}
               </section>
-              {(engine?.engine.error || error) && (
-                <Notice danger>{error || engine?.engine.error}</Notice>
+              {((engine?.engine.error && !externalBusy) || error) && (
+                <Notice danger={!!error || !runtimeCancelled}>{error || (runtimeCancelled ? t("运行环境操作已取消，可重新检查或修复。", "The runtime operation was cancelled. You can check or repair it again.") : engine?.engine.maintenance_unavailable ? t("本机磁盘访问异常，暂时无法检查或修复运行环境。请检查访问权限后重试。", "Local disk access prevents runtime checks or repairs. Check access permissions, then try again.") : engine?.engine.error)}</Notice>
               )}
               {engine?.engine.log && (
                 <details
                   className="install-log"
-                  open={engine.engine.installing || !!engine.engine.error}
+                  open={runtimeBusy || !!engine.engine.error}
                 >
-                  <summary>{t("安装日志", "Installation log")}</summary>
+                  <summary>{t("运行环境日志", "Runtime log")}</summary>
                   <pre tabIndex={0}>{engine.engine.log}</pre>
                 </details>
               )}

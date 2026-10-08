@@ -13,7 +13,7 @@ export interface EngineSelection {
   runtimesDirectory: string;
   reused: boolean;
 }
-const ROOT_GENERATED = new Set(['.venv', 'biomaker.egg-info', '.desktop-engine-ready', '.desktop-engine.json', '.desktop-engine-identity.json']);
+const ROOT_GENERATED = new Set(['.venv', 'biomaker.egg-info', '.desktop-engine-ready', '.desktop-engine.json', '.desktop-engine-identity.json', '.desktop-engine-operation.lock']);
 const IDENTITY_FILE = '.desktop-engine-identity.json';
 
 function sha(value: string | Buffer) { return createHash('sha256').update(value).digest('hex'); }

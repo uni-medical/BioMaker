@@ -6,6 +6,7 @@ experiment execution with BioMaker's durable runner, including background runs.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -30,7 +31,7 @@ from history_import import HistoryImporter, HistoryImportError
 from run_metadata import RunMetadataStore, RunMetadataUpdate, RunMetadataError
 from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, provision_native_runtime
 
-VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.6")
+VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.7")
 
 
 class HistoryPreviewRequest(BaseModel):
@@ -156,18 +157,37 @@ class DesktopAccess:
 
 
 class EngineInstaller:
-    """Install the locked Python engine off the request thread, with cancellation."""
+    """Own bounded engine maintenance, including its cross-process worker lease."""
+
+    VERIFY_TIMEOUT_SECONDS = 90.0
+    SETUP_TIMEOUT_SECONDS = 1800.0
+    TERMINATE_GRACE_SECONDS = 3.0
+    MAX_OUTPUT_LINE_BYTES = 8192
+    FAILURE_MARKER = b"BioMaker engine health failed v1\n"
+    MAX_MARKER_BYTES = 128
 
     def __init__(self, config: DesktopConfig):
         self.config = config
         self._lock = threading.RLock()
+        self._termination_lock = threading.Lock()
         self._log: deque[str] = deque(maxlen=120)
-        self._process: subprocess.Popen[str] | None = None
+        self._process: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._cancelled = threading.Event()
+        self._operation: str | None = None
+        self._claim_fd: int | None = None
+        self._external_seen = False
+        self._maintenance_unavailable = False
         self._installing = False
         self._error: str | None = None
+        self._health = "unknown"
+        self._checked_at: str | None = None
         self._ready = self._has_receipt()
+        self._last_marker_state = self._marker_state()
+        if self._last_marker_state != "clear":
+            self._ready = False
+            self._health = "failed"
+            self._error = self._marker_error(self._last_marker_state)
 
     @property
     def receipt(self) -> Path:
@@ -175,9 +195,7 @@ class EngineInstaller:
 
     @property
     def interpreter(self) -> Path:
-        folder, executable = (
-            ("Scripts", "python.exe") if os.name == "nt" else ("bin", "python")
-        )
+        folder, executable = (("Scripts", "python.exe") if os.name == "nt" else ("bin", "python"))
         return self.config.engine_root / ".venv" / folder / executable
 
     def _fingerprint(self) -> str:
@@ -194,21 +212,126 @@ class EngineInstaller:
 
     def _has_receipt(self) -> bool:
         try:
+            if self._marker_state() != "clear":
+                return False
             receipt = json.loads(self.receipt.read_text())
             return (
-                self.interpreter.is_file()
+                isinstance(receipt, dict)
+                and self.interpreter.is_file()
                 and receipt.get("fingerprint") == self._fingerprint()
                 and native_receipt_is_current(self.config.engine_root, receipt.get("native_runtime"))
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
             return False
+
+    def _marker_state(self) -> str:
+        import stat
+
+        descriptor = None
+        try:
+            descriptor = os.open(
+                self.config.engine_root / ".desktop-engine-operation.lock",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            )
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > self.MAX_MARKER_BYTES:
+                return "invalid"
+            data = os.read(descriptor, self.MAX_MARKER_BYTES)
+            if data == b"":
+                return "clear"
+            return "failed" if data == self.FAILURE_MARKER else "invalid"
+        except FileNotFoundError:
+            return "clear"  # Legacy engines have no operation lock yet.
+        except OSError:
+            return "unavailable"
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def _marker_error(state: str) -> str:
+        if state == "unavailable":
+            return "The engine health record is unavailable. Check local disk access before repairing the runtime."
+        if state == "invalid":
+            return "The engine health record is invalid. Repair the runtime before starting an experiment."
+        return "A previous engine check or maintenance failed. Repair the runtime before starting an experiment."
+
+    def _write_marker(self, failed: bool) -> None:
+        if self._claim_fd is None:
+            raise RuntimeError("Engine health cannot be saved without owning its maintenance lock.")
+        if failed:
+            os.lseek(self._claim_fd, 0, os.SEEK_SET)
+            remaining = self.FAILURE_MARKER
+            while remaining:
+                written = os.write(self._claim_fd, remaining)
+                if written <= 0:
+                    raise OSError("The engine health record could not be written.")
+                remaining = remaining[written:]
+            os.ftruncate(self._claim_fd, len(self.FAILURE_MARKER))
+        else:
+            os.ftruncate(self._claim_fd, 0)
+        os.fsync(self._claim_fd)
+        self._last_marker_state = "failed" if failed else "clear"
+
+    def _open_claim(self) -> int | None:
+        import fcntl
+        import stat
+
+        # Keep this inode permanently: unlinking a lock file would split the
+        # ownership domain between old descriptors and a newly created file.
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(self.config.engine_root / ".desktop-engine-operation.lock", flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("The engine operation lock is not a regular file.")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(descriptor)
+                return None
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _external_busy(self) -> bool:
+        if self._claim_fd is not None or os.name == "nt":
+            self._maintenance_unavailable = False
+            return False
+        try:
+            descriptor = self._open_claim()
+        except OSError:
+            self._maintenance_unavailable = True
+            return False
+        self._maintenance_unavailable = False
+        if descriptor is None:
+            return True
+        # Close only: LOCK_UN would also unlock an inherited worker descriptor.
+        os.close(descriptor)
+        return False
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            external = self._external_busy()
+            marker = self._marker_state()
+            if external or self._maintenance_unavailable:
+                self._external_seen = True
+            elif self._operation is None and (self._external_seen or marker != self._last_marker_state):
+                self._ready = self._has_receipt()
+                self._health = "unknown" if marker == "clear" else "failed"
+                self._error = None if marker == "clear" else self._marker_error(marker)
+                self._external_seen = False
+                self._last_marker_state = marker
             return {
-                "ready": self._ready and self.interpreter.is_file(),
+                "ready": self._ready and self._operation is None and not external and not self._maintenance_unavailable and self.receipt.is_file() and self.interpreter.is_file(),
                 "installing": self._installing,
-                "error": self._error,
+                "checking": self._operation == "check",
+                "operation": self._operation,
+                "health": "failed" if self._maintenance_unavailable else "unknown" if external else self._health,
+                "checked_at": self._checked_at,
+                "busy_external": external,
+                "maintenance_unavailable": self._maintenance_unavailable,
+                "error": "The engine operation lock is unavailable. Check local disk access." if self._maintenance_unavailable else "Another BioMaker engine operation is active. Wait for it to finish." if external else self._error,
                 "log": "\n".join(self._log),
             }
 
@@ -221,13 +344,9 @@ class EngineInstaller:
             stored = {}
         secrets = [self.config.token, *stored.values()]
         secrets.extend(os.environ.get(key, "") for key in SECRET_ENV_KEYS)
-        for secret in sorted(
-            (value for value in secrets if value), key=len, reverse=True
-        ):
+        for secret in sorted((value for value in secrets if value), key=len, reverse=True):
             text = text.replace(secret, "[redacted]")
-        text = re.sub(
-            r"(?i)(authorization\s*[:=]\s*bearer\s+)\S+", r"\1[redacted]", text
-        )
+        text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)\S+", r"\1[redacted]", text)
         text = re.sub(r"\b(?:sk-|sk_|jina_)[A-Za-z0-9_-]{8,}\b", "[redacted]", text)
         text = re.sub(r"(https?://)[^\s/@]+:[^\s/@]+@", r"\1[redacted]@", text)
         return text
@@ -239,161 +358,271 @@ class EngineInstaller:
                 self._log.append(sanitized[:2000])
 
     def start(self) -> dict[str, Any]:
+        return self._begin("install")
+
+    def check(self) -> dict[str, Any]:
+        return self._begin("check")
+
+    def repair(self) -> dict[str, Any]:
+        return self._begin("repair")
+
+    def _begin(self, operation: str) -> dict[str, Any]:
         if os.name == "nt":
-            raise ValueError(
-                "Local engine execution currently requires macOS or Linux; Windows support is planned."
-            )
+            raise ValueError("Local engine execution currently requires macOS or Linux; Windows support is planned.")
         with self._lock:
-            if self._installing or self.snapshot()["ready"]:
+            current = self.snapshot()
+            if self._operation is not None or current["busy_external"] or (operation == "install" and current["ready"]):
+                return current
+            try:
+                claim = self._open_claim()
+            except OSError as exc:
+                raise ValueError("The engine operation lock is unavailable. Check local disk access.") from exc
+            if claim is None:
                 return self.snapshot()
-            self._installing = True
+            self._claim_fd = claim
+            self._operation = operation
+            self._installing = operation in {"install", "repair"}
             self._error = None
             self._ready = False
+            self._health = "unknown"
             self._cancelled.clear()
             self._log.clear()
-            self._thread = threading.Thread(
-                target=self._install, name="biomaker-engine-install", daemon=True
-            )
-            self._thread.start()
+            self._thread = threading.Thread(target=self._execute, args=(operation,), name=f"biomaker-engine-{operation}", daemon=True)
+            try:
+                self._thread.start()
+            except BaseException:
+                self._finish_operation()
+                raise
             return self.snapshot()
 
-    def _run(self, command: list[str], environment: dict[str, str]) -> None:
+    def _cancel_message(self) -> str:
+        return {"check": "Engine check cancelled.", "repair": "Engine repair cancelled."}.get(self._operation, "Installation cancelled.")
+
+    def _run(self, command: list[str], environment: dict[str, str], timeout: float | None = None) -> None:
+        import selectors
+        import time
+
         if self._cancelled.is_set():
-            raise InterruptedError("Installation cancelled.")
+            raise InterruptedError(self._cancel_message())
         process = subprocess.Popen(
-            command,
-            cwd=self.config.engine_root,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            start_new_session=os.name != "nt",
+            command, cwd=self.config.engine_root, env=environment,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=0, start_new_session=True,
+            # The worker keeps the lease even if the sidecar is killed abruptly.
+            pass_fds=(self._claim_fd,) if self._claim_fd is not None else (),
         )
         with self._lock:
             self._process = process
-        if self._cancelled.is_set():
-            self._terminate(process)
+        deadline = time.monotonic() + (self.SETUP_TIMEOUT_SECONDS if timeout is None else timeout)
+        pending = bytearray()
+        skipping_line = False
+        confirmed = False
         try:
             assert process.stdout is not None
-            for line in process.stdout:
-                self._append(line)
+            os.set_blocking(process.stdout.fileno(), False)
+            with selectors.DefaultSelector() as reader:
+                reader.register(process.stdout, selectors.EVENT_READ)
+                pipe_open = True
+                while pipe_open or process.poll() is None:
+                    if self._cancelled.is_set():
+                        raise InterruptedError(self._cancel_message())
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Engine verification timed out." if timeout == self.VERIFY_TIMEOUT_SECONDS else "Engine setup timed out.")
+                    for key, _ in reader.select(min(0.1, remaining)):
+                        try:
+                            chunk = os.read(key.fd, 8192)
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            reader.unregister(key.fileobj)
+                            pipe_open = False
+                            continue
+                        for piece in chunk.splitlines(keepends=True):
+                            ended = piece.endswith((b"\n", b"\r"))
+                            if skipping_line:
+                                skipping_line = not ended
+                                continue
+                            pending.extend(piece)
+                            if len(pending) > self.MAX_OUTPUT_LINE_BYTES:
+                                pending.clear()
+                                skipping_line = not ended
+                                self._append("[An oversized output line was omitted.]")
+                            elif ended:
+                                self._append(pending.decode("utf-8", errors="replace"))
+                                pending.clear()
+                if pending:
+                    self._append(pending.decode("utf-8", errors="replace"))
             code = process.wait()
             if self._cancelled.is_set():
-                raise InterruptedError("Installation cancelled.")
+                raise InterruptedError(self._cancel_message())
             if code != 0:
-                raise RuntimeError(
-                    f"Engine setup exited with code {code}. See the installation log."
-                )
+                raise RuntimeError(f"Engine {'verification' if self._operation == 'check' else 'setup'} exited with code {code}. See the engine log.")
         finally:
-            if process.poll() is None:
-                self._terminate(process)
-            with self._lock:
-                self._process = None
+            # A reaped leader is insufficient if a descendant still owns its
+            # process group or the inherited operation descriptor.
+            with self._termination_lock:
+                confirmed = self._terminate(process)
             if process.stdout:
                 process.stdout.close()
+            with self._lock:
+                if confirmed and self._process is process:
+                    self._process = None
+            if not confirmed:
+                raise RuntimeError("The engine command did not stop completely. Quit BioMaker and wait for it to stop before retrying.")
 
-    def _install(self) -> None:
+    @staticmethod
+    def _now() -> str:
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat()
+
+    def _verify(self, environment: dict[str, str]) -> None:
+        self._append("Checking the installed BioMaker engine and scientific packages…")
+        self._run([str(self.interpreter), "-I", "-B", str(Path(__file__).with_name("verify_engine.py"))], environment, self.VERIFY_TIMEOUT_SECONDS)
+
+    def _save_receipt(self, native_runtime: dict[str, Any]) -> None:
+        fd, name = tempfile.mkstemp(prefix=".desktop-engine-", dir=self.config.engine_root)
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump({"version": VERSION, "fingerprint": self._fingerprint(), "native_runtime": native_runtime}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(name, self.receipt)
+        finally:
+            Path(name).unlink(missing_ok=True)
+
+    def _execute(self, operation: str) -> None:
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
         environment.pop("BIOMAKER_DESKTOP_TOKEN", None)
-        environment["UV_NO_PROGRESS"] = "1"
-        environment["UV_PROJECT_ENVIRONMENT"] = str(self.config.engine_root / ".venv")
-        environment["UV_PYTHON_DOWNLOADS"] = "never"
+        environment.update(UV_NO_PROGRESS="1", UV_PROJECT_ENVIRONMENT=str(self.config.engine_root / ".venv"), UV_PYTHON_DOWNLOADS="never", PYTHONDONTWRITEBYTECODE="1")
         try:
-            self._append(
-                "Installing the locked BioMaker engine. The first setup downloads scientific computing packages."
-            )
-            self._run(
-                [
-                    self.config.uv,
-                    "sync",
-                    "--frozen",
-                    "--project",
-                    str(self.config.engine_root),
-                    "--python",
-                    self.config.python,
-                ],
-                environment,
-            )
-            if not self.interpreter.is_file():
-                raise RuntimeError(
-                    "Setup did not create the engine Python environment."
-                )
-            self._append("Verifying the BioMaker engine and scientific packages…")
-            native_runtime = provision_native_runtime(self.config.engine_root, run=lambda command: self._run(command, environment))
-            self._run(
-                [
-                    str(self.interpreter),
-                    "-I",
-                    str(Path(__file__).with_name("verify_engine.py")),
-                ],
-                environment,
-            )
+            if operation != "check":
+                self.receipt.unlink(missing_ok=True)
             if self._cancelled.is_set():
-                raise InterruptedError("Installation cancelled.")
-            fd, name = tempfile.mkstemp(
-                prefix=".desktop-engine-", dir=self.config.engine_root
-            )
-            try:
-                with os.fdopen(fd, "w") as handle:
-                    json.dump(
-                        {"version": VERSION, "fingerprint": self._fingerprint(), "native_runtime": native_runtime}, handle
-                    )
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(name, self.receipt)
-            finally:
-                Path(name).unlink(missing_ok=True)
+                raise InterruptedError(self._cancel_message())
+            if operation == "check":
+                if not self._has_receipt():
+                    raise RuntimeError("The engine interpreter or installation receipt is missing or outdated. Install or repair the engine.")
+                self._verify(environment)
+            else:
+                # Invalidate before uv or native patching can change any files.
+                # A cancelled repair must never leave a trusted old receipt.
+                self._append("Repairing the locked BioMaker engine; installed packages will be reinstalled." if operation == "repair" else "Installing the locked BioMaker engine. The first setup downloads scientific computing packages.")
+                command = [self.config.uv, "sync", "--frozen"]
+                if operation == "repair":
+                    command.append("--reinstall")
+                command.extend(["--project", str(self.config.engine_root), "--python", self.config.python])
+                self._run(command, environment)
+                if not self.interpreter.is_file():
+                    raise RuntimeError("Setup did not create the engine Python environment.")
+                if self._cancelled.is_set():
+                    raise InterruptedError(self._cancel_message())
+                native_runtime = provision_native_runtime(self.config.engine_root, run=lambda command: self._run(command, environment, 30.0))
+                self._verify(environment)
+            # Serialize cancellation with the successful receipt/state commit.
             with self._lock:
+                if self._cancelled.is_set():
+                    raise InterruptedError(self._cancel_message())
+                if operation != "check":
+                    self._save_receipt(native_runtime)
+                    # Verify and commit the receipt first. A crash before this
+                    # fsync leaves the durable failure state blocking readiness.
+                    self._write_marker(False)
                 self._ready = True
+                self._health = "healthy"
+                self._checked_at = self._now()
         except Exception as exc:
+            cancelled = isinstance(exc, InterruptedError)
+            if not cancelled:
+                try:
+                    # The held writable inode survives even if the directory
+                    # refuses receipt deletion. Unknown/partial marker bytes
+                    # are also rejected on the next startup.
+                    self._write_marker(True)
+                except OSError:
+                    self._append("The engine health failure could not be saved; check local disk access.")
+                try:
+                    self.receipt.unlink(missing_ok=True)
+                except OSError:
+                    # Preserve a deterministic failure, never re-enable execution.
+                    self._append("The failed engine receipt could not be removed; check local disk access.")
             message = self._redact(str(exc))
             self._append(message)
             with self._lock:
                 self._error = message
                 self._ready = False
+                self._health = "unknown" if cancelled else "failed"
+                if not cancelled:
+                    self._checked_at = self._now()
         finally:
             with self._lock:
-                self._installing = False
+                self._finish_operation()
 
-    @staticmethod
-    def _terminate(process: subprocess.Popen) -> None:
-        if process.poll() is not None:
-            return
-        try:
-            if os.name == "nt":
-                process.terminate()
-            else:
-                os.killpg(process.pid, signal.SIGTERM)
+    def _finish_operation(self) -> None:
+        if self._process is not None:
+            return  # Keep the lease and busy state until child exit is confirmed.
+        self._operation = None
+        self._installing = False
+        if self._claim_fd is not None:
+            os.close(self._claim_fd)
+            self._claim_fd = None
+
+    def _terminate(self, process: subprocess.Popen) -> bool:
+        import time
+
+        def group_alive() -> bool:
             try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                if os.name == "nt":
-                    process.kill()
-                else:
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=3)
-        except ProcessLookupError:
-            pass
+                os.killpg(process.pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except OSError:
+                return True
+
+        process.poll()
+        if not group_alive():
+            try:
+                process.wait(timeout=self.TERMINATE_GRACE_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            return True
+        for action in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, action)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return False
+            deadline = time.monotonic() + self.TERMINATE_GRACE_SECONDS
+            while time.monotonic() < deadline:
+                process.poll()
+                if not group_alive():
+                    return process.poll() is not None
+                time.sleep(0.025)
+        return process.poll() is not None and not group_alive()
+
+    def _cancel_process(self, process: subprocess.Popen) -> None:
+        with self._termination_lock:
+            confirmed = self._terminate(process)
+        with self._lock:
+            if confirmed and self._process is process and (self._thread is None or not self._thread.is_alive()):
+                self._process = None
+                self._finish_operation()
 
     def cancel(self) -> dict[str, Any]:
         with self._lock:
-            if self._installing:
+            if self._operation is not None:
                 self._cancelled.set()
                 process = self._process
                 if process is not None:
-                    threading.Thread(
-                        target=self._terminate, args=(process,), daemon=True
-                    ).start()
+                    threading.Thread(target=self._cancel_process, args=(process,), daemon=True).start()
             return self.snapshot()
 
     def close(self) -> None:
         self.cancel()
         if self._thread is not None:
             self._thread.join(timeout=7)
-
 
 def create_desktop_app(
     config: DesktopConfig, *, installer: EngineInstaller | None = None
@@ -494,27 +723,47 @@ def create_desktop_app(
             },
         }
 
-    @app.post("/api/desktop/engine/install", status_code=202)
-    def install_engine():
-        queue = app.state.manager.summary()
-        if queue["running"] or queue["queued"]:
+    def engine_operation(action: str):
+        # Include unsettled descendants even after their leader is terminal.
+        # Admission middleware below keeps enqueue/requeue/resume from racing
+        # this inspection and the installer's synchronous busy-state transition.
+        records = app.state.run_store.list_records("runs")
+        if any(
+            record.get("managed", True)
+            and (
+                record.get("status") in {"queued", "running", "stopping"}
+                or record.get("cleanup_pending")
+            )
+            for record in records
+        ):
             return JSONResponse(
                 {
-                    "detail": "Finish or cancel queued experiments before changing the engine."
+                    "detail": "Finish or cancel queued experiments and wait for process cleanup before checking or repairing the runtime."
                 },
                 status_code=409,
             )
         try:
-            return engine.start()
+            return getattr(engine, action)()
         except ValueError as exc:
             return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    @app.post("/api/desktop/engine/install", status_code=202)
+    def install_engine():
+        return engine_operation("start")
+
+    @app.post("/api/desktop/engine/check", status_code=202)
+    def check_engine():
+        return engine_operation("check")
+
+    @app.post("/api/desktop/engine/repair", status_code=202)
+    def repair_engine():
+        return engine_operation("repair")
 
     @app.post("/api/desktop/engine/cancel", status_code=202)
     def cancel_install():
         return engine.cancel()
 
-    @app.middleware("http")
-    async def preflight(request: Request, call_next):
+    async def checked_dispatch(request: Request, call_next):
         path = request.url.path
         control = re.fullmatch(r"/api/runs/([^/]+)/(?:stop|cancel|requeue)", path)
         if request.method == "POST" and control:
@@ -527,11 +776,12 @@ def create_desktop_app(
             and path.startswith("/api/runs/")
             and path.endswith("/requeue")
         )
-        if is_create or is_requeue:
+        is_resume = request.method == "POST" and path == "/api/queue/resume"
+        if is_create or is_requeue or is_resume:
             if os.name == "nt" or not engine.snapshot()["ready"]:
                 return JSONResponse(
                     {
-                        "detail": "Install the BioMaker engine before starting an experiment."
+                        "detail": "Install or repair the BioMaker runtime, and wait for maintenance to finish before starting an experiment."
                     },
                     status_code=409,
                 )
@@ -561,7 +811,7 @@ def create_desktop_app(
                 model = (record or {}).get("options", {}).get(
                     "model_for_all_agents"
                 ) or model
-            if not isinstance(model, str) or not model.strip():
+            if not is_resume and (not isinstance(model, str) or not model.strip()):
                 return JSONResponse(
                     {
                         "detail": "Choose a model in Settings or the experiment options before starting."
@@ -569,6 +819,24 @@ def create_desktop_app(
                     status_code=409,
                 )
         return await call_next(request)
+
+    admission = asyncio.Lock()
+
+    @app.middleware("http")
+    async def preflight(request: Request, call_next):
+        path = request.url.path.rstrip("/")
+        exclusive = request.method == "POST" and (
+            path in {
+                "/api/runs", "/api/queue/resume",
+                "/api/desktop/engine/install", "/api/desktop/engine/check",
+                "/api/desktop/engine/repair",
+            }
+            or re.fullmatch(r"/api/runs/[^/]+/requeue", path)
+        )
+        if exclusive:
+            async with admission:
+                return await checked_dispatch(request, call_next)
+        return await checked_dispatch(request, call_next)
 
     app.add_middleware(
         DesktopAccess, token=config.token, allowed_origins=config.allowed_origins

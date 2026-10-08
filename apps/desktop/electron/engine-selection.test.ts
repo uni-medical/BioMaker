@@ -58,6 +58,7 @@ test('a UI-only version bump reuses the newest complete legacy engine in place',
     writeFileSync(path.join(previous.engine, 'biomaker/__pycache__/run.cpython-312.pyc'), 'generated cache');
     mkdirSync(path.join(previous.engine, 'biomaker.egg-info'));
     writeFileSync(path.join(previous.engine, 'biomaker.egg-info/PKG-INFO'), 'generated metadata');
+    writeFileSync(path.join(previous.engine, '.desktop-engine-operation.lock'), '');
     f.manifest.applicationVersion = '0.1.2'; f.saveManifest();
     const selection = selectEngine(f.runtime, f.data);
     assert.equal(selection.directory, previous.engine);

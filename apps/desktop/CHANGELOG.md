@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.7 — 2026-10-09
+
+Adds runtime checks and explicit repair from Settings. A check runs the real
+dependency imports and a fixed CPU self-test without downloading packages.
+Repair reinstalls the locked dependencies, repairs native libraries and verifies
+the result before making the runtime available again. Failed checks invalidate
+the installation receipt so restarting cannot silently restore a false ready state.
+
+Runtime maintenance supports bounded execution, cancellation, progress logs and
+failure retry. An inherited engine lock prevents another service from modifying
+the environment while its maintenance worker remains alive. Desktop experiment
+submission, requeue and queue resume are serialized with maintenance admission;
+queued, running, stopping or cleaning experiments block maintenance.
+
+The interface preserves drafts and unsaved settings, distinguishes checking,
+repairing and external maintenance, and ignores status requests that began before
+a newer operation result. Repair requires an explicit in-window choice.
+
 ## 0.1.6 — 2026-10-09
 
 Keeps the desktop window usable when constructing or starting the local service
