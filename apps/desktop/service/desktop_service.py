@@ -30,8 +30,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from history_import import HistoryImporter, HistoryImportError
 from run_metadata import RunMetadataStore, RunMetadataUpdate, RunMetadataError
 from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, provision_native_runtime
+from provider_check import ProviderChecker, check_request
 
-VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.7")
+VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.8")
 
 
 class HistoryPreviewRequest(BaseModel):
@@ -639,6 +640,7 @@ def create_desktop_app(
     engine = installer or EngineInstaller(config)
     history = HistoryImporter(settings, app.state.manager)
     metadata = RunMetadataStore(settings.state_dir / "desktop-metadata.sqlite3", app.state.run_store)
+    provider = ProviderChecker(config.env_file)
     original_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
@@ -648,6 +650,7 @@ def create_desktop_app(
                 history.recover()
                 yield
         finally:
+            provider.close()
             history.close()
             metadata.close()
             engine.close()
@@ -656,6 +659,11 @@ def create_desktop_app(
     app.state.desktop_engine = engine
     app.state.history_importer = history
     app.state.run_metadata = metadata
+    app.state.provider_checker = provider
+
+    @app.post("/api/desktop/provider/check")
+    async def check_provider(request: Request):
+        return await check_request(request, provider)
 
     @app.exception_handler(RunMetadataError)
     async def metadata_error(_request: Request, exc: RunMetadataError):

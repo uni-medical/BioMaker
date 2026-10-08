@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.8 — 2026-10-09
+
+Adds an explicit model-response check in provider settings. One short Chat
+Completions request tests the current form without saving it, creating an
+experiment or installing the training environment. Model lists, saved settings
+and successful response checks have distinct feedback. No paid probe runs
+automatically or retries without another user action.
+
+Provider checks use a bounded worker, a fixed prompt and output-token budget,
+and return status metadata without provider response text. Saved keys are reused
+only for the same normalized provider URL; redirects cannot forward them.
+Editing provider fields or replacing the local service invalidates stale results.
+
 ## 0.1.7 — 2026-10-09
 
 Adds runtime checks and explicit repair from Settings. A check runs the real

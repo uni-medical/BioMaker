@@ -2,6 +2,12 @@
 
 ## Release gates
 
+- Run `tests/provider-check-smoke.mjs` against the real sidecar and a local model
+  fixture, then repeat against the packaged executable. Verify explicit-only
+  requests, draft/configuration preservation, credential reuse boundaries,
+  editable-field and service-revision invalidation, failure feedback and retry.
+  A returned model list, a saved configuration and a successful short generation
+  probe are different results. Do not use real user credentials in QA.
 - Run `tests/runtime-health-smoke.mjs` for runtime maintenance UI and admission
   feedback, reporting its synthetic backend responses explicitly. Separately run
   `tests/engine-health-smoke.py` with bundled Python `-I -B` inside a network-denying

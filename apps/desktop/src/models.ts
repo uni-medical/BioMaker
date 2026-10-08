@@ -3,6 +3,60 @@ import type { ServiceState } from "./bridge";
 export type Language = "zh" | "en";
 export type Theme = "system" | "light" | "dark";
 export type Translate = (zh: string, en: string) => string;
+export interface ProviderCheckResult {
+  status: "ok" | "error";
+  code: string;
+  elapsed_ms: number;
+  checked_at: string;
+}
+export function providerCheckMessage(code: string, t: Translate): string {
+  switch (code) {
+    case "ok": return t("模型响应测试通过", "Model response test passed");
+    case "invalid_url": return t("API 地址无效，请填写完整的 http:// 或 https:// 基础地址。", "Invalid API address. Enter the full http:// or https:// base URL.");
+    case "missing_key": return t("请填写此 API 地址的密钥，再手动测试。", "Enter an API key for this address, then test again manually.");
+    case "invalid_key": return t("密钥格式无效，请检查是否包含换行或其它无效字符。", "Invalid key format. Check for line breaks or other invalid characters.");
+    case "missing_model": return t("请填写要测试的模型名称。", "Enter the model to test.");
+    case "auth": return t("服务拒绝了身份验证，请检查密钥、账户权限和 API 地址。", "The provider rejected authentication. Check the key, account permissions, and API address.");
+    case "model": return t("服务未找到此模型或当前账户无权使用，请核对模型 ID 和权限。", "The provider could not find this model, or your account cannot use it. Check the model ID and permissions.");
+    case "rate_limit": return t("服务达到速率或额度限制，请检查账户额度后手动重试。", "The provider reported a rate or quota limit. Check your account before retrying manually.");
+    case "timeout": return t("本次请求超时，未自动重试。可检查服务状态后手动测试。", "This request timed out and was not retried. Check the provider, then test again manually.");
+    case "network": return t("无法连接模型服务，请检查网络、代理和 API 地址。", "Could not connect to the provider. Check the network, proxy, and API address.");
+    case "request_rejected": return t("服务拒绝了本次短请求。请确认接口支持 Chat Completions 和 max_completion_tokens；这不代表模型不可用。", "The provider rejected this short request. Check support for Chat Completions and max_completion_tokens; this does not mean the model is unavailable.");
+    case "invalid_request": return t("测试参数无效，请检查填写内容后重试。", "The test parameters are invalid. Check the entered settings before trying again.");
+    case "invalid_response": return t("本次短请求未返回可读的助手文本。可能是接口格式不兼容或生成预算不足，不能据此判断模型不可用。", "This short request returned no readable assistant text. The response format or generation budget may be incompatible; this does not establish that the model is unavailable.");
+    case "response_too_large": return t("服务返回的内容超出本次短请求的读取限制，请检查接口兼容性。", "The response exceeded this short test's size limit. Check API compatibility.");
+    case "redirect": return t("服务要求重定向，测试已停止。请直接填写最终 API 基础地址。", "The provider requested a redirect, so the test stopped. Enter the final API base URL directly.");
+    case "busy": return t("已有模型测试正在进行，请稍后手动测试。", "A model test is already running. Test again manually after it finishes.");
+    case "unavailable": return t("模型服务暂时无法完成请求，请稍后手动重试。", "The provider could not complete this request. Try again manually later.");
+    case "local_service": return t("本地服务未能完成测试，未自动重试。请检查本地服务状态。", "The local service could not complete the test. It was not retried; check the local service status.");
+    default: return t("本次测试未能完成，未自动重试。请检查服务状态后再试。", "This test could not finish and was not retried. Check the service before trying again.");
+  }
+}
+export function sameProviderBaseUrl(first: string, second: string): boolean {
+  const normalize = (value: string) => {
+    if (value.length > 4096 || /[\u0000-\u001f\u007f]/.test(value)) return null;
+    const raw = value.trim() || "https://api.openai.com/v1";
+    if (/\s|[?#\\]/u.test(raw)) return null;
+    const parts = /^(https?):\/\/([^/]+)(\/.*)?$/i.exec(raw);
+    if (!parts || parts[2].includes("@")) return null;
+    // Parse the authority only: WHATWG URL parsing must not collapse path
+    // segments or repeated slashes before comparing the provider address.
+    const url = new URL(`${parts[1]}://${parts[2]}/`);
+    if (url.port === "0") return null;
+    const rawHost = parts[2].startsWith("[") ? url.hostname : parts[2].split(":")[0];
+    const host = /[^\x00-\x7f]/.test(rawHost) ? url.hostname : rawHost.toLowerCase();
+    if (!host.startsWith("[") && (!/^[a-z0-9.-]+$/.test(host) || host.replace(/\.$/, "").split(".").some(part => !part))) return null;
+    let path = parts[3] || "";
+    if (/%(?![0-9a-f]{2})/i.test(path) || path.split("/").some(part => /^\.{1,2}$/.test(part.replace(/%2e/gi, ".")))) return null;
+    path = encodeURI(path).replace(/%25([0-9a-f]{2})/gi, "%$1");
+    if (path.endsWith("/")) path = path.slice(0, -1);
+    return `${url.protocol}//${host}${url.port ? `:${url.port}` : ""}${path}`;
+  };
+  try {
+    const normalized = normalize(first);
+    return normalized !== null && normalized === normalize(second);
+  } catch { return false; }
+}
 export function serviceStatusLabel(state: ServiceState, t: Translate): string {
   switch (state.status) {
     case "starting": return t("正在启动本地服务…", "Starting the local service…");

@@ -20,7 +20,9 @@ import type { ServiceState } from "./bridge";
 import ServiceRecovery from "./ServiceRecovery";
 import {
   errorMessage,
+  providerCheckMessage,
   request,
+  sameProviderBaseUrl,
   serviceStatusLabel,
   runtimeOperation,
   runtimeOperationLabel,
@@ -28,6 +30,7 @@ import {
   type EngineStatus,
   type EnvConfig,
   type Language,
+  type ProviderCheckResult,
   type Theme,
   type Translate,
 } from "./models";
@@ -88,6 +91,8 @@ export default function Settings({
   const [pending, setPending] = useState("");
   const [error, setError] = useState("");
   const [discovery, setDiscovery] = useState("");
+  const [providerResult, setProviderResult] = useState<{ result: ProviderCheckResult; target: string } | null>(null);
+  const [checkRequest, setCheckRequest] = useState<{ target: string; generation: number } | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saved, setSaved] = useState(false);
   const [removeKey, setRemoveKey] = useState(false);
@@ -96,6 +101,10 @@ export default function Settings({
   const [confirmRepair, setConfirmRepair] = useState(false);
   const [cancelRequested, setCancelRequested] = useState(false);
   const runtimeRequest = useRef(false);
+  const providerRequest = useRef<"save" | "discover" | "check" | null>(null);
+  const providerGeneration = useRef(0);
+  const mounted = useRef(true);
+  const knownEnv = useRef(env);
   const repairCancel = useRef<HTMLButtonElement>(null);
   const repairButton = useRef<HTMLButtonElement>(null);
   const currentService = useRef(serviceState);
@@ -110,16 +119,37 @@ export default function Settings({
   const checkedAt = engine?.engine.checked_at && Number.isFinite(Date.parse(engine.engine.checked_at))
     ? new Date(engine.engine.checked_at).toLocaleString(lang === "zh" ? "zh-CN" : "en-US") : null;
   const configured = !!env?.values.OPENAI_API_KEY?.configured;
-  const effectiveKey = !!key.trim() || (configured && !removeKey);
-  const effectiveModel = !!model.trim() || !!modelOverride;
+  const canUseSavedKey = configured && !removeKey && sameProviderBaseUrl(base, env?.values.OPENAI_BASE_URL?.value || "");
+  const effectiveKey = !!key.trim() || canUseSavedKey;
+  const checkTarget = model.trim() || modelOverride?.trim() || "";
+  const effectiveModel = !!checkTarget;
   const savedProviderReady =
     configured && !!(env?.values.BIOMAKER_MAIN_MODEL?.value || modelOverride);
-  const changed = () => {
+  const invalidateProvider = (clearModels = true) => {
+    providerGeneration.current += 1;
+    setProviderResult(null);
+    if (clearModels) {
+      setDiscovery("");
+      setModels([]);
+    }
+  };
+  const changed = (provider: "connection" | "model" | false = false) => {
+    if (provider) invalidateProvider(provider === "connection");
     closeState.current.dirty = true;
     setDirty(true);
     setSaved(false);
     setError("");
   };
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; providerGeneration.current += 1; };
+  }, []);
+  useEffect(() => {
+    invalidateProvider();
+  }, [serviceState.revision, serviceState.status]);
+  useEffect(() => {
+    invalidateProvider(false);
+  }, [modelOverride]);
   const close = () => {
     if (confirmRepair) { setConfirmRepair(false); repairButton.current?.focus(); return; }
     if (closeState.current.saving) {
@@ -141,6 +171,10 @@ export default function Settings({
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, []);
   useEffect(() => {
+    if (env !== knownEnv.current) {
+      knownEnv.current = env;
+      invalidateProvider();
+    }
     if (env && !dirty) {
       setBase(env.values.OPENAI_BASE_URL?.value || "");
       setModel(env.values.BIOMAKER_MAIN_MODEL?.value || "");
@@ -160,7 +194,10 @@ export default function Settings({
   }, [confirmRepair]);
 
   async function save() {
-    if (pending || !env || !serviceReady) return;
+    if (pending || providerRequest.current || runtimeRequest.current || !env || !serviceReady) return;
+    providerRequest.current = "save";
+    const generation = providerGeneration.current;
+    const revision = serviceState.revision;
     closeState.current.saving = true;
     setPending("save");
     setConfirmClose(false);
@@ -185,6 +222,18 @@ export default function Settings({
       if (serper.trim()) values.SERPER_API_KEY = serper.trim();
       if (jina.trim()) values.JINA_API_KEY = jina.trim();
       const result = await request<EnvConfig>("/api/env", "PUT", values);
+      if (!mounted.current) return;
+      if (generation !== providerGeneration.current || currentService.current.status !== "ready" || currentService.current.revision !== revision) {
+        setError(t("服务状态已变化，请重新读取已保存的配置后确认。", "The service state changed. Reload saved settings to confirm the result."));
+        return;
+      }
+      // Saving the exact tested form preserves its result; it never triggers another test.
+      if (!sameProviderBaseUrl(base, result.values.OPENAI_BASE_URL?.value || "") ||
+          model.trim() !== (result.values.BIOMAKER_MAIN_MODEL?.value || "").trim() ||
+          (!!key.trim() || (configured && !removeKey)) !== !!result.values.OPENAI_API_KEY?.configured) {
+        invalidateProvider();
+      }
+      knownEnv.current = result;
       onSaved(result);
       setKey("");
       setSerper("");
@@ -207,14 +256,23 @@ export default function Settings({
             : t("模型配置已保存", "Model settings saved"),
       );
     } catch (e) {
-      setError(errorMessage(e));
+      if (mounted.current) {
+        invalidateProvider();
+        setError(errorMessage(e));
+      }
     } finally {
+      providerRequest.current = null;
       closeState.current.saving = false;
-      setPending("");
+      if (mounted.current) setPending("");
     }
   }
   async function discover() {
-    if (pending || !env || !serviceReady) return;
+    if (pending || providerRequest.current || runtimeRequest.current || !env || !serviceReady || !effectiveKey) return;
+    providerRequest.current = "discover";
+    const generation = providerGeneration.current;
+    const revision = serviceState.revision;
+    const current = () => mounted.current && generation === providerGeneration.current &&
+      currentService.current.status === "ready" && currentService.current.revision === revision;
     setPending("discover");
     setError("");
     setDiscovery("");
@@ -227,12 +285,13 @@ export default function Settings({
         base_url: base.trim() || "https://api.openai.com/v1",
         ...(key.trim() ? { api_key: key.trim() } : {}),
       });
+      if (!current()) return;
       setModels(result.models || []);
       if (result.models?.length)
         setDiscovery(
           t(
-            `连接成功，发现 ${result.models.length} 个模型。`,
-            `Connected. Found ${result.models.length} models.`,
+            `模型列表已获取，发现 ${result.models.length} 个模型。`,
+            `Model list retrieved. Found ${result.models.length} models.`,
           ),
         );
       else
@@ -244,13 +303,46 @@ export default function Settings({
             ),
         );
     } catch (e) {
-      setError(errorMessage(e));
+      if (current()) setError(errorMessage(e));
     } finally {
-      setPending("");
+      providerRequest.current = null;
+      if (mounted.current) setPending("");
+    }
+  }
+  async function checkProvider() {
+    if (pending || providerRequest.current || runtimeRequest.current || !env || !serviceReady || !effectiveKey || !checkTarget) return;
+    providerRequest.current = "check";
+    const generation = providerGeneration.current;
+    const revision = serviceState.revision;
+    const target = checkTarget;
+    const current = () => mounted.current && generation === providerGeneration.current &&
+      currentService.current.status === "ready" && currentService.current.revision === revision;
+    setPending("provider-check");
+    setCheckRequest({ target, generation });
+    setProviderResult(null);
+    setError("");
+    try {
+      const result = await request<ProviderCheckResult>("/api/desktop/provider/check", "POST", {
+        base_url: base.trim() || null,
+        ...(key.trim() ? { api_key: key.trim() } : {}),
+        model: target,
+        use_saved_key: !key.trim() && canUseSavedKey,
+      });
+      if (current()) setProviderResult({ result, target });
+    } catch {
+      if (current()) setProviderResult({
+        result: { status: "error", code: "local_service", elapsed_ms: 0, checked_at: "" }, target,
+      });
+    } finally {
+      providerRequest.current = null;
+      if (mounted.current) {
+        setPending("");
+        setCheckRequest(null);
+      }
     }
   }
   async function engineAction(action: "install" | "check" | "repair" | "cancel") {
-    if (!serviceReady || pending || runtimeRequest.current || externalBusy || (action !== "cancel" && runtimeBusy)) return;
+    if (!serviceReady || pending || providerRequest.current || runtimeRequest.current || externalBusy || (action !== "cancel" && runtimeBusy)) return;
     runtimeRequest.current = true;
     setPending(action);
     setError("");
@@ -348,7 +440,7 @@ export default function Settings({
                   value={base}
                   onChange={(e) => {
                     setBase(e.target.value);
-                    changed();
+                    changed("connection");
                   }}
                   placeholder="https://api.openai.com/v1"
                   autoComplete="off"
@@ -379,7 +471,7 @@ export default function Settings({
                     onChange={(e) => {
                       setKey(e.target.value);
                       setRemoveKey(false);
-                      changed();
+                      changed("connection");
                     }}
                     placeholder={
                       configured && !removeKey
@@ -404,7 +496,7 @@ export default function Settings({
                       title={t("移除已保存的密钥", "Remove saved key")}
                       onClick={() => {
                         setRemoveKey(!removeKey);
-                        changed();
+                        changed("connection");
                       }}
                     >
                       <Trash2 size={16} />
@@ -419,6 +511,14 @@ export default function Settings({
                     )}
                   </small>
                 )}
+                {configured && !removeKey && !key.trim() && !canUseSavedKey && (
+                  <small>
+                    {t(
+                      "API 地址已更改，请填写此地址的密钥后再获取模型或测试。已保存的密钥不会用于新地址。",
+                      "The API address changed. Enter a key for this address to retrieve models or test. The saved key will not be used at the new address.",
+                    )}
+                  </small>
+                )}
               </label>
               <div className="model-label">
                 <label htmlFor="provider-model">
@@ -427,7 +527,7 @@ export default function Settings({
                 <button
                   className="text-button"
                   onClick={discover}
-                  disabled={!!pending || !serviceReady || !(key.trim() || configured)}
+                  disabled={!!pending || !env || !serviceReady || !effectiveKey}
                 >
                   {pending === "discover" ? (
                     <Spinner size={13} />
@@ -443,7 +543,7 @@ export default function Settings({
                 value={model}
                 onChange={(e) => {
                   setModel(e.target.value);
-                  changed();
+                  changed("model");
                 }}
                 placeholder={t(
                   "输入模型 ID，或从服务获取",
@@ -467,7 +567,7 @@ export default function Settings({
                   onChange={(e) => {
                     if (e.target.value) {
                       setModel(e.target.value);
-                      changed();
+                      changed("model");
                     }
                   }}
                 >
@@ -481,14 +581,10 @@ export default function Settings({
               )}
               {env && (
                 <div
-                  className={`provider-readiness ${effectiveKey && effectiveModel ? "complete" : ""}`}
+                  className="provider-readiness"
                   role="status"
                 >
-                  {effectiveKey && effectiveModel ? (
-                    <Check size={14} />
-                  ) : (
-                    <KeyRound size={14} />
-                  )}
+                  <KeyRound size={14} />
                   <span>
                     {!effectiveKey
                       ? t(
@@ -502,13 +598,15 @@ export default function Settings({
                           )
                         : dirty
                           ? t(
-                              "配置已填写完整，保存后继续。",
-                              "The required settings are filled in. Save to continue.",
+                              "配置已填写，尚未保存。",
+                              "Settings are filled in but have not been saved.",
                             )
-                          : t(
-                              "模型配置完整，可以返回实验。",
-                              "Model settings are complete. You can return to your experiment.",
-                            )}
+                          : providerResult
+                            ? t("配置已保存。", "Settings are saved.")
+                            : t(
+                                "配置已保存，尚未测试模型响应。",
+                                "Settings are saved. The model response has not been tested.",
+                              )}
                   </span>
                 </div>
               )}
@@ -518,6 +616,62 @@ export default function Settings({
                   {discovery}
                 </p>
               )}
+              <div className="provider-check">
+                <div className="provider-check-action">
+                  <div>
+                    <strong>{t("验证模型响应", "Verify a model response")}</strong>
+                    <p className="provider-check-target">
+                      {checkTarget
+                        ? t(`测试对象：${checkTarget}`, `Test target: ${checkTarget}`)
+                        : t("填写默认模型后可测试。", "Enter a default model to test.")}
+                    </p>
+                    {!model.trim() && !!modelOverride?.trim() && (
+                      <p className="provider-check-note">
+                        {t("默认模型留空，本次使用当前实验指定的模型。", "The default is blank; this test uses the current experiment's model override.")}
+                      </p>
+                    )}
+                  </div>
+                  <button
+                    className="secondary-button"
+                    onClick={checkProvider}
+                    disabled={!!pending || !env || !serviceReady || !effectiveKey || !effectiveModel}
+                  >
+                    {pending === "provider-check" ? <Spinner size={14} /> : <RefreshCw size={14} />}
+                    {t("测试模型响应", "Test model response")}
+                  </button>
+                </div>
+                <p className="provider-check-note">
+                  {t(
+                    "点击后仅发送固定短文本“Reply with exactly OK.”，可能产生少量 API 费用。不会发送实验内容或保存配置，也不会自动重试。",
+                    "Clicking sends only the fixed short text “Reply with exactly OK.” and may incur a small API charge. It sends no experiment content, saves no settings, and never retries automatically.",
+                  )}
+                </p>
+                {checkRequest && (
+                  <p className="provider-check-pending" role="status">
+                    {checkRequest.generation === providerGeneration.current
+                      ? t(`正在等待 ${checkRequest.target} 响应。可继续编辑或关闭设置，请求最多持续约 25 秒。`, `Waiting for ${checkRequest.target}. You can edit or close settings; the request lasts up to about 25 seconds.`)
+                      : t("配置或服务状态已变化，本次结果将忽略。原请求仍可能完成，不会自动重试。", "Settings or service state changed; this result will be ignored. The original request may still finish and will not be retried.")}
+                  </p>
+                )}
+                {providerResult && (
+                  <div
+                    className={`provider-check-result ${providerResult.result.status === "ok" ? "passed" : "failed"}`}
+                    role="status"
+                  >
+                    <strong>{providerCheckMessage(providerResult.result.code, t)}</strong>
+                    <span>{t(`测试对象：${providerResult.target}`, `Test target: ${providerResult.target}`)}</span>
+                    {providerResult.result.checked_at && Number.isFinite(Date.parse(providerResult.result.checked_at)) && (
+                      <span className="provider-check-meta">
+                        {new Date(providerResult.result.checked_at).toLocaleString(lang === "zh" ? "zh-CN" : "en-US")}
+                        {Number.isFinite(providerResult.result.elapsed_ms) && ` · ${(providerResult.result.elapsed_ms / 1000).toFixed(1)} ${t("秒", "s")}`}
+                      </span>
+                    )}
+                    {providerResult.result.status === "ok" && (
+                      <span>{t("仅确认本次短文本请求获得响应，不保证完整实验成功。", "This confirms only that this short text request received a response; it does not guarantee a complete experiment will succeed.")}</span>
+                    )}
+                  </div>
+                )}
+              </div>
               <button
                 className="disclosure optional-toggle"
                 onClick={() => setOptional(!optional)}

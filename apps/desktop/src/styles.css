@@ -2998,13 +2998,75 @@ kbd {
 .provider-readiness > svg {
   margin-top: 3px;
 }
-.provider-readiness.complete {
+.provider-check {
+  margin-top: 18px;
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--background);
+}
+.provider-check-action {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+.provider-check-action > div {
+  min-width: 0;
+}
+.provider-check-action > div > strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.provider-check-action > button {
+  flex-shrink: 0;
+}
+.provider-check-target {
+  margin: 5px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.provider-check-note,
+.provider-check-pending {
+  margin: 9px 0 0;
+  font-size: 11px;
+  line-height: 1.75;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.provider-check-result {
+  display: grid;
+  gap: 5px;
+  margin-top: 13px;
+  padding: 12px;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.provider-check-result.passed {
   color: var(--accent);
+  background: var(--accent-soft);
+}
+.provider-check-result.failed {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.provider-check-result > strong {
+  font-weight: 600;
+}
+.provider-check-meta {
+  font-variant-numeric: tabular-nums;
 }
 .settings-footer > .muted {
   flex: 1;
 }
 @media (max-width: 580px) {
+  .provider-check-action {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
   .submit-button.setup-submit {
     font-size: 10px;
     padding: 0 8px;
