@@ -50,9 +50,11 @@ try {
   const draftTask = 'Synthetic onboarding draft. Never submit or call a provider.';
   const draftDataset = path.join(profile, 'workspace', 'datasets', 'desktop-qa-fixture');
   await mkdir(draftDataset, { recursive: true });
+  await writeFile(path.join(draftDataset, 'synthetic-metadata-fixture.txt'), 'Synthetic onboarding fixture; never used for training.\n');
   await app.evaluate(({ dialog }, folder) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] }); }, draftDataset);
   await page.getByLabel('实验任务', { exact: true }).fill(draftTask);
   await page.locator('.dataset-button').click();
+  await page.locator('.dataset-overview[data-code="ok"]').waitFor();
   await page.getByRole('button', { name: '准备运行环境', exact: true }).click();
   await page.getByRole('dialog').waitFor();
   await page.keyboard.press('Escape');

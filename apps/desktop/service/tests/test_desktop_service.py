@@ -172,6 +172,7 @@ def test_status_and_saved_settings_do_not_expose_credentials(config):
 def test_run_guard_checks_engine_credentials_and_explicit_model(config, monkeypatch):
     dataset = config.workspace / "data"
     dataset.mkdir()
+    (dataset / "fixture.bin").write_bytes(b"fixture")
     payload = {
         "experiment": {"dataset_path": str(dataset), "task_body": "Classify images."}
     }

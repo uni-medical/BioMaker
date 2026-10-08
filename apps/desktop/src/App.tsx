@@ -5,7 +5,6 @@ import {
   ArrowUp,
   BookOpen,
   Box,
-  Check,
   ChevronDown,
   ChevronRight,
   CircleHelp,
@@ -44,6 +43,8 @@ import Settings from "./Settings";
 import RunView, { ResourcesView } from "./RunView";
 import HistoryImport from "./HistoryImport";
 import ServiceRecovery from "./ServiceRecovery";
+import DatasetOverview from "./DatasetOverview";
+import { datasetAdmissionCode, datasetInspectionMessage, useDatasetInspection } from "./datasetInspection";
 import { emptyDraft, hasDraft, reuseDraft, type Draft } from "./experimentDraft";
 import { decorateRun, defaultMetadata, isCurrentRun, mergeMetadata, type MetadataMap, type RunMetadata } from "./runMetadata";
 import type { ServiceState } from "./bridge";
@@ -196,6 +197,9 @@ export default function App() {
   );
   const textarea = useRef<HTMLTextAreaElement>(null);
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const draftEpoch = useRef(0);
+  const submitInFlight = useRef(false);
+  const pickerEpoch = useRef(0);
   const form = useRef<HTMLFormElement>(null);
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
@@ -209,6 +213,7 @@ export default function App() {
   const notificationsEdited = useRef(false);
   const alive = useRef(true);
   const toast = useCallback((message: string) => setToastMessage(message), []);
+  const datasetInspection = useDatasetInspection(draft.dataset, !selectedId && !history, serviceState);
 
   useEffect(() => {
     alive.current = true;
@@ -265,6 +270,7 @@ export default function App() {
   };
   const openNotificationRun = useCallback((runId: string) => {
     if (typeof runId !== "string" || !runId.trim()) return;
+    pickerEpoch.current += 1;
     setSelectedId(runId);
     setHistory(false);
     setSearchOpen(false);
@@ -578,6 +584,8 @@ export default function App() {
     if (selectedId) void loadDetail(selectedId, true);
   }, [selectedId, loadDetail]);
   const startNew = useCallback(() => {
+    if (submitInFlight.current) return;
+    pickerEpoch.current += 1;
     setSelectedId(null);
     setHistory(false);
     setSearchOpen(false);
@@ -590,6 +598,7 @@ export default function App() {
   }, []);
   useEffect(() => {
     const action = (value: string) => {
+      if (submitInFlight.current && value !== "toggle-sidebar") return;
       if (document.querySelector("[role=dialog]") && value !== "refresh")
         return;
       if (value === "new-experiment" || value === "new-task") startNew();
@@ -638,6 +647,7 @@ export default function App() {
   }, [startNew, openSearch, refresh, settings, searchOpen, templatesOpen, importOpen, pendingReuse]);
 
   const openTaskSettings = (section: "provider" | "runtime") => {
+    if (submitInFlight.current) return;
     setSettingsReturnToExperiment(true);
     setSettings(section);
   };
@@ -651,18 +661,28 @@ export default function App() {
       requestAnimationFrame(() => textarea.current?.focus());
   };
   const updateDraft = (value: Partial<Draft>) => {
+    if (submitInFlight.current) return;
+    draftEpoch.current += 1;
+    if (Object.hasOwn(value, "dataset")) datasetInspection.invalidate();
     setDraft((d) => ({ ...d, ...value }));
     setSubmitError("");
   };
-  const updateOptions = (value: Partial<Options>) =>
+  const updateOptions = (value: Partial<Options>) => {
+    if (submitInFlight.current) return;
+    draftEpoch.current += 1;
     setDraft((d) => ({ ...d, options: { ...d.options, ...value } }));
+  };
   const selectRun = (id: string) => {
+    pickerEpoch.current += 1;
     setSelectedId(id);
     setHistory(false);
     setSearchOpen(false);
   };
   const applyReuse = (run: Run) => {
+    if (submitInFlight.current) return;
     const next = reuseDraft(run);
+    draftEpoch.current += 1;
+    datasetInspection.invalidate();
     if (draftSaveTimer.current) clearTimeout(draftSaveTimer.current);
     persist("biomaker.draft", next);
     setDraft(next);
@@ -671,16 +691,20 @@ export default function App() {
     startNew();
   };
   const requestReuse = (run: Run) => {
+    if (submitInFlight.current) return;
     if (!run.project_snapshot?.task_body?.trim()) return;
     if (hasDraft(draft)) setPendingReuse(run);
     else applyReuse(run);
   };
   const chooseFolder = async () => {
+    if (submitInFlight.current) return;
+    const sequence = ++pickerEpoch.current;
+    const epoch = draftEpoch.current;
     try {
       const folder = await window.biomaker.chooseDirectory();
-      if (folder) updateDraft({ dataset: folder });
+      if (alive.current && sequence === pickerEpoch.current && epoch === draftEpoch.current && !submitInFlight.current && folder) updateDraft({ dataset: folder });
     } catch (e) {
-      toast(errorMessage(e));
+      if (alive.current && sequence === pickerEpoch.current) toast(errorMessage(e));
     }
   };
   const openPath = async (path?: string) => {
@@ -704,7 +728,7 @@ export default function App() {
       ? "provider"
       : null;
   const primaryNeedsSetup = serviceReady && draftReady && !!preparation;
-  const canContinue = serviceReady && draftReady && !busy && !loading && !connectionError;
+  const canContinue = serviceReady && draftReady && datasetInspection.ready && !busy && !loading && !connectionError;
   const canSubmit = canContinue && !preparation;
   const selectedRun =
     detail?.id === selectedId
@@ -746,7 +770,7 @@ export default function App() {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (busy || serviceRef.current.status !== "ready") return;
+    if (busy || submitInFlight.current || serviceRef.current.status !== "ready") return;
     setSubmitError("");
     if (!draft.task.trim()) {
       textarea.current?.focus();
@@ -769,6 +793,12 @@ export default function App() {
       setSubmitError(
         t("请先选择数据集文件夹。", "Choose a dataset folder first."),
       );
+      return;
+    }
+    if (!datasetInspection.isReady()) {
+      setSubmitError(datasetInspection.pending
+        ? t("请等待当前数据集目录检查完成。", "Wait for the current dataset folder inspection to finish.")
+        : datasetInspectionMessage(datasetInspection.result?.code || datasetInspection.errorCode || "internal", t));
       return;
     }
     if (!engineReady) {
@@ -809,15 +839,26 @@ export default function App() {
       setAdvanced(true);
       return;
     }
+    const snapshot = structuredClone(draft);
+    const epoch = draftEpoch.current;
+    const serviceRevision = serviceRef.current.revision;
+    const current = () => alive.current && epoch === draftEpoch.current && serviceRef.current.status === "ready" && serviceRef.current.revision === serviceRevision;
+    submitInFlight.current = true;
+    pickerEpoch.current += 1;
     setBusy("submit");
+    let dispatched = false;
     try {
       const [currentEngine, currentEnv] = await Promise.all([
         request<EngineStatus>("/api/desktop/status"),
         request<EnvConfig>("/api/env"),
       ]);
-      setEngine(currentEngine);
+      if (!current() || !datasetInspection.isReady()) {
+        if (alive.current) setSubmitError(t("开始前检查期间状态已变化，尚未提交实验。请检查当前配置后再开始。", "The state changed during the pre-start check. No experiment was submitted; review the current settings before starting again."));
+        return;
+      }
+      applyEngineSnapshot(currentEngine.engine);
       setEnv(currentEnv);
-      if (!currentEngine.engine.ready)
+      if (!currentEngine.engine.ready || isRuntimeBusy(currentEngine.engine))
         throw new Error(
           t(
             "运行环境尚未就绪，请在设置中完成安装。",
@@ -827,34 +868,60 @@ export default function App() {
       if (
         !currentEnv.values.OPENAI_API_KEY?.configured ||
         !(
-          draft.options.model_for_all_agents ||
+          snapshot.options.model_for_all_agents ||
           currentEnv.values.BIOMAKER_MAIN_MODEL?.value
         )
       )
         throw new Error(
           t("请配置 API Key 和模型。", "Configure an API key and model."),
         );
+      dispatched = true;
       const run = await request<Run>("/api/runs", "POST", {
         experiment: {
-          dataset_path: draft.dataset,
-          task_template_path: draft.template,
-          task_body: draft.task.trim(),
-          advanced_defaults: draft.options,
+          dataset_path: snapshot.dataset,
+          task_template_path: snapshot.template,
+          task_body: snapshot.task.trim(),
+          advanced_defaults: snapshot.options,
         },
-        requested_exp_name: draft.name.trim() || null,
+        requested_exp_name: snapshot.name.trim() || null,
       });
+      if (!current()) {
+        if (alive.current) {
+          setSubmitError(t("提交后服务状态已变化，实验可能已加入队列。草稿已保留，请先查看全部实验再决定是否重新提交。", "The service state changed after submission; the experiment may already be queued. Your draft is preserved. Check All experiments before submitting again."));
+          void refresh();
+        }
+        return;
+      }
       setRuns((previous) => [
         run,
         ...previous.filter((item) => item.id !== run.id),
       ]);
       selectRun(run.id);
-      updateDraft({ task: "", name: "", template: null, reusedFrom: undefined });
+      const next = { ...snapshot, task: "", name: "", template: null, reusedFrom: undefined };
+      draftEpoch.current += 1;
+      if (draftSaveTimer.current) clearTimeout(draftSaveTimer.current);
+      persist("biomaker.draft", next);
+      setDraft(next);
       toast(t("实验已加入队列", "Experiment added to the queue"));
       await refresh();
     } catch (e) {
-      setSubmitError(errorMessage(e));
+      if (alive.current) {
+        const message = errorMessage(e);
+        const datasetCode = datasetAdmissionCode(message);
+        if (datasetCode) {
+          setSubmitError(`${datasetInspectionMessage(datasetCode, t)} ${t("实验尚未提交，草稿已保留。", "The experiment was not submitted. Your draft is preserved.")}`);
+          datasetInspection.invalidate();
+        } else {
+          setSubmitError(dispatched
+            ? `${message} ${t("未能确认实验提交结果，草稿已保留。请先查看全部实验，确认没有新增记录后再重试。", "The submission result could not be confirmed. Your draft is preserved. Check All experiments for a new record before retrying.")}`
+            : current() ? message
+              : t("开始前检查期间服务状态已变化，尚未提交实验。", "The service state changed during the pre-start check. No experiment was submitted."));
+          if (dispatched) void refresh();
+        }
+      }
     } finally {
-      setBusy("");
+      submitInFlight.current = false;
+      if (alive.current) setBusy("");
     }
   }
   async function runAction(
@@ -862,7 +929,7 @@ export default function App() {
     run: Run,
     confirmed = false,
   ) {
-    if (busy || serviceRef.current.status !== "ready") return;
+    if (busy || submitInFlight.current || serviceRef.current.status !== "ready") return;
     if ((action === "stop" || action === "cancel") && !confirmed) {
       setConfirmation({ action, run });
       return;
@@ -882,13 +949,15 @@ export default function App() {
       await refresh();
       if (selectedRef.current) await loadDetail(selectedRef.current, true);
     } catch (e) {
-      toast(errorMessage(e));
+      const message = errorMessage(e);
+      const datasetCode = datasetAdmissionCode(message);
+      toast(datasetCode ? datasetInspectionMessage(datasetCode, t) : message);
     } finally {
       setBusy("");
     }
   }
   async function resumeQueue() {
-    if (busy || serviceRef.current.status !== "ready") return;
+    if (busy || submitInFlight.current || serviceRef.current.status !== "ready") return;
     setBusy("resume");
     try {
       const queue = await request<QueueState>("/api/queue");
@@ -1079,7 +1148,8 @@ export default function App() {
           <div className="sidebar-bottom">
             <button
               className="local-status"
-              onClick={() => setSettings("runtime")}
+              disabled={busy === "submit"}
+              onClick={() => { if (!submitInFlight.current) setSettings("runtime"); }}
             >
               <span
                 className={`connection-dot ${serviceState.status === "failed" ? "error" : !serviceReady ? "installing" : engineReady ? "ready" : isRuntimeBusy(engine?.engine) ? "installing" : ""}`}
@@ -1100,7 +1170,8 @@ export default function App() {
             <button
               className="sidebar-settings"
               aria-label={t("设置", "Settings")}
-              onClick={() => setSettings("provider")}
+              disabled={busy === "submit"}
+              onClick={() => { if (!submitInFlight.current) setSettings("provider"); }}
             >
               <Settings2 size={17} />
               <span>{t("设置", "Settings")}</span>
@@ -1409,6 +1480,7 @@ export default function App() {
                     <button
                       type="button"
                       className={`dataset-button ${draft.dataset ? "has-dataset" : ""}`}
+                      disabled={busy === "submit"}
                       onClick={chooseFolder}
                       title={
                         draft.dataset ||
@@ -1421,7 +1493,7 @@ export default function App() {
                           ? basename(draft.dataset)
                           : t("选择数据集", "Choose dataset")}
                       </span>
-                      {draft.dataset && <Check size={12} />}
+                      {draft.dataset && <small>{t("已选择", "Selected")}</small>}
                     </button>
                     <div className="composer-right">
                       <button
@@ -1457,8 +1529,12 @@ export default function App() {
                                   "先描述实验目标",
                                   "Describe your experiment first",
                                 )
-                              : !draft.dataset
+                            : !draft.dataset
                                 ? t("请先选择数据集", "Choose a dataset first")
+                                : !datasetInspection.ready
+                                  ? datasetInspection.pending
+                                    ? t("正在检查数据集目录", "Checking dataset folder")
+                                    : t("请先处理数据集目录问题", "Resolve the dataset folder issue first")
                                 : !engineReady
                                   ? t(
                                       "请先安装运行环境",
@@ -1498,6 +1574,7 @@ export default function App() {
                 <div className="composer-meta">
                   <button
                     type="button"
+                    disabled={busy === "submit"}
                     onClick={() => openTaskSettings("provider")}
                   >
                     <span
@@ -1519,8 +1596,14 @@ export default function App() {
                     {t("小时探索上限", "h exploration limit")}
                   </span>
                 </div>
+                {draft.dataset && <DatasetOverview
+                  path={draft.dataset} inspection={datasetInspection} serviceReady={serviceReady}
+                  submitting={busy === "submit"} lang={lang} t={t}
+                  onChoose={() => void chooseFolder()} onOpen={() => void openPath(draft.dataset)}
+                  onRefresh={() => { if (!submitInFlight.current) { datasetInspection.invalidate(); setSubmitError(""); } }}
+                />}
                 {advanced && (
-                  <div className="advanced-panel">
+                  <fieldset className="advanced-panel" disabled={busy === "submit"}>
                     <div className="advanced-heading">
                       <h3>{t("实验设置", "Experiment settings")}</h3>
                       <button
@@ -1697,7 +1780,7 @@ export default function App() {
                         </small>
                       </span>
                     </label>
-                  </div>
+                  </fieldset>
                 )}
                 {submitError && <Notice danger>{submitError}</Notice>}
               </form>
@@ -1803,7 +1886,9 @@ export default function App() {
               {templates.length > 0 && (
                 <button
                   className="template-link"
+                  disabled={busy === "submit"}
                   onClick={() => {
+                    if (submitInFlight.current) return;
                     setTemplatesOpen(true);
                     setChosenTemplate(null);
                   }}
@@ -2160,9 +2245,9 @@ export default function App() {
             </small>
             <button
               className="primary-button"
-              disabled={!chosenTemplate}
+              disabled={!chosenTemplate || busy === "submit"}
               onClick={() => {
-                if (!chosenTemplate) return;
+                if (!chosenTemplate || submitInFlight.current) return;
                 updateDraft({
                   task: chosenTemplate.body,
                   template: chosenTemplate.path,

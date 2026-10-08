@@ -12,6 +12,7 @@ import { externalURL, isWithin, validateArtifact, validateRequest, validTheme } 
 import { readResponse } from './response';
 import { RunNotifications, type RunCompletion } from './run-notifications';
 import { CloseGuard, type CloseBlockReason } from './close-guard';
+import { datasetInspectionBody } from './dataset-inspection';
 
 app.setName('BioMaker');
 // Test/review installs can use a separate profile without touching real projects.
@@ -198,6 +199,12 @@ function setupIPC() {
   handle('biomaker:request', async (rawPath, options) => {
     const request = validateRequest(rawPath, options);
     const pathname = decodeURIComponent(request.path.split('?')[0]).replace(/\/+$/, '');
+    if (request.method === 'POST' && pathname === '/api/desktop/dataset/inspect') {
+      request.body = datasetInspectionBody(request.body ? JSON.parse(request.body) : null, [
+        ...preferences.directories,
+        path.join(app.getPath('userData'), 'workspace'),
+      ]);
+    }
     if (request.method === 'POST' && pathname === '/api/desktop/history/preview') {
       const body = request.body ? JSON.parse(request.body) : null;
       if (!body || typeof body.path !== 'string' || !path.isAbsolute(body.path) || !existsSync(body.path)) throw new Error(t('请选择已有实验文件夹。', 'Choose an existing experiment folder.'));

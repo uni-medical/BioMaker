@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.9 — 2026-10-09
+
+Adds a local dataset overview to new experiment drafts, with ordinary-file counts,
+logical sizes, file types and a limited list of top-level entries. It reads only
+filesystem metadata, uses native folder grants, and does not read file contents
+or call a model. Large or partly inaccessible directories show partial results;
+internal symbolic links are counted without following their targets.
+
+Dataset inspection runs in a bounded worker. Desktop submission and requeue
+perform a fresh access check, rejecting confirmed empty or inaccessible roots
+before creating an experiment. Draft changes and service replacement invalidate
+older overview results. The check describes the filesystem at inspection time,
+not scientific validity or availability throughout a queued experiment.
+
 ## 0.1.8 — 2026-10-09
 
 Adds an explicit model-response check in provider settings. One short Chat

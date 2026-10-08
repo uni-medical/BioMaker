@@ -2,6 +2,18 @@
 
 ## Release gates
 
+- Run `tests/dataset-inspection-smoke.mjs` through the native bridge and real
+  sidecar in an isolated profile, then repeat with the packaged executable.
+  Verify granted and ungranted directories, confirmed-empty and partial results,
+  symbolic-link boundaries, stale-response protection and responsive themes.
+  Metadata inspection must not open dataset file contents, enqueue an experiment,
+  install dependencies or send provider requests. Keep submission-time filesystem
+  checks separate from scientific data validity and later queue-time availability.
+- Run `tests/dataset-submission-smoke.mjs` for localized dataset refusals, stale
+  preflight rejection, draft snapshot protection, duplicate submissions and
+  uncertain outcomes after service restart. Its readiness and submission
+  responses are simulated; all POSTs are intercepted and the real ledger must
+  remain empty. Verify actual execution separately with the installed workflow.
 - Run `tests/provider-check-smoke.mjs` against the real sidecar and a local model
   fixture, then repeat against the packaged executable. Verify explicit-only
   requests, draft/configuration preservation, credential reuse boundaries,

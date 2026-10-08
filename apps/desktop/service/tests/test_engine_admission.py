@@ -46,6 +46,7 @@ def configured_app(config, monkeypatch):
     monkeypatch.setattr(app.state.manager, "_ensure_supervisor", lambda: None)
     dataset = config.workspace / "synthetic-data"
     dataset.mkdir()
+    (dataset / "fixture.bin").write_bytes(b"fixture")
     payload = {"experiment": {"dataset_path": str(dataset), "task_body": "Synthetic admission only."}}
     return app, engine, payload
 

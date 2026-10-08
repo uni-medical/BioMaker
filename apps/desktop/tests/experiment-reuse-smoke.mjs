@@ -29,6 +29,7 @@ const dirtyDataset = path.join(temporary, 'draft-dataset');
 const selectedDataset = path.join(temporary, 'selected-for-new-experiment');
 const ownLogs = path.join(profile, 'workspace/logs', ownId);
 for (const directory of [profile, output, ownDataset, originalDataset, dirtyDataset, selectedDataset]) await mkdir(directory, { recursive: true });
+for (const directory of [ownDataset, originalDataset, dirtyDataset, selectedDataset]) await writeFile(path.join(directory, 'synthetic-metadata-fixture.txt'), 'Synthetic reuse fixture; never used for training.\n');
 await writeFile(path.join(profile, 'desktop-preferences.json'), JSON.stringify({ language: 'zh', theme: 'light', notifications: false, directories: [] }));
 
 async function seedHistory(directory, dataset, task, options) {
@@ -142,6 +143,7 @@ async function chooseDataset(directory) {
   await page.locator('.dataset-button').click();
   const resolved = await realpath(directory);
   await until(async () => (await draftObject())?.dataset === resolved, 'Chosen dataset was not persisted');
+  await page.locator('.dataset-overview[data-code="ok"]').waitFor();
   return resolved;
 }
 function invariantRecord(run) {

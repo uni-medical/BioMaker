@@ -96,6 +96,7 @@ try {
   await app.evaluate(({ dialog }, dataset) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [dataset] }); }, config.dataset);
   await page.getByLabel('实验任务', { exact: true }).fill(config.task);
   await page.locator('.dataset-button').click();
+  await page.locator('.dataset-overview[data-code="ok"]').waitFor();
   await page.getByRole('button', { name: '实验设置', exact: true }).click();
   await page.getByLabel('实验名称', { exact: false }).fill('synthetic-desktop-ui-workflow');
   await page.getByLabel('最大探索步数', { exact: true }).fill('1');

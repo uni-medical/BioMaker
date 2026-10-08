@@ -31,8 +31,9 @@ from history_import import HistoryImporter, HistoryImportError
 from run_metadata import RunMetadataStore, RunMetadataUpdate, RunMetadataError
 from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, provision_native_runtime
 from provider_check import ProviderChecker, check_request
+from dataset_inspection import DatasetInspector, inspect_request, ADMISSION_MESSAGES
 
-VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.8")
+VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.9")
 
 
 class HistoryPreviewRequest(BaseModel):
@@ -632,6 +633,7 @@ def create_desktop_app(
     from contextlib import asynccontextmanager
 
     from webui.env_file import read_env_values
+    from webui.models import RunCreate
     from webui.server import create_app
     from webui.settings import Settings
 
@@ -641,6 +643,7 @@ def create_desktop_app(
     history = HistoryImporter(settings, app.state.manager)
     metadata = RunMetadataStore(settings.state_dir / "desktop-metadata.sqlite3", app.state.run_store)
     provider = ProviderChecker(config.env_file)
+    datasets = DatasetInspector(settings.workspace_root)
     original_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
@@ -650,20 +653,27 @@ def create_desktop_app(
                 history.recover()
                 yield
         finally:
-            provider.close()
-            history.close()
-            metadata.close()
-            engine.close()
+            # One failed cleanup must not strand another owned worker.
+            for component in (provider, datasets, history, metadata, engine):
+                try:
+                    component.close()
+                except Exception:
+                    pass
 
     app.router.lifespan_context = lifespan
     app.state.desktop_engine = engine
     app.state.history_importer = history
     app.state.run_metadata = metadata
     app.state.provider_checker = provider
+    app.state.dataset_inspector = datasets
 
     @app.post("/api/desktop/provider/check")
     async def check_provider(request: Request):
         return await check_request(request, provider)
+
+    @app.post("/api/desktop/dataset/inspect")
+    async def inspect_dataset(request: Request):
+        return await inspect_request(request, datasets)
 
     @app.exception_handler(RunMetadataError)
     async def metadata_error(_request: Request, exc: RunMetadataError):
@@ -802,9 +812,15 @@ def create_desktop_app(
                     status_code=409,
                 )
             model = values.get("BIOMAKER_MAIN_MODEL")
+            dataset_path = None
             if is_create:
                 try:
                     payload = await request.json()
+                    try:
+                        validated_run = RunCreate.model_validate(payload)
+                        dataset_path = validated_run.experiment.dataset_path
+                    except ValueError:
+                        pass  # Let the original route report schema errors.
                     model = (
                         (payload.get("options") or {}).get("model_for_all_agents")
                         or (
@@ -819,6 +835,7 @@ def create_desktop_app(
                 model = (record or {}).get("options", {}).get(
                     "model_for_all_agents"
                 ) or model
+                dataset_path = ((record or {}).get("project_snapshot") or {}).get("dataset_path")
             if not is_resume and (not isinstance(model, str) or not model.strip()):
                 return JSONResponse(
                     {
@@ -826,6 +843,11 @@ def create_desktop_app(
                     },
                     status_code=409,
                 )
+            if not is_resume and dataset_path is not None:
+                checked = await asyncio.to_thread(datasets.inspect, {"path": dataset_path}, mode="admission")
+                if checked["status"] == "error":
+                    code = checked["code"]
+                    return JSONResponse({"detail": f"[dataset:{code}] {ADMISSION_MESSAGES.get(code, ADMISSION_MESSAGES['internal'])}", "code": code}, status_code=409 if code == "busy" else 422)
         return await call_next(request)
 
     admission = asyncio.Lock()
