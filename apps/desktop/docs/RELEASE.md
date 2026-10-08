@@ -332,3 +332,12 @@ arbitrarily large, malformed suffixes may require a full scan, and exact event
 counts read every initial byte. Desktop Results retains its independent byte and
 record caps and must report incomplete evidence honestly. See
 [ACCEPTANCE-0.1.15.md](ACCEPTANCE-0.1.15.md) for current verification status.
+
+The frozen 0.1.15 source is `a86f0bf619293e4c171a40b86fdfe4911aff947e`.
+918 source, 113 development, 206 packaged and four offline engine checks passed.
+Package equality/signatures, actual upgrade, independent native runtime setup,
+installed synthetic CPU workflow and final normal launch passed. Configuration,
+preferences, draft bytes and complete run rows were preserved; the acceptance
+record defines the exact verification scope and does not claim a whole-profile
+comparison. Remaining release work includes Developer ID/notarization and
+separate platform acceptance.

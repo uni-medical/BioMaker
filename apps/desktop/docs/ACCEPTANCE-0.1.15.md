@@ -2,16 +2,17 @@
 
 Target: macOS Apple silicon / arm64. Date: 2026-10-09.
 
-Status: source and development acceptance passed. Frozen-package, upgrade,
-installed-runtime and final native-launch acceptance are **pending**. This draft
-does not claim that a 0.1.15 installer or installed application has passed.
+918 source, 113 development, 206 packaged and four offline engine checks passed.
+Package verification, actual upgrade, independent runtime setup, preservation of
+the specified user records, installed synthetic CPU workflow and normal native
+launch passed on this Apple silicon Mac.
 
 918 source checks passed: WebUI 198, desktop service 552, native/package unit
 checks 157, close protection 7 and event presentation 4. TypeScript and the
 production build passed. A production build is separate from distribution
 packaging and application acceptance.
 
-Release source commit and package fingerprints: **pending**. The performance
+Release source: `a86f0bf619293e4c171a40b86fdfe4911aff947e`. The performance
 baseline is `877f328f96f714396bc67a02528855449668ae87`; final v4 measurements use
 the optimized working-tree source, identified by the six SHA256 values in
 `output/long-history-after-0.1.15-v4-final.json`. Those six source files stayed
@@ -203,7 +204,7 @@ the failed first script and log remain preserved. V4 retains the exact v2
 fixture generation, operation order and semantic assertions, with binary read
 counters and descriptor passthrough introduced in v3.
 
-## Pending application and release acceptance
+## Development application acceptance
 
 Development acceptance passed 113 checks across nine suites: long history 11,
 catalog refresh 13, log reader 14, artifact preview 11, history import 10,
@@ -214,25 +215,94 @@ source; these tests do not silently use an older engine copy.
 
 The new native test generated 12 histories with 40,000 ordinary events each and
 120,000 selected result rows, totaling 169,700,762 event/result bytes. Cold profile
-service readiness took 2618.692 ms and complete app relaunch took 981.637 ms on
-this machine, with zero startup retries. The native timeout remains 30 seconds
+service readiness took 2618.692 ms; readiness after a complete app relaunch took
+981.637 ms on this machine, with zero startup retries. The native timeout remains 30 seconds
 per attempt. These are fixture-specific observations, not a size-independent
 startup guarantee. The independent Results evidence reader correctly reports
 oversized event history as unavailable instead of inferring a selection.
 
-| Gate | Current status |
-| --- | --- |
-| Development Electron/UI suites, including long-history flow | **113 passed** |
-| Release source freeze and commit provenance | **Pending** |
-| Frozen packaged suites and independent screenshot review | **Pending** |
-| DMG/ZIP generation, signatures, equality and SHA-256 verification | **Pending** |
-| Actual installation or upgrade and rollback preservation | **Pending** |
-| Installed runtime setup and retained-profile verification | **Pending** |
-| Installed isolated CPU workflow and offline recovery | **Pending** |
-| Normal native launch and final installed bundle/profile verification | **Pending** |
+The independent development review inspected 32 screenshots. Eight suites retain
+exact profile paths with raw/canonical process checks. The native-service-state
+receipt omits its profile path; its harness removes the temporary directory and
+the review found no process with its QA prefix. That is a narrower cleanup receipt.
 
-No 0.1.14 application or installation result is promoted to a 0.1.15 pass.
+## Packaged and installed acceptance
+
+`output/packaged-acceptance-0.1.15.json` records 206 passed checks across 17 suites:
+native 73, UI 82 and service 51. All frozen-package attempts passed. Independent
+reviews inspected 20 native and 22 UI screenshots and checked raw/canonical
+temporary-profile paths for remaining processes. No blocking visual regression
+was found. Existing transient toasts, compact-view heading occlusion and the
+catalog status-reason text after terminal events leave the 5,000-object window
+remain recorded as follow-up observations. Ledger ownership remains unchanged.
+
+The source-provenance review confirms that the six v4 measured source hashes
+match both the frozen Git commit and the packaged files. Package verification
+confirms clean source provenance, deep strict signatures, the Applications
+shortcut, and complete equality of the unpacked app, read-only DMG and extracted
+ZIP. These signatures remain ad-hoc, not Developer ID or notarization acceptance.
+
+The bundle has 2,819 files and fingerprint
+`dc35f149df5bd85b740ea50703dbd9feb33ae67bce8835fbac8d65bd442ac720`.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `release/BioMaker-0.1.15-mac-arm64.dmg` | `4d2dddc176704865ceac66947b77b76b51dbff89c3034a4e971837c174883024` |
+| `release/BioMaker-0.1.15-mac-arm64.zip` | `d5a562f1ad801eb762c7ab9783de9dabc7f61c8248e3725b9bd10902f0686cbc` |
+
+The actual `/Applications/BioMaker.app` was upgraded from 0.1.14 after a normal
+native quit. The old bundle is retained at
+`release/installed-backups/BioMaker-0.1.14-20261009-065643.app`.
+Source and staged fingerprints were verified before replacement.
+
+Native UI setup prepared the independent engine
+`engine-7aea2b5edf05dd6c63ac54f08a05f5eb916b1395851b6bf4f9ad9b8f8f22d534`.
+The previous engine remains retained at
+`engine-918f7133a2fe716db5d15551948c7fbd9a074da679249d2e8adcb57b73f59775`.
+Bundled engine source SHA-256 is
+`8aeb130bca1d2993950d365a00fbaee4aa74b4c3b6120ddabd4491023879e70a`.
+Installed read-only verification used a system-only PATH and confirmed readiness;
+provider credentials and model selection remain unconfigured.
+
+Upgrade preservation checks cover exact bytes/existence for `config.env`, `.env`,
+`experiment-drafts.json` and `desktop-preferences.json`; complete `runs` table
+rows; and the previous engine's two identity/setup receipts, `run_catalog.py`
+and interpreter symlink target. Actual user run count remains zero. The original
+draft SHA-256 remains
+`e4b3f05ea91babc4acc1ae81b7093c3bca0fe21af83208dcc675ee0ebe9948f7`.
+These checks do not fingerprint the entire user profile or previous engine.
+`state/desktop-metadata.sqlite3` was not snapshotted before this upgrade and is
+not included in the preservation claim.
+
+`output/desktop-workflow-acceptance-0.1.15.json` passed in 23.768 seconds. The
+installed app submitted an isolated synthetic CPU experiment, ran the durable
+queue, inspected results/candidates, exported a report through the native save
+dialog and read logs. A local model fixture and inherited network restrictions
+were used; this is software acceptance, not biomedical validation or external
+model-provider acceptance. The complete isolated home is retained with symlinks
+preserved under `output/qa/desktop-workflow-0.1.15/`; its seven screenshots are
+copied separately from `output/playwright/desktop-workflow/` into the versioned
+archive and verified by hash.
+
+## Offline recovery and final launch
+
+`output/engine-health-packaged-0.1.15.json` records four checks passed in 111.061
+seconds. A network-denying macOS sandbox runs the packaged service against an
+APFS clone. Removing a real dependency only from that clone produces a visible
+failure which persists across restart; offline locked reinstall then restores
+the environment and a second fixed CPU check passes. Complete fingerprints of
+the original engine (29,584 files) and package cache (29,546 files) are identical
+before and after. The clone remains at its recorded path; the receipt and review
+are retained under `output/qa/engine-health-0.1.15/`.
+
+Post-workflow verification confirms that the complete installed app still matches
+the verified package, strict signatures remain valid, the specified user records
+are unchanged and no owned packaged/workflow QA processes remain. Final CUA
+launch raised the real app and verified version 0.1.15, local runtime ready and
+the original saved blank draft. The app is left open there. Another read-only
+check after normal launch confirmed the same preserved records.
+
 Developer ID signing and Apple notarization remain separate public-distribution
 requirements. Windows, Linux and macOS x64 remain separate validation targets.
 Synthetic software checks do not establish biomedical performance or external
-model-provider access.
+model-provider access. The development goal remains active for further iteration.
