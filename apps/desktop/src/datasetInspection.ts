@@ -52,15 +52,15 @@ export function datasetWarningMessage(code: string, t: Translate): string {
   }
 }
 
-type InspectionRecord = { generation: number; path: string; revision: number; result: DatasetInspection | null; errorCode: string | null };
-export function useDatasetInspection(path: string, enabled: boolean, service: ServiceState) {
+type InspectionRecord = { generation: number; path: string; contextKey: string; revision: number; result: DatasetInspection | null; errorCode: string | null };
+export function useDatasetInspection(path: string, enabled: boolean, service: ServiceState, contextKey = '') {
   const [record, setRecord] = useState<InspectionRecord | null>(null);
   const [refreshEpoch, setRefreshEpoch] = useState(0);
   const generation = useRef(0);
   const currentRecord = useRef<InspectionRecord | null>(null);
   const queue = useRef<Promise<void>>(Promise.resolve());
-  const context = useRef({ path, enabled, service });
-  context.current = { path, enabled, service };
+  const context = useRef({ path, enabled, service, contextKey });
+  context.current = { path, enabled, service, contextKey };
   const invalidate = useCallback(() => {
     generation.current += 1;
     currentRecord.current = null;
@@ -73,7 +73,7 @@ export function useDatasetInspection(path: string, enabled: boolean, service: Se
     setRecord(null);
     if (!path || !enabled || service.status !== "ready") return;
     const revision = service.revision;
-    const current = () => generation.current === sequence && context.current.path === path &&
+    const current = () => generation.current === sequence && context.current.path === path && context.current.contextKey === contextKey &&
       context.current.enabled && context.current.service.status === "ready" && context.current.service.revision === revision;
     // A newer folder waits for the old bounded request, then skips all obsolete
     // queued requests. This avoids overlapping scans and automatic busy retries.
@@ -82,9 +82,9 @@ export function useDatasetInspection(path: string, enabled: boolean, service: Se
       let next: InspectionRecord;
       try {
         const result = await request<DatasetInspection>("/api/desktop/dataset/inspect", "POST", { path });
-        next = { generation: sequence, path, revision, result, errorCode: null };
+        next = { generation: sequence, path, contextKey, revision, result, errorCode: null };
       } catch (error) {
-        next = { generation: sequence, path, revision, result: null, errorCode: datasetAdmissionCode(errorMessage(error)) || "internal" };
+        next = { generation: sequence, path, contextKey, revision, result: null, errorCode: datasetAdmissionCode(errorMessage(error)) || "internal" };
       }
       if (current()) {
         currentRecord.current = next;
@@ -92,9 +92,9 @@ export function useDatasetInspection(path: string, enabled: boolean, service: Se
       }
     });
     return () => { generation.current += 1; currentRecord.current = null; };
-  }, [path, enabled, service.status, service.revision, refreshEpoch]);
+  }, [path, enabled, service.status, service.revision, refreshEpoch, contextKey]);
   const matches = (value: InspectionRecord | null) => !!value && value.generation === generation.current &&
-    value.path === context.current.path && context.current.enabled && context.current.service.status === "ready" &&
+    value.path === context.current.path && value.contextKey === context.current.contextKey && context.current.enabled && context.current.service.status === "ready" &&
     value.revision === context.current.service.revision;
   const visible = matches(record) ? record : null;
   const isReady = () => matches(currentRecord.current) && currentRecord.current?.result?.status === "ok";

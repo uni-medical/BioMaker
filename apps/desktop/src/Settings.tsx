@@ -18,6 +18,7 @@ import {
 import { Modal, Notice, SettingRow, Spinner } from "./components";
 import type { ServiceState } from "./bridge";
 import ServiceRecovery from "./ServiceRecovery";
+import { registerCloseProtection } from "./closeProtection";
 import {
   errorMessage,
   providerCheckMessage,
@@ -187,17 +188,10 @@ export default function Settings({
     if (dirty) setConfirmClose(true);
     else onClose();
   };
-  useEffect(() => {
-    const beforeUnload = (event: BeforeUnloadEvent) => {
-      const state = closeState.current;
-      if (!state.dirty && !state.saving) return;
-      event.preventDefault();
-      event.returnValue = "Unsaved model settings";
-      window.biomaker.reportCloseBlock(state.saving ? "saving" : "unsaved");
-    };
-    window.addEventListener("beforeunload", beforeUnload);
-    return () => window.removeEventListener("beforeunload", beforeUnload);
-  }, []);
+  useEffect(() => registerCloseProtection("settings", () => {
+    const state = closeState.current;
+    return state.saving ? "saving" : state.dirty ? "unsaved" : null;
+  }), []);
   useEffect(() => {
     if (env !== knownEnv.current) {
       knownEnv.current = env;

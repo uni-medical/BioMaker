@@ -124,6 +124,12 @@ try {
   await assert.rejects(api('/api/desktop/history/preview', 'POST', { path: sources }), /choose|selected|authorized|选择/i);
   checks.push('unpicked-source-rejected');
   await page.getByLabel('实验任务', { exact: true }).fill(draft);
+  await until(async () => {
+    const saved = await page.evaluate(() => window.biomaker.getDrafts());
+    return saved.drafts.find(entry => entry.id === saved.activeId)?.content.task === draft;
+  }, 'The original experiment draft was not persisted');
+  const draftId = (await page.evaluate(() => window.biomaker.getDrafts())).activeId;
+  assert(draftId, 'The original task must have a durable draft identity');
   await openImport();
   await chooseSources();
   assert.equal(await page.getByLabel(`选择 ${invalid}`, { exact: true }).isDisabled(), true);
@@ -199,8 +205,11 @@ try {
   assert.equal(duplicateResult.imported.length, 0);
   assert.equal(duplicateResult.skipped[0].run_id, imported.id);
   await page.getByRole('button', { name: '取消', exact: true }).click();
-  await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.send('biomaker:menu-action', 'new-experiment'));
+  await page.locator('.primary-nav').getByRole('button', { name: /^草稿/ }).click();
+  await page.locator(`[data-draft-id="${draftId}"]`).getByRole('button', { name: /^继续编辑草稿/ }).click();
+  await page.getByLabel('实验任务', { exact: true }).waitFor();
   assert.equal(await page.getByLabel('实验任务', { exact: true }).inputValue(), draft);
+  assert.equal((await page.evaluate(() => window.biomaker.getDrafts())).activeId, draftId, 'History import must retain the original draft identity');
   checks.push('duplicates-skip-without-overwrite-and-draft-preserved');
 
   await application.close(); application = undefined;

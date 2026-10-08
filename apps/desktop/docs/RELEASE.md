@@ -2,6 +2,14 @@
 
 ## Release gates
 
+- Run `tests/drafts-smoke.mjs` with the real native draft store and repeat against
+  the packaged executable. Verify independent draft identities, autosave, search,
+  rename, duplicate, delete, restart, legacy migration and edits without a live
+  sidecar. Check new/reused drafts preserve existing entries, confirmed submission
+  removes only its draft, and failed or uncertain submissions retain it. Exercise
+  persistence failures and recovery, revision conflicts, and native close/quit
+  protection for pending edits. Keep intercepted submission states separate from
+  the installed experiment workflow and retain every QA profile's cleanup receipt.
 - Run `tests/result-overview-smoke.mjs` with the real sidecar and repeat against
   the packaged executable. Verify recorded selection versus code matching,
   candidate identity and metric direction, conflicting/missing evidence,
@@ -97,8 +105,9 @@
   sandbox, with an exact `/bin/ps` exception for process identity inspection.
 - Run `tests/run-organization-smoke.mjs` and `tests/experiment-reuse-smoke.mjs`
   against the packaged executable. Verify revision conflicts, delayed refreshes,
-  archive/restore, restart, explicit draft replacement and original file/ledger
-  preservation. QA uses isolated synthetic profiles and makes no provider call.
+  archive/restore, restart, independent draft creation, existing draft preservation
+  and original file/ledger preservation. QA uses isolated synthetic profiles and
+  makes no provider call.
 - After packaged acceptance, run `npm run verify:release`. It verifies deep strict
   signatures, clean-source provenance, version and complete application equality
   across the unpacked bundle, read-only DMG and extracted ZIP, then writes checksums.
@@ -113,6 +122,15 @@ The macOS app stores its own workspace, settings, run ledger and writable engine
 environment under the user's Application Support directory. It does not take over
 the research repository's existing `.env` or outputs. Engine code is versioned
 separately from user data. Replacing the `.app` must not delete experiments.
+
+Experiment drafts are stored in `experiment-drafts.json` under the native app data
+directory, independently of the Python service. Preserve this library and its
+active draft across upgrades. Valid legacy single-draft localStorage content
+migrates once; retain the raw original for recovery. Malformed, unsupported or
+conflicting persisted state must produce a recoverable error rather than silently
+replace user data. Verify migration, restart and failed-save recovery again from
+the packaged and installed build; a development pass does not establish upgrade
+acceptance.
 
 API credentials are stored in the application's private config file with owner-only
 permissions, as required by the existing Python engine. They are not stored in
@@ -177,5 +195,24 @@ scope of each check and the remaining distribution and platform boundaries.
 
 - Improve long-running activity and log navigation with useful current-stage
   information, explicit following controls and search.
-- Support multiple persisted experiment drafts so starting a new idea does not
-  require replacing the single current draft or submitting it early.
+
+## Multiple-draft implementation for 0.1.12
+
+The source now includes a searchable native draft library with autosave, independent
+new/reused/duplicated entries, rename and confirmed deletion. Draft names are
+separate from experiment directory names. Drafts remain editable without the
+sidecar; confirmed submission removes only its entry, while failures or uncertain
+outcomes preserve it. Persistence errors expose retry and content-recovery actions,
+and pending edits participate in native close protection.
+
+Eight development regression suites have passed 99 checks, and their isolated
+profile processes have exited. The aggregate receipt is
+`output/development-regressions-0.1.12.json`. It covers a development snapshot using
+synthetic data, local provider fixtures and explicitly intercepted runtime,
+submission or notification states. It is not proof of a real experiment, engine
+installation, or the final source after subsequent changes.
+
+The 0.1.12 final-source freeze, packaged acceptance, bundle verification, actual
+installation/upgrade and retained-profile workflow still require their own final
+receipts. The completed 0.1.11 acceptance above remains the previous-release record
+and must not be used as acceptance of the new multiple-draft workflow.

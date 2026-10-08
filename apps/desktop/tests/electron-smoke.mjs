@@ -55,6 +55,12 @@ try {
   await page.getByLabel('实验任务', { exact: true }).fill(draftTask);
   await page.locator('.dataset-button').click();
   await page.locator('.dataset-overview[data-code="ok"]').waitFor();
+  await page.waitForFunction(async task => {
+    const saved = await window.biomaker.getDrafts();
+    return saved.drafts.find(entry => entry.id === saved.activeId)?.content.task === task;
+  }, draftTask);
+  const draftId = (await page.evaluate(() => window.biomaker.getDrafts())).activeId;
+  assert(draftId, 'The onboarding task must have a durable draft identity');
   await page.getByRole('button', { name: '准备运行环境', exact: true }).click();
   await page.getByRole('dialog').waitFor();
   await page.keyboard.press('Escape');
@@ -188,9 +194,11 @@ try {
     await page.locator('.run-intro').waitFor();
     await page.waitForTimeout(100);
     assert.equal(await page.evaluate(() => window.biomaker.getPendingRun()), null, 'Recreated renderer acknowledges the notification target');
-    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.send('biomaker:menu-action', 'new-experiment'));
+    await page.locator('.primary-nav').getByRole('button', { name: /^草稿/ }).click();
+    await page.locator(`[data-draft-id="${draftId}"]`).getByRole('button', { name: /^继续编辑草稿/ }).click();
     await page.getByLabel('实验任务', { exact: true }).waitFor();
     assert.equal(await page.getByLabel('实验任务', { exact: true }).inputValue(), draftTask, 'Notification navigation preserves the draft');
+    assert.equal((await page.evaluate(() => window.biomaker.getDrafts())).activeId, draftId, 'Notification navigation preserves the original draft identity');
   }
   assert.deepEqual(errors, []);
   const report = { passed: true, executablePath: executablePath || 'development Electron', platform: process.platform, arch: process.arch, profile, output, checks: ['real-sidecar', 'isolated-profile', 'renderer-sandbox', 'IPC-path-boundaries', 'missing-engine-preflight', 'settings-persistence', 'partial-provider-guidance', 'onboarding-draft-preservation', 'secret-masking', 'theme', 'language-and-native-menus', 'preference-validation', 'restart', 'history-import', 'candidates-and-nonfinite-metrics', 'native-artifact-export', 'console', 'compact-layout', 'notification-preference-persistence', 'background-native-notification-after-window-close', 'notification-click-recreates-window-and-preserves-draft', 'no-renderer-errors'] };

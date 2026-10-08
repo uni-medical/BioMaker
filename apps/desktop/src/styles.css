@@ -499,6 +499,35 @@ kbd {
 }
 .header-left > span:first-of-type {
   color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.draft-save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.draft-save-state.failed { color: var(--danger); }
+.draft-save-error {
+  flex-shrink: 0;
+  margin: 0 24px 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  font-size: 12px;
+}
+.draft-save-error p { margin: 0 0 10px; overflow-wrap: anywhere; }
+.draft-save-error > div { display: flex; flex-wrap: wrap; gap: 8px; }
+@media (max-width: 700px) {
+  .draft-save-state { max-width: 90px; overflow: hidden; text-overflow: ellipsis; }
+  .draft-save-error { margin-inline: 12px; }
 }
 .header-run-title {
   overflow: hidden;

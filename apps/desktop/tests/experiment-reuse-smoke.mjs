@@ -109,7 +109,12 @@ async function close() {
   await application.close(); application = undefined;
 }
 const api = (endpoint, method = 'GET', body) => page.evaluate(({ endpoint, method, body }) => window.biomaker.request(endpoint, { method, ...(body === undefined ? {} : { body }) }), { endpoint, method, body });
-const storedDraft = () => page.evaluate(() => localStorage.getItem('biomaker.draft'));
+const draftState = () => page.evaluate(() => window.biomaker.getDrafts());
+const storedDraft = () => page.evaluate(async () => {
+  const snapshot = await window.biomaker.getDrafts();
+  const active = snapshot.drafts.find(entry => entry.id === snapshot.activeId);
+  return active ? JSON.stringify(active.content) : null;
+});
 async function draftObject() { return JSON.parse(await storedDraft()); }
 async function openRun(id) {
   // Native notification navigation selects the fixture; the reuse button itself
@@ -118,9 +123,11 @@ async function openRun(id) {
   await page.locator('.run-intro').waitFor();
   await page.getByRole('button', { name: '复用为新实验', exact: true }).waitFor();
 }
-async function newDraft() {
-  await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.send('biomaker:menu-action', 'new-experiment'));
+async function openDraft(id) {
+  await page.locator('.primary-nav').getByRole('button', { name: /^草稿/ }).click();
+  await page.locator(`[data-draft-id="${id}"]`).getByRole('button', { name: /^继续编辑草稿/ }).click();
   await page.getByLabel('实验任务', { exact: true }).waitFor();
+  await until(async () => (await draftState()).activeId === id, 'The selected draft did not become active');
 }
 async function advanced() {
   const button = page.getByRole('button', { name: '实验设置', exact: true });
@@ -207,35 +214,44 @@ try {
     return options && Object.entries(dirtyOptions).every(([key, value]) => options[key] === value);
   }, 'Edited options were not persisted');
   const dirtyRaw = await storedDraft();
+  const dirtyState = await draftState();
+  const dirtyId = dirtyState.activeId;
+  const dirtyRecord = dirtyState.drafts.find(entry => entry.id === dirtyId);
+  assert(dirtyRecord, 'The edited draft must have a durable identity');
   const dirtyExpected = { task: dirtyTask, dataset: dirtyPath, name: 'qa-unsaved-draft', options: dirtyOptions };
   await assertForm(dirtyExpected);
   await openRun(importedId);
   await page.getByRole('button', { name: '复用为新实验', exact: true }).click();
-  await page.getByRole('dialog', { name: '替换当前草稿？', exact: true }).waitFor();
-  await until(async () => await page.getByRole('button', { name: '保留当前草稿', exact: true }).evaluate(element => document.activeElement === element), 'Cancel must receive the initial focus in the replacement dialog');
-  await page.getByRole('button', { name: '保留当前草稿', exact: true }).click();
-  assert.equal(await storedDraft(), dirtyRaw);
-  await newDraft();
+  await page.getByLabel('实验任务', { exact: true }).waitFor();
+  assert.equal(await page.getByRole('dialog', { name: '替换当前草稿？', exact: true }).count(), 0);
+  const importedState = await draftState();
+  assert.notEqual(importedState.activeId, dirtyId, 'Reuse must create an independent draft');
+  assert.equal(importedState.drafts.length, dirtyState.drafts.length + 1);
+  for (const previous of dirtyState.drafts) assert.deepEqual(importedState.drafts.find(entry => entry.id === previous.id), previous, 'Reuse changed a pre-existing draft');
+  await openDraft(dirtyId);
   await assertForm(dirtyExpected);
   assert.equal(await storedDraft(), dirtyRaw);
-  checks.push('cancel-reuse-preserves-exact-draft-text-path-name-and-options');
+  checks.push('independent-reuse-preserves-exact-existing-draft-text-path-name-options-and-identity');
 
   await openRun(ownId);
   await page.getByRole('button', { name: '复用为新实验', exact: true }).click();
-  await page.getByRole('button', { name: '替换并复用', exact: true }).click();
   await page.getByLabel('实验任务', { exact: true }).waitFor();
-  const replacedRaw = await storedDraft();
-  for (const [key, value] of Object.entries(ownExpected)) assert.deepEqual(JSON.parse(replacedRaw)[key], value);
+  const reusedRaw = await storedDraft();
+  const beforeRestart = await draftState();
+  assert.notEqual(beforeRestart.activeId, dirtyId);
+  assert.notEqual(beforeRestart.activeId, importedState.activeId);
+  assert.deepEqual(beforeRestart.drafts.find(entry => entry.id === dirtyId), dirtyRecord);
+  for (const [key, value] of Object.entries(ownExpected)) assert.deepEqual(JSON.parse(reusedRaw)[key], value);
   await close();
   await launch();
-  await newDraft();
-  assert.deepEqual(await draftObject(), JSON.parse(replacedRaw));
+  await page.getByLabel('实验任务', { exact: true }).waitFor();
+  assert.deepEqual(await draftState(), beforeRestart, 'Restart must restore the complete saved draft library and active identity');
+  assert.deepEqual(await draftObject(), JSON.parse(reusedRaw));
   await assertForm(ownExpected);
-  checks.push('explicit-replacement-persists-immediately-and-survives-app-restart');
+  checks.push('independent-reuse-persists-immediately-and-complete-draft-library-survives-app-restart');
 
   await openRun(importedId);
   await page.getByRole('button', { name: '复用为新实验', exact: true }).click();
-  await page.getByRole('button', { name: '替换并复用', exact: true }).click();
   await page.getByLabel('实验任务', { exact: true }).waitFor();
   const importExpected = { task: importedTask, dataset: '', name: '', template: null, options: importedOptions };
   await assertForm(importExpected);
@@ -249,6 +265,8 @@ try {
   await chooseDataset(selectedDataset);
   assert.notEqual((await draftObject()).dataset, originalDataset);
   assert.equal((await draftObject()).dataset, await realpath(selectedDataset));
+  const finalDrafts = await draftState();
+  for (const previous of beforeRestart.drafts) assert.deepEqual(finalDrafts.drafts.find(entry => entry.id === previous.id), previous, 'Editing a new reused draft changed another saved draft');
   assert.equal(await page.locator('.submit-button').isDisabled(), false, 'Selecting a dataset enables review of the missing runtime setup; it does not start a run');
   checks.push('imported-readonly-reuse-clears-existing-dataset-and-requires-a-new-selection');
 

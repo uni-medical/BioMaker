@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { ServiceState } from './sidecar';
 import type { ArtifactTarget, ArtifactSave } from './artifacts';
+import type { DraftMutation } from './drafts';
 
 const invoke = (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args);
 contextBridge.exposeInMainWorld('biomaker', Object.freeze({
@@ -20,6 +21,9 @@ contextBridge.exposeInMainWorld('biomaker', Object.freeze({
     return () => ipcRenderer.removeListener('biomaker:service-state', listener);
   },
   getPreferences: () => invoke('biomaker:get-preferences'),
+  getDrafts: () => invoke('biomaker:get-drafts'),
+  mutateDrafts: (input: DraftMutation) => invoke('biomaker:mutate-drafts', input),
+  flushDrafts: (input: DraftMutation) => ipcRenderer.sendSync('biomaker:flush-drafts', input),
   setPreferences: (preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications?: boolean }) => invoke('biomaker:set-preferences', preferences),
   getPendingRun: () => invoke('biomaker:get-pending-run'),
   acknowledgeOpenRun: (id: string) => invoke('biomaker:acknowledge-open-run', id),

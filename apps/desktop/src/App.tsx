@@ -45,7 +45,9 @@ import HistoryImport from "./HistoryImport";
 import ServiceRecovery from "./ServiceRecovery";
 import DatasetOverview from "./DatasetOverview";
 import { datasetAdmissionCode, datasetInspectionMessage, useDatasetInspection } from "./datasetInspection";
-import { emptyDraft, hasDraft, reuseDraft, type Draft } from "./experimentDraft";
+import { reuseDraft, type Draft } from "./experimentDraft";
+import DraftLibrary, { draftEntryTitle } from "./DraftLibrary";
+import { useDraftWorkspace } from "./useDraftWorkspace";
 import { decorateRun, defaultMetadata, isCurrentRun, mergeMetadata, type MetadataMap, type RunMetadata } from "./runMetadata";
 import type { ServiceState } from "./bridge";
 import {
@@ -130,14 +132,8 @@ export default function App() {
     (zh, en) => (lang === "zh" ? zh : en),
     [lang],
   );
-  const [draft, setDraft] = useState<Draft>(() => {
-    const stored = readStored<Partial<Draft>>("biomaker.draft", {});
-    return {
-      ...emptyDraft,
-      ...stored,
-      options: { ...defaultOptions, ...stored.options },
-    };
-  });
+  const drafts = useDraftWorkspace(t);
+  const draft = drafts.draft;
   const [rawRuns, setRuns] = useState<Run[]>([]);
   const [metadata, setMetadata] = useState<MetadataMap>({});
   const [metadataLoaded, setMetadataLoaded] = useState(false);
@@ -173,10 +169,10 @@ export default function App() {
   const [inspector, setInspector] = useState(() => window.innerWidth > 1050);
   const [advanced, setAdvanced] = useState(false);
   const [history, setHistory] = useState(false);
+  const [draftLibrary, setDraftLibrary] = useState(false);
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyFilter, setHistoryFilter] = useState("all");
   const [historyScope, setHistoryScope] = useState("current");
-  const [pendingReuse, setPendingReuse] = useState<Run | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [settings, setSettings] = useState<
     "provider" | "runtime" | "appearance" | null
@@ -197,10 +193,10 @@ export default function App() {
     new Set(),
   );
   const textarea = useRef<HTMLTextAreaElement>(null);
-  const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const draftEpoch = useRef(0);
   const submitInFlight = useRef(false);
   const pickerEpoch = useRef(0);
+  const navigationEpoch = useRef(0);
   const form = useRef<HTMLFormElement>(null);
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
@@ -214,7 +210,11 @@ export default function App() {
   const notificationsEdited = useRef(false);
   const alive = useRef(true);
   const toast = useCallback((message: string) => setToastMessage(message), []);
-  const datasetInspection = useDatasetInspection(draft.dataset, !selectedId && !history, serviceState);
+  const datasetInspection = useDatasetInspection(draft.dataset, drafts.ready && !selectedId && !history && !draftLibrary, serviceState, drafts.activeId || '');
+
+  useEffect(() => {
+    if (drafts.ready && !drafts.activeId && !selectedId && !history) setDraftLibrary(true);
+  }, [drafts.ready, drafts.activeId, selectedId, history]);
 
   useEffect(() => {
     alive.current = true;
@@ -272,8 +272,10 @@ export default function App() {
   const openNotificationRun = useCallback((runId: string) => {
     if (typeof runId !== "string" || !runId.trim()) return;
     pickerEpoch.current += 1;
+    navigationEpoch.current++;
     setSelectedId(runId);
     setHistory(false);
+    setDraftLibrary(false);
     setSearchOpen(false);
     setTemplatesOpen(false);
     setConfirmation(null);
@@ -332,11 +334,6 @@ export default function App() {
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
   }, [theme]);
-  useEffect(() => {
-    const timeout = setTimeout(() => persist("biomaker.draft", draft), 350);
-    draftSaveTimer.current = timeout;
-    return () => clearTimeout(timeout);
-  }, [draft]);
   useEffect(() => {
     if (!toastMessage) return;
     const timeout = setTimeout(() => setToastMessage(""), 6000);
@@ -586,16 +583,51 @@ export default function App() {
     setDetailError("");
     if (selectedId) void loadDetail(selectedId, true);
   }, [selectedId, loadDetail]);
-  const startNew = useCallback(() => {
+  const showComposer = useCallback(() => {
     if (submitInFlight.current) return;
     pickerEpoch.current += 1;
     setSelectedId(null);
     setHistory(false);
+    setDraftLibrary(false);
     setSearchOpen(false);
     setSubmitError("");
     requestAnimationFrame(() => textarea.current?.focus());
   }, []);
+  const changeDraftContext = useCallback(() => {
+    draftEpoch.current++;
+    pickerEpoch.current++;
+    datasetInspection.invalidate();
+  }, [datasetInspection.invalidate]);
+  const startNew = useCallback(async () => {
+    if (submitInFlight.current) return false;
+    changeDraftContext();
+    const navigation = ++navigationEpoch.current;
+    const ok = await drafts.create();
+    if (ok && navigation === navigationEpoch.current) { showComposer(); return true; }
+    return false;
+  }, [drafts.create, changeDraftContext, showComposer]);
+  const openDraft = async (id: string) => {
+    if (submitInFlight.current) return;
+    changeDraftContext();
+    const navigation = ++navigationEpoch.current;
+    if (await drafts.activate(id) && navigation === navigationEpoch.current) showComposer();
+  };
+  const duplicateDraft = async (id: string) => {
+    if (submitInFlight.current) return false;
+    changeDraftContext();
+    const navigation = ++navigationEpoch.current;
+    const ok = await drafts.duplicate(id);
+    if (ok && navigation === navigationEpoch.current) showComposer();
+    return ok;
+  };
+  const deleteDraft = async (id: string) => {
+    if (submitInFlight.current) return false;
+    changeDraftContext();
+    return drafts.remove(id);
+  };
   const openSearch = useCallback(() => {
+    navigationEpoch.current++;
+    pickerEpoch.current++;
     setSearch("");
     setSearchOpen(true);
   }, []);
@@ -636,7 +668,7 @@ export default function App() {
         !importOpen &&
         !searchOpen &&
         !templatesOpen &&
-        !pendingReuse
+        !draftLibrary
       ) {
         event.preventDefault();
         form.current?.requestSubmit();
@@ -647,7 +679,7 @@ export default function App() {
       stop?.();
       document.removeEventListener("keydown", key);
     };
-  }, [startNew, openSearch, refresh, settings, searchOpen, templatesOpen, importOpen, pendingReuse]);
+  }, [startNew, openSearch, refresh, settings, searchOpen, templatesOpen, importOpen, draftLibrary]);
 
   const openTaskSettings = (section: "provider" | "runtime") => {
     if (submitInFlight.current) return;
@@ -660,52 +692,45 @@ export default function App() {
   };
   const returnToExperiment = () => {
     closeSettings();
-    if (!selectedId && !history)
+    if (!selectedId && !history && !draftLibrary)
       requestAnimationFrame(() => textarea.current?.focus());
   };
   const updateDraft = (value: Partial<Draft>) => {
     if (submitInFlight.current) return;
     draftEpoch.current += 1;
     if (Object.hasOwn(value, "dataset")) datasetInspection.invalidate();
-    setDraft((d) => ({ ...d, ...value }));
+    drafts.update((d) => ({ ...d, ...value }));
     setSubmitError("");
   };
   const updateOptions = (value: Partial<Options>) => {
     if (submitInFlight.current) return;
     draftEpoch.current += 1;
-    setDraft((d) => ({ ...d, options: { ...d.options, ...value } }));
+    drafts.update((d) => ({ ...d, options: { ...d.options, ...value } }));
   };
   const selectRun = (id: string) => {
+    navigationEpoch.current++;
     pickerEpoch.current += 1;
     setSelectedId(id);
     setHistory(false);
+    setDraftLibrary(false);
     setSearchOpen(false);
   };
-  const applyReuse = (run: Run) => {
-    if (submitInFlight.current) return;
-    const next = reuseDraft(run);
-    draftEpoch.current += 1;
-    datasetInspection.invalidate();
-    if (draftSaveTimer.current) clearTimeout(draftSaveTimer.current);
-    persist("biomaker.draft", next);
-    setDraft(next);
-    setPendingReuse(null);
-    setAdvanced(true);
-    startNew();
-  };
-  const requestReuse = (run: Run) => {
+  const requestReuse = async (run: Run) => {
     if (submitInFlight.current) return;
     if (!run.project_snapshot?.task_body?.trim()) return;
-    if (hasDraft(draft)) setPendingReuse(run);
-    else applyReuse(run);
+    changeDraftContext();
+    const navigation = ++navigationEpoch.current;
+    if (await drafts.create(reuseDraft(run)) && navigation === navigationEpoch.current) { showComposer(); setAdvanced(true); }
   };
   const chooseFolder = async () => {
-    if (submitInFlight.current) return;
+    if (submitInFlight.current || !drafts.ready) return;
     const sequence = ++pickerEpoch.current;
     const epoch = draftEpoch.current;
+    const draftId = drafts.currentId();
+    if (!draftId) return;
     try {
       const folder = await window.biomaker.chooseDirectory();
-      if (alive.current && sequence === pickerEpoch.current && epoch === draftEpoch.current && !submitInFlight.current && folder) updateDraft({ dataset: folder });
+      if (alive.current && sequence === pickerEpoch.current && epoch === draftEpoch.current && draftId === drafts.currentId() && !submitInFlight.current && folder) updateDraft({ dataset: folder });
     } catch (e) {
       if (alive.current && sequence === pickerEpoch.current) toast(errorMessage(e));
     }
@@ -724,7 +749,9 @@ export default function App() {
     draft.options.model_for_all_agents || env?.values.BIOMAKER_MAIN_MODEL?.value
   );
   const providerReady = keyReady && modelReady;
-  const draftReady = !!draft.task.trim() && !!draft.dataset;
+  const draftDisabled = !drafts.ready || !drafts.activeId || drafts.operating || busy === 'submit';
+  const activeDraft = drafts.items.find(item => item.id === drafts.activeId);
+  const draftReady = drafts.ready && !!drafts.activeId && !drafts.operating && !!draft.task.trim() && !!draft.dataset;
   const preparation = !engineReady
     ? "runtime"
     : !providerReady
@@ -773,7 +800,7 @@ export default function App() {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (busy || submitInFlight.current || serviceRef.current.status !== "ready") return;
+    if (busy || submitInFlight.current || serviceRef.current.status !== "ready" || !drafts.ready || drafts.operating || !drafts.activeId || draftLibrary) return;
     setSubmitError("");
     if (!draft.task.trim()) {
       textarea.current?.focus();
@@ -843,15 +870,20 @@ export default function App() {
       return;
     }
     const snapshot = structuredClone(draft);
+    const submittedDraftId = drafts.currentId()!;
     const epoch = draftEpoch.current;
     const settingsEpoch = environmentEpoch.current;
     const serviceRevision = serviceRef.current.revision;
-    const current = () => alive.current && epoch === draftEpoch.current && serviceRef.current.status === "ready" && serviceRef.current.revision === serviceRevision;
+    const current = () => alive.current && drafts.currentId() === submittedDraftId && epoch === draftEpoch.current && serviceRef.current.status === "ready" && serviceRef.current.revision === serviceRevision;
     submitInFlight.current = true;
     pickerEpoch.current += 1;
     setBusy("submit");
     let dispatched = false;
     try {
+      if (!await drafts.flush()) {
+        setSubmitError(t('草稿尚未保存，实验未提交。请先解决草稿保存问题。', 'The draft has not been saved and no experiment was submitted. Resolve the draft save issue first.'));
+        return;
+      }
       const [currentEngine, currentEnv] = await Promise.all([
         request<EngineStatus>("/api/desktop/status"),
         request<EnvConfig>("/api/env"),
@@ -903,12 +935,10 @@ export default function App() {
         ...previous.filter((item) => item.id !== run.id),
       ]);
       selectRun(run.id);
-      const next = { ...snapshot, task: "", name: "", template: null, reusedFrom: undefined };
       draftEpoch.current += 1;
-      if (draftSaveTimer.current) clearTimeout(draftSaveTimer.current);
-      persist("biomaker.draft", next);
-      setDraft(next);
-      toast(t("实验已加入队列", "Experiment added to the queue"));
+      const consumed = await drafts.remove(submittedDraftId);
+      toast(consumed ? t("实验已加入队列", "Experiment added to the queue")
+        : t("实验已加入队列，但未能移除已提交草稿。请查看此实验，避免重复提交。", "The experiment was queued, but its draft could not be removed. Review this experiment before submitting it again."));
       await refresh();
     } catch (e) {
       if (alive.current) {
@@ -1005,7 +1035,7 @@ export default function App() {
     );
   return (
     <div
-      className={`app-shell ${sidebar ? "" : "sidebar-hidden"} ${inspector && !history ? "" : "inspector-hidden"}`}
+      className={`app-shell ${sidebar ? "" : "sidebar-hidden"} ${inspector && !history && !draftLibrary ? "" : "inspector-hidden"}`}
     >
       {sidebar && (
         <aside className="sidebar">
@@ -1024,8 +1054,8 @@ export default function App() {
           </div>
           <nav className="primary-nav">
             <button
-              className={!selectedId && !history ? "selected" : ""}
-              onClick={startNew}
+              onClick={() => void startNew()}
+              disabled={!drafts.ready || drafts.operating || busy === 'submit'}
             >
               <SquarePen size={17} />
               <span>{t("新建实验", "New experiment")}</span>
@@ -1036,10 +1066,18 @@ export default function App() {
               <span>{t("搜索", "Search")}</span>
               <kbd>⌘ K</kbd>
             </button>
+            <button className={draftLibrary || (!selectedId && !history) ? 'selected' : ''} disabled={busy === 'submit'} onClick={() => { navigationEpoch.current++; pickerEpoch.current++; setDraftLibrary(true); setHistory(false); setSelectedId(null); }}>
+              <FileText size={17} /><span>{t('草稿', 'Drafts')}</span>
+              {drafts.items.length > 0 && <span className="nav-count">{drafts.items.length}</span>}
+            </button>
             <button
               className={history ? "selected" : ""}
+              disabled={busy === 'submit'}
               onClick={() => {
+                navigationEpoch.current++;
                 setHistory(true);
+                setDraftLibrary(false);
+                pickerEpoch.current++;
                 setSelectedId(null);
               }}
             >
@@ -1058,9 +1096,9 @@ export default function App() {
                 "Choose dataset for a new experiment",
               )}
               onClick={() => {
-                startNew();
-                void chooseFolder();
+                void startNew().then(ok => { if (ok) void chooseFolder(); });
               }}
+              disabled={!drafts.ready || drafts.operating || busy === 'submit'}
             >
               <Plus size={14} />
             </IconButton>
@@ -1133,7 +1171,11 @@ export default function App() {
                   {!collapsedGroups.has(name) && groupRuns.length > 15 && (
                     <button
                       className="group-more"
+                      disabled={busy === 'submit'}
                       onClick={() => {
+                        navigationEpoch.current++;
+                        pickerEpoch.current++;
+                        setDraftLibrary(false);
                         setHistory(true);
                         setSelectedId(null);
                         setHistoryQuery(name);
@@ -1198,13 +1240,15 @@ export default function App() {
               </IconButton>
             )}
             <span>
-              {history
+              {draftLibrary
+                ? t('草稿', 'Drafts')
+                : history
                 ? t("全部实验", "All experiments")
                 : selectedRun
                   ? selectedRun.dataset_name ||
                     basename(selectedRun.dataset_path) ||
                     t("实验", "Experiment")
-                  : t("新实验", "New experiment")}
+                  : activeDraft ? draftEntryTitle(activeDraft, t) : t("新实验", "New experiment")}
             </span>
             {selectedRun && (
               <>
@@ -1216,6 +1260,12 @@ export default function App() {
             )}
           </div>
           <div className="header-actions">
+            {drafts.ready && ((!selectedId && !history) || drafts.dirty || drafts.saving || drafts.operating || drafts.error) && <span className={`draft-save-state ${drafts.error ? 'failed' : ''}`} role="status" data-testid="draft-save-state">
+              {drafts.saving || drafts.operating ? <Spinner size={12} /> : null}
+              {drafts.error ? t('草稿保存异常', 'Draft save issue')
+                : drafts.saving || drafts.operating ? t('正在保存…', 'Saving…')
+                : drafts.dirty ? t('等待保存', 'Unsaved changes') : t('草稿已保存', 'Drafts saved')}
+            </span>}
             <IconButton
               label={t("刷新", "Refresh")}
               onClick={() => void refreshAll()}
@@ -1223,7 +1273,7 @@ export default function App() {
             >
               <RefreshCw size={16} />
             </IconButton>
-            {!history && (
+            {!history && !draftLibrary && (
               <IconButton
                 label={
                   inspector
@@ -1288,8 +1338,27 @@ export default function App() {
           </div>
         )}
         {metadataError && <Notice danger>{t("实验整理信息暂时无法载入：", "Experiment organization is unavailable: ")}{metadataError} <button className="text-button" disabled={!serviceReady} onClick={() => void refresh()}>{t("重试", "Retry")}</button></Notice>}
+        {drafts.error && <div className="draft-save-error" role="alert">
+          <p>{drafts.error}</p>
+          <div>
+            <button className="secondary-button" disabled={drafts.saving || drafts.operating} onClick={() => void drafts.retry()}>{t('重试草稿保存', 'Retry drafts')}</button>
+            {drafts.dirty && <button className="secondary-button" disabled={drafts.saving || drafts.operating || busy === 'submit'} onClick={() => {
+              changeDraftContext();
+              const navigation = ++navigationEpoch.current;
+              void drafts.recoverAsCopy().then(ok => { if (ok && navigation === navigationEpoch.current) showComposer(); });
+            }}>{t('另存为新草稿', 'Save as a new draft')}</button>}
+            {(drafts.dirty || drafts.legacyRaw) && <button className="text-button" onClick={() => {
+              const content = drafts.dirty ? JSON.stringify(draft, null, 2) : drafts.legacyRaw!;
+              void navigator.clipboard.writeText(content).then(() => toast(t('草稿内容已复制', 'Draft content copied'))).catch(() => toast(t('无法复制，请手动保留当前内容。', 'Could not copy. Preserve the content manually.')));
+            }}>{t('复制草稿内容', 'Copy draft content')}</button>}
+          </div>
+        </div>}
         <div className="workspace-content">
-          {history ? (
+          {draftLibrary ? (
+            <DraftLibrary items={drafts.items} activeId={drafts.activeId} lang={lang} t={t}
+              busy={!drafts.ready || drafts.operating || busy === 'submit'} onOpen={id => void openDraft(id)}
+              onNew={() => void startNew()} onRename={drafts.rename} onDuplicate={duplicateDraft} onDelete={deleteDraft} />
+          ) : history ? (
             <div className="history-view">
               <div className="history-heading">
                 <div>
@@ -1303,7 +1372,7 @@ export default function App() {
                 </div>
                 <div className="history-heading-actions">
                   <button className="secondary-button" disabled={!serviceReady} onClick={() => setImportOpen(true)}><Import size={15} />{t("导入已有实验", "Import existing experiments")}</button>
-                  <button className="primary-button" onClick={startNew}><Plus size={15} />{t("新建实验", "New experiment")}</button>
+                  <button className="primary-button" disabled={!drafts.ready || drafts.operating || busy === 'submit'} onClick={() => void startNew()}><Plus size={15} />{t("新建实验", "New experiment")}</button>
                 </div>
               </div>
               <div className="history-toolbar">
@@ -1436,6 +1505,12 @@ export default function App() {
                 </button>
               </div>
             )
+          ) : !drafts.ready || !drafts.activeId ? (
+            <div className="detail-empty" role="status">
+              {!drafts.error && <Spinner size={24} />}
+              <h3>{drafts.error ? t('草稿暂时无法载入', 'Drafts are unavailable') : t('正在载入草稿', 'Loading drafts')}</h3>
+              <p>{t('你的草稿保存在这台电脑上。', 'Your drafts are stored on this computer.')}</p>
+            </div>
           ) : (
             <div
               className={`new-experiment ${!engineReady || !keyReady || !modelReady ? "needs-setup" : ""}`}
@@ -1479,14 +1554,14 @@ export default function App() {
                     )}
                     aria-label={t("实验任务", "Experiment task")}
                     rows={5}
-                    disabled={busy === "submit"}
+                    disabled={draftDisabled}
                     maxLength={500000}
                   />
                   <div className="composer-tools">
                     <button
                       type="button"
                       className={`dataset-button ${draft.dataset ? "has-dataset" : ""}`}
-                      disabled={busy === "submit"}
+                      disabled={draftDisabled}
                       onClick={chooseFolder}
                       title={
                         draft.dataset ||
@@ -1508,6 +1583,7 @@ export default function App() {
                         title={t("实验设置", "Experiment settings")}
                         aria-label={t("实验设置", "Experiment settings")}
                         aria-expanded={advanced}
+                        disabled={draftDisabled}
                         onClick={() => setAdvanced(!advanced)}
                       >
                         <SlidersHorizontal size={16} />
@@ -1592,24 +1668,24 @@ export default function App() {
                     <ChevronDown size={12} />
                   </button>
                   <span>
-                    {draft.options.agent_steps} {t("步", "steps")}
+                    {Number.isFinite(draft.options.agent_steps) ? draft.options.agent_steps : '—'} {t("步", "steps")}
                     <span className="meta-dot" />
-                    {(
+                    {Number.isFinite(draft.options.agent_total_time_limit) ? (
                       draft.options.agent_total_time_limit / 3600
                     ).toLocaleString(lang === "zh" ? "zh-CN" : "en-US", {
                       maximumFractionDigits: 2,
-                    })}{" "}
+                    }) : '—'}{" "}
                     {t("小时探索上限", "h exploration limit")}
                   </span>
                 </div>
                 {draft.dataset && <DatasetOverview
                   path={draft.dataset} inspection={datasetInspection} serviceReady={serviceReady}
-                  submitting={busy === "submit"} lang={lang} t={t}
+                  submitting={draftDisabled} lang={lang} t={t}
                   onChoose={() => void chooseFolder()} onOpen={() => void openPath(draft.dataset)}
                   onRefresh={() => { if (!submitInFlight.current) { datasetInspection.invalidate(); setSubmitError(""); } }}
                 />}
                 {advanced && (
-                  <fieldset className="advanced-panel" disabled={busy === "submit"}>
+                  <fieldset className="advanced-panel" disabled={draftDisabled}>
                     <div className="advanced-heading">
                       <h3>{t("实验设置", "Experiment settings")}</h3>
                       <button
@@ -1857,6 +1933,7 @@ export default function App() {
                     }) => (
                       <button
                         key={id}
+                        disabled={draftDisabled}
                         onClick={() => {
                           updateDraft({
                             task: t(promptZh, promptEn),
@@ -1892,7 +1969,7 @@ export default function App() {
               {templates.length > 0 && (
                 <button
                   className="template-link"
-                  disabled={busy === "submit"}
+                  disabled={draftDisabled}
                   onClick={() => {
                     if (submitInFlight.current) return;
                     setTemplatesOpen(true);
@@ -1944,7 +2021,7 @@ export default function App() {
           </span>
         </footer>
       </main>
-      {inspector && !history && (
+      {inspector && !history && !draftLibrary && (
         <aside className="inspector">
           <header>
             <span>{t("实验信息", "Experiment details")}</span>
@@ -1996,7 +2073,7 @@ export default function App() {
                   {t("未记录数据集路径", "No dataset path recorded")}
                 </p>
               ) : (
-                <button className="choose-dataset-empty" onClick={chooseFolder}>
+                <button className="choose-dataset-empty" disabled={draftDisabled} onClick={chooseFolder}>
                   <FolderOpen size={23} />
                   <span>{t("选择本地数据集", "Choose a local dataset")}</span>
                   <small>
@@ -2014,12 +2091,12 @@ export default function App() {
               <dl className="inspector-facts">
                 <div>
                   <dt>{t("探索步数", "Exploration steps")}</dt>
-                  <dd>{inspectedOptions?.agent_steps ?? "—"}</dd>
+                  <dd>{Number.isFinite(inspectedOptions?.agent_steps) ? inspectedOptions?.agent_steps : "—"}</dd>
                 </div>
                 <div>
                   <dt>{t("探索时长上限", "Exploration time limit")}</dt>
                   <dd>
-                    {inspectedOptions?.agent_total_time_limit != null
+                    {inspectedOptions?.agent_total_time_limit != null && Number.isFinite(inspectedOptions.agent_total_time_limit)
                       ? `${Math.round((inspectedOptions.agent_total_time_limit / 3600) * 100) / 100} ${t("小时", "hours")}`
                       : "—"}
                   </dd>
@@ -2029,7 +2106,7 @@ export default function App() {
                   <dd>
                     {inspectedOptions?.exec_parallel_workers === "auto"
                       ? t("自动", "Auto")
-                      : (inspectedOptions?.exec_parallel_workers ?? "—")}
+                      : Number.isFinite(inspectedOptions?.exec_parallel_workers) ? inspectedOptions?.exec_parallel_workers : "—"}
                   </dd>
                 </div>
                 <div>
@@ -2047,6 +2124,7 @@ export default function App() {
               {!selectedId && (
                 <button
                   className="text-button"
+                  disabled={draftDisabled}
                   onClick={() => setAdvanced(!advanced)}
                 >
                   <SlidersHorizontal size={13} />
@@ -2141,7 +2219,7 @@ export default function App() {
           </div>
           <div className="command-results">
             {!search && (
-              <button className="command-item" onClick={startNew}>
+              <button className="command-item" disabled={!drafts.ready || drafts.operating || busy === 'submit'} onClick={() => void startNew()}>
                 <SquarePen size={18} />
                 <span>{t("新建实验", "New experiment")}</span>
                 <kbd>⌘ N</kbd>
@@ -2273,14 +2351,6 @@ export default function App() {
           </div>
         </Modal>
       )}
-      {pendingReuse && <Modal title={t("替换当前草稿？", "Replace the current draft?")} onClose={() => setPendingReuse(null)} t={t} className="confirm-modal">
-        <p>{t("当前有未提交的任务或设置。复用后，会用所选实验的任务和设置替换这份草稿。", "You have an unsubmitted task or settings. Reusing this experiment replaces the current draft with its task and settings.")}</p>
-        <strong className="confirm-run-title">{runTitle(pendingReuse)}</strong>
-        <div className="confirm-actions">
-          <button autoFocus data-modal-autofocus className="secondary-button" onClick={() => setPendingReuse(null)}>{t("保留当前草稿", "Keep current draft")}</button>
-          <button className="primary-button" onClick={() => applyReuse(pendingReuse)}>{t("替换并复用", "Replace and reuse")}</button>
-        </div>
-      </Modal>}
       {confirmation && (
         <Modal
           title={

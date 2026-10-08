@@ -60,6 +60,28 @@ from OS notification permission. Clicking a notification opens its experiment.
 UI-only upgrades reuse a source- and Python-compatible engine without moving its
 virtual environment; engine changes are isolated and preserve older environments.
 
+## Experiment drafts
+
+The 0.1.12 source workflow adds a **Drafts** library. New Experiment creates an
+independent draft with default options; it reuses an already empty, unnamed draft
+to avoid clutter. Drafts save automatically and can be searched, reopened,
+renamed, duplicated or deleted. Renaming a draft does not change its experiment
+output directory name. Deleting a draft does not delete datasets or existing runs.
+
+Reusing an experiment creates a separate draft and preserves the others. Review
+its dataset, model and budget before submitting; imported history requires a
+local dataset selection. Confirmed submission removes only the submitted draft.
+Failed or uncertain submissions retain it for review before retrying.
+
+Drafts persist in the application's native data directory across restarts and
+remain editable when the local Python service is unavailable. Existing valid
+single-draft data migrates once, with its original content retained for recovery.
+Save failures remain visible with retry and recovery actions; closing the app
+attempts to save pending edits and protects them if that save fails.
+
+These changes are implemented in the 0.1.12 development source. Acceptance of the
+0.1.12 package, installation and actual upgrade is still pending.
+
 ## Results and files
 
 Completed experiments open on Results; running experiments initially open on
@@ -121,7 +143,7 @@ cd ../webui
 uv run --group dev pytest
 ```
 
-Version 0.1.11 has passed 701 source checks, 32 development checks, 152 packaged
+The previous release, 0.1.11, has passed 701 source checks, 32 development checks, 152 packaged
 checks, four offline engine checks, package verification and an actual upgrade.
 The retained-profile check, installed synthetic CPU training workflow, complete
 bundle verification and normal native launch have also passed on this Apple silicon Mac.
@@ -129,3 +151,9 @@ See the [0.1.11 acceptance record](docs/ACCEPTANCE-0.1.11.md) for evidence and
 [docs/RELEASE.md](docs/RELEASE.md) for release checks, platform boundaries,
 and iteration priorities. Keep scientific model evaluation separate from desktop
 installation and interaction checks.
+
+For the next 0.1.12 iteration, eight development regression suites have a recorded
+pass covering 99 checks, with all isolated profiles exited. The receipt is
+`output/development-regressions-0.1.12.json`. This development snapshot does not
+establish final-source, packaged, installed or upgrade acceptance for 0.1.12;
+those gates must be recorded against the final build.

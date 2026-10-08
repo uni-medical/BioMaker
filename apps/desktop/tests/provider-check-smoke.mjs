@@ -36,6 +36,7 @@ const heldUpstream = [];
 let application;
 let page;
 let draftRaw;
+let draftId;
 let savedConfig;
 let restartedService;
 
@@ -81,7 +82,12 @@ const providerBase = `${providerOrigin}/v1`;
 const alternativeBase = `${providerOrigin}/alternate/v1`;
 const config = () => readFile(path.join(profile, 'config.env'), 'utf8').catch(error => error.code === 'ENOENT' ? '' : Promise.reject(error));
 const state = () => page.evaluate(() => window.biomaker.getServiceState());
-const storedDraft = () => page.evaluate(() => localStorage.getItem('biomaker.draft'));
+const draftState = () => page.evaluate(() => window.biomaker.getDrafts());
+const storedDraft = () => page.evaluate(async () => {
+  const snapshot = await window.biomaker.getDrafts();
+  const active = snapshot.drafts.find(entry => entry.id === snapshot.activeId);
+  return active ? JSON.stringify(active.content) : null;
+});
 const probeButton = () => page.getByRole('button', { name: '测试模型响应', exact: true });
 const discoverButton = () => page.getByRole('button', { name: '连接并获取模型', exact: true });
 const baseInput = () => page.getByRole('textbox', { name: /^API 地址/ });
@@ -99,6 +105,7 @@ async function noModels() {
 async function assertPrivateState(expectedConfig = '') {
   assert.equal(await config(), expectedConfig, 'Testing a provider must not persist unsaved settings');
   assert.equal(await storedDraft(), draftRaw, 'Provider operations must retain the exact experiment draft');
+  assert.equal((await draftState()).activeId, draftId, 'Provider operations must retain the active draft identity');
   const browserStorage = await page.evaluate(() => JSON.stringify(localStorage));
   assert(!browserStorage.includes(fixtureKey));
   assert(!browserStorage.includes(replacementKey));
@@ -191,6 +198,8 @@ try {
   await page.getByLabel('最大探索步数', { exact: true }).fill('7');
   await until(async () => JSON.parse(await storedDraft() || '{}').options?.agent_steps === 7, 'Draft was not persisted');
   draftRaw = await storedDraft();
+  draftId = (await draftState()).activeId;
+  assert(draftId, 'The synthetic task must have a durable draft identity');
   await page.locator('.sidebar-settings').click();
   await baseInput().fill(providerBase);
   await keyInput().fill(fixtureKey);

@@ -13,6 +13,7 @@ import { CloseGuard, type CloseBlockReason } from './close-guard';
 import { datasetInspectionBody } from './dataset-inspection';
 import { saveProviderSettings } from './provider-settings';
 import { artifactRequest, artifactService, previewArtifact, createArtifactSaver } from './artifacts';
+import { DraftStore, DraftError, type DraftFlushResult } from './drafts';
 
 app.setName('BioMaker');
 // Test/review installs can use a separate profile without touching real projects.
@@ -22,6 +23,7 @@ const locked = app.requestSingleInstanceLock();
 if (!locked) app.quit();
 let mainWindow: BrowserWindow | null = null;
 let serviceController: ServiceController<Sidecar> | null = null;
+let draftStore: DraftStore | null = null;
 let diagnosticsExport: Promise<string | null> | null = null;
 let quitting = false;
 let serviceState: ServiceState = { status: 'starting', revision: 0 };
@@ -40,9 +42,9 @@ const closeGuard = new CloseGuard({
   confirmClose: reason => {
     const saving = reason === 'saving';
     const response = dialog.showMessageBoxSync(mainWindow!, {
-      type: 'warning', title: t('模型配置', 'Model settings'),
-      message: saving ? t('配置正在保存，请稍候。', 'Settings are being saved. Please wait.') : t('模型配置尚未保存。', 'Model settings have not been saved.'),
-      detail: saving ? t('保存完成后可以关闭窗口或退出。', 'You can close the window or quit after saving finishes.') : t('放弃更改后，未保存的内容将丢失。', 'Discarding changes will lose the settings you have not saved.'),
+      type: 'warning', title: t('未保存的更改', 'Unsaved changes'),
+      message: saving ? t('正在保存，请稍候。', 'Saving changes. Please wait.') : t('仍有未保存的更改。', 'Some changes have not been saved.'),
+      detail: saving ? t('保存完成后可以关闭窗口或退出。', 'You can close the window or quit after saving finishes.') : t('放弃更改后，未保存的内容将丢失。', 'Discarding changes will lose your unsaved edits.'),
       buttons: saving ? [t('继续等待', 'Keep waiting')] : [t('继续编辑', 'Keep editing'), t('放弃更改', 'Discard changes')],
       defaultId: 0, cancelId: 0, noLink: true,
     });
@@ -187,6 +189,20 @@ function installMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 function setupIPC() {
+  const drafts = () => {
+    if (quitting || !draftStore) throw new DraftError('unavailable');
+    return draftStore;
+  };
+  handle('biomaker:get-drafts', () => drafts().getDrafts());
+  handle('biomaker:mutate-drafts', value => drafts().mutateDrafts(value));
+  // Bounded synchronous updates give beforeunload a final durable save attempt.
+  // All writes, including ordinary invoke, use the same synchronous transaction.
+  ipcMain.on('biomaker:flush-drafts', (event, value) => {
+    let result: DraftFlushResult;
+    try { senderAllowed(event); result = drafts().flushDrafts(value); }
+    catch { result = { ok: false, code: 'unavailable' }; }
+    event.returnValue = result;
+  });
   // Synchronous only at beforeunload: the reason must arrive before Electron's
   // will-prevent-unload event. No form values or secrets cross this channel.
   ipcMain.on('biomaker:close-block', (event, reason) => {
@@ -311,6 +327,7 @@ app.on('before-quit', event => {
 });
 if (locked) void app.whenReady().then(async () => {
   mkdirSync(app.getPath('userData'), { recursive: true, mode: 0o700 });
+  try { draftStore = new DraftStore(app.getPath('userData')); } catch { /* Keep the window usable and report a fixed draft storage error over IPC. */ }
   try { const saved = JSON.parse(readFileSync(preferencesPath(), 'utf8')); preferences = { theme: validTheme(saved?.theme) ? saved.theme : 'system', language: saved?.language === 'en' || saved?.language === 'zh' ? saved.language : undefined, notifications: saved?.notifications !== false, directories: Array.isArray(saved?.directories) ? saved.directories.filter((item: unknown) => typeof item === 'string' && path.isAbsolute(item)).slice(-100) : [], bounds: saved?.bounds && ['x', 'y', 'width', 'height'].every(key => Number.isFinite(saved.bounds[key])) ? saved.bounds : undefined }; } catch { /* Fresh profile. */ }
   nativeTheme.themeSource = preferences.theme;
   app.setAboutPanelOptions({ applicationName: 'BioMaker', applicationVersion: app.getVersion(), copyright: 'BioMaker · Biomedical AI research workspace', website: 'https://github.com/uni-medical/BioMaker' });

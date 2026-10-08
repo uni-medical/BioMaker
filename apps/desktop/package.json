@@ -1,6 +1,6 @@
 {
   "name": "biomaker-desktop",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "private": true,
   "description": "BioMaker — a desktop workspace for biomedical model development",
   "author": "BioMaker contributors",
@@ -15,7 +15,8 @@
     "prepare:runtime": "node scripts/prepare-runtime.mjs",
     "icons": "node scripts/build-icons.mjs",
     "start": "electron .",
-    "test": "npm run build:electron && node --test dist-electron/*.test.js scripts/check-package.test.cjs",
+    "test": "npm run build:electron && node --test dist-electron/*.test.js scripts/check-package.test.cjs && npm run test:close-protection",
+    "test:close-protection": "node --experimental-strip-types --test tests/close-protection.test.mjs",
     "test:e2e": "node tests/electron-smoke.mjs",
     "package:mac": "npm run build && electron-builder --config electron-builder.yml --mac --arm64",
     "package:dir": "npm run build && electron-builder --config electron-builder.yml --dir",

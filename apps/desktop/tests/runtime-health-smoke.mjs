@@ -29,6 +29,7 @@ const errors = [];
 let application;
 let page;
 let draftRaw;
+let draftId;
 async function until(predicate, message, timeout = 30_000) {
   const deadline = Date.now() + timeout;
   while (!(await predicate())) {
@@ -36,7 +37,12 @@ async function until(predicate, message, timeout = 30_000) {
     await new Promise(resolve => setTimeout(resolve, 30));
   }
 }
-const storedDraft = () => page.evaluate(() => localStorage.getItem('biomaker.draft'));
+const draftState = () => page.evaluate(() => window.biomaker.getDrafts());
+const storedDraft = () => page.evaluate(async () => {
+  const snapshot = await window.biomaker.getDrafts();
+  const active = snapshot.drafts.find(entry => entry.id === snapshot.activeId);
+  return active ? JSON.stringify(active.content) : null;
+});
 async function refresh() {
   await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.send('biomaker:menu-action', 'refresh'));
 }
@@ -56,6 +62,7 @@ async function closeSettings() {
 async function maintenanceRequests() { return application.evaluate(() => globalThis.__runtimeHealthFixture.requests); }
 async function assertDraft() {
   assert.equal(await storedDraft(), draftRaw, 'Runtime operations must preserve the exact persisted draft');
+  assert.equal((await draftState()).activeId, draftId, 'Runtime operations must preserve the active draft identity');
   assert.equal(await page.getByLabel('实验任务', { exact: true }).inputValue(), task);
 }
 async function confirmRepair() {
@@ -147,6 +154,8 @@ try {
     return draft.task === task && draft.name === 'qa-runtime-health-draft' && draft.options?.agent_steps === 9;
   }, 'The synthetic draft was not persisted');
   draftRaw = await storedDraft();
+  draftId = (await draftState()).activeId;
+  assert(draftId, 'The synthetic task must have a durable draft identity');
   await until(async () => await page.locator('.dataset-overview').getAttribute('data-code') === 'ok' &&
     await page.locator('.dataset-overview').getAttribute('data-state') === 'ready', 'The real dataset metadata fixture did not become ready');
   await until(async () => await page.locator('.submit-button').isEnabled() && await page.locator('.submit-button').getAttribute('aria-label') === '开始实验', 'Fixture setup did not enable the baseline experiment control');

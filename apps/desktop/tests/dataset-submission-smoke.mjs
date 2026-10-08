@@ -29,11 +29,17 @@ const errors = [];
 const restarts = [];
 const task = '  Synthetic submission race test.\nPreserve this exact draft; no actual experiment may run.  ';
 const nextTask = '  A new draft after a simulated submission.\nDo not let the older picker replace this dataset.  ';
+const freshOptions = { model_for_all_agents: null, agent_steps: 35, exec_timeout: 600, exec_parallel_workers: 'auto', agent_total_time_limit: 86400, final_retrain_enabled: true };
 let application;
 let page;
 const api = (route) => page.evaluate(route => window.biomaker.request(route), route);
 const state = () => page.evaluate(() => window.biomaker.getServiceState());
-const storedDraft = () => page.evaluate(() => localStorage.getItem('biomaker.draft'));
+const draftState = () => page.evaluate(() => window.biomaker.getDrafts());
+const storedDraft = () => page.evaluate(async () => {
+  const snapshot = await window.biomaker.getDrafts();
+  const active = snapshot.drafts.find(entry => entry.id === snapshot.activeId);
+  return active ? JSON.stringify(active.content) : null;
+});
 const submitButton = () => page.locator('.submit-button');
 const taskInput = () => page.getByLabel('实验任务', { exact: true });
 const renderFrame = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -195,8 +201,8 @@ try {
   checks.push('held-preflight-across-real-service-restart-never-dispatches-submission');
   await screenshot('01-preflight-generation-change.png');
 
-  // Hold a native picker before starting. It must not overwrite a cleared or
-  // subsequently edited draft when its old selection finally comes back.
+  // Hold a native picker before starting. It must not overwrite a different
+  // draft when its old selection finally comes back after successful submission.
   await application.evaluate(({ dialog }, directory) => {
     dialog.showOpenDialog = () => new Promise(resolve => {
       globalThis.__submissionQA.releasePicker = () => { delete globalThis.__submissionQA.releasePicker; globalThis.__submissionQA.pickerReleased = true; resolve({ canceled: false, filePaths: [directory] }); };
@@ -219,13 +225,22 @@ try {
   assert.equal(await page.getByRole('dialog', { name: '设置', exact: true }).count(), 0);
   const sent = await application.evaluate(() => globalThis.__submissionQA.posts.at(-1).body);
   const snapshot = JSON.parse(draftRaw);
+  const beforeConsumption = await draftState();
+  const submittedDraftId = beforeConsumption.activeId;
+  assert(submittedDraftId, 'Submission must capture an existing durable draft');
   assert.deepEqual(sent, { experiment: { dataset_path: snapshot.dataset, task_template_path: snapshot.template, task_body: snapshot.task.trim(), advanced_defaults: snapshot.options }, requested_exp_name: snapshot.name });
   await assertDraft(draftRaw);
   await application.evaluate(() => globalThis.__submissionQA.releasePost());
-  await until(async () => JSON.parse(await storedDraft() || '{}').task === '', 'A successful simulated submission did not clear its own draft');
+  await until(async () => !(await draftState()).drafts.some(entry => entry.id === submittedDraftId), 'A successful simulated submission did not remove its own draft');
+  const afterConsumption = await draftState();
+  assert.deepEqual(afterConsumption.drafts, beforeConsumption.drafts.filter(entry => entry.id !== submittedDraftId), 'Submission must preserve every other draft');
   await page.locator('.primary-nav').getByRole('button', { name: /新建实验/ }).click();
+  await taskInput().waitFor();
+  const newState = await draftState();
+  assert.notEqual(newState.activeId, submittedDraftId);
+  assert.deepEqual(JSON.parse(await storedDraft()), { task: '', dataset: '', name: '', options: freshOptions, template: null }, 'New experiments must start with fresh defaults, not the submitted dataset or budget');
   await taskInput().fill(nextTask);
-  await ready();
+  await choose(dataset);
   await until(async () => JSON.parse(await storedDraft() || '{}').task === nextTask, 'The next draft was not saved');
   draftRaw = await storedDraft();
   await application.evaluate(() => globalThis.__submissionQA.releasePicker());

@@ -32,6 +32,7 @@ const restarts = [];
 let application;
 let page;
 let draft;
+let draftId;
 const sanitize = value => Object.values(secrets).reduce((text, secret) => text.split(secret).join('[synthetic-secret-redacted]'), String(value));
 const equalPrivate = (actual, expected, message) => assert(actual === expected, message);
 async function until(predicate, message, timeout = 30_000) {
@@ -65,6 +66,12 @@ const baseB = `${origin}/b/v1`;
 const api = (pathname, method = 'GET', body) => page.evaluate(([pathname, method, body]) => window.biomaker.request(pathname, { method, ...(body === undefined ? {} : { body }) }), [pathname, method, body]);
 const config = () => readFile(path.join(profile, 'config.env'), 'utf8').catch(error => error.code === 'ENOENT' ? '' : Promise.reject(error));
 const state = () => page.evaluate(() => window.biomaker.getServiceState());
+const draftState = () => page.evaluate(() => window.biomaker.getDrafts());
+const storedDraft = () => page.evaluate(async () => {
+  const snapshot = await window.biomaker.getDrafts();
+  const active = snapshot.drafts.find(entry => entry.id === snapshot.activeId);
+  return active ? JSON.stringify(active.content) : null;
+});
 const baseInput = () => page.getByRole('textbox', { name: /^API 地址/ });
 const keyInput = () => page.getByLabel('API Key', { exact: false }).first();
 const modelInput = () => page.getByLabel('默认模型', { exact: true });
@@ -130,7 +137,8 @@ async function noSecretVisible() {
   for (const input of [keyInput(), serperInput(), jinaInput()]) if (await input.count()) assert.equal(await input.getAttribute('type'), 'password');
   const stored = await page.evaluate(() => JSON.stringify(localStorage));
   assert(!Object.values(secrets).some(secret => stored.includes(secret)), 'A synthetic secret entered browser storage');
-  equalPrivate(await page.evaluate(() => localStorage.getItem('biomaker.draft')), draft, 'The experiment draft changed');
+  equalPrivate(await storedDraft(), draft, 'The experiment draft changed');
+  assert.equal((await draftState()).activeId, draftId, 'Provider settings must preserve the active draft identity');
 }
 async function snapshot(filename, locator = reviewPanel()) {
   await page.locator('.toast').waitFor({ state: 'hidden' });
@@ -218,8 +226,10 @@ try {
   const initial = await api('/api/env');
   assert.match(initial.settings_revision, /^[a-f0-9]{64}$/);
   await page.getByLabel('实验任务', { exact: true }).fill(privateTask);
-  await until(async () => JSON.parse(await page.evaluate(() => localStorage.getItem('biomaker.draft')) || '{}').task === privateTask, 'The synthetic task draft was not persisted');
-  draft = await page.evaluate(() => localStorage.getItem('biomaker.draft'));
+  await until(async () => JSON.parse(await storedDraft() || '{}').task === privateTask, 'The synthetic task draft was not persisted');
+  draft = await storedDraft();
+  draftId = (await draftState()).activeId;
+  assert(draftId, 'The synthetic task must have a durable draft identity');
   await page.locator('.sidebar-settings').click();
   await until(() => baseInput().isEnabled(), 'The initial saved settings did not load');
   await fillInputs({ base: baseA, key: secrets.keyA, model: 'qa-model-a', serper: secrets.serperA, jina: secrets.jinaA });

@@ -33,6 +33,7 @@ const fixturePaths = {};
 let application;
 let page;
 let draftRaw;
+let draftId;
 let specialServer;
 let restart;
 
@@ -87,7 +88,12 @@ async function until(predicate, message, timeout = 30_000) {
 }
 const api = (pathname, method = 'GET', body) => page.evaluate(([pathname, method, body]) => window.biomaker.request(pathname, { method, ...(body === undefined ? {} : { body }) }), [pathname, method, body]);
 const state = () => page.evaluate(() => window.biomaker.getServiceState());
-const storedDraft = () => page.evaluate(() => localStorage.getItem('biomaker.draft'));
+const draftState = () => page.evaluate(() => window.biomaker.getDrafts());
+const storedDraft = () => page.evaluate(async () => {
+  const snapshot = await window.biomaker.getDrafts();
+  const active = snapshot.drafts.find(entry => entry.id === snapshot.activeId);
+  return active ? JSON.stringify(active.content) : null;
+});
 const overview = () => page.locator('.dataset-overview');
 const refreshButton = () => page.getByRole('button', { name: '重新检查数据集', exact: true });
 const renderFrame = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -284,6 +290,8 @@ try {
   assert.equal(await application.evaluate(() => globalThis.__datasetQA.operations.at(-1).roots.some(root => root.includes('\n'))), false);
   checks.push('unsupported-picked-name-prompts-reselection-without-scan-and-cannot-poison-valid-grants');
   draftRaw = await storedDraft();
+  draftId = (await draftState()).activeId;
+  assert(draftId, 'The synthetic task must have a durable draft identity');
   const originalCard = await overview().innerText();
   await picker(normal, true);
   await page.locator('.dataset-button').click();
@@ -363,6 +371,7 @@ try {
   await assertNoMutation();
   assert.equal(await page.getByLabel('实验任务', { exact: true }).inputValue(), task);
   assert.equal(await storedDraft(), draftRaw);
+  assert.equal((await draftState()).activeId, draftId, 'Dataset inspection must preserve the active draft identity');
   const native = await application.evaluate(() => ({ operations: globalThis.__datasetQA.operations, forbidden: globalThis.__datasetQA.forbidden }));
   assert.deepEqual(native.forbidden, []);
   assert.deepEqual(errors, []);
