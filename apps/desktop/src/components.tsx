@@ -80,7 +80,7 @@ export function Modal({
     const dialog = container.current;
     const frame = requestAnimationFrame(() => {
       const target =
-        dialog?.querySelector<HTMLElement>("[autofocus]") ||
+        dialog?.querySelector<HTMLElement>("[autofocus], [data-modal-autofocus]") ||
         dialog?.querySelector<HTMLElement>(
           "input:not(:disabled), textarea:not(:disabled), select:not(:disabled)",
         ) ||

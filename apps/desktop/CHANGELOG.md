@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.5 — 2026-10-08
+
+Adds Unicode display names and reversible experiment archiving. Organization
+metadata is versioned separately from the run ledger and original files;
+concurrent edits preserve the user's input and require an explicit retry.
+Running or cleaning-up experiments remain visible.
+
+Reusing an experiment now creates an editable draft. It preserves supported
+recorded options, confirms replacing an existing draft, and requires dataset
+selection for imported histories. A new run is submitted only through Start.
+
+Release verification checks deep strict signatures and complete bundle equality
+across the unpacked application, read-only DMG and extracted ZIP.
+
+## 0.1.4 — 2026-10-08
+
+Adds previewed read-only history import with native directory grants, bounded
+record copies, changed-source checks, durable jobs, duplicate handling and
+restart recovery. Imported results retain their provenance and original files.
+
+Service readiness and reconnect states now follow authenticated health. Stale
+responses cannot overwrite recovered UI state; drafts and unsaved settings
+survive interruptions.
+
 ## 0.1.3 — 2026-10-08
 
 Protects unsaved model settings when closing the native window or quitting the

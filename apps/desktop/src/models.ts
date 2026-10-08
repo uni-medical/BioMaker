@@ -36,6 +36,10 @@ export interface Run {
   dataset_name?: string;
   dataset_path?: string;
   read_only?: boolean;
+  managed?: boolean;
+  cleanup_pending?: boolean;
+  display_name?: string | null;
+  archived?: boolean;
   history_import?: { mode: "copy"; source_id: string; source_path: string; name: string; imported_at: string };
   status_reason?: string;
   error?: string;
@@ -171,6 +175,7 @@ export function errorMessage(error: unknown): string {
 }
 export function runTitle(run: Run): string {
   return (
+    run.display_name ||
     run.history_import?.name ||
     run.requested_exp_name ||
     run.actual_exp_name ||

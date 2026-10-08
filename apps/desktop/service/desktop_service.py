@@ -13,6 +13,7 @@ import os
 import platform
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -26,9 +27,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from history_import import HistoryImporter, HistoryImportError
+from run_metadata import RunMetadataStore, RunMetadataUpdate, RunMetadataError
 from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, provision_native_runtime
 
-VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.4")
+VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.5")
 
 
 class HistoryPreviewRequest(BaseModel):
@@ -407,6 +409,7 @@ def create_desktop_app(
     app = create_app(settings)
     engine = installer or EngineInstaller(config)
     history = HistoryImporter(settings, app.state.manager)
+    metadata = RunMetadataStore(settings.state_dir / "desktop-metadata.sqlite3", app.state.run_store)
     original_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
@@ -417,11 +420,32 @@ def create_desktop_app(
                 yield
         finally:
             history.close()
+            metadata.close()
             engine.close()
 
     app.router.lifespan_context = lifespan
     app.state.desktop_engine = engine
     app.state.history_importer = history
+    app.state.run_metadata = metadata
+
+    @app.exception_handler(RunMetadataError)
+    async def metadata_error(_request: Request, exc: RunMetadataError):
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
+
+    @app.get("/api/desktop/run-metadata")
+    def list_run_metadata():
+        return metadata.list_items()
+
+    @app.get("/api/desktop/run-metadata/{run_id}")
+    def get_run_metadata(run_id: str):
+        return metadata.get(run_id)
+
+    @app.put("/api/desktop/run-metadata/{run_id}")
+    def update_run_metadata(run_id: str, payload: RunMetadataUpdate):
+        try:
+            return metadata.update(run_id, payload)
+        except sqlite3.Error as exc:
+            raise HTTPException(status_code=503, detail="Organization settings could not be saved. Check local disk access and retry.") from exc
 
     @app.post("/api/desktop/history/preview")
     def preview_history(payload: HistoryPreviewRequest):

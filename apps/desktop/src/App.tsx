@@ -43,6 +43,8 @@ import {
 import Settings from "./Settings";
 import RunView, { ResourcesView } from "./RunView";
 import HistoryImport from "./HistoryImport";
+import { emptyDraft, hasDraft, reuseDraft, type Draft } from "./experimentDraft";
+import { decorateRun, defaultMetadata, isCurrentRun, mergeMetadata, type MetadataMap, type RunMetadata } from "./runMetadata";
 import type { ServiceState } from "./bridge";
 import {
   basename,
@@ -71,20 +73,6 @@ import {
   type Translate,
 } from "./models";
 
-interface Draft {
-  task: string;
-  dataset: string;
-  name: string;
-  options: Options;
-  template: string | null;
-}
-const emptyDraft: Draft = {
-  task: "",
-  dataset: "",
-  name: "",
-  options: defaultOptions,
-  template: null,
-};
 const exampleTasks = [
   {
     id: "classification",
@@ -146,7 +134,12 @@ export default function App() {
       options: { ...defaultOptions, ...stored.options },
     };
   });
-  const [runs, setRuns] = useState<Run[]>([]);
+  const [rawRuns, setRuns] = useState<Run[]>([]);
+  const [metadata, setMetadata] = useState<MetadataMap>({});
+  const [metadataLoaded, setMetadataLoaded] = useState(false);
+  const [metadataError, setMetadataError] = useState("");
+  const mergeRunMetadata = useCallback((row: RunMetadata) => setMetadata(current => mergeMetadata(current, [row])), []);
+  const runs = useMemo(() => rawRuns.map(run => decorateRun(run, metadata)), [rawRuns, metadata]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<Run | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
@@ -172,6 +165,8 @@ export default function App() {
   const [history, setHistory] = useState(false);
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyFilter, setHistoryFilter] = useState("all");
+  const [historyScope, setHistoryScope] = useState("current");
+  const [pendingReuse, setPendingReuse] = useState<Run | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [settings, setSettings] = useState<
     "provider" | "runtime" | "appearance" | null
@@ -192,6 +187,7 @@ export default function App() {
     new Set(),
   );
   const textarea = useRef<HTMLTextAreaElement>(null);
+  const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const form = useRef<HTMLFormElement>(null);
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
@@ -323,6 +319,7 @@ export default function App() {
   }, [theme]);
   useEffect(() => {
     const timeout = setTimeout(() => persist("biomaker.draft", draft), 350);
+    draftSaveTimer.current = timeout;
     return () => clearTimeout(timeout);
   }, [draft]);
   useEffect(() => {
@@ -417,12 +414,19 @@ export default function App() {
         request<Health>("/api/health"),
         request<EngineStatus>("/api/desktop/status"),
         request<Resources>("/api/system/resources"),
+        request<{ items: RunMetadata[] }>("/api/desktop/run-metadata"),
       ]);
       if (!current()) return;
       if (result[0].status === "fulfilled") setRuns(result[0].value);
       if (result[1].status === "fulfilled") setHealth(result[1].value);
       if (result[2].status === "fulfilled") setEngine(result[2].value);
       if (result[3].status === "fulfilled") setResources(result[3].value);
+      if (result[4].status === "fulfilled") {
+        const rows = result[4].value.items;
+        setMetadata(current => mergeMetadata(current, rows));
+        setMetadataLoaded(true);
+        setMetadataError("");
+      } else setMetadataError(errorMessage(result[4].reason));
       const requiredError = result
         .slice(0, 3)
         .find((item) => item.status === "rejected");
@@ -487,6 +491,8 @@ export default function App() {
       setDetailLoading(false);
       setConnectionError("");
       setDetailError("");
+      setMetadataLoaded(false);
+      setMetadataError("");
       pollState.current.failures = 0;
       if (next.status === "ready") {
         configLoaded.current = { env: false, templates: false };
@@ -605,7 +611,8 @@ export default function App() {
         !settings &&
         !importOpen &&
         !searchOpen &&
-        !templatesOpen
+        !templatesOpen &&
+        !pendingReuse
       ) {
         event.preventDefault();
         form.current?.requestSubmit();
@@ -616,7 +623,7 @@ export default function App() {
       stop?.();
       document.removeEventListener("keydown", key);
     };
-  }, [startNew, openSearch, refresh, settings, searchOpen, templatesOpen, importOpen]);
+  }, [startNew, openSearch, refresh, settings, searchOpen, templatesOpen, importOpen, pendingReuse]);
 
   const openTaskSettings = (section: "provider" | "runtime") => {
     setSettingsReturnToExperiment(true);
@@ -641,6 +648,20 @@ export default function App() {
     setSelectedId(id);
     setHistory(false);
     setSearchOpen(false);
+  };
+  const applyReuse = (run: Run) => {
+    const next = reuseDraft(run);
+    if (draftSaveTimer.current) clearTimeout(draftSaveTimer.current);
+    persist("biomaker.draft", next);
+    setDraft(next);
+    setPendingReuse(null);
+    setAdvanced(true);
+    startNew();
+  };
+  const requestReuse = (run: Run) => {
+    if (!run.project_snapshot?.task_body?.trim()) return;
+    if (hasDraft(draft)) setPendingReuse(run);
+    else applyReuse(run);
   };
   const chooseFolder = async () => {
     try {
@@ -675,12 +696,13 @@ export default function App() {
   const canSubmit = canContinue && !preparation;
   const selectedRun =
     detail?.id === selectedId
-      ? detail
+      ? decorateRun(detail, metadata)
       : runs.find((run) => run.id === selectedId);
   const inspectedOptions = selectedId ? selectedRun?.options : draft.options;
   const groups = useMemo(() => {
     const map = new Map<string, Run[]>();
     for (const run of runs) {
+      if (!isCurrentRun(run)) continue;
       const key =
         run.dataset_name ||
         basename(run.dataset_path || run.project_snapshot?.dataset_path) ||
@@ -693,6 +715,9 @@ export default function App() {
     runs.filter((run) =>
       [
         runTitle(run),
+        run.history_import?.name,
+        run.requested_exp_name,
+        run.actual_exp_name,
         run.dataset_name,
         run.dataset_path,
         run.id,
@@ -702,10 +727,9 @@ export default function App() {
         .toLocaleLowerCase()
         .includes(query.toLocaleLowerCase()),
     );
-  const filteredHistory = queryRuns(historyQuery).filter((run) =>
-    historyFilter === "all" || historyFilter === "active"
-      ? historyFilter === "all" || isActive(run)
-      : run.status === historyFilter,
+  const filteredHistory = queryRuns(historyQuery).filter(run =>
+    (historyScope === "archived" ? !!run.archived : isCurrentRun(run)) &&
+    (historyFilter === "all" || (historyFilter === "active" ? isActive(run) : run.status === historyFilter)),
   );
 
   async function submit(event: React.FormEvent) {
@@ -812,7 +836,7 @@ export default function App() {
         ...previous.filter((item) => item.id !== run.id),
       ]);
       selectRun(run.id);
-      updateDraft({ task: "", name: "", template: null });
+      updateDraft({ task: "", name: "", template: null, reusedFrom: undefined });
       toast(t("实验已加入队列", "Experiment added to the queue"));
       await refresh();
     } catch (e) {
@@ -822,28 +846,11 @@ export default function App() {
     }
   }
   async function runAction(
-    action: "stop" | "cancel" | "requeue",
+    action: "stop" | "cancel",
     run: Run,
     confirmed = false,
   ) {
     if (busy || serviceRef.current.status !== "ready") return;
-    if (action === "requeue") {
-      if (!engineReady) {
-        openTaskSettings("runtime");
-        return;
-      }
-      if (
-        !keyReady ||
-        !(
-          run.options?.model_for_all_agents ||
-          run.options?.main_model ||
-          env?.values.BIOMAKER_MAIN_MODEL?.value
-        )
-      ) {
-        openTaskSettings("provider");
-        return;
-      }
-    }
     if ((action === "stop" || action === "cancel") && !confirmed) {
       setConfirmation({ action, run });
       return;
@@ -851,15 +858,12 @@ export default function App() {
     setBusy(action);
     setConfirmation(null);
     try {
-      const result = await request<Run>(
+      await request<Run>(
         `/api/runs/${encodeURIComponent(run.id)}/${action}`,
         "POST",
       );
-      if (action === "requeue") selectRun(result.id);
       toast(
-        action === "requeue"
-          ? t("已创建新的实验运行", "Created a new run")
-          : action === "stop"
+        action === "stop"
             ? t("正在停止实验", "Stopping experiment")
             : t("已取消排队", "Queued run cancelled"),
       );
@@ -980,7 +984,7 @@ export default function App() {
                 <Spinner size={15} />
                 <span>{t("正在载入", "Loading")}</span>
               </div>
-            ) : !runs.length ? (
+            ) : !groups.length ? (
               <div className="sidebar-empty">
                 <Folder size={22} />
                 <p>
@@ -1046,6 +1050,8 @@ export default function App() {
                         setHistory(true);
                         setSelectedId(null);
                         setHistoryQuery(name);
+                        setHistoryScope("current");
+                        setHistoryFilter("all");
                       }}
                     >
                       {t(
@@ -1191,6 +1197,7 @@ export default function App() {
             </button>
           </div>
         )}
+        {metadataError && <Notice danger>{t("实验整理信息暂时无法载入：", "Experiment organization is unavailable: ")}{metadataError} <button className="text-button" disabled={!serviceReady} onClick={() => void refresh()}>{t("重试", "Retry")}</button></Notice>}
         <div className="workspace-content">
           {history ? (
             <div className="history-view">
@@ -1222,6 +1229,10 @@ export default function App() {
                     aria-label={t("搜索全部实验", "Search all experiments")}
                   />
                 </div>
+                <select aria-label={t("实验范围", "Experiment scope")} value={historyScope} onChange={event => { setHistoryScope(event.target.value); setHistoryFilter("all"); }}>
+                  <option value="current">{t("当前实验", "Current experiments")}</option>
+                  <option value="archived">{t("已归档", "Archived")}</option>
+                </select>
                 <select
                   aria-label={t("筛选实验状态", "Filter run status")}
                   value={historyFilter}
@@ -1243,7 +1254,7 @@ export default function App() {
                         <Activity size={17} />
                       </span>
                       <div>
-                        <strong>{runTitle(run)}</strong>
+                        <strong>{runTitle(run)} {run.archived && <span className="archive-badge">{t("已归档", "Archived")}</span>}</strong>
                         <span>
                           {run.dataset_name || basename(run.dataset_path)} ·{" "}
                           {dateText(run.timestamps?.created_at, lang)}
@@ -1307,6 +1318,10 @@ export default function App() {
                 busy={busy || (!serviceReady ? "service" : "")}
                 serviceReady={serviceReady}
                 serviceRevision={serviceState.revision}
+                metadata={metadata[selectedId] || defaultMetadata(selectedId)}
+                metadataReady={metadataLoaded}
+                onMetadataChange={mergeRunMetadata}
+                onReuse={requestReuse}
                 onAction={runAction}
                 onRetryLoad={() => void loadDetail(selectedId, true)}
                 toast={toast}
@@ -1352,6 +1367,12 @@ export default function App() {
                   )}
                 </p>
               </div>
+              {draft.reusedFrom && <div className="reuse-notice"><Notice>
+                <strong>{t("已从实验复用草稿：", "Draft reused from: ")}{draft.reusedFrom.title}</strong>
+                <p>{t("请检查任务、数据集、模型与预算，点击开始后才会创建新实验。", "Review the task, dataset, model, and budget. A new experiment is created only when you start it.")}</p>
+                {draft.reusedFrom.requiresDataset && !draft.dataset && <p>{t("历史记录中的数据集路径未沿用，请重新选择本机数据集。", "Historical dataset paths are not reused. Choose a dataset on this computer.")}</p>}
+                {draft.reusedFrom.usedDefaults && <p>{t("部分原设置未记录或不可用，已填入默认值，请逐项检查。", "Some original settings were missing or unavailable. Defaults were filled in; review each setting.")}</p>}
+              </Notice></div>}
               <form ref={form} onSubmit={submit} className="experiment-form">
                 <div
                   className={`composer ${busy === "submit" ? "is-submitting" : ""}`}
@@ -1617,6 +1638,7 @@ export default function App() {
                           }
                         >
                           <option value="auto">{t("自动", "Auto")}</option>
+                          {typeof draft.options.exec_parallel_workers === "number" && ![1, 2, 4, 8, 16, 32, 64].includes(draft.options.exec_parallel_workers) && <option value={draft.options.exec_parallel_workers}>{draft.options.exec_parallel_workers}</option>}
                           {[1, 2, 4, 8, 16, 32, 64].map((n) => (
                             <option key={n} value={n}>
                               {n}
@@ -2031,6 +2053,7 @@ export default function App() {
                       {run.dataset_name || basename(run.dataset_path)}
                     </small>
                   </span>
+                  {run.archived && <span className="archive-badge">{t("已归档", "Archived")}</span>}
                   <span className="command-status">{statusLabel(run, t)}</span>
                 </button>
               ))}
@@ -2141,6 +2164,14 @@ export default function App() {
           </div>
         </Modal>
       )}
+      {pendingReuse && <Modal title={t("替换当前草稿？", "Replace the current draft?")} onClose={() => setPendingReuse(null)} t={t} className="confirm-modal">
+        <p>{t("当前有未提交的任务或设置。复用后，会用所选实验的任务和设置替换这份草稿。", "You have an unsubmitted task or settings. Reusing this experiment replaces the current draft with its task and settings.")}</p>
+        <strong className="confirm-run-title">{runTitle(pendingReuse)}</strong>
+        <div className="confirm-actions">
+          <button autoFocus data-modal-autofocus className="secondary-button" onClick={() => setPendingReuse(null)}>{t("保留当前草稿", "Keep current draft")}</button>
+          <button className="primary-button" onClick={() => applyReuse(pendingReuse)}>{t("替换并复用", "Replace and reuse")}</button>
+        </div>
+      </Modal>}
       {confirmation && (
         <Modal
           title={

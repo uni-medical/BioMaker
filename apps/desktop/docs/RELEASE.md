@@ -38,8 +38,15 @@
   check. Run it after the actual application profile has initialized the new
   runtime. It uses synthetic data, a local model fixture and a test-only network
   sandbox, with an exact `/bin/ps` exception for process identity inspection.
-- Mount the DMG, check its Applications shortcut and app bundle, then generate
-  SHA-256 checksums for the final artifacts.
+- Run `tests/run-organization-smoke.mjs` and `tests/experiment-reuse-smoke.mjs`
+  against the packaged executable. Verify revision conflicts, delayed refreshes,
+  archive/restore, restart, explicit draft replacement and original file/ledger
+  preservation. QA uses isolated synthetic profiles and makes no provider call.
+- After packaged acceptance, run `npm run verify:release`. It verifies deep strict
+  signatures, clean-source provenance, version and complete application equality
+  across the unpacked bundle, read-only DMG and extracted ZIP, then writes checksums.
+  Never execute bundled Python without `-B`; isolated `-I` ignores the environment's
+  bytecode setting and can otherwise mutate the signed application during QA.
 - For a public release, apply Developer ID signing and Apple notarization. Keep
   signing credentials in the release environment and never in source files.
 

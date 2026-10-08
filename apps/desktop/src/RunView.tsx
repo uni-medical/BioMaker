@@ -2,6 +2,8 @@ import { historyMessage } from "./historyMessages";
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import Candidates from "./Candidates";
+import RunOrganization from "./RunOrganization";
+import type { RunMetadata } from "./runMetadata";
 import {
   Activity,
   ArrowDownToLine,
@@ -140,6 +142,10 @@ export default function RunView({
   serviceReady,
   serviceRevision,
   onAction,
+  onReuse,
+  metadata,
+  metadataReady,
+  onMetadataChange,
   onRetryLoad,
   toast,
 }: {
@@ -153,7 +159,11 @@ export default function RunView({
   busy: string;
   serviceReady: boolean;
   serviceRevision: number;
-  onAction: (action: "stop" | "cancel" | "requeue", run: Run) => void;
+  onAction: (action: "stop" | "cancel", run: Run) => void;
+  onReuse: (run: Run) => void;
+  metadata: RunMetadata;
+  metadataReady: boolean;
+  onMetadataChange: (row: RunMetadata) => void;
   onRetryLoad: () => void;
   toast: (message: string) => void;
 }) {
@@ -241,16 +251,16 @@ export default function RunView({
             <h1>{runTitle(run)}</h1>
           </div>
           <div className="run-actions">
-            {actions.includes("requeue") && (
-              <button
+            <RunOrganization run={run} metadata={metadata} ready={serviceReady && metadataReady && !busy} serviceRevision={serviceRevision} t={t} onChange={onMetadataChange} toast={toast} />
+            <button
                 className="secondary-button"
-                onClick={() => onAction("requeue", run)}
-                disabled={!!busy}
+                onClick={() => onReuse(run)}
+                disabled={!!busy || loading || !run.project_snapshot?.task_body?.trim()}
+                title={!run.project_snapshot?.task_body?.trim() ? t("原实验没有保存任务内容，无法复用。", "The original task was not saved, so it cannot be reused.") : undefined}
               >
-                {busy === "requeue" ? <Spinner /> : <RotateCcw size={14} />}
-                {t("再次运行", "Run again")}
-              </button>
-            )}
+                <RotateCcw size={14} />
+                {t("复用为新实验", "Reuse as new experiment")}
+            </button>
             {actions.includes("stop") && (
               <button
                 className="secondary-button"
@@ -273,6 +283,9 @@ export default function RunView({
             )}
           </div>
         </div>
+        {run.archived && <div className="archived-note"><Notice>{isActive(run) || run.cleanup_pending
+          ? t("此实验已归档，但仍在运行或清理，因此也显示在当前实验中。", "This archived experiment is still running or cleaning up, so it also appears in current experiments.")
+          : t("此实验已归档。实验记录和文件均保留，可以随时恢复。", "This experiment is archived. Its records and files are kept, and you can restore it at any time.")}</Notice></div>}
         {run.project_snapshot?.task_body && (
           <div className="task-message">
             <button

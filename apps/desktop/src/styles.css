@@ -1290,6 +1290,7 @@ kbd {
 }
 .run-title-row {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 20px;
   align-items: center;
@@ -1340,12 +1341,38 @@ kbd {
 }
 .run-actions {
   display: flex;
+  flex-wrap: wrap;
+  max-width: 100%;
   gap: 7px;
   flex-shrink: 0;
 }
 .run-actions .secondary-button {
   font-size: 11px;
 }
+.archive-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  margin-left: 5px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.archived-note { margin-bottom: 18px; }
+.reuse-notice { width: 100%; margin-bottom: 18px; }
+.reuse-notice p { margin: 5px 0 0; }
+.organization-original { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.rename-modal .field { margin-top: 18px; }
+.rename-modal > form { padding: 20px 24px 0; overflow-y: auto; }
+.rename-modal > form > p { font-size: 12px; line-height: 1.85; color: var(--muted); }
+.rename-modal .confirm-actions { flex-wrap: wrap; }
+.rename-modal .confirm-actions { padding-right: 0; padding-left: 0; }
+.rename-modal .confirm-actions .text-button { margin-right: auto; }
+.rename-modal .notice { margin-top: 12px; }
 .task-message {
   margin-bottom: 22px;
   border: 1px solid var(--border);
@@ -1732,6 +1759,7 @@ kbd {
 }
 .history-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   padding-bottom: 19px;

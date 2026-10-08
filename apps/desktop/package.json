@@ -1,8 +1,8 @@
 {
   "name": "biomaker-desktop",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
-  "description": "BioMaker — a desktop workspace for biomedical model development",
+  "description": "BioMaker \u2014 a desktop workspace for biomedical model development",
   "author": "BioMaker contributors",
   "license": "MIT",
   "type": "module",
@@ -20,7 +20,8 @@
     "package:mac": "npm run build && electron-builder --config electron-builder.yml --mac --arm64",
     "package:dir": "npm run build && electron-builder --config electron-builder.yml --dir",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.electron.json --noEmit",
-    "lock:engine": "node scripts/lock-engine.mjs"
+    "lock:engine": "node scripts/lock-engine.mjs",
+    "verify:release": "node scripts/verify-release.mjs"
   },
   "dependencies": {
     "json5": "2.2.3",
