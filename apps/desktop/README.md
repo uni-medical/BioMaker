@@ -13,7 +13,8 @@ UI are portable; Linux and Windows release targets still require platform accept
    environment and configuring an OpenAI-compatible model provider.
 3. Choose a local dataset folder, describe your task and validation criteria,
    choose a model, review the compute budget, and start the experiment.
-4. Follow activity and logs, inspect the recorded results, and export output files.
+4. Follow activity and logs, then use **Results** to inspect the recorded selection,
+   open its candidate, and preview or save reports, solution code and metrics.
 
 The application includes its own Python and package manager. It does not require
 Homebrew, Node.js, Terminal, or a system Python installation. The first engine
@@ -59,6 +60,32 @@ from OS notification permission. Clicking a notification opens its experiment.
 UI-only upgrades reuse a source- and Python-compatible engine without moving its
 virtual environment; engine changes are isolated and preserve older environments.
 
+## Results and files
+
+Completed experiments open on Results; running experiments initially open on
+Activity. The overview distinguishes an explicit recorded selection from a unique
+match to the saved solution code. It shows the selected candidate's recorded
+metric and direction, with a link to that candidate. Missing or conflicting
+evidence stays explicit. Generated report prose is a summary to read alongside
+the original records, and imported history represents only the copied files.
+
+Final retraining has its own status. A receipt, a completion event without a
+receipt, an explicit disabled setting and unavailable records have different
+meanings. Recorded candidate metrics and successful retraining do not establish
+independent test performance or clinical validity.
+
+Text previews are limited to 500,000 bytes and preserve the original UTF-8 content.
+Saving from a preview verifies the downloaded bytes against that preview's
+SHA-256 and checks that the local service has not changed. If the file or service
+changes, refresh the preview before saving; a rejected export preserves an existing
+destination. Save from the file list remains available for direct exports and
+larger files. Both actions use the native save dialog.
+
+Only one artifact save can run at a time across the application. Closing the
+preview does not cancel an approved save. Wait for that save to finish before
+starting another; overlapping requests are refused without opening another
+dialog or queuing a later overwrite.
+
 ## Development
 
 Use Node.js 22.12+ (or 24+) and a host `uv` for the one-time runtime build. These are
@@ -94,7 +121,8 @@ cd ../webui
 uv run --group dev pytest
 ```
 
-See the [0.1.10 acceptance record](docs/ACCEPTANCE-0.1.10.md) for measured results and
+See the [0.1.11 acceptance record](docs/ACCEPTANCE-0.1.11.md) for current validation
+status, including any pending release gates, and
 [docs/RELEASE.md](docs/RELEASE.md) for release checks, platform boundaries,
 and iteration priorities. Keep scientific model evaluation separate from desktop
 installation and interaction checks.

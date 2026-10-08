@@ -1,7 +1,8 @@
 import { historyMessage } from "./historyMessages";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import Candidates from "./Candidates";
+import RunResults from "./RunResults";
 import RunOrganization from "./RunOrganization";
 import type { RunMetadata } from "./runMetadata";
 import {
@@ -20,6 +21,7 @@ import {
   Layers3,
   Play,
   RotateCcw,
+  RefreshCw,
   Square,
   Terminal,
   X,
@@ -30,7 +32,6 @@ import {
   errorMessage,
   formatBytes,
   isActive,
-  request,
   runTitle,
   statusLabel,
   type Artifact,
@@ -40,6 +41,26 @@ import {
   type RunEvent,
   type Translate,
 } from "./models";
+
+type RunTab = "results" | "activity" | "candidates" | "artifacts" | "log";
+type FilePreview = {
+  runId: string; name: string; content: string; sha256: string;
+  size: number; serviceRevision: number; listedRevision: string;
+};
+const fileRevision = (artifact: Artifact) => artifact.revision || `${artifact.size}:${artifact.modified_at}`;
+function artifactMessage(error: unknown, t: Translate): string {
+  const code = /\[artifact:([a-z_]+)\]/.exec(errorMessage(error))?.[1];
+  switch (code) {
+    case "busy": return t("已有文件正在导出，请完成后再保存。", "A file export is already in progress. Wait for it to finish before saving again.");
+    case "changed": return t("文件已更新。请重新预览后再保存；目标文件未被替换。", "The file changed. Preview it again before saving; the destination was not replaced.");
+    case "service_changed": return t("本地服务已变化。请重新预览后再保存；目标文件未被替换。", "The local service changed. Preview again before saving; the destination was not replaced.");
+    case "too_large": return t("文件较大，请从文件列表保存后查看。", "This file is large. Save it from Files to view it.");
+    case "invalid_text": return t("此文件无法作为文本预览。可以从文件列表保存。", "This file cannot be previewed as text. You can save it from Files.");
+    case "unavailable": return t("文件暂时无法读取。请刷新实验文件后重试。", "The file could not be read. Refresh the experiment files and try again.");
+    case "save_failed": return t("文件未能保存。请检查目标位置的权限和可用空间后重试。", "The file could not be saved. Check access and free space at the destination, then retry.");
+    default: return t("文件操作未能完成。请刷新实验后重试。", "The file operation could not finish. Refresh the experiment and try again.");
+  }
+}
 
 const eventNames: Record<string, [string, string]> = {
   run_started: ["实验已启动", "Experiment started"],
@@ -61,6 +82,8 @@ const eventNames: Record<string, [string, string]> = {
   evaluation_finished: ["评估完成", "Evaluation completed"],
   search_started: ["开始检索", "Research started"],
   report_generated: ["实验报告已生成", "Experiment report created"],
+  report_started: ["正在生成实验报告", "Generating experiment report"],
+  report_finished: ["实验报告已生成", "Experiment report created"],
   checkpoint_saved: ["检查点已保存", "Checkpoint saved"],
   budget_exhausted: ["已达到资源上限", "Resource limit reached"],
   run_stopping: ["正在停止实验", "Stopping experiment"],
@@ -86,11 +109,12 @@ function EventItem({
 }) {
   const [open, setOpen] = useState(false);
   const name = event.event || "event";
-  const title = eventNames[name]
+  const retrainFailed = name === "final_retrain_finished" && event.ok === false;
+  const title = retrainFailed ? t("最终重训未成功", "Final retraining failed") : eventNames[name]
     ? t(...eventNames[name])
     : name.replaceAll("_", " ");
   const summary = event.message || event.error || event.reason;
-  const failure = name.includes("failed") || !!event.error;
+  const failure = retrainFailed || name.includes("failed") || !!event.error;
   const fields = Object.fromEntries(
     Object.entries(event).filter(
       ([key]) => !["event", "ts", "message", "error", "reason"].includes(key),
@@ -167,61 +191,97 @@ export default function RunView({
   onRetryLoad: () => void;
   toast: (message: string) => void;
 }) {
-  const [tab, setTab] = useState<
-    "activity" | "candidates" | "artifacts" | "log"
-  >("activity");
+  const [tab, setTab] = useState<RunTab>(() => isActive(run) ? "activity" : "results");
+  const [requestedCandidate, setRequestedCandidate] = useState<string | null>(null);
+  const tabButtons = useRef<Partial<Record<RunTab, HTMLButtonElement | null>>>({});
   const [promptOpen, setPromptOpen] = useState(false);
-  const [preview, setPreview] = useState<{
-    name: string;
-    content: string;
-  } | null>(null);
+  const [preview, setPreview] = useState<FilePreview | null>(null);
+  const [previewError, setPreviewError] = useState("");
   const [fileBusy, setFileBusy] = useState("");
+  const fileSequence = useRef(0);
+  const saving = useRef(false);
+  const alive = useRef(true);
+  const current = useRef({ run, serviceReady, serviceRevision, preview });
+  current.current = { run, serviceReady, serviceRevision, preview };
+  useEffect(() => { alive.current = true; return () => { alive.current = false; fileSequence.current++; }; }, []);
   const results = run.observed?.results;
   const artifacts = run.artifacts || [];
   const actions = run.allowed_actions || [];
+  const currentPreviewFile = preview ? artifacts.find(file => file.name === preview.name) : undefined;
+  const previewStale = !!preview && (!serviceReady || preview.serviceRevision !== serviceRevision
+    || !currentPreviewFile || fileRevision(currentPreviewFile) !== preview.listedRevision);
+  function switchTab(next: RunTab, focus = false) {
+    setTab(next);
+    if (focus) tabButtons.current[next]?.focus();
+  }
+  function closePreview() {
+    // Closing the preview abandons an in-flight read, but an approved export
+    // still owns its busy state until native code has finished or refused it.
+    if (!saving.current) { fileSequence.current++; setFileBusy(""); }
+    current.current.preview = null;
+    setPreview(null);
+    setPreviewError("");
+  }
   const done = run.progress?.completed_steps;
   const steps = run.progress?.total_steps || run.options?.agent_steps;
   const progress =
     done !== undefined && done !== null && steps
       ? Math.max(0, Math.min(100, (done / steps) * 100))
       : null;
-  async function save(artifact: Artifact) {
-    if (!serviceReady) return;
+  async function save(artifact: Artifact, viewed?: FilePreview) {
+    if (!serviceReady || saving.current) return;
+    if (viewed && previewStale) return;
+    saving.current = true;
+    const sequence = ++fileSequence.current;
+    const runId = run.id;
     setFileBusy(artifact.name);
+    setPreviewError("");
     try {
       const path = await window.biomaker.saveArtifact({
         runId: run.id,
         name: artifact.name,
+        ...(viewed ? { expectedSha256: viewed.sha256, serviceRevision: viewed.serviceRevision } : {}),
       });
-      if (path) toast(t("文件已保存", "File saved"));
+      if (alive.current && current.current.run.id === runId && sequence === fileSequence.current && path) toast(t("文件已保存", "File saved"));
     } catch (e) {
-      toast(errorMessage(e));
+      if (alive.current && current.current.run.id === runId && sequence === fileSequence.current) {
+        const message = artifactMessage(e, t);
+        if (viewed && current.current.preview?.sha256 === viewed.sha256) setPreviewError(message); else toast(message);
+      }
     } finally {
-      setFileBusy("");
+      saving.current = false;
+      if (alive.current && sequence === fileSequence.current) setFileBusy("");
     }
   }
   async function showPreview(artifact: Artifact) {
-    if (!serviceReady) return;
+    if (!serviceReady || saving.current) return;
     if (artifact.size > 500_000) {
       toast(
         t("文件较大，请保存后查看。", "This file is large. Save it to view."),
       );
       return;
     }
+    const sequence = ++fileSequence.current;
+    const runId = run.id;
+    const generation = serviceRevision;
+    const listedRevision = fileRevision(artifact);
     setFileBusy(artifact.name);
+    setPreviewError("");
+    const valid = () => alive.current && current.current.run.id === runId && current.current.serviceReady
+      && current.current.serviceRevision === generation && sequence === fileSequence.current;
     try {
-      const content = await request<unknown>(artifact.url);
-      setPreview({
-        name: artifact.name,
-        content:
-          typeof content === "string"
-            ? content
-            : JSON.stringify(content, null, 2),
-      });
+      const value = await window.biomaker.previewArtifact({ runId, name: artifact.name });
+      if (!valid()) return;
+      const latest = current.current.run.artifacts?.find(file => file.name === artifact.name);
+      if (!latest || fileRevision(latest) !== listedRevision || value.serviceRevision !== generation) {
+        toast(t("文件在读取时发生了变化，请重新预览。", "The file changed while loading. Preview it again."));
+        return;
+      }
+      setPreview({ ...value, listedRevision });
     } catch (e) {
-      toast(errorMessage(e));
+      if (valid()) { const message = artifactMessage(e, t); setPreviewError(message); toast(message); }
     } finally {
-      setFileBusy("");
+      if (alive.current && sequence === fileSequence.current) setFileBusy("");
     }
   }
   async function copy(value: string) {
@@ -338,20 +398,6 @@ export default function RunView({
                 <strong>{results.count}</strong>
               </div>
             )}
-            {results?.best_metric !== null &&
-              results?.best_metric !== undefined && (
-                <div>
-                  <span>{t("最佳记录指标", "Best recorded metric")}</span>
-                  <strong>
-                    {Number.isFinite(results.best_metric)
-                      ? Number(results.best_metric.toPrecision(6)).toString()
-                      : "—"}
-                  </strong>
-                  <small>
-                    {t("以实验定义的指标为准", "As defined by this experiment")}
-                  </small>
-                </div>
-              )}
           </div>
         ) : null}
       </div>
@@ -362,6 +408,7 @@ export default function RunView({
       >
         {(
           [
+            { id: "results", label: t("结果", "Results"), Icon: FileText },
             { id: "activity", label: t("活动", "Activity"), Icon: Activity },
             {
               id: "candidates",
@@ -374,9 +421,21 @@ export default function RunView({
         ).map(({ id, label, Icon }) => (
           <button
             key={id}
+            id={`run-tab-${id}`}
+            ref={element => { tabButtons.current[id] = element; }}
             role="tab"
             aria-selected={tab === id}
-            onClick={() => setTab(id)}
+            aria-controls="run-detail-panel"
+            tabIndex={tab === id ? 0 : -1}
+            onClick={() => switchTab(id)}
+            onKeyDown={event => {
+              const order: RunTab[] = ["results", "activity", "candidates", "artifacts", "log"];
+              const index = order.indexOf(id);
+              const next = event.key === "ArrowRight" ? order[(index + 1) % order.length]
+                : event.key === "ArrowLeft" ? order[(index + order.length - 1) % order.length]
+                  : event.key === "Home" ? order[0] : event.key === "End" ? order.at(-1) : undefined;
+              if (next) { event.preventDefault(); switchTab(next, true); }
+            }}
             className={tab === id ? "selected" : ""}
           >
             <Icon size={15} />
@@ -397,7 +456,9 @@ export default function RunView({
         </div>
       </div>
       <div
+        id="run-detail-panel"
         role="tabpanel"
+        aria-labelledby={`run-tab-${tab}`}
         className={`run-tab-content ${tab === "log" ? "log-panel" : ""}`}
       >
         {detailError && (
@@ -408,6 +469,12 @@ export default function RunView({
             </button>
           </Notice>
         )}
+        {tab === "results" && <RunResults
+          run={run} t={t} serviceReady={serviceReady} serviceRevision={serviceRevision}
+          fileBusy={fileBusy} onPreview={artifact => void showPreview(artifact)}
+          onSave={artifact => void save(artifact)} onFiles={() => switchTab("artifacts", true)}
+          onCandidate={id => { setRequestedCandidate(id); switchTab("candidates", true); }}
+        />}
         {tab === "activity" && (
           <>
             {events.length > 0 ? (
@@ -476,7 +543,7 @@ export default function RunView({
             )}
           </>
         )}
-        {tab === "candidates" && <Candidates run={run} t={t} serviceReady={serviceReady} serviceRevision={serviceRevision} />}
+        {tab === "candidates" && <Candidates run={run} t={t} serviceReady={serviceReady} serviceRevision={serviceRevision} requestedCandidate={requestedCandidate} />}
         {tab === "artifacts" && (
           <>
             {artifacts.length > 0 ? (
@@ -570,10 +637,15 @@ export default function RunView({
       {preview && (
         <Modal
           title={preview.name}
-          onClose={() => setPreview(null)}
+          onClose={closePreview}
           t={t}
           className="preview-modal"
         >
+          <div className="preview-version-note" role="status">
+            {previewStale ? t("文件或本地服务已变化。当前仍显示上次预览，请重新预览后再保存。", "The file or local service changed. The previous preview is still shown. Preview again before saving.")
+              : t("保存时会核对文件内容，确保与此预览一致。", "Saving checks the file contents against this preview.")}
+          </div>
+          {previewError && <Notice danger>{previewError}</Notice>}
           <div className="file-preview">
             {preview.name.endsWith(".md") ? (
               <div className="markdown">
@@ -591,13 +663,18 @@ export default function RunView({
               <Copy size={14} />
               {t("复制内容", "Copy contents")}
             </button>
+            {(previewStale || previewError) && <button className="secondary-button"
+              disabled={!!fileBusy || !serviceReady || !currentPreviewFile}
+              onClick={() => { if (currentPreviewFile) void showPreview(currentPreviewFile); }}>
+              {fileBusy ? <Spinner size={14} /> : <RefreshCw size={14} />}
+              {t("重新预览", "Preview again")}
+            </button>}
             <button
               className="primary-button"
               onClick={() => {
-                const artifact = artifacts.find((a) => a.name === preview.name);
-                if (artifact) void save(artifact);
+                if (currentPreviewFile) void save(currentPreviewFile, preview);
               }}
-              disabled={!!fileBusy || !serviceReady}
+              disabled={!!fileBusy || previewStale}
             >
               <ArrowDownToLine size={14} />
               {t("保存文件", "Save file")}

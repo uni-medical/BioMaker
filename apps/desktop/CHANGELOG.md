@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.11 — release candidate
+
+Adds a Results tab with direct access to reports, saved solution code, candidate
+metrics and final-retraining receipts. Recorded selection and exact code matching
+have distinct provenance; the overview links to the identified candidate without
+ranking unrelated metrics or treating generated report prose as evidence.
+Missing, contradictory and changing records remain explicit, including imported
+snapshots that do not contain a final-retraining receipt.
+
+Text previews use bounded, stable reads of registered artifacts without following
+symbolic links. Saving from a preview verifies the original UTF-8 bytes against
+its SHA-256 and the local service generation before replacing the destination.
+Changed content, service replacement and failed writes preserve an existing target.
+Direct exports and native save dialogs remain available. An application-wide save
+barrier refuses overlapping exports without queuing an older overwrite.
+
+Candidate navigation retains the selected result beyond the first 1,500 displayed
+nodes, identifies truncated lists, and filters malformed optional display fields.
+
+Release evidence and outstanding packaged/installed gates are tracked in the
+[0.1.11 acceptance record](docs/ACCEPTANCE-0.1.11.md).
+
 ## 0.1.10 — 2026-10-09
 
 Fixes provider switching: saving a different API address can no longer silently

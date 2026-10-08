@@ -137,8 +137,17 @@ try {
   assert(detail.artifacts.some(file => file.name === 'best_solution.py'));
   proof.detail = detail;
   await page.locator('.run-intro .status-label').filter({ hasText: '已完成' }).waitFor({ timeout: 30000 });
+  await page.getByRole('tab', { name: '结果', exact: true }).click();
+  await page.locator('.result-selection').getByRole('heading', { name: '运行记录中的选择', exact: true }).waitFor();
+  const overview = await page.evaluate(id => window.biomaker.request(`/api/desktop/runs/${id}/result`), runId);
+  assert.equal(overview.snapshot.status, 'stable');
+  assert.equal(overview.selection.status, 'recorded');
+  assert.equal(overview.selection.code_match, true);
+  assert.equal(overview.selection.metric.value, 1);
+  assert.equal(overview.final_retrain.state, 'disabled');
+  proof.result_overview = overview;
   await snapshot('04-real-result-overview');
-  await page.getByRole('tab', { name: '候选方案', exact: true }).click();
+  await page.getByRole('button', { name: '查看候选方案', exact: true }).click();
   await page.locator('.candidate-row').waitFor();
   assert.equal(await page.locator('.candidate-row').count(), 1);
   await page.getByRole('tab', { name: '代码', exact: true }).click();

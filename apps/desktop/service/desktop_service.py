@@ -33,8 +33,10 @@ from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, p
 from provider_check import ProviderChecker, check_request
 from provider_settings import ProviderSettings, provider_settings_request
 from dataset_inspection import DatasetInspector, inspect_request, ADMISSION_MESSAGES
+from artifact_preview import ArtifactPreviewError, preview_artifact
+from result_overview import build_result_overview
 
-VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.10")
+VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.11")
 
 
 class HistoryPreviewRequest(BaseModel):
@@ -691,6 +693,20 @@ def create_desktop_app(
     @app.post("/api/desktop/dataset/inspect")
     async def inspect_dataset(request: Request):
         return await inspect_request(request, datasets)
+
+    @app.get("/api/desktop/runs/{run_id}/result")
+    def result_overview(run_id: str):
+        record = app.state.run_store.get_record("runs", run_id)
+        if record is None:
+            return JSONResponse({"detail": "Run not found."}, status_code=404, headers={"Cache-Control": "no-store"})
+        return JSONResponse(build_result_overview(record, logs_root=settings.logs_root), headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/desktop/runs/{run_id}/artifacts/{name}/preview")
+    def preview_result_artifact(run_id: str, name: str):
+        try:
+            return JSONResponse(preview_artifact(settings.logs_root, app.state.run_store, run_id, name), headers={"Cache-Control": "no-store"})
+        except ArtifactPreviewError as exc:
+            return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=exc.status_code, headers={"Cache-Control": "no-store"})
 
     @app.exception_handler(RunMetadataError)
     async def metadata_error(_request: Request, exc: RunMetadataError):

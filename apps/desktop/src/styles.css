@@ -49,6 +49,13 @@
   --shadow: 0 18px 65px #0006, 0 3px 14px #0003;
   --code: #1c211d;
 }
+.preview-version-note {
+  color: var(--muted);
+  line-height: 1.6;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.preview-footer { flex-wrap: wrap; }
 * {
   box-sizing: border-box;
 }

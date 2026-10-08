@@ -2,6 +2,26 @@
 
 ## Release gates
 
+- Run `tests/result-overview-smoke.mjs` with the real sidecar and repeat against
+  the packaged executable. Verify recorded selection versus code matching,
+  candidate identity and metric direction, conflicting/missing evidence,
+  imported-snapshot limitations, retraining receipts and partial event streams.
+  Include selected candidates beyond the visible-list limit, malformed optional
+  fields, keyboard focus and light/dark compact layouts. Keep synthetic lifecycle
+  or response states identified separately from real file parsing and service
+  replacement.
+- Run `tests/artifact-preview-smoke.mjs` through real Electron IPC and repeat
+  against the packaged executable. Check original-byte preservation, changed
+  content even when size and mtime are retained, native save cancellation,
+  service replacement during reads/dialogs/downloads, existing-destination
+  preservation and temporary-file cleanup. Verify the app-wide save barrier
+  across closed previews and run navigation: overlapping requests must open no
+  second dialog, make no download and queue no later overwrite. No model request,
+  installation or experiment is needed for these checks.
+- The result and preview service tests must reject source/ancestor symbolic links
+  and directory replacements, ordinary-file substitutions, unsupported file types
+  and bounded-read violations. Platforms without equivalent descriptor-relative
+  no-follow reads must fail closed until their safe-open adapter is implemented.
 - Run `tests/provider-settings-smoke.mjs` against the real sidecar and repeat
   against the packaged executable. Use only synthetic profiles and loopback
   providers. Verify changed-address key decisions, byte-preserving refusals,
@@ -128,13 +148,26 @@ Each iteration needs a concrete change, a recorded check and a versioned artifac
 Passing desktop checks is not evidence that a generated model is scientifically
 correct or suitable for clinical use.
 
-## Next workflow improvements identified in the 0.1.10 review
+## Result and file contract in 0.1.11
 
-- Make reports and the engine-selected solution easier to find in completed
-  experiments. Use recorded selection/artifact provenance; do not invent a
-  cross-metric ranking or treat generated report prose as evaluation evidence.
-- Preserve the relationship between a file preview and the version being
-  exported when an active experiment updates its artifacts or the service restarts.
+The Results tab reads fixed evidence files from a registered experiment. Selection
+is an explicit saved event or a separately labelled unique exact code match;
+metrics are copied from that candidate. Final retraining is a separate conclusion
+with its own receipt/event/configuration provenance. An unreadable event stream
+cannot establish that an identity-free receipt belongs to the latest attempt.
+
+Artifact-list revisions remain inexpensive refresh signals. Preview-save identity
+uses a digest of the actual original bytes and the native service revision.
+Downloads go to a private temporary file and replace the chosen destination only
+after validation. Direct file exports do not require a preview; all artifact saves
+share one app-wide in-flight guard and use the native destination picker.
+
+Track final-source, packaged and installed evidence separately in
+[ACCEPTANCE-0.1.11.md](ACCEPTANCE-0.1.11.md). A passing source suite does not complete
+the package, signature, installation or retained-engine workflow gates.
+
+## Next workflow improvements
+
 - Improve long-running activity and log navigation with useful current-stage
   information, explicit following controls and search.
 - Support multiple persisted experiment drafts so starting a new idea does not

@@ -1,19 +1,18 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { Readable } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
 import { Sidecar, type ServiceState } from './sidecar';
 import { ServiceController } from './service-controller';
 import { collectDiagnostics } from './diagnostics';
-import { externalURL, isWithin, validateArtifact, validateRequest, validTheme } from './security';
+import { externalURL, isWithin, validateRequest, validTheme } from './security';
 import { readResponse } from './response';
 import { RunNotifications, type RunCompletion } from './run-notifications';
 import { CloseGuard, type CloseBlockReason } from './close-guard';
 import { datasetInspectionBody } from './dataset-inspection';
 import { saveProviderSettings } from './provider-settings';
+import { artifactRequest, artifactService, previewArtifact, createArtifactSaver } from './artifacts';
 
 app.setName('BioMaker');
 // Test/review installs can use a separate profile without touching real projects.
@@ -32,6 +31,7 @@ let notificationTimer: NodeJS.Timeout | null = null;
 let notificationPollRunning = false;
 let pendingRunId: string | null = null;
 const visibleNotifications = new Set<Electron.Notification>();
+const saveArtifact = createArtifactSaver();
 let closeBlockReason: CloseBlockReason = 'unsaved';
 const t = (zh: string, en: string) => preferences.language === 'en' ? en : zh;
 const closeGuard = new CloseGuard({
@@ -244,17 +244,20 @@ function setupIPC() {
     if (!roots.some(root => isWithin(resolved, root))) throw new Error(t('请先通过目录选择器授权访问此位置。', 'Choose this location using the folder picker to grant access first.'));
     const error = await shell.openPath(resolved); if (error) throw new Error(error);
   });
+  handle('biomaker:preview-artifact', async (artifact) => {
+    const target = artifactRequest(artifact);
+    const current = artifactService(() => serviceController?.getService(), () => serviceState);
+    const sidecar = current.service;
+    return previewArtifact(target, current.revision, () => fetchService(`${sidecar.origin}/api/desktop/runs/${encodeURIComponent(target.runId)}/artifacts/${encodeURIComponent(target.name)}/preview`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(45_000) }), current.assertCurrent);
+  });
   handle('biomaker:save-artifact', async (artifact) => {
-    const { runId, name } = validateArtifact(artifact?.runId, artifact?.name);
-    const sidecar = serviceController?.getService();
-    if (!sidecar || serviceState.status !== 'ready') throw new Error(t('本地服务不可用。', 'The local service is unavailable.'));
-    const result = await dialog.showSaveDialog(mainWindow!, { title: t('导出实验产物', 'Export experiment output'), defaultPath: path.join(app.getPath('downloads'), name), buttonLabel: t('导出', 'Export') });
-    if (result.canceled || !result.filePath) return null;
-    const response = await fetchService(`${sidecar.origin}/artifacts/runs/${encodeURIComponent(runId)}/${encodeURIComponent(name)}`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(300_000) });
-    if (!response.ok || !response.body) throw new Error(`${t('导出失败', 'Export failed')} (${response.status}).`);
-    const temporary = `${result.filePath}.biomaker-${process.pid}.part`;
-    try { await pipeline(Readable.fromWeb(response.body as any), createWriteStream(temporary, { flags: 'wx', mode: 0o600 })); renameSync(temporary, result.filePath); } catch (error) { rmSync(temporary, { force: true }); throw error; }
-    return result.filePath;
+    const target = artifactRequest(artifact, true);
+    const current = artifactService(() => serviceController?.getService(), () => serviceState, target.serviceRevision);
+    const sidecar = current.service;
+    return saveArtifact(target, async () => {
+      const result = await dialog.showSaveDialog(mainWindow!, { title: t('导出实验产物', 'Export experiment output'), defaultPath: path.join(app.getPath('downloads'), target.name), buttonLabel: t('导出', 'Export') });
+      return result.canceled || !result.filePath ? null : result.filePath;
+    }, () => fetchService(`${sidecar.origin}/artifacts/runs/${encodeURIComponent(target.runId)}/${encodeURIComponent(target.name)}`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(300_000) }), current.assertCurrent);
   });
   handle('biomaker:app-info', () => ({ version: app.getVersion(), platform: process.platform }));
   handle('biomaker:get-service-state', () => ({ ...serviceState }));
