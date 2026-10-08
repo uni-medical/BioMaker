@@ -1,12 +1,13 @@
-# BioMaker Desktop 0.1.11 acceptance — draft
+# BioMaker Desktop 0.1.11 acceptance
 
 Date: 2026-10-09. Target: macOS, Apple silicon / arm64.
-Release source commit: **pending source freeze**.
+Release source commit: `24a59333cf1c654d12285a591d790a0ddffd8b7d`.
 
-This draft records implemented behavior, 701 passing source checks and 32 passing
-development acceptance checks. It is not a completed release acceptance:
-packaged execution, package verification, installation and installed workflow
-must still be recorded against the frozen 0.1.11 source and artifacts below.
+This record confirms 701 passing source checks, 32 passing development checks,
+152 passing packaged checks and four passing offline engine checks. Package
+verification, the actual upgrade, retained-profile inspection, installed synthetic
+training, final file verification and normal native launch have passed on this
+Apple silicon Mac. The release boundaries below remain explicit.
 
 ## Result contract
 
@@ -104,39 +105,123 @@ passing run. `pre-dark-ui-acceptance.json` is superseded because its supposed da
 screenshot had not actually switched theme. The `initial-*` captures are retained
 as history and are not the final acceptance receipt.
 
-Existing workflow regressions against the packaged application remain **pending**.
+The packaged regression results are recorded separately below.
 
-## Packaged acceptance — pending
+## Packaged acceptance — passed
 
-No 0.1.11 packaged-executable acceptance is claimed in this draft. After source
-freeze and packaging, repeat the new result/preview suites and the required
-existing workflow suites with isolated profiles and a system-only PATH. Record
-the executable, suite receipts, renderer errors, forbidden operations, reviewed
-screenshots and confirmation that test processes exited.
+`output/packaged-acceptance-0.1.11.json` records **152 passed checks** against
+`release/mac-arm64/BioMaker.app/Contents/MacOS/BioMaker`, built from the frozen
+source commit above. The tests use isolated profiles and a system-only PATH.
 
-## Package artifacts and verification — pending
+| Suite | Passed | Receipt |
+| --- | ---: | --- |
+| Result overview | 21 | `output/result-overview-packaged-0.1.11/acceptance.json` |
+| Artifact preview/save | 11 | `output/artifact-preview-packaged-0.1.11/acceptance.json` |
+| Provider settings | 15 | `output/provider-settings-packaged-0.1.11/acceptance.json` |
+| Provider response check | 14 | `output/provider-check-packaged-0.1.11/acceptance.json` |
+| Dataset inspection | 14 | `output/dataset-inspection-packaged-0.1.11/acceptance.json` |
+| Dataset submission protection | 7 | `output/dataset-submission-packaged-0.1.11/acceptance.json` |
+| Native close lifecycle | 6 | `output/native-close-packaged-0.1.11/acceptance.json` |
+| Run organization | 8 | `output/run-organization-packaged-0.1.11/acceptance.json` |
+| Experiment reuse | 8 | `output/experiment-reuse-packaged-0.1.11/acceptance.json` |
+| History import | 10 | `output/history-import-packaged-0.1.11/acceptance.json` |
+| Service recovery | 7 | `output/service-recovery-packaged-0.1.11/acceptance.json` |
+| Runtime health UI | 9 | `output/runtime-health-ui-packaged-0.1.11/acceptance.json` |
+| General Electron interactions | 22 | `output/electron-packaged-0.1.11/electron-acceptance.json` |
 
-- Frozen-source manifest and application version: pending.
-- DMG/ZIP production and SHA-256: pending.
-- Read-only DMG mount, Applications shortcut and complete bundle equality: pending.
-- Deep strict signatures on unpacked, DMG and ZIP applications: pending.
-- `npm run verify:release` receipt: pending.
+Reported renderer-error and forbidden-request collections are empty. The saved
+screenshots were reviewed, including light, dark and compact states, and the
+combined receipt records no remaining QA process IDs. These suites use synthetic
+records, deterministic loopback providers and explicitly intercepted cases;
+dataset-submission fixtures do not establish that a real experiment executed.
 
-Do not reuse 0.1.10 hashes or verification receipts as 0.1.11 evidence.
+## Package artifacts and verification — passed
 
-## Installation and retained data — pending
+`output/package-verification-0.1.11.json` records version 0.1.11 and a clean
+frozen-source manifest. `output/verify-release-0.1.11.log` records a passing
+`npm run verify:release` invocation.
 
-Actual installation/upgrade, preservation of the previous application, configured
-profile and complete run rows, compatible-engine reuse, and a normal native launch
-are pending for 0.1.11. Record exact before/after checks and paths when performed.
-Do not insert synthetic records or settings into the real user profile.
+The DMG was mounted read-only and its Applications shortcut verified. Both the
+mounted DMG and extracted ZIP application match the complete unpacked bundle:
+2,816 files, bundle fingerprint
+`81a12cc3337e9199ccb5d3307f1616ba7b3ccf06f31cfb037aa98da9b8ed66c2`.
+Deep strict signature verification passed on all three application copies.
+This does not establish Developer ID signing or notarization.
 
-## Engine repair and installed workflow — pending
+| Artifact | SHA-256 |
+| --- | --- |
+| `release/BioMaker-0.1.11-mac-arm64.dmg` | `c0caa3886f3849055aa1be3bdccdce57d0a4437a57f6012963daec298ad40e2f` |
+| `release/BioMaker-0.1.11-mac-arm64.zip` | `c54b2e6a21f7a1912b8da7dcdef0305e7c7950881a6d3414588e974ea5d468d7` |
 
-Repeat the required offline cloned-engine verification/repair and installed
-synthetic training workflow after packaging. Record their own receipts, actual
-engine/runtime preservation checks and process cleanup. UI fixture results do
-not establish that a packaged or installed engine executes training successfully.
+## Installation and retained data — passed
+
+`output/package-installation-0.1.11.json` records the actual upgrade from 0.1.10
+to 0.1.11 at `/Applications/BioMaker.app`. The previous app was preserved at
+`release/installed-backups/BioMaker-0.1.10-20261009-041446.app`. The pre-upgrade
+profile snapshot is `output/profile-before-upgrade-0.1.11.json`.
+
+`output/installed-engine-acceptance-0.1.11.json` records a read-only check of the
+installed application with the existing user profile and a system-only PATH.
+Configuration file hashes and complete run records remained identical; the real
+profile had zero runs before and after. The compatible engine was reused and
+ready, with no installation requested. API key and model configuration were
+absent and remained absent. No settings, imported fixtures or provider requests
+were introduced, and no renderer errors were recorded.
+
+## Offline engine verification and repair — passed
+
+`output/engine-health-packaged-0.1.11.json` records **four passed checks in
+125.938 seconds** using the packaged service, a cloned engine and cloned cache,
+with outbound networking denied:
+
+1. A healthy engine completed real scientific-package imports and a fixed CPU
+   self-test without invoking the package manager.
+2. Removing MONAI from the clone produced a verification failure, and restarting
+   did not incorrectly mark that damaged engine ready.
+3. A forced offline reinstall restored the locked packages and native libraries,
+   then passed the full engine verification.
+4. The repaired engine passed a second download-free health check.
+
+The source engine's 34,295 files and source cache's 29,507 files retained their
+complete before/after fingerprints. Damage and repair were confined to the clones.
+The matching detailed receipt is `output/qa/engine-health-0.1.11/acceptance.json`.
+
+## Installed synthetic training workflow — passed
+
+`output/desktop-workflow-acceptance-0.1.11.json` records a completed workflow in
+**15.866 seconds** from `/Applications/BioMaker.app/Contents/MacOS/BioMaker`.
+It used an isolated synthetic profile, the compatible installed engine and a
+deterministic loopback provider. Production sources were not overridden, and no
+new engine installation or external-provider call occurred.
+
+The real queue progressed through queued, running and succeeded. A CPU
+`sklearn.linear_model.LogisticRegression` candidate trained on 12 synthetic rows,
+completed the fixed evaluator and produced solution code, metrics and a report.
+The Results UI confirmed recorded selection from `step_saved`, a matching saved
+solution, the fixture's recorded metric of 1.0 and explicitly disabled final
+retraining. Candidate navigation, report export and execution-log viewing passed
+without renderer errors. This synthetic score is a software fixture outcome,
+not a biomedical benchmark result.
+
+The QA Python process tree was restricted to localhost; the candidate confirmed
+that an external connection was denied. A test-only exception allowed the exact
+`/bin/ps` executable for read-only process identity checks; Electron retained its
+production Chromium sandbox. Installed engine metadata and immutable source
+hashes remained unchanged. Evidence is retained under
+`output/qa/desktop-workflow-0.1.11/`, with symbolic links preserved.
+
+## Final verification and native launch — passed
+
+`output/post-workflow-verification-0.1.11.json` confirms unchanged real-profile
+configuration files and complete run records, with zero user runs. Installed and
+packaged signatures passed verification, and the entire installed application
+matched the verified 2,816-file package fingerprint above. No QA processes remained.
+
+`output/native-launch-0.1.11.json` records a normal native launch and window raise,
+checked through the accessibility tree and screenshot. Version 0.1.11 showed the
+local runtime ready and an empty new experiment. A subsequent read-only profile
+check again confirmed unchanged configuration and run records. The normal user
+application was left open.
 
 ## Release boundaries
 

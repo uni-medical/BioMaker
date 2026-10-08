@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.11 — release candidate
+## 0.1.11 — 2026-10-09
 
 Adds a Results tab with direct access to reports, saved solution code, candidate
 metrics and final-retraining receipts. Recorded selection and exact code matching
@@ -19,7 +19,11 @@ barrier refuses overlapping exports without queuing an older overwrite.
 Candidate navigation retains the selected result beyond the first 1,500 displayed
 nodes, identifies truncated lists, and filters malformed optional display fields.
 
-Release evidence and outstanding packaged/installed gates are tracked in the
+The frozen build passed 701 source checks, 32 development checks, 152 packaged
+checks, four offline engine checks, package verification and an actual upgrade.
+The installed synthetic CPU training workflow, retained-profile checks, final
+bundle verification and normal native launch also passed on Apple silicon.
+Release evidence is tracked in the
 [0.1.11 acceptance record](docs/ACCEPTANCE-0.1.11.md).
 
 ## 0.1.10 — 2026-10-09

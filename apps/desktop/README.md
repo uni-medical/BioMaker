@@ -121,8 +121,11 @@ cd ../webui
 uv run --group dev pytest
 ```
 
-See the [0.1.11 acceptance record](docs/ACCEPTANCE-0.1.11.md) for current validation
-status, including any pending release gates, and
+Version 0.1.11 has passed 701 source checks, 32 development checks, 152 packaged
+checks, four offline engine checks, package verification and an actual upgrade.
+The retained-profile check, installed synthetic CPU training workflow, complete
+bundle verification and normal native launch have also passed on this Apple silicon Mac.
+See the [0.1.11 acceptance record](docs/ACCEPTANCE-0.1.11.md) for evidence and
 [docs/RELEASE.md](docs/RELEASE.md) for release checks, platform boundaries,
 and iteration priorities. Keep scientific model evaluation separate from desktop
 installation and interaction checks.

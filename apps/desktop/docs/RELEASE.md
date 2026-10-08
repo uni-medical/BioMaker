@@ -166,6 +166,13 @@ Track final-source, packaged and installed evidence separately in
 [ACCEPTANCE-0.1.11.md](ACCEPTANCE-0.1.11.md). A passing source suite does not complete
 the package, signature, installation or retained-engine workflow gates.
 
+For the frozen 0.1.11 build, 701 source checks, 32 development checks, 152 packaged
+checks and four offline engine checks have passed. Package verification, the
+actual upgrade with retained-profile inspection, installed synthetic CPU training,
+final bundle/profile verification, QA process cleanup and normal native launch
+have also passed on Apple silicon. The acceptance record retains the distinct
+scope of each check and the remaining distribution and platform boundaries.
+
 ## Next workflow improvements
 
 - Improve long-running activity and log navigation with useful current-stage
