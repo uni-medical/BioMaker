@@ -259,3 +259,11 @@ Inspect long-line, compact, keyboard, light/dark and bilingual states. Keep
 synthetic lifecycle/timing injection distinct from real filesystem and native IPC
 operations. tests/event-presentation.test.mjs covers historical malformed fields
 and real execution/evaluation failure semantics.
+
+
+The 0.1.13 frozen source is `7499b13287a492188a43a9f5c96b0a8344ed61f3`.
+All 826 source, 89 development, 182 packaged and four offline engine checks passed.
+Package verification, actual installation with independent engine setup, original
+profile preservation, installed synthetic workflow and normal launch passed.
+See [ACCEPTANCE-0.1.13.md](ACCEPTANCE-0.1.13.md) for exact receipts, source-bound
+package checksums, known boundaries and preserved harness failures.

@@ -79,12 +79,12 @@ single-draft data migrates once, with its original content retained for recovery
 Save failures remain visible with retry and recovery actions; closing the app
 attempts to save pending edits and protects them if that save fails.
 
-The 0.1.12 package, actual upgrade, retained-draft migration and installed workflow
-have passed on this Apple silicon Mac; see the versioned acceptance record below.
+The 0.1.13 upgrade preserves this draft library and passed the installed workflow
+on this Apple silicon Mac; see the versioned acceptance record below.
 
 ## Activity and console
 
-The 0.1.13 source adds a log reader with explicit following and pause controls,
+Version 0.1.13 adds a log reader with explicit following and pause controls,
 search and match navigation within the displayed window, earlier windows, line
 wrapping, current-window copy and native full-log export. Reading or selecting
 older output never stops the experiment. New output waits behind a paused window
@@ -157,11 +157,11 @@ cd ../webui
 uv run --group dev pytest
 ```
 
-Version 0.1.12 has passed 745 source checks, 115 development checks, 168 packaged
+Version 0.1.13 has passed 826 source checks, 89 development checks, 182 packaged
 checks and four offline engine checks. Package verification, the actual upgrade,
-exact legacy draft migration, retained configuration/run records, installed
+independent engine setup, retained drafts/configuration/run records, installed
 synthetic CPU training and normal native launch also passed on this Apple silicon Mac.
-See the [0.1.12 acceptance record](docs/ACCEPTANCE-0.1.12.md) and
+See the [0.1.13 acceptance record](docs/ACCEPTANCE-0.1.13.md) and
 [release policy](docs/RELEASE.md) for scopes, receipts and remaining platform and
 signing boundaries. Software acceptance does not establish scientific or clinical
 model validity.
