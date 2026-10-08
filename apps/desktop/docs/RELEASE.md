@@ -24,6 +24,12 @@
   --engine <installed-engine>` for a deterministic local-model fixture through
   the actual split/evaluator/candidate/artifact workflow; keep that result distinct
   from medical or model-provider performance.
+- On macOS, `tests/desktop-workflow-smoke.py --installed-receipt <receipt.json>
+  --expected-version <version> --report <output.json>` adds UI submission, durable
+  queue execution, result inspection and native export to the installed-engine
+  check. Run it after the actual application profile has initialized the new
+  runtime. It uses synthetic data, a local model fixture and a test-only network
+  sandbox, with an exact `/bin/ps` exception for process identity inspection.
 - Mount the DMG, check its Applications shortcut and app bundle, then generate
   SHA-256 checksums for the final artifacts.
 - For a public release, apply Developer ID signing and Apple notarization. Keep

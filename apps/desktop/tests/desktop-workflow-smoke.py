@@ -26,7 +26,16 @@ import traceback
 
 DESKTOP = Path(__file__).resolve().parents[1]
 TASK = "Synthetic software acceptance only. Train a binary classifier using x0 and x1 to predict label. Id is a sample key. Use the explicit train.csv, validation.csv, and test.csv splits; label is private in validation and test. Primary validation metric: accuracy. Export class probabilities prob_0 and prob_1 with Id. Use CPU only. This is not a biomedical benchmark."
-SANDBOX = '(version 1)\n(allow default)\n(deny network-outbound)\n(allow network-outbound (remote ip "localhost:*"))\n'
+# macOS ps requires an unsandboxed exec for read-only process identity checks.
+# The exact executable exception does not release Python, uv, or candidates
+# from the inherited localhost-only network restriction.
+SANDBOX = (
+    '(version 1)\n'
+    '(allow default)\n'
+    '(deny network-outbound)\n'
+    '(allow network-outbound (remote ip "localhost:*"))\n'
+    '(allow process-exec (literal "/bin/ps") (with no-sandbox))\n'
+)
 PROBE = r"""
 import errno, json, os, socket
 from pathlib import Path
@@ -202,6 +211,14 @@ def main() -> None:
         "external_provider_calls": 0,
         "scientific_performance_claim": False,
         "network_enforcement": "Test-only spawn wrapper sandboxes Python sidecar and all queue/uv/engine descendants to localhost; Electron keeps production Chromium sandbox",
+        "qa_sandbox_exception": {
+            "rule": '(allow process-exec (literal "/bin/ps") (with no-sandbox))',
+            "scope": "Exact /bin/ps executable only, for read-only process identity inspection.",
+            "production_source_modified": False,
+            "chromium_sandbox_modified": False,
+            "candidate_external_connect_assertion": "connect_ex(TEST-NET-1:443) == errno.EPERM",
+            "python_uv_training_remain_network_restricted": True,
+        },
         "sandbox_policy_sha256": sha(home / "network.sb"),
         "installed_before": before,
         "immutable_sha256": immutable,
