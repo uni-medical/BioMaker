@@ -12,6 +12,7 @@ declare global {
       openPath(path: string): Promise<void>;
       previewArtifact(artifact: { runId: string; name: string }): Promise<ArtifactPreview>;
       saveArtifact(artifact: { runId: string; name: string; expectedSha256?: string; serviceRevision?: number }): Promise<string | null>;
+      saveConsole(input: { runId: string; serviceRevision: number }): Promise<string | null>;
       getAppInfo(): Promise<{ version: string; platform: string }>;
       getServiceState(): Promise<ServiceState>;
       retryService(): Promise<ServiceState>;

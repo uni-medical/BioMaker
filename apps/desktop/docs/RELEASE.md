@@ -193,8 +193,8 @@ scope of each check and the remaining distribution and platform boundaries.
 
 ## Next workflow improvements
 
-- Improve long-running activity and log navigation with useful current-stage
-  information, explicit following controls and search.
+- Cache historical catalog observations with explicit invalidation so long event
+  histories do not require repeated full scans for experiment lists and details.
 
 ## Multiple-draft implementation for 0.1.12
 
@@ -216,3 +216,46 @@ final bundle/profile checks and normal native launch passed.
 See [ACCEPTANCE-0.1.12.md](ACCEPTANCE-0.1.12.md) for receipts and limitations.
 The previous 0.1.11 record remains separate. A synthetic workflow establishes
 software behavior, not biomedical model performance or external-provider access.
+
+
+## Activity and console contract for 0.1.13
+
+Desktop stream routes read only registered sources, independently of the catalog.
+Console windows are capped at 400 lines and 256 KiB; activity windows are capped at
+200 valid JSON objects and 512 KiB. File identity, byte ranges, observation time,
+missing-source state and incomplete/undecodable content accompany each window.
+Earlier pages replace the visible window. Authenticated cursors bind the run,
+source and byte offset, with bounded continuity anchors; they are not a full-file
+integrity proof. A source change or service restart invalidates earlier cursors.
+The existing shared list/detail catalog still scans history and is not covered by
+these per-window IO bounds.
+
+Log following pauses on upward navigation, selection or search. Background reads
+do not replace a paused window. Search is literal, case-insensitive and limited to
+the displayed window; highlighting stops at 1,000 matches. Copy uses that displayed
+text. Earlier-page reads and latest-follow actions cannot apply stale responses
+across navigation or service replacement. Hidden tabs retain reading state.
+
+Full console export resolves the registered path in the service. It captures the
+initial file length, permits appends after that boundary, and verifies the exact
+bytes against a SHA-256 digest before atomic destination replacement. The export
+limit is 256 MiB. It shares the app-wide native export lock with artifact saves;
+no renderer path is accepted. Cancellation or validation failure preserves the
+existing destination. Truncation, replacement, symbolic links and directory
+substitutions are refused.
+
+Activity uses real engine event labels and explicit execution/evaluation failure
+fields, handles unknown JSON field types, and keys rows by source and byte offset.
+The latest recorded event is not presented as the unique current phase of a
+parallel experiment. Progress states recorded exploration candidates versus the
+configured limit, without a training percentage or ETA.
+
+Release validation must include tests/log-reader-smoke.mjs against the real
+sidecar in an isolated profile, then the final packaged executable. Verify append,
+paused selection/search, match navigation and copy scope, earlier pages,
+rotation/truncation, same-run and cross-run delayed responses, source replacement,
+service recovery, native full export/cancellation and shared save exclusion.
+Inspect long-line, compact, keyboard, light/dark and bilingual states. Keep
+synthetic lifecycle/timing injection distinct from real filesystem and native IPC
+operations. tests/event-presentation.test.mjs covers historical malformed fields
+and real execution/evaluation failure semantics.

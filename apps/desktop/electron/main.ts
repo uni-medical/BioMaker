@@ -12,7 +12,7 @@ import { RunNotifications, type RunCompletion } from './run-notifications';
 import { CloseGuard, type CloseBlockReason } from './close-guard';
 import { datasetInspectionBody } from './dataset-inspection';
 import { saveProviderSettings } from './provider-settings';
-import { artifactRequest, artifactService, previewArtifact, createArtifactSaver } from './artifacts';
+import { artifactRequest, consoleRequest, artifactService, previewArtifact, createArtifactSaver } from './artifacts';
 import { DraftStore, DraftError, type DraftFlushResult } from './drafts';
 
 app.setName('BioMaker');
@@ -274,6 +274,20 @@ function setupIPC() {
       const result = await dialog.showSaveDialog(mainWindow!, { title: t('导出实验产物', 'Export experiment output'), defaultPath: path.join(app.getPath('downloads'), target.name), buttonLabel: t('导出', 'Export') });
       return result.canceled || !result.filePath ? null : result.filePath;
     }, () => fetchService(`${sidecar.origin}/artifacts/runs/${encodeURIComponent(target.runId)}/${encodeURIComponent(target.name)}`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(300_000) }), current.assertCurrent);
+  });
+  handle('biomaker:save-console', async (input) => {
+    const target = consoleRequest(input);
+    const current = artifactService(() => serviceController?.getService(), () => serviceState, target.serviceRevision);
+    const sidecar = current.service;
+    // Share the app-wide export lock with artifact saves, including the chooser.
+    return saveArtifact({ runId: target.runId, name: 'console.log' }, async () => {
+      const result = await dialog.showSaveDialog(mainWindow!, {
+        title: t('保存完整运行日志', 'Save full console log'),
+        defaultPath: path.join(app.getPath('downloads'), 'BioMaker-console.log'),
+        buttonLabel: t('保存', 'Save'), filters: [{ name: t('运行日志', 'Console log'), extensions: ['log'] }],
+      });
+      return result.canceled || !result.filePath ? null : result.filePath;
+    }, () => fetchService(`${sidecar.origin}/api/desktop/runs/${encodeURIComponent(target.runId)}/console/download`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(300_000) }), current.assertCurrent, 'console');
   });
   handle('biomaker:app-info', () => ({ version: app.getVersion(), platform: process.platform }));
   handle('biomaker:get-service-state', () => ({ ...serviceState }));

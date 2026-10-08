@@ -2,6 +2,9 @@ import { historyMessage } from "./historyMessages";
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import Candidates from "./Candidates";
+import RunActivity from "./RunActivity";
+import RunLogViewer from "./RunLogViewer";
+import type { ActivityWindow, LogWindow } from "./runStreams";
 import RunResults from "./RunResults";
 import RunOrganization from "./RunOrganization";
 import type { RunMetadata } from "./runMetadata";
@@ -38,7 +41,6 @@ import {
   type Language,
   type Resources,
   type Run,
-  type RunEvent,
   type Translate,
 } from "./models";
 
@@ -62,102 +64,15 @@ function artifactMessage(error: unknown, t: Translate): string {
   }
 }
 
-const eventNames: Record<string, [string, string]> = {
-  run_started: ["实验已启动", "Experiment started"],
-  run_finished: ["实验已完成", "Experiment completed"],
-  run_failed: ["实验运行失败", "Experiment failed"],
-  run_interrupted: ["实验已中断", "Experiment interrupted"],
-  round_started: ["开始新一轮探索", "Exploration round started"],
-  round_finished: ["本轮探索完成", "Exploration round completed"],
-  node_started: ["执行候选方案", "Running a candidate"],
-  node_finished: ["候选方案执行完成", "Candidate execution completed"],
-  node_failed: ["候选方案执行失败", "Candidate execution failed"],
-  final_retrain_started: ["开始最终重训", "Final retraining started"],
-  final_retrain_finished: ["最终重训完成", "Final retraining completed"],
-  final_retrain_failed: ["最终重训失败", "Final retraining failed"],
-  agent_started: ["智能体开始工作", "Agent started"],
-  agent_finished: ["智能体工作完成", "Agent finished"],
-  code_generated: ["已生成实验代码", "Experiment code generated"],
-  evaluation_started: ["开始评估", "Evaluation started"],
-  evaluation_finished: ["评估完成", "Evaluation completed"],
-  search_started: ["开始检索", "Research started"],
-  report_generated: ["实验报告已生成", "Experiment report created"],
-  report_started: ["正在生成实验报告", "Generating experiment report"],
-  report_finished: ["实验报告已生成", "Experiment report created"],
-  checkpoint_saved: ["检查点已保存", "Checkpoint saved"],
-  budget_exhausted: ["已达到资源上限", "Resource limit reached"],
-  run_stopping: ["正在停止实验", "Stopping experiment"],
-  final_retrain_skipped: ["已跳过最终重训", "Final retraining skipped"],
-  node_evaluated: ["候选方案已评估", "Candidate evaluated"],
-  candidate_started: ["开始候选方案", "Candidate started"],
-  candidate_finished: ["候选方案完成", "Candidate completed"],
-  agent_step_started: ["智能体执行步骤", "Agent step started"],
-  agent_step_finished: ["智能体步骤完成", "Agent step completed"],
-  model_request_started: ["正在请求模型", "Requesting model"],
-  model_request_finished: ["模型响应已返回", "Model response received"],
-  tool_started: ["正在执行工具", "Running tool"],
-  tool_finished: ["工具执行完成", "Tool completed"],
-};
-function EventItem({
-  event,
-  lang,
-  t,
-}: {
-  event: RunEvent;
-  lang: Language;
-  t: Translate;
-}) {
-  const [open, setOpen] = useState(false);
-  const name = event.event || "event";
-  const retrainFailed = name === "final_retrain_finished" && event.ok === false;
-  const title = retrainFailed ? t("最终重训未成功", "Final retraining failed") : eventNames[name]
-    ? t(...eventNames[name])
-    : name.replaceAll("_", " ");
-  const summary = event.message || event.error || event.reason;
-  const failure = retrainFailed || name.includes("failed") || !!event.error;
-  const fields = Object.fromEntries(
-    Object.entries(event).filter(
-      ([key]) => !["event", "ts", "message", "error", "reason"].includes(key),
-    ),
-  );
-  return (
-    <div className={`event-item ${failure ? "event-error" : ""}`}>
-      <span className="event-node">
-        {failure ? (
-          <X size={12} />
-        ) : name.endsWith("finished") || name.endsWith("saved") ? (
-          <Check size={12} />
-        ) : (
-          <span />
-        )}
-      </span>
-      <div className="event-body">
-        <button
-          className="event-heading"
-          onClick={() => setOpen(!open)}
-          aria-expanded={open}
-        >
-          <strong>{title}</strong>
-          {event.step !== undefined && (
-            <span className="event-step">
-              {t("步骤", "Step")} {event.step}
-            </span>
-          )}
-          <time>{dateText(event.ts, lang, true)}</time>
-          <ChevronRight size={13} className={open ? "rotate-down" : ""} />
-        </button>
-        {summary && <p>{String(summary)}</p>}
-        {open && (
-          <pre className="event-data">{JSON.stringify(fields, null, 2)}</pre>
-        )}
-      </div>
-    </div>
-  );
-}
 export default function RunView({
   run,
-  events,
+  activity,
+  activityError,
   log,
+  logError,
+  connected,
+  onLoadOlderLog,
+  onLoadOlderActivity,
   loading,
   detailError,
   lang,
@@ -174,8 +89,13 @@ export default function RunView({
   toast,
 }: {
   run: Run;
-  events: RunEvent[];
-  log: string;
+  activity: ActivityWindow | null;
+  activityError: string;
+  log: LogWindow | null;
+  logError: string;
+  connected: boolean;
+  onLoadOlderLog: (cursor: string) => Promise<LogWindow>;
+  onLoadOlderActivity: (cursor: string) => Promise<ActivityWindow>;
   loading: boolean;
   detailError: string;
   lang: Language;
@@ -253,6 +173,20 @@ export default function RunView({
       if (alive.current && sequence === fileSequence.current) setFileBusy("");
     }
   }
+  async function saveConsole() {
+    if (!serviceReady || saving.current) return;
+    saving.current = true;
+    const sequence = ++fileSequence.current;
+    const runId = run.id;
+    setFileBusy("__console__");
+    try {
+      const path = await window.biomaker.saveConsole({ runId, serviceRevision });
+      if (alive.current && current.current.run.id === runId && sequence === fileSequence.current && path) toast(t("运行日志已保存", "Console log saved"));
+    } finally {
+      saving.current = false;
+      if (alive.current && sequence === fileSequence.current) setFileBusy("");
+    }
+  }
   async function showPreview(artifact: Artifact) {
     if (!serviceReady || saving.current) return;
     if (artifact.size > 500_000) {
@@ -288,6 +222,7 @@ export default function RunView({
     try {
       await navigator.clipboard.writeText(value);
       toast(t("已复制", "Copied"));
+      return true;
     } catch {
       toast(
         t(
@@ -295,6 +230,7 @@ export default function RunView({
           "Could not copy. Select the text manually.",
         ),
       );
+      return false;
     }
   }
   return (
@@ -382,7 +318,7 @@ export default function RunView({
           <div className="run-summary">
             {progress !== null ? (
               <div>
-                <span>{t("探索进度", "Exploration progress")}</span>
+                <span>{t("已记录探索候选 / 配置上限", "Recorded exploration candidates / configured limit")}</span>
                 <strong>
                   {done}
                   <small> / {steps}</small>
@@ -447,7 +383,7 @@ export default function RunView({
         ))}
         <div className="tabs-right">
           {loading && <Spinner size={14} />}
-          {isActive(run) && (
+          {isActive(run) && connected && !detailError && !activityError && !logError && (
             <span className="live-label">
               <span />
               {t("实时更新", "Live")}
@@ -475,74 +411,11 @@ export default function RunView({
           onSave={artifact => void save(artifact)} onFiles={() => switchTab("artifacts", true)}
           onCandidate={id => { setRequestedCandidate(id); switchTab("candidates", true); }}
         />}
-        {tab === "activity" && (
-          <>
-            {events.length > 0 ? (
-              <div className="timeline">
-                {events.map((event, i) => (
-                  <EventItem
-                    key={`${event.ts}-${event.event}-${i}`}
-                    event={event}
-                    lang={lang}
-                    t={t}
-                  />
-                ))}
-                {isActive(run) && (
-                  <div className="event-item current">
-                    <span className="event-node">
-                      <Spinner size={12} />
-                    </span>
-                    <div className="event-body">
-                      <span>
-                        {run.status === "queued"
-                          ? t("等待运行", "Waiting to run")
-                          : run.status === "stopping"
-                            ? t(
-                                "正在结束当前进程…",
-                                "Ending the current process…",
-                              )
-                            : t(
-                                "等待下一条活动…",
-                                "Waiting for the next activity…",
-                              )}
-                      </span>
-                    </div>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="detail-empty">
-                <Activity size={28} />
-                <h3>
-                  {loading
-                    ? t("正在读取实验活动", "Loading activity")
-                    : run.status === "queued"
-                      ? t("实验已加入队列", "Experiment is queued")
-                      : t("尚无活动记录", "No activity recorded yet")}
-                </h3>
-                <p>
-                  {run.status === "queued"
-                    ? t(
-                        "轮到此实验时会自动开始，运行过程将在这里记录。",
-                        "This experiment starts automatically when its turn arrives. Activity will appear here.",
-                      )
-                    : t(
-                        "实验产生的步骤和结果会按时间显示在这里。",
-                        "Experiment steps and results appear here in chronological order.",
-                      )}
-                </p>
-              </div>
-            )}
-            {(run.observed?.event_count || 0) > events.length && (
-              <p className="tail-note">
-                {t(
-                  `显示最近 ${events.length} 条活动，完整记录可在文件中保存。`,
-                  `Showing the latest ${events.length} events. Save the event file for the full history.`,
-                )}
-              </p>
-            )}
-          </>
-        )}
+        <div hidden={tab !== "activity"}>
+          <RunActivity run={run} snapshot={activity} error={activityError} loading={loading}
+            connected={connected} serviceRevision={serviceRevision} lang={lang} t={t}
+            onLoadOlder={onLoadOlderActivity} onRefresh={onRetryLoad} />
+        </div>
         {tab === "candidates" && <Candidates run={run} t={t} serviceReady={serviceReady} serviceRevision={serviceRevision} requestedCandidate={requestedCandidate} />}
         {tab === "artifacts" && (
           <>
@@ -615,24 +488,12 @@ export default function RunView({
             )}
           </>
         )}
-        {tab === "log" && (
-          <>
-            <div className="log-toolbar">
-              <span>{t("最近 400 行", "Last 400 lines")}</span>
-              <button
-                className="text-button"
-                onClick={() => copy(log)}
-                disabled={!log}
-              >
-                <Copy size={13} />
-                {t("复制", "Copy")}
-              </button>
-            </div>
-            <pre className="console-log" tabIndex={0}>
-              {log || t("运行日志尚未生成。", "No console output yet.")}
-            </pre>
-          </>
-        )}
+        <div hidden={tab !== "log"}>
+          <RunLogViewer key={run.id} visible={tab === "log"} runId={run.id} snapshot={log} loading={loading} error={logError || null}
+            connected={connected} active={isActive(run)} lang={lang} t={t}
+            onLoadOlder={onLoadOlderLog} onRefresh={onRetryLoad} onCopy={copy}
+            onSaveFullLog={saveConsole} exportBusy={!!fileBusy} />
+        </div>
       </div>
       {preview && (
         <Modal

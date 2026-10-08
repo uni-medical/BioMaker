@@ -7,6 +7,7 @@ import { validateArtifact } from './security';
 export const MAX_PREVIEW_BYTES = 500_000;
 // JSON may escape each source byte as six ASCII bytes (for example, NUL).
 export const MAX_PREVIEW_RESPONSE_BYTES = MAX_PREVIEW_BYTES * 6 + 4096;
+export const MAX_CONSOLE_DOWNLOAD_BYTES = 256 * 1024 * 1024;
 const messages = {
   invalid_request: 'The artifact request is invalid.',
   unavailable: 'The artifact is unavailable. Refresh the experiment and try again.',
@@ -24,7 +25,21 @@ export class ArtifactError extends Error {
 export interface ArtifactTarget { runId: string; name: string }
 export interface ArtifactSave extends ArtifactTarget { expectedSha256?: string; serviceRevision?: number }
 export interface ArtifactPreview extends ArtifactTarget { content: string; sha256: string; size: number; serviceRevision: number }
+export interface ConsoleSave { runId: string; serviceRevision: number }
 interface ServiceState { status: string; revision: number }
+
+/** A console export resolves the registered run in the service. Renderer input
+ * cannot choose a source path, filename, content, or a different download URL. */
+export function consoleRequest(raw: unknown): ConsoleSave {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new ArtifactError('invalid_request');
+  const value = raw as Record<string, unknown>;
+  if (Object.keys(value).some(key => key !== 'runId' && key !== 'serviceRevision') ||
+      !Object.hasOwn(value, 'runId') || !Object.hasOwn(value, 'serviceRevision') ||
+      typeof value.serviceRevision !== 'number' || !Number.isSafeInteger(value.serviceRevision) || value.serviceRevision < 0) throw new ArtifactError('invalid_request');
+  try { validateArtifact(value.runId, 'console.log'); }
+  catch { throw new ArtifactError('invalid_request'); }
+  return { runId: value.runId as string, serviceRevision: value.serviceRevision };
+}
 
 export function artifactRequest(raw: unknown, saving = false): ArtifactSave {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new ArtifactError('invalid_request');
@@ -116,7 +131,7 @@ export async function previewArtifact(target: ArtifactTarget, serviceRevision: n
 /** A preview save never writes text supplied by the renderer. The authenticated
  * original artifact is streamed to a private temporary file, checked against
  * the displayed snapshot, and only then replaces the chosen destination. */
-export async function saveArtifact(target: ArtifactSave, chooseDestination: () => Promise<string | null>, send: () => Promise<Response>, assertCurrent: () => void): Promise<string | null> {
+export async function saveArtifact(target: ArtifactSave, chooseDestination: () => Promise<string | null>, send: () => Promise<Response>, assertCurrent: () => void, source: 'artifact' | 'console' = 'artifact'): Promise<string | null> {
   let temporary: string | undefined;
   let response: Response | undefined;
   let writing = false;
@@ -127,13 +142,36 @@ export async function saveArtifact(target: ArtifactSave, chooseDestination: () =
     assertCurrent();
     response = await send();
     assertCurrent();
-    if (!response.ok || !response.body) throw new ArtifactError('unavailable');
+    if (!response.ok) {
+      // The registered console route has fixed status codes. Never return its
+      // body, which might contain a source path or raw storage error.
+      if (source === 'console' && response.status === 413) throw new ArtifactError('too_large');
+      if (source === 'console' && response.status === 409) throw new ArtifactError('changed');
+      throw new ArtifactError('unavailable');
+    }
+    if (!response.body) throw new ArtifactError('unavailable');
+    let expectedSize: number | undefined;
+    let expectedHash = target.expectedSha256;
+    if (source === 'console') {
+      const length = response.headers.get('content-length');
+      const digest = response.headers.get('x-biomaker-console-sha256');
+      const encoding = response.headers.get('content-encoding');
+      if (response.status !== 200 || !length || !/^(0|[1-9][0-9]*)$/.test(length) ||
+          !Number.isSafeInteger(Number(length)) || !digest || !/^[a-f0-9]{64}$/.test(digest) ||
+          response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/octet-stream' ||
+          (encoding !== null && encoding.toLowerCase() !== 'identity')) throw new ArtifactError('unavailable');
+      expectedSize = Number(length);
+      if (expectedSize > MAX_CONSOLE_DOWNLOAD_BYTES) throw new ArtifactError('too_large');
+      expectedHash = digest;
+    }
     if (target.expectedSha256 && Number(response.headers.get('content-length') ?? '0') > MAX_PREVIEW_BYTES) throw new ArtifactError('changed');
     temporary = `${destination}.biomaker-${randomUUID()}.part`;
     const hash = createHash('sha256');
     let size = 0;
     const check = new Transform({ transform(chunk: Buffer, _encoding, callback) {
       size += chunk.length;
+      if (source === 'console' && size > MAX_CONSOLE_DOWNLOAD_BYTES) { callback(new ArtifactError('too_large')); return; }
+      if (expectedSize !== undefined && size > expectedSize) { callback(new ArtifactError('changed')); return; }
       if (target.expectedSha256 && size > MAX_PREVIEW_BYTES) { callback(new ArtifactError('changed')); return; }
       hash.update(chunk);
       callback(null, chunk);
@@ -141,7 +179,8 @@ export async function saveArtifact(target: ArtifactSave, chooseDestination: () =
     writing = true;
     await pipeline(Readable.fromWeb(response.body as any), check, createWriteStream(temporary, { flags: 'wx', mode: 0o600 }));
     assertCurrent();
-    if (target.expectedSha256 && hash.digest('hex') !== target.expectedSha256) throw new ArtifactError('changed');
+    if (expectedSize !== undefined && size !== expectedSize) throw new ArtifactError('changed');
+    if (expectedHash && hash.digest('hex') !== expectedHash) throw new ArtifactError('changed');
     assertCurrent();
     renameSync(temporary, destination);
     return destination;

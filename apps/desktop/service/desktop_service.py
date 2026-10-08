@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, ConfigDict, Field
 from history_import import HistoryImporter, HistoryImportError
 from run_metadata import RunMetadataStore, RunMetadataUpdate, RunMetadataError
@@ -35,6 +36,7 @@ from provider_settings import ProviderSettings, provider_settings_request
 from dataset_inspection import DatasetInspector, inspect_request, ADMISSION_MESSAGES
 from artifact_preview import ArtifactPreviewError, preview_artifact
 from result_overview import build_result_overview
+from run_streams import RunStreams, StreamError
 
 VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.11")
 
@@ -700,6 +702,31 @@ def create_desktop_app(
         if record is None:
             return JSONResponse({"detail": "Run not found."}, status_code=404, headers={"Cache-Control": "no-store"})
         return JSONResponse(build_result_overview(record, logs_root=settings.logs_root), headers={"Cache-Control": "no-store"})
+
+    streams = RunStreams(settings.logs_root, settings.state_dir, app.state.run_store)
+    app.state.run_streams = streams
+
+    @app.exception_handler(StreamError)
+    async def stream_error(_request: Request, exc: StreamError):
+        return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=exc.status_code,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/desktop/runs/{run_id}/console")
+    def console_window(run_id: str, before: str | None = None):
+        return JSONResponse(streams.window(run_id, "console", before), headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/desktop/runs/{run_id}/activity")
+    def activity_window(run_id: str, before: str | None = None):
+        return JSONResponse(streams.window(run_id, "activity", before), headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/desktop/runs/{run_id}/console/download")
+    def download_console(run_id: str):
+        download = streams.download(run_id)
+        return StreamingResponse(download.chunks(), media_type="application/octet-stream",
+                                 headers={"Cache-Control": "no-store", "Content-Length": str(download.size),
+                                          "Content-Disposition": 'attachment; filename="console.log"',
+                                          "X-BioMaker-Console-SHA256": download.sha256},
+                                 background=BackgroundTask(download.close))
 
     @app.get("/api/desktop/runs/{run_id}/artifacts/{name}/preview")
     def preview_result_artifact(run_id: str, name: str):

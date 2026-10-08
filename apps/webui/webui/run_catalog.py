@@ -99,7 +99,8 @@ def run_from_log_dir(settings: Settings, log_dir: Path) -> dict[str, Any] | None
         (
             event
             for event in reversed(events)
-            if event.get("event") in TERMINAL_EVENT_STATUSES
+            if isinstance(event.get("event"), str)
+            and event["event"] in TERMINAL_EVENT_STATUSES
         ),
         None,
     )

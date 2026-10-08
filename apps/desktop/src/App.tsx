@@ -41,6 +41,7 @@ import {
 } from "./components";
 import Settings from "./Settings";
 import RunView, { ResourcesView } from "./RunView";
+import type { ActivityWindow, LogWindow } from "./runStreams";
 import HistoryImport from "./HistoryImport";
 import ServiceRecovery from "./ServiceRecovery";
 import DatasetOverview from "./DatasetOverview";
@@ -73,7 +74,6 @@ import {
   type Resources,
   type Revisions,
   type Run,
-  type RunEvent,
   type Template,
   type Theme,
   type Translate,
@@ -142,8 +142,11 @@ export default function App() {
   const runs = useMemo(() => rawRuns.map(run => decorateRun(run, metadata)), [rawRuns, metadata]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<Run | null>(null);
-  const [events, setEvents] = useState<RunEvent[]>([]);
-  const [log, setLog] = useState("");
+  const [streamRunId, setStreamRunId] = useState<string | null>(null);
+  const [activity, setActivity] = useState<ActivityWindow | null>(null);
+  const [log, setLog] = useState<LogWindow | null>(null);
+  const [activityError, setActivityError] = useState("");
+  const [logError, setLogError] = useState("");
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
   const [engine, setEngine] = useState<EngineStatus | null>(null);
@@ -365,54 +368,50 @@ export default function App() {
       setDetailError("");
     }
     try {
-      const next = await request<Revisions>(
-        `/api/runs/${encodeURIComponent(id)}/updates`,
-      );
-      if (!current()) return;
-      const previous = force ? null : revisions.current;
-      const detailChanged =
-        !previous ||
-        previous.run_revision !== next.run_revision ||
-        previous.artifacts?.revision !== next.artifacts?.revision ||
-        previous.events?.revision !== next.events?.revision;
-      const eventChanged =
-        !previous || previous.events?.revision !== next.events?.revision;
-      const logChanged =
-        !previous || previous.console?.revision !== next.console?.revision;
+      // Read streams independently of catalog/detail refreshes. Each response is
+      // bounded and carries its own source identity and observation timestamp.
       const results = await Promise.allSettled([
-        detailChanged
-          ? request<Run>(`/api/runs/${encodeURIComponent(id)}`)
-          : Promise.resolve(null),
-        eventChanged && next.events?.available
-          ? request<{ events: RunEvent[] }>(
-              `/api/runs/${encodeURIComponent(id)}/events?tail=200`,
-            )
-          : Promise.resolve(null),
-        logChanged && next.console?.available
-          ? request<string>(`/api/runs/${encodeURIComponent(id)}/log?tail=400`)
-          : Promise.resolve(null),
+        (async () => {
+          const next = await request<Revisions>(`/api/runs/${encodeURIComponent(id)}/updates`);
+          const previous = force ? null : revisions.current;
+          const changed = !previous || previous.run_revision !== next.run_revision
+            || previous.artifacts?.revision !== next.artifacts?.revision
+            || previous.events?.revision !== next.events?.revision;
+          const value = changed ? await request<Run>(`/api/runs/${encodeURIComponent(id)}`) : null;
+          return { next, value };
+        })(),
+        request<ActivityWindow>(`/api/desktop/runs/${encodeURIComponent(id)}/activity`),
+        request<LogWindow>(`/api/desktop/runs/${encodeURIComponent(id)}/console`),
       ]);
       if (!current()) return;
-      if (results[0].status === "fulfilled" && results[0].value)
-        setDetail(results[0].value);
-      if (results[1].status === "fulfilled" && results[1].value)
-        setEvents(results[1].value.events);
-      if (results[2].status === "fulfilled" && results[2].value !== null)
-        setLog(results[2].value);
-      if (next.events?.available === false) setEvents([]);
-      if (next.console?.available === false) setLog("");
-      const failed = results.find((result) => result.status === "rejected");
-      if (failed?.status === "rejected")
-        setDetailError(errorMessage(failed.reason));
-      else {
-        revisions.current = next;
+      const [detailResult, activityResult, logResult] = results;
+      setStreamRunId(id);
+      if (detailResult.status === "fulfilled") {
+        if (detailResult.value.value) setDetail(detailResult.value.value);
+        revisions.current = detailResult.value.next;
         setDetailError("");
-      }
-    } catch (e) {
-      if (current()) setDetailError(errorMessage(e));
+      } else setDetailError(errorMessage(detailResult.reason));
+      if (activityResult.status === "fulfilled") {
+        setActivity(activityResult.value);
+        setActivityError("");
+      } else setActivityError(errorMessage(activityResult.reason));
+      if (logResult.status === "fulfilled") {
+        setLog(logResult.value);
+        setLogError("");
+      } else setLogError(errorMessage(logResult.reason));
     } finally {
       if (current()) setDetailLoading(false);
     }
+  }, []);
+
+  const loadOlderStream = useCallback(async <T extends ActivityWindow | LogWindow>(id: string, kind: "activity" | "console", cursor: string): Promise<T> => {
+    const generation = serviceRef.current.revision;
+    const navigation = navigationEpoch.current;
+    if (serviceRef.current.status !== "ready" || selectedRef.current !== id) throw new Error("[stream:changed]");
+    const value = await request<T>(`/api/desktop/runs/${encodeURIComponent(id)}/${kind}?before=${encodeURIComponent(cursor)}`);
+    if (!alive.current || selectedRef.current !== id || navigationEpoch.current !== navigation
+      || serviceRef.current.status !== "ready" || serviceRef.current.revision !== generation) throw new Error("[stream:changed]");
+    return value;
   }, []);
 
   const refresh = useCallback((): Promise<void> => {
@@ -578,8 +577,11 @@ export default function App() {
   useEffect(() => {
     revisions.current = null;
     setDetail(null);
-    setEvents([]);
-    setLog("");
+    setStreamRunId(null);
+    setActivity(null);
+    setLog(null);
+    setActivityError("");
+    setLogError("");
     setDetailError("");
     if (selectedId) void loadDetail(selectedId, true);
   }, [selectedId, loadDetail]);
@@ -1468,8 +1470,13 @@ export default function App() {
               <RunView
                 key={selectedId}
                 run={selectedRun}
-                events={events}
-                log={log}
+                activity={streamRunId === selectedId ? activity : null}
+                activityError={streamRunId === selectedId ? activityError : ""}
+                log={streamRunId === selectedId ? log : null}
+                logError={streamRunId === selectedId ? logError : ""}
+                connected={serviceReady && !connectionError}
+                onLoadOlderLog={cursor => loadOlderStream<LogWindow>(selectedId, "console", cursor)}
+                onLoadOlderActivity={cursor => loadOlderStream<ActivityWindow>(selectedId, "activity", cursor)}
                 loading={detailLoading}
                 detailError={detailError}
                 lang={lang}

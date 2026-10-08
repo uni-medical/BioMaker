@@ -82,6 +82,20 @@ attempts to save pending edits and protects them if that save fails.
 The 0.1.12 package, actual upgrade, retained-draft migration and installed workflow
 have passed on this Apple silicon Mac; see the versioned acceptance record below.
 
+## Activity and console
+
+The 0.1.13 source adds a log reader with explicit following and pause controls,
+search and match navigation within the displayed window, earlier windows, line
+wrapping, current-window copy and native full-log export. Reading or selecting
+older output never stops the experiment. New output waits behind a paused window
+until you choose Follow latest. Missing files, read errors and source changes are
+reported separately while retained text remains available.
+
+Activity labels match the actual engine. Failed execution/validation and buggy
+candidate evaluation are shown as failures. Unknown historical fields remain
+inspectable without breaking the workspace. The latest recorded event is evidence
+of activity, not an inferred current phase for every parallel candidate.
+
 ## Results and files
 
 Completed experiments open on Results; running experiments initially open on

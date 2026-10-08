@@ -130,6 +130,16 @@ def artifact_revision(
     return file_revision(path)
 
 
+def _event_float(value: str) -> float | str:
+    """Keep undefined event numbers explicit without breaking HTTP JSON.
+
+    Python's engine event writer permits NaN/Infinity; very large exponents can
+    also overflow during parsing. These are diagnostic strings, not scores.
+    """
+    number = float(value)
+    return number if math.isfinite(number) else ("Infinity" if number > 0 else "-Infinity")
+
+
 def read_events(
     settings: Settings, run: dict[str, Any], *, tail: int = 200
 ) -> dict[str, Any]:
@@ -146,7 +156,7 @@ def read_events(
                     continue
                 count += 1
                 try:
-                    event = json.loads(line)
+                    event = json.loads(line, parse_constant=str, parse_float=_event_float)
                 except json.JSONDecodeError:
                     continue
                 if isinstance(event, dict):

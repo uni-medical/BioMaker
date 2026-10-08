@@ -3224,3 +3224,20 @@ kbd {
     max-width: none;
   }
 }
+
+.activity-context, .activity-navigation, .activity-navigation > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.activity-context { padding: 4px 0 0; }
+.activity-context strong { font-size: 12px; }
+.activity-context p { margin: 6px 0; color: var(--text); font-size: 13px; }
+.activity-explanation { color: var(--muted); font-size: 11px; line-height: 1.65; margin: 4px 0 18px; }
+.activity-navigation { color: var(--muted); font-size: 11px; border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 18px; }
+.run-activity .event-heading { flex-wrap: wrap; }
+.run-activity .event-body { min-width: 0; }
+.run-activity .event-body p, .run-activity .event-heading strong { overflow-wrap: anywhere; }
+.run-activity .event-data { max-height: 320px; overflow: auto; }

@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { ServiceState } from './sidecar';
-import type { ArtifactTarget, ArtifactSave } from './artifacts';
+import type { ArtifactTarget, ArtifactSave, ConsoleSave } from './artifacts';
 import type { DraftMutation } from './drafts';
 
 const invoke = (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args);
@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('biomaker', Object.freeze({
   openPath: (path: string) => invoke('biomaker:open-path', path),
   previewArtifact: (artifact: ArtifactTarget) => invoke('biomaker:preview-artifact', artifact),
   saveArtifact: (artifact: ArtifactSave) => invoke('biomaker:save-artifact', artifact),
+  saveConsole: (input: ConsoleSave) => invoke('biomaker:save-console', input),
   getAppInfo: () => invoke('biomaker:app-info'),
   getServiceState: () => invoke('biomaker:get-service-state'),
   retryService: () => invoke('biomaker:retry-service'),
