@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const profile = await mkdtemp(path.join(os.tmpdir(), 'biomaker-desktop-qa-'));
-const output = path.join(root, 'output', 'playwright');
+const output = process.env.BIOMAKER_QA_OUTPUT || path.join(root, 'output', 'playwright');
 await mkdir(output, { recursive: true });
 const env = { ...process.env, BIOMAKER_DESKTOP_HOME: profile, BIOMAKER_DESKTOP_USER_DATA: profile };
 delete env.ELECTRON_RUN_AS_NODE;
