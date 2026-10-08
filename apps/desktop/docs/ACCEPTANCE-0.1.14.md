@@ -2,8 +2,12 @@
 
 Target: macOS Apple silicon / arm64. Date: 2026-10-09.
 
-Status: source and development validation passed; package and installation
-acceptance pending.
+Release source: `03fafd895c222ef8e2066e1b74f41efe5fbc1192`.
+
+857 source, 102 development, 195 packaged and four offline engine checks passed.
+Package verification, the actual upgrade, independent runtime setup,
+retained-profile verification, installed synthetic CPU workflow and normal
+native launch passed on this Apple silicon Mac.
 
 ## Catalog and detail contract
 
@@ -91,6 +95,74 @@ each measurement. No actual profile, model, experiment or worker was used.
 ## Distribution boundaries
 
 Developer ID signing and Apple notarization remain required for public release.
-Only Apple silicon macOS has prior installed acceptance; Linux, Windows and
+Only Apple silicon macOS has installed acceptance; Linux, Windows and
 macOS x64 remain separate validation targets. Synthetic software tests do not
 establish biomedical performance or external model-provider access.
+
+## Packaged and installed acceptance
+
+`output/packaged-acceptance-0.1.14.json` records 195 checks across 16 suites: native
+62, UI 82 and service 51. All frozen-package attempts passed. The native review
+inspected 18 screenshots, including four catalog-refresh captures; the UI review
+inspected 22. Both rechecked raw and canonical temporary profile paths for process
+cleanup. No material layout regression was found. Existing transient toast and
+captured scroll-position observations remain recorded in the UI review. Recorded
+request traces are not an OS-wide network-capture claim.
+
+`output/package-verification-0.1.14.json` confirms clean source provenance,
+deep strict signatures, the Applications shortcut and complete application
+equality between the unpacked directory, read-only DMG and extracted ZIP.
+Signatures remain ad-hoc; this is not Developer ID or notarization acceptance.
+
+The application has 2,818 files and fingerprint
+`3b2c3ed05c0d2c2d7b86c6d0fb2932b21c3680f85f1642511638135549660730`.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `release/BioMaker-0.1.14-mac-arm64.dmg` | `510a552fb4fc74cc585e18dde7a09b47d276f8b311aaa53432b52f49b16c8e41` |
+| `release/BioMaker-0.1.14-mac-arm64.zip` | `52fdb26c4b0454eff4d4d876afa7785669664a99359958c41e1cc9ce27cb11cf` |
+
+The actual `/Applications/BioMaker.app` was upgraded from 0.1.13. The prior bundle
+is preserved at `release/installed-backups/BioMaker-0.1.13-20261009-062106.app`.
+The installer initially refused replacement while the old app was still running;
+raising its window and quitting normally allowed the upgrade. No files were
+replaced by that refused attempt.
+
+Native UI setup prepared the independent engine
+`engine-918f7133a2fe716db5d15551948c7fbd9a074da679249d2e8adcb57b73f59775`.
+The previous `engine-0e32352cb38aa727873ec64a1550067ded4e99e9075ab1358988d488341f9d4c`
+remains unchanged. Bundled engine source SHA-256 is
+`245052d1ca1523e58f50018d2c915cb0c9b9a0673e150875f55dcbb0acc42e83`.
+
+Installed read-only verification used system-only PATH and confirmed that
+configuration, preferences, exact draft bytes and complete SQLite rows were
+preserved (zero actual user runs). The original draft retains SHA-256
+`e4b3f05ea91babc4acc1ae81b7093c3bca0fe21af83208dcc675ee0ebe9948f7`.
+Provider credentials and model selection remain unconfigured.
+
+`output/desktop-workflow-acceptance-0.1.14.json` passed in 23.092 seconds. The
+installed application submitted an isolated synthetic CPU experiment, executed
+the durable queue, inspected results/candidates, exported a report natively and
+read logs. A local model fixture and inherited network restrictions were used;
+this is software acceptance, not biomedical model validation. The full isolated
+home and seven screenshots are retained at `output/qa/desktop-workflow-0.1.14/`
+with symlinks preserved. The post-workflow verification confirms that the complete
+installed bundle still matches the verified package and the actual profile is
+unchanged.
+
+## Offline recovery and final launch
+
+`output/engine-health-packaged-0.1.14.json` records four passed checks in 118.050
+seconds. In a network-denying macOS sandbox, the packaged service detected a
+dependency removed only from an APFS clone, preserved failure across restart,
+reinstalled locked packages offline and passed a second fixed CPU check.
+Complete fingerprints of the original engine (29,583 files) and package cache
+(29,533 files) match before and after. The clone is preserved; its receipt and
+zero-owned-process verification are copied to `output/qa/engine-health-0.1.14/`.
+
+Final CUA launch raised the actual application and verified version 0.1.14,
+local runtime ready and the saved original blank draft. The app is left open
+there. Profile verification after normal launch again confirmed unchanged
+configuration, preferences, draft bytes and complete run rows. The goal remains
+active for further iteration; cold and actively changing histories still need
+work before their entire request IO can be described as bounded.

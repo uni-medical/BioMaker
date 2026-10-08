@@ -293,3 +293,10 @@ First reads, changed files, oversized uncached summaries and cache eviction can
 still require full history parsing. The cache payload limit is not a bound on
 transient parser memory, total service memory or total request IO. Preserve the
 existing event-count and last-5,000-valid-event catalog semantics.
+
+The 0.1.14 frozen source is `03fafd895c222ef8e2066e1b74f41efe5fbc1192`.
+857 source, 102 development, 195 packaged and four offline engine checks passed.
+Package equality/signatures, actual installation, independent engine setup,
+retained-profile verification, installed synthetic CPU training and normal
+native launch passed. See [ACCEPTANCE-0.1.14.md](ACCEPTANCE-0.1.14.md) for measured
+costs, cold-read limitations, source-bound checksums and acceptance receipts.

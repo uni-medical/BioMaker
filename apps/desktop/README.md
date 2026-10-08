@@ -157,11 +157,19 @@ cd ../webui
 uv run --group dev pytest
 ```
 
-Version 0.1.13 has passed 826 source checks, 89 development checks, 182 packaged
+Version 0.1.14 has passed 857 source checks, 102 development checks, 195 packaged
 checks and four offline engine checks. Package verification, the actual upgrade,
 independent engine setup, retained drafts/configuration/run records, installed
 synthetic CPU training and normal native launch also passed on this Apple silicon Mac.
-See the [0.1.13 acceptance record](docs/ACCEPTANCE-0.1.13.md) and
+See the [0.1.14 acceptance record](docs/ACCEPTANCE-0.1.14.md) and
 [release policy](docs/RELEASE.md) for scopes, receipts and remaining platform and
 signing boundaries. Software acceptance does not establish scientific or clinical
 model validity.
+
+Version 0.1.14 reduces repeated experiment reads with indexed run lookup and a
+bounded, service-owned observation cache. Fresh ledger records still determine
+lifecycle and actions. File changes invalidate summaries and refresh the UI,
+including same-size/same-mtime replacements. In the isolated 100-run benchmark,
+warm list reads fell from 257 ms to 6.7 ms and warm detail reads from 259 ms to
+0.25 ms. These are instrumented endpoint timings; first reads and changed
+histories can still scan full files.
