@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -172,9 +173,13 @@ def read_results_summary(settings: Settings, run: dict[str, Any]) -> dict[str, A
     metric_rows: list[tuple[float, dict[str, str]]] = []
     for row in rows:
         try:
-            metric_rows.append((float(row.get("metric", "")), row))
+            metric = float(row.get("metric", ""))
         except (TypeError, ValueError):
             continue
+        # Undefined evaluator scores can appear in historical result tables.
+        # They are not comparable and cannot be serialized as HTTP JSON.
+        if math.isfinite(metric):
+            metric_rows.append((metric, row))
     best_metric = None
     if metric_rows:
         maximize = str(metric_rows[-1][1].get("maximize", "true")).lower() != "false"

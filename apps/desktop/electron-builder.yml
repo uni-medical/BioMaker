@@ -1,0 +1,73 @@
+appId: org.biomaker.desktop
+productName: BioMaker
+copyright: Copyright © BioMaker contributors
+directories:
+  output: release
+  buildResources: build
+asar: true
+npmRebuild: false
+beforePack: scripts/check-package.cjs
+files:
+  - dist/**
+  - dist-electron/**
+  - '!dist-electron/**/*.test.js'
+  - package.json
+extraResources:
+  - from: build/runtime
+    to: runtime
+    filter:
+      - '**/*'
+      - '!**/__pycache__/**'
+      - '!**/*.pyc'
+  - from: service
+    to: service
+    filter:
+      - '**/*.py'
+      - '!**/tests/**'
+      - '!**/__pycache__/**'
+mac:
+  identity: '-'
+  category: public.app-category.developer-tools
+  icon: build/icon.icns
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
+  artifactName: '${productName}-${version}-mac-${arch}.${ext}'
+  extendInfo:
+    NSHighResolutionCapable: true
+dmg:
+  title: BioMaker
+  window:
+    width: 560
+    height: 360
+  contents:
+    - x: 150
+      y: 180
+    - x: 410
+      y: 180
+      type: link
+      path: /Applications
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+      arch: [x64]
+  artifactName: '${productName}-${version}-windows-${arch}.${ext}'
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+linux:
+  icon: build/icon.png
+  category: Science
+  target: [AppImage, deb]
+  artifactName: '${productName}-${version}-linux-${arch}.${ext}'
+publish: null

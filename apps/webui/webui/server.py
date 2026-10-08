@@ -338,7 +338,11 @@ def create_app(
     ) -> dict[str, Any]:
         _require_loopback(request)
         values = read_env_values(app_settings.env_file)
-        configured_base_url = values.get("OPENAI_BASE_URL")
+        # OpenAI's client defaults to this URL when the setting is blank. Use
+        # the same effective provider when deciding whether to reuse its key.
+        configured_base_url = (
+            values.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        )
         base_url = payload.base_url or configured_base_url
         if payload.api_key:
             api_key = payload.api_key

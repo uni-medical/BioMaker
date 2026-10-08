@@ -369,6 +369,32 @@ def test_queue_and_system_resources_api(settings, monkeypatch):
         assert resources.headers["cache-control"] == "no-store"
 
 
+def test_model_discovery_uses_default_openai_url_without_leaking_saved_key(
+    settings, monkeypatch
+):
+    settings.env_file.write_text(
+        "OPENAI_API_KEY=default-provider-secret\n", encoding="utf-8"
+    )
+    calls = []
+
+    def fake_discover(base_url, api_key):
+        calls.append((base_url, api_key))
+        return {"status": "ok", "models": ["test-model"], "base_url": base_url}
+
+    monkeypatch.setattr(server, "discover_models", fake_discover)
+    with TestClient(create_app(settings), client=("127.0.0.1", 50000)) as client:
+        for payload in ({}, {"base_url": "https://api.openai.com/v1"}):
+            response = client.post("/api/models/discover", json=payload)
+            assert response.status_code == 200
+            assert calls[-1] == ("https://api.openai.com/v1", "default-provider-secret")
+            assert "default-provider-secret" not in response.text
+        response = client.post(
+            "/api/models/discover", json={"base_url": "https://other.example/v1"}
+        )
+        assert response.status_code == 200
+        assert calls[-1] == ("https://other.example/v1", None)
+
+
 def test_model_discovery_uses_configured_or_supplied_credentials(settings, monkeypatch):
     settings.env_file.write_text(
         "OPENAI_BASE_URL=https://configured.example/v1\n"

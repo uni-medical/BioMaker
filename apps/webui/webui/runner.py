@@ -318,6 +318,17 @@ def _run_bootstrap_main(database_path: str, run_id: str, launch_token: str) -> i
             os.chdir(working_directory)
         environment = os.environ.copy()
         environment.pop(RUN_BOOTSTRAP_ENV, None)
+        if environment.get("BIOMAKER_DESKTOP_HOME"):
+            # The portable sidecar needs its bundled service dependencies while
+            # bootstrapping. Experiments must resolve only their engine venv.
+            environment.pop("PYTHONPATH", None)
+            # A detached queue supervisor may outlive an application update.
+            # Each queued command retains its engine checkout in ``cwd``; never
+            # synchronize a newer project's packages into an older engine venv.
+            if working_directory:
+                environment["UV_PROJECT_ENVIRONMENT"] = str(
+                    Path(working_directory).resolve() / ".venv"
+                )
         os.execvpe(command[0], command, environment)
     except Exception as exc:  # noqa: BLE001 - os.exec boundary
         error = f"Run exec failed: {type(exc).__name__}: {exc}"

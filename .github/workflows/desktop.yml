@@ -1,0 +1,63 @@
+name: Desktop checks
+
+on:
+  pull_request:
+    paths: ['apps/desktop/**', 'apps/webui/**', 'biomaker/**', 'pyproject.toml', 'requirements.txt', 'uv.lock', '.github/workflows/desktop.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable-ui:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=high
+
+  macos-acceptance:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.11.7'
+      - run: npm ci
+      - run: npm run icons
+      - run: npm run prepare:runtime
+      - run: npm run build
+      - run: npm test
+      - run: uv run --project ../webui --group dev pytest ../../apps/desktop/service/tests
+      - run: uv run --project ../webui --group dev pytest ../webui/tests
+      - run: npm run test:e2e
+      - run: npx electron-builder --config electron-builder.yml --mac --$(node -p process.arch)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: biomaker-macos-unsigned-review
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.zip
+            apps/desktop/output/playwright/*.png
+          retention-days: 14

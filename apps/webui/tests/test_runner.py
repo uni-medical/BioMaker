@@ -341,6 +341,71 @@ def test_pre_manifest_exec_failure_is_failed_not_interrupted(settings):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="bootstrap recovery is POSIX-only")
+@pytest.mark.parametrize("desktop", [False, True])
+def test_bootstrap_retains_service_imports_but_isolates_desktop_engine(
+    settings, desktop
+):
+    """A real bootstrap imports the sidecar, then execs with the right engine path."""
+    settings.ensure_directories()
+    database = settings.state_dir / "runs.sqlite3"
+    output = settings.state_dir / "engine-environment.json"
+    store = SQLiteRunStore(database)
+    store.add_record(
+        "runs",
+        {
+            "id": "desktop-env-test",
+            "managed": True,
+            "status": "running",
+            "launch_token": "desktop-env-token",
+            "pid": None,
+            "cwd": str(settings.method_root),
+            "command": [
+                sys.executable,
+                "-c",
+                "import json, os, pathlib, sys; "
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
+                "'pythonpath': os.environ.get('PYTHONPATH'), "
+                "'environment': os.environ.get('UV_PROJECT_ENVIRONMENT')}))",
+                str(output),
+            ],
+        },
+    )
+    store.close()
+    environment = os.environ.copy()
+    sidecar_imports = str(Path(runner_module.__file__).resolve().parents[1])
+    environment["PYTHONPATH"] = sidecar_imports + os.pathsep + "/desktop-test-sentinel"
+    environment["UV_PROJECT_ENVIRONMENT"] = "/previous-engine-version/.venv"
+    if desktop:
+        environment["BIOMAKER_DESKTOP_HOME"] = str(settings.workspace_root)
+    else:
+        environment.pop("BIOMAKER_DESKTOP_HOME", None)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from webui.runner import _run_bootstrap_main; "
+            "sys.exit(_run_bootstrap_main(sys.argv[1], 'desktop-env-test', 'desktop-env-token'))",
+            str(database),
+        ],
+        cwd=settings.method_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        start_new_session=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output.read_text()) == {
+        "pythonpath": None if desktop else environment["PYTHONPATH"],
+        "environment": (
+            str(settings.method_root.resolve() / ".venv")
+            if desktop
+            else "/previous-engine-version/.venv"
+        ),
+    }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bootstrap recovery is POSIX-only")
 def test_bootstrap_self_registers_when_launching_manager_never_attaches(settings):
     settings.ensure_directories()
     database = settings.state_dir / "runs.sqlite3"

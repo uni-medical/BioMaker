@@ -1,0 +1,5 @@
+{
+  "baseRequirementsSha256": "5eaa5b751a5942a707d2022bb2ba9d6bf150b725c6dd5d14bbaab36710fb768b",
+  "basePyprojectSha256": "86b19a478cd21c9e5fa01c069f35363c2d81c6548ef012e063025110f4a984b3",
+  "purpose": "Desktop distribution dependency lock; historical research environment remains unchanged."
+}
