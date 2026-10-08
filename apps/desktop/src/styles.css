@@ -3059,6 +3059,36 @@ kbd {
   border-radius: 10px;
   background: var(--background);
 }
+.provider-saved-address {
+  overflow-wrap: anywhere;
+}
+.provider-settings-review {
+  margin-top: 16px;
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--background);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.provider-settings-review > p {
+  margin: 9px 0 12px;
+  color: var(--muted);
+}
+.provider-settings-review dl {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+}
+.provider-settings-review dl > div {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.7fr) minmax(0, 1.6fr);
+  gap: 10px;
+}
+.provider-settings-review dt { color: var(--muted); }
+.provider-settings-review dd { margin: 0; overflow-wrap: anywhere; }
+.provider-review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.provider-review-actions button { white-space: normal; text-align: left; }
 .provider-check-action {
   display: flex;
   align-items: flex-start;

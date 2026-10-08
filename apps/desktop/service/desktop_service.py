@@ -31,9 +31,10 @@ from history_import import HistoryImporter, HistoryImportError
 from run_metadata import RunMetadataStore, RunMetadataUpdate, RunMetadataError
 from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, provision_native_runtime
 from provider_check import ProviderChecker, check_request
+from provider_settings import ProviderSettings, provider_settings_request
 from dataset_inspection import DatasetInspector, inspect_request, ADMISSION_MESSAGES
 
-VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.9")
+VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.10")
 
 
 class HistoryPreviewRequest(BaseModel):
@@ -639,6 +640,22 @@ def create_desktop_app(
 
     settings = Settings.default()
     app = create_app(settings)
+    # Replace inherited routes before adding desktop policy; duplicate routes
+    # appended after the shared handlers would never intercept those requests.
+    app.router.routes = [route for route in app.router.routes if not (
+        getattr(route, "path", None) == "/api/env"
+        and getattr(route, "methods", set()) & {"GET", "PUT"}
+    )]
+    provider_settings = ProviderSettings(config.env_file)
+
+    @app.get("/api/env")
+    @app.put("/api/env")
+    @app.get("/api/env/", include_in_schema=False)
+    @app.put("/api/env/", include_in_schema=False)
+    async def desktop_provider_settings(request: Request):
+        return await provider_settings_request(request, provider_settings)
+
+    app.state.provider_settings = provider_settings
     engine = installer or EngineInstaller(config)
     history = HistoryImporter(settings, app.state.manager)
     metadata = RunMetadataStore(settings.state_dir / "desktop-metadata.sqlite3", app.state.run_store)

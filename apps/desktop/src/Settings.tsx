@@ -21,6 +21,8 @@ import ServiceRecovery from "./ServiceRecovery";
 import {
   errorMessage,
   providerCheckMessage,
+  providerSettingsCode,
+  providerSettingsMessage,
   request,
   sameProviderBaseUrl,
   serviceStatusLabel,
@@ -80,6 +82,10 @@ export default function Settings({
   toast: (s: string) => void;
 }) {
   const [section, setSection] = useState<Section>(initialSection || "provider");
+  const [baseline, setBaseline] = useState(env);
+  const [reviewRequired, setReviewRequired] = useState(false);
+  const [reviewedSettings, setReviewedSettings] = useState<{ config: EnvConfig; serviceRevision: number } | null>(null);
+  const [reviewMessage, setReviewMessage] = useState("");
   const [base, setBase] = useState(env?.values.OPENAI_BASE_URL?.value || "");
   const [key, setKey] = useState("");
   const [model, setModel] = useState(
@@ -101,12 +107,15 @@ export default function Settings({
   const [confirmRepair, setConfirmRepair] = useState(false);
   const [cancelRequested, setCancelRequested] = useState(false);
   const runtimeRequest = useRef(false);
-  const providerRequest = useRef<"save" | "discover" | "check" | null>(null);
+  const providerRequest = useRef<"save" | "read" | "discover" | "check" | null>(null);
   const providerGeneration = useRef(0);
   const mounted = useRef(true);
   const knownEnv = useRef(env);
+  const providerService = useRef(serviceState);
+  const reviewSequence = useRef(0);
   const repairCancel = useRef<HTMLButtonElement>(null);
   const repairButton = useRef<HTMLButtonElement>(null);
+  const baseInput = useRef<HTMLInputElement>(null);
   const currentService = useRef(serviceState);
   currentService.current = serviceState;
   const closeState = useRef({ dirty: false, saving: false });
@@ -118,13 +127,16 @@ export default function Settings({
   const runtimeCancelled = /^(Installation|Engine check|Engine repair) cancelled\.$/.test(engine?.engine.error || "");
   const checkedAt = engine?.engine.checked_at && Number.isFinite(Date.parse(engine.engine.checked_at))
     ? new Date(engine.engine.checked_at).toLocaleString(lang === "zh" ? "zh-CN" : "en-US") : null;
-  const configured = !!env?.values.OPENAI_API_KEY?.configured;
-  const canUseSavedKey = configured && !removeKey && sameProviderBaseUrl(base, env?.values.OPENAI_BASE_URL?.value || "");
-  const effectiveKey = !!key.trim() || canUseSavedKey;
+  const configured = !!baseline?.values.OPENAI_API_KEY?.configured;
+  const savedBase = baseline?.values.OPENAI_BASE_URL?.value || "";
+  const sameSavedAddress = sameProviderBaseUrl(base, savedBase);
+  const canUseSavedKey = configured && !removeKey && sameSavedAddress && !reviewRequired;
+  const effectiveKey = !removeKey && (!!key.trim() || canUseSavedKey);
+  const needsReplacementKey = configured && !sameSavedAddress && !key.trim() && !removeKey;
   const checkTarget = model.trim() || modelOverride?.trim() || "";
   const effectiveModel = !!checkTarget;
   const savedProviderReady =
-    configured && !!(env?.values.BIOMAKER_MAIN_MODEL?.value || modelOverride);
+    configured && !!(baseline?.values.BIOMAKER_MAIN_MODEL?.value || modelOverride);
   const invalidateProvider = (clearModels = true) => {
     providerGeneration.current += 1;
     setProviderResult(null);
@@ -140,12 +152,28 @@ export default function Settings({
     setSaved(false);
     setError("");
   };
+  const requireSettingsReview = (message: string) => {
+    invalidateProvider();
+    reviewSequence.current += 1;
+    setReviewRequired(true);
+    setReviewedSettings(null);
+    setReviewMessage(message);
+    setError("");
+    setSaved(false);
+  };
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; providerGeneration.current += 1; };
+    return () => { mounted.current = false; providerGeneration.current += 1; reviewSequence.current += 1; };
   }, []);
   useEffect(() => {
     invalidateProvider();
+    const previous = providerService.current;
+    providerService.current = serviceState;
+    if (previous.revision !== serviceState.revision || previous.status !== serviceState.status) {
+      reviewSequence.current += 1;
+      setReviewedSettings(null);
+      if (closeState.current.dirty) requireSettingsReview(t("本地服务状态已变化。输入已保留，请读取并核对最新配置后再保存。", "The local service changed. Your inputs are preserved. Read and review the latest settings before saving."));
+    }
   }, [serviceState.revision, serviceState.status]);
   useEffect(() => {
     invalidateProvider(false);
@@ -174,8 +202,17 @@ export default function Settings({
     if (env !== knownEnv.current) {
       knownEnv.current = env;
       invalidateProvider();
+      if (dirty && env?.settings_revision && baseline?.settings_revision && env.settings_revision !== baseline.settings_revision) {
+        // A recovery refresh may finish beside the explicit settings read.
+        // Keep that read (or its identical snapshot) usable without adopting
+        // anything into the dirty form. A different reviewed snapshot expires.
+        if (!reviewRequired || (reviewedSettings && reviewedSettings.config.settings_revision !== env.settings_revision)) {
+          requireSettingsReview(providerSettingsMessage("conflict", t));
+        }
+      }
     }
     if (env && !dirty) {
+      setBaseline(env);
       setBase(env.values.OPENAI_BASE_URL?.value || "");
       setModel(env.values.BIOMAKER_MAIN_MODEL?.value || "");
     }
@@ -194,7 +231,9 @@ export default function Settings({
   }, [confirmRepair]);
 
   async function save() {
-    if (pending || providerRequest.current || runtimeRequest.current || !env || !serviceReady) return;
+    if (pending || providerRequest.current || runtimeRequest.current || !baseline || !serviceReady || reviewRequired) return;
+    if (needsReplacementKey) { setError(providerSettingsMessage("key_required", t)); return; }
+    if (!sameProviderBaseUrl(base, base)) { setError(providerSettingsMessage("invalid_url", t)); return; }
     providerRequest.current = "save";
     const generation = providerGeneration.current;
     const revision = serviceState.revision;
@@ -203,37 +242,29 @@ export default function Settings({
     setConfirmClose(false);
     setError("");
     try {
-      if (base.trim()) {
-        const url = new URL(base);
-        if (!["https:", "http:"].includes(url.protocol))
-          throw new Error(
-            t(
-              "API 地址需要以 https:// 或 http:// 开头。",
-              "Use an API address beginning with https:// or http://.",
-            ),
-          );
-      }
       const values: Record<string, string | null> = {
         OPENAI_BASE_URL: base.trim() || null,
         BIOMAKER_MAIN_MODEL: model.trim() || null,
+        ...(baseline.settings_revision ? { expected_revision: baseline.settings_revision } : {}),
       };
-      if (key.trim()) values.OPENAI_API_KEY = key.trim();
-      else if (removeKey) values.OPENAI_API_KEY = null;
+      if (removeKey) values.OPENAI_API_KEY = null;
+      else if (key.trim()) values.OPENAI_API_KEY = key.trim();
       if (serper.trim()) values.SERPER_API_KEY = serper.trim();
       if (jina.trim()) values.JINA_API_KEY = jina.trim();
       const result = await request<EnvConfig>("/api/env", "PUT", values);
       if (!mounted.current) return;
       if (generation !== providerGeneration.current || currentService.current.status !== "ready" || currentService.current.revision !== revision) {
-        setError(t("服务状态已变化，请重新读取已保存的配置后确认。", "The service state changed. Reload saved settings to confirm the result."));
+        requireSettingsReview(providerSettingsMessage("uncertain", t));
         return;
       }
       // Saving the exact tested form preserves its result; it never triggers another test.
       if (!sameProviderBaseUrl(base, result.values.OPENAI_BASE_URL?.value || "") ||
           model.trim() !== (result.values.BIOMAKER_MAIN_MODEL?.value || "").trim() ||
-          (!!key.trim() || (configured && !removeKey)) !== !!result.values.OPENAI_API_KEY?.configured) {
+          (!removeKey && (!!key.trim() || configured)) !== !!result.values.OPENAI_API_KEY?.configured) {
         invalidateProvider();
       }
       knownEnv.current = result;
+      setBaseline(result);
       onSaved(result);
       setKey("");
       setSerper("");
@@ -258,13 +289,74 @@ export default function Settings({
     } catch (e) {
       if (mounted.current) {
         invalidateProvider();
-        setError(errorMessage(e));
+        const message = errorMessage(e);
+        const code = providerSettingsCode(message);
+        if (code === "conflict" || code === "uncertain" || currentService.current.status !== "ready" || currentService.current.revision !== revision) {
+          requireSettingsReview(providerSettingsMessage(code === "conflict" ? "conflict" : "uncertain", t));
+        } else setError(code ? providerSettingsMessage(code, t) : message);
       }
     } finally {
       providerRequest.current = null;
       closeState.current.saving = false;
       if (mounted.current) setPending("");
     }
+  }
+  async function readLatestSettings() {
+    if (pending || providerRequest.current || runtimeRequest.current || !serviceReady) return;
+    providerRequest.current = "read";
+    const sequence = ++reviewSequence.current;
+    const revision = serviceState.revision;
+    const incomingAtStart = knownEnv.current;
+    const current = () => mounted.current && reviewSequence.current === sequence &&
+      currentService.current.status === "ready" && currentService.current.revision === revision;
+    setPending("settings-read");
+    setReviewedSettings(null);
+    setError("");
+    invalidateProvider();
+    try {
+      const config = await request<EnvConfig>("/api/env");
+      if (!current()) return;
+      if (knownEnv.current !== incomingAtStart && knownEnv.current?.settings_revision && config.settings_revision &&
+          knownEnv.current.settings_revision !== config.settings_revision) {
+        requireSettingsReview(providerSettingsMessage("conflict", t));
+        return;
+      }
+      setReviewedSettings({ config, serviceRevision: revision });
+    } catch (e) {
+      if (current()) setError(providerSettingsMessage(providerSettingsCode(errorMessage(e)) || "io_error", t));
+    } finally {
+      providerRequest.current = null;
+      if (mounted.current) setPending("");
+    }
+  }
+  function adoptReviewedSettings(replaceInputs: boolean) {
+    if (!reviewedSettings || pending || !serviceReady) return;
+    if (reviewedSettings.serviceRevision !== currentService.current.revision) {
+      requireSettingsReview(providerSettingsMessage("conflict", t));
+      return;
+    }
+    const config = reviewedSettings.config;
+    invalidateProvider();
+    knownEnv.current = config;
+    setBaseline(config);
+    onSaved(config);
+    setReviewRequired(false);
+    setReviewedSettings(null);
+    setReviewMessage("");
+    setError("");
+    setSaved(false);
+    setConfirmClose(false);
+    if (replaceInputs) {
+      setBase(config.values.OPENAI_BASE_URL?.value || "");
+      setModel(config.values.BIOMAKER_MAIN_MODEL?.value || "");
+      setKey(""); setSerper(""); setJina(""); setRemoveKey(false);
+      closeState.current.dirty = false;
+      setDirty(false);
+    } else {
+      closeState.current.dirty = true;
+      setDirty(true);
+    }
+    requestAnimationFrame(() => baseInput.current?.focus());
   }
   async function discover() {
     if (pending || providerRequest.current || runtimeRequest.current || !env || !serviceReady || !effectiveKey) return;
@@ -435,6 +527,7 @@ export default function Settings({
               <label className="field">
                 <span>{t("API 地址", "API base URL")}</span>
                 <input
+                  ref={baseInput}
                   disabled={!env || saving}
                   type="url"
                   value={base}
@@ -459,7 +552,7 @@ export default function Settings({
                   {configured && !removeKey && (
                     <span className="configured">
                       <Check size={12} />
-                      {t("已配置", "Configured")}
+                      {sameSavedAddress ? t("已保存", "Saved") : t("原地址已保存", "Saved for original address")}
                     </span>
                   )}
                 </span>
@@ -474,11 +567,13 @@ export default function Settings({
                       changed("connection");
                     }}
                     placeholder={
-                      configured && !removeKey
+                      configured && !removeKey && sameSavedAddress
                         ? t(
                             "留空保留现有密钥",
                             "Leave blank to keep existing key",
                           )
+                        : configured && !removeKey && !sameSavedAddress
+                          ? t("输入新地址的 API Key", "Enter the new address's API key")
                         : t(
                             "输入服务提供商的 API Key",
                             "Enter your provider API key",
@@ -487,7 +582,7 @@ export default function Settings({
                     autoComplete="new-password"
                     spellCheck={false}
                   />
-                  {configured && (
+                  {(configured || removeKey) && (
                     <button
                       type="button"
                       className={`icon-button ${removeKey ? "danger-text" : ""}`}
@@ -503,21 +598,17 @@ export default function Settings({
                     </button>
                   )}
                 </div>
+                {configured && <small className="provider-saved-address">{t("已保存密钥对应地址：", "Saved key address: ")}{savedBase || "https://api.openai.com/v1"}</small>}
                 {removeKey && (
                   <small className="danger-text">
                     {t(
-                      "保存后将移除密钥。再次点击垃圾桶可撤销。",
-                      "Saving will remove the key. Click the trash icon again to undo.",
+                      "保存后将移除密钥，输入框中的新密钥也不会保存。再次点击垃圾桶可撤销。",
+                      "Saving will remove the key; any new key in the field will not be saved either. Click the trash icon again to undo.",
                     )}
                   </small>
                 )}
-                {configured && !removeKey && !key.trim() && !canUseSavedKey && (
-                  <small>
-                    {t(
-                      "API 地址已更改，请填写此地址的密钥后再获取模型或测试。已保存的密钥不会用于新地址。",
-                      "The API address changed. Enter a key for this address to retrieve models or test. The saved key will not be used at the new address.",
-                    )}
-                  </small>
+                {needsReplacementKey && (
+                  <small className="danger-text provider-switch-note">{providerSettingsMessage("key_required", t)}</small>
                 )}
               </label>
               <div className="model-label">
@@ -688,7 +779,7 @@ export default function Settings({
                   <label className="field">
                     <span>
                       Serper API Key{" "}
-                      {env?.values.SERPER_API_KEY?.configured && (
+                      {baseline?.values.SERPER_API_KEY?.configured && (
                         <Check size={13} />
                       )}
                     </span>
@@ -710,7 +801,7 @@ export default function Settings({
                   <label className="field">
                     <span>
                       Jina API Key{" "}
-                      {env?.values.JINA_API_KEY?.configured && (
+                      {baseline?.values.JINA_API_KEY?.configured && (
                         <Check size={13} />
                       )}
                     </span>
@@ -738,6 +829,27 @@ export default function Settings({
                 )}
               </p>
               {error && <Notice danger>{error}</Notice>}
+              {reviewRequired && <section className="provider-settings-review" data-state={pending === "settings-read" ? "loading" : reviewedSettings ? "loaded" : "required"} aria-label={t("核对已保存配置", "Review saved settings")}>
+                <strong>{t("先核对已保存的配置", "Review saved settings first")}</strong>
+                <p role="status">{reviewMessage || providerSettingsMessage("conflict", t)}</p>
+                <button className="secondary-button" disabled={!!pending || !serviceReady} onClick={readLatestSettings}>
+                  {pending === "settings-read" ? <Spinner size={14} /> : <RefreshCw size={14} />}
+                  {t("读取最新已保存配置", "Read latest saved settings")}
+                </button>
+                {reviewedSettings && <>
+                  <p>{t("下列是刚读取的已保存配置。表单中的输入尚未更改，密钥仅显示配置状态。", "These are the saved settings just read. Your form inputs are unchanged; keys show only whether they are configured.")}</p>
+                  <dl>
+                    <div><dt>{t("API 地址", "API address")}</dt><dd data-field="base">{reviewedSettings.config.values.OPENAI_BASE_URL?.value || "https://api.openai.com/v1"}</dd></div>
+                    <div><dt>{t("默认模型", "Default model")}</dt><dd data-field="model">{reviewedSettings.config.values.BIOMAKER_MAIN_MODEL?.value || t("未设置", "Not set")}</dd></div>
+                    {[["OPENAI_API_KEY", "API Key", "api-key"], ["SERPER_API_KEY", "Serper API Key", "serper-key"], ["JINA_API_KEY", "Jina API Key", "jina-key"]].map(([field, label, id]) => <div key={field}><dt>{label}</dt><dd data-field={id}>{reviewedSettings.config.values[field]?.configured ? t("已配置", "Configured") : t("未配置", "Not configured")}</dd></div>)}
+                  </dl>
+                  <p>{t("载入会替换所有未保存输入。保留输入后可继续修改；点击“保存配置”才会覆盖上面的配置。", "Loading replaces all unsaved inputs. Keeping inputs lets you continue editing; only Save settings replaces the configuration shown above.")}</p>
+                  <div className="provider-review-actions">
+                    <button className="secondary-button" disabled={!!pending || !serviceReady} onClick={() => adoptReviewedSettings(true)}>{t("载入已保存配置并替换输入", "Load saved settings and replace inputs")}</button>
+                    <button className="secondary-button" disabled={!!pending || !serviceReady} onClick={() => adoptReviewedSettings(false)}>{t("保留输入并继续编辑", "Keep inputs and continue editing")}</button>
+                  </div>
+                </>}
+              </section>}
               <div className="settings-footer">
                 <span className="muted">
                   {saving
@@ -758,7 +870,7 @@ export default function Settings({
                 )}
                 <button
                   className="primary-button"
-                  disabled={!!pending || !dirty || !env || !serviceReady}
+                  disabled={!!pending || !dirty || !baseline || !serviceReady || reviewRequired || needsReplacementKey}
                   onClick={save}
                 >
                   {pending === "save" ? <Spinner /> : <Check size={15} />}

@@ -13,6 +13,7 @@ import { readResponse } from './response';
 import { RunNotifications, type RunCompletion } from './run-notifications';
 import { CloseGuard, type CloseBlockReason } from './close-guard';
 import { datasetInspectionBody } from './dataset-inspection';
+import { saveProviderSettings } from './provider-settings';
 
 app.setName('BioMaker');
 // Test/review installs can use a separate profile without touching real projects.
@@ -219,7 +220,9 @@ function setupIPC() {
     if (!sidecar || serviceState.status !== 'ready') throw new Error(serviceState.message ?? (serviceState.status === 'failed' ? t('本地服务不可用。请重试本地服务，或导出诊断。', 'The local service is unavailable. Retry the service or export diagnostics.') : serviceState.status === 'reconnecting' ? t('正在重新连接 BioMaker 服务，请稍后重试。', 'BioMaker is reconnecting. Please try again shortly.') : t('BioMaker 服务正在启动，请稍后重试。', 'BioMaker is starting. Please try again shortly.')));
     const isRunResponse = /^\/api\/runs(?:\/[^/]+(?:\/(?:requeue|stop|cancel))?)?$/.test(request.path.split('?')[0]);
     const ticket = isRunResponse ? runNotifications.issue() : 0;
-    const response = await fetchService(`${sidecar.origin}${request.path}`, { method: request.method, body: request.body, headers: { Authorization: `Bearer ${sidecar.token}`, ...(request.body === undefined ? {} : { 'Content-Type': 'application/json' }) }, redirect: 'error', signal: AbortSignal.timeout(45_000) });
+    const send = () => fetchService(`${sidecar.origin}${request.path}`, { method: request.method, body: request.body, headers: { Authorization: `Bearer ${sidecar.token}`, ...(request.body === undefined ? {} : { 'Content-Type': 'application/json' }) }, redirect: 'error', signal: AbortSignal.timeout(45_000) });
+    if (request.method === 'PUT' && pathname === '/api/env') return saveProviderSettings(send);
+    const response = await send();
     const result = await readResponse(response, request.path.startsWith('/api/'));
     if (isRunResponse) observeRuns(result, ticket);
     return result;

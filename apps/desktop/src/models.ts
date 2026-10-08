@@ -32,6 +32,22 @@ export function providerCheckMessage(code: string, t: Translate): string {
     default: return t("本次测试未能完成，未自动重试。请检查服务状态后再试。", "This test could not finish and was not retried. Check the service before trying again.");
   }
 }
+export function providerSettingsCode(message: string): string | null {
+  return /\[provider_settings:(key_required|conflict|invalid_url|invalid_key|invalid_request|busy|io_error|uncertain)\]/.exec(message)?.[1] || null;
+}
+export function providerSettingsMessage(code: string, t: Translate): string {
+  switch (code) {
+    case "key_required": return t("API 地址已更改。请填写新地址的密钥，或明确移除已保存的密钥后再保存。", "The API address changed. Enter a key for the new address, or explicitly remove the saved key before saving.");
+    case "conflict": return t("已保存的配置发生了变化。你的输入已保留，请读取并核对最新配置后再保存。", "Saved settings have changed. Your inputs are preserved. Read and review the latest settings before saving.");
+    case "invalid_url": return t("API 地址无效，请填写完整的 http:// 或 https:// 基础地址。", "Invalid API address. Enter the full http:// or https:// base URL.");
+    case "invalid_key": return t("密钥格式无效，请检查是否包含换行或其它无效字符。输入已保留。", "Invalid key format. Check for line breaks or other invalid characters. Your inputs are preserved.");
+    case "invalid_request": return t("配置内容无法保存，请检查输入；必要时读取最新配置后再试。", "The settings could not be saved. Check your inputs, or read the latest settings before trying again.");
+    case "busy": return t("另一项配置操作正在进行，输入已保留。请稍后重试。", "Another settings operation is in progress. Your inputs are preserved. Try again shortly.");
+    case "io_error": return t("无法读写本机配置，输入已保留。请检查磁盘访问权限后重试。", "Local settings could not be read or written. Your inputs are preserved. Check disk access permissions and try again.");
+    case "uncertain": return t("未能确认配置是否保存成功，输入已保留。请读取并核对最新配置后再决定是否保存。", "The save outcome could not be confirmed. Your inputs are preserved. Read and review the latest settings before deciding whether to save.");
+    default: return t("未能确认配置操作结果，输入已保留。请读取最新配置后再决定是否保存。", "The settings operation could not be confirmed. Your inputs are preserved. Read the latest settings before deciding whether to save.");
+  }
+}
 export function sameProviderBaseUrl(first: string, second: string): boolean {
   const normalize = (value: string) => {
     if (value.length > 4096 || /[\u0000-\u001f\u007f]/.test(value)) return null;
@@ -186,6 +202,7 @@ export function runtimeOperationLabel(engine: EngineStatus["engine"] | undefined
       : t("正在安装运行环境", "Installing runtime");
 }
 export interface EnvConfig {
+  settings_revision?: string;
   values: Record<
     string,
     { configured: boolean; value?: string; masked?: string; secret?: boolean }

@@ -157,6 +157,7 @@ export default function App() {
     setEngine(current => current ? { ...current, engine: snapshot } : current);
   }, []);
   const [env, setEnv] = useState<EnvConfig | null>(null);
+  const environmentEpoch = useRef(0);
   const [health, setHealth] = useState<Health | null>(null);
   const [resources, setResources] = useState<Resources | null>(null);
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -460,6 +461,7 @@ export default function App() {
         result[1].status === "fulfilled" &&
         (!configLoaded.current.env || !configLoaded.current.templates)
       ) {
+        const requestedEnvironmentEpoch = environmentEpoch.current;
         const config = await Promise.allSettled([
           configLoaded.current.env
             ? Promise.resolve(null)
@@ -469,7 +471,7 @@ export default function App() {
             : request<Template[]>("/api/task-templates"),
         ]);
         if (!current()) return;
-        if (config[0].status === "fulfilled" && config[0].value) {
+        if (config[0].status === "fulfilled" && config[0].value && requestedEnvironmentEpoch === environmentEpoch.current) {
           setEnv(config[0].value);
           configLoaded.current.env = true;
         }
@@ -477,7 +479,8 @@ export default function App() {
           setTemplates(config[1].value);
           configLoaded.current.templates = true;
         }
-        const configError = config.find((item) => item.status === "rejected");
+        const configError = config.find((item, index) => item.status === "rejected" &&
+          (index !== 0 || requestedEnvironmentEpoch === environmentEpoch.current));
         if (configError?.status === "rejected") {
           setConnectionError(errorMessage(configError.reason));
           pollState.current.failures += 1;
@@ -841,6 +844,7 @@ export default function App() {
     }
     const snapshot = structuredClone(draft);
     const epoch = draftEpoch.current;
+    const settingsEpoch = environmentEpoch.current;
     const serviceRevision = serviceRef.current.revision;
     const current = () => alive.current && epoch === draftEpoch.current && serviceRef.current.status === "ready" && serviceRef.current.revision === serviceRevision;
     submitInFlight.current = true;
@@ -852,12 +856,14 @@ export default function App() {
         request<EngineStatus>("/api/desktop/status"),
         request<EnvConfig>("/api/env"),
       ]);
-      if (!current() || !datasetInspection.isReady()) {
+      if (!current() || settingsEpoch !== environmentEpoch.current || !datasetInspection.isReady()) {
         if (alive.current) setSubmitError(t("开始前检查期间状态已变化，尚未提交实验。请检查当前配置后再开始。", "The state changed during the pre-start check. No experiment was submitted; review the current settings before starting again."));
         return;
       }
       applyEngineSnapshot(currentEngine.engine);
+      environmentEpoch.current += 1;
       setEnv(currentEnv);
+      configLoaded.current.env = true;
       if (!currentEngine.engine.ready || isRuntimeBusy(currentEngine.engine))
         throw new Error(
           t(
@@ -2101,6 +2107,9 @@ export default function App() {
               : null
           }
           onSaved={(value) => {
+            // A background refresh started before a save or explicit review
+            // must not replace the newer configuration the user just accepted.
+            environmentEpoch.current += 1;
             setEnv(value);
             configLoaded.current.env = true;
           }}

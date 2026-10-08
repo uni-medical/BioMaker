@@ -2,6 +2,13 @@
 
 ## Release gates
 
+- Run `tests/provider-settings-smoke.mjs` against the real sidecar and repeat
+  against the packaged executable. Use only synthetic profiles and loopback
+  providers. Verify changed-address key decisions, byte-preserving refusals,
+  equivalent-address retention, stale-save conflicts, explicit review/reload,
+  draft and unsaved-field preservation, restart recovery and native close
+  protection. A successful settings save must make no provider call; any probe
+  requires a separate explicit action.
 - Run `tests/dataset-inspection-smoke.mjs` through the native bridge and real
   sidecar in an isolated profile, then repeat with the packaged executable.
   Verify granted and ungranted directories, confirmed-empty and partial results,
@@ -120,3 +127,15 @@ does not automatically configure a remote GPU server.
 Each iteration needs a concrete change, a recorded check and a versioned artifact.
 Passing desktop checks is not evidence that a generated model is scientifically
 correct or suitable for clinical use.
+
+## Next workflow improvements identified in the 0.1.10 review
+
+- Make reports and the engine-selected solution easier to find in completed
+  experiments. Use recorded selection/artifact provenance; do not invent a
+  cross-metric ranking or treat generated report prose as evaluation evidence.
+- Preserve the relationship between a file preview and the version being
+  exported when an active experiment updates its artifacts or the service restarts.
+- Improve long-running activity and log navigation with useful current-stage
+  information, explicit following controls and search.
+- Support multiple persisted experiment drafts so starting a new idea does not
+  require replacing the single current draft or submitting it early.

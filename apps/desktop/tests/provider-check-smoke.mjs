@@ -346,11 +346,17 @@ try {
   assert.equal(await baseInput().inputValue(), providerBase);
   await assertPrivateState(savedConfig);
   restartedService = { previousRevision: beforeRestart.revision, recoveredRevision: (await state()).revision };
+  assert.equal(await probeButton().isDisabled(), true, 'An unreviewed saved key cannot be reused after service replacement');
+  await page.getByRole('button', { name: '读取最新已保存配置', exact: true }).click();
+  await page.locator('.provider-settings-review[data-state="loaded"]').waitFor();
+  await assertPrivateState(savedConfig);
+  await page.getByRole('button', { name: '保留输入并继续编辑', exact: true }).click();
+  await assertPrivateState(savedConfig);
   const afterRestart = await start('check');
   await waitOperation(afterRestart.index);
   await success();
   await screenshotResult('03-recovered-service.png');
-  checks.push('real-sidecar-restart-discards-old-success-preserves-draft-and-allows-new-check');
+  checks.push('real-sidecar-restart-discards-old-success-preserves-draft-and-reviews-saved-key-before-new-check');
 
   await page.getByRole('button', { name: '通用', exact: true }).click();
   await page.getByRole('button', { name: '深色', exact: true }).click();

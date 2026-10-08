@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.10 — 2026-10-09
+
+Fixes provider switching: saving a different API address can no longer silently
+retain the previous provider's key. Enter a replacement key or explicitly remove
+the saved key before saving the new address. Equivalent addresses can still
+retain their saved key. Saving settings does not make a provider request.
+
+Desktop configuration updates use a serialized, atomic save and an opaque
+revision. Stale settings cannot overwrite a newer configuration without review.
+Conflicts preserve entered values, show the latest saved public settings, and
+offer loading those settings or continuing to edit the retained inputs before
+a separate save. Secrets remain masked and are never included in revision tokens.
+
 ## 0.1.9 — 2026-10-09
 
 Adds a local dataset overview to new experiment drafts, with ordinary-file counts,
