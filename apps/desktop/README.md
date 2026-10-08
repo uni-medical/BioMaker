@@ -88,6 +88,7 @@ cd ../webui
 uv run --group dev pytest
 ```
 
-See [docs/RELEASE.md](docs/RELEASE.md) for release checks, platform boundaries,
+See the [0.1.1 acceptance record](docs/ACCEPTANCE-0.1.1.md) for measured results and
+[docs/RELEASE.md](docs/RELEASE.md) for release checks, platform boundaries,
 and iteration priorities. Keep scientific model evaluation separate from desktop
 installation and interaction checks.
