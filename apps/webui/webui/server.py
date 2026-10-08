@@ -420,6 +420,10 @@ def create_app(
 
     def enrich_run(raw_session: dict[str, Any]) -> dict[str, Any]:
         current = session_run(raw_session)
+        # Observations saved at import are not evidence about the current tail.
+        # Drop them even when the log directory can no longer be catalogued.
+        current.pop("event_tail", None)
+        current["terminal_event"] = None
         raw_log_dir = current.get("log_dir")
         base = observations.catalog(Path(str(raw_log_dir))) if raw_log_dir else None
         if base is None:
@@ -434,12 +438,13 @@ def create_app(
             "actual_exp_name",
             "options",
             "log_modified_at",
-            "terminal_event",
         ):
             if base.get(key) is not None:
                 current[key] = base[key]
-        if not current.get("status_reason") and base.get("status_reason"):
-            current["status_reason"] = base["status_reason"]
+        # Tail evidence is separate from the ledger's lifecycle explanation.
+        # None is meaningful: an earlier terminal event may have left the window.
+        current["terminal_event"] = base.get("terminal_event")
+        current["event_tail"] = base["event_tail"]
         return current
 
     def all_runs() -> list[dict[str, Any]]:

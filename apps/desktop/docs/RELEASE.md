@@ -341,3 +341,31 @@ preferences, draft bytes and complete run rows were preserved; the acceptance
 record defines the exact verification scope and does not claim a whole-profile
 comparison. Remaining release work includes Developer ID/notarization and
 separate platform acceptance.
+
+## Status evidence and interaction feedback for 0.1.16
+
+Keep persisted lifecycle, reason, ownership and actions authoritative. Return
+current catalog-tail evidence separately and clear top-level `terminal_event`
+when that tail contains no terminal event. This intentionally includes terminals
+that moved outside the last 5,000 valid JSON objects. Distinguish unavailable
+evidence from an available empty tail; do not migrate persistence or silently
+rewrite status/actions. Check boundary events, malformed/non-object lines,
+source deletion/restoration and imported reasons that describe registration-time
+evidence. UI explanations must distinguish these saved assessments from current
+observations and preserve unknown errors.
+
+Run `tests/run-navigation-smoke.mjs` in development and against the packaged app.
+Check pre-switch scroll alignment, another-run top reset, visible keyboard focus
+under sticky tabs and preservation of manual reading/refresh positions. Run
+`tests/toast-feedback-smoke.mjs` for fresh notification IDs, repeated messages,
+independent dismissal timers, stale navigation/language/settings/service feedback
+and held A-to-B-to-A context transitions. Settings must expose saving/saved/dirty
+feedback inline, and another edit must clear the saved indication.
+
+The [0.1.16 candidate record](ACCEPTANCE-0.1.16.md) tracks completed development
+evidence and remaining gates. Freeze source before distribution acceptance;
+repeat package verification, packaged regressions, actual installed upgrade,
+retained-record checks, independent engine setup, installed synthetic workflow,
+offline engine recovery and normal native launch for 0.1.16. Successful 0.1.15
+artifacts do not satisfy these gates. Keep signing and other-platform claims
+within their separately verified scope.

@@ -53,6 +53,7 @@ export default function Settings({
   env,
   version,
   initialSection,
+  onSectionChange,
   onClose,
   onSaved,
   onReturnToExperiment,
@@ -74,6 +75,7 @@ export default function Settings({
   env: EnvConfig | null;
   version: string;
   initialSection?: Section;
+  onSectionChange: (section: Section) => void;
   onClose: () => void;
   onSaved: (config: EnvConfig) => void;
   onReturnToExperiment?: () => void;
@@ -82,7 +84,8 @@ export default function Settings({
   onEngineChanged: (engine: EngineStatus["engine"]) => void;
   toast: (s: string) => void;
 }) {
-  const [section, setSection] = useState<Section>(initialSection || "provider");
+  const [section, setLocalSection] = useState<Section>(initialSection || "provider");
+  const setSection = (next: Section) => { setLocalSection(next); onSectionChange(next); };
   const [baseline, setBaseline] = useState(env);
   const [reviewRequired, setReviewRequired] = useState(false);
   const [reviewedSettings, setReviewedSettings] = useState<{ config: EnvConfig; serviceRevision: number } | null>(null);
@@ -181,10 +184,7 @@ export default function Settings({
   }, [modelOverride]);
   const close = () => {
     if (confirmRepair) { setConfirmRepair(false); repairButton.current?.focus(); return; }
-    if (closeState.current.saving) {
-      toast(t("配置正在保存，请稍候。", "Settings are being saved. Please wait."));
-      return;
-    }
+    if (closeState.current.saving) return;
     if (dirty) setConfirmClose(true);
     else onClose();
   };
@@ -267,19 +267,6 @@ export default function Settings({
       closeState.current.dirty = false;
       setDirty(false);
       setSaved(true);
-      toast(
-        !result.values.OPENAI_API_KEY?.configured
-          ? t(
-              "配置已保存；添加 API Key 后才能运行实验",
-              "Settings saved. Add an API key before running an experiment.",
-            )
-          : !(result.values.BIOMAKER_MAIN_MODEL?.value || modelOverride)
-            ? t(
-                "配置已保存；还需填写默认模型",
-                "Settings saved. A default model is still needed.",
-              )
-            : t("模型配置已保存", "Model settings saved"),
-      );
     } catch (e) {
       if (mounted.current) {
         invalidateProvider();
@@ -845,7 +832,7 @@ export default function Settings({
                 </>}
               </section>}
               <div className="settings-footer">
-                <span className="muted">
+                <span className="muted" role="status">
                   {saving
                     ? t("正在保存…", "Saving…")
                     : saved

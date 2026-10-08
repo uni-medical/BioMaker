@@ -151,7 +151,7 @@ async function close(label) {
   await verifyExited(label);
 }
 function assertLedgerOwnership(run, expected) {
-  for (const key of ['status', 'detailed_status', 'managed', 'read_only', 'allowed_actions']) assert.deepEqual(run[key], expected[key], `Live ledger ownership changed for ${key}`);
+  for (const key of ['status', 'detailed_status', 'status_source', 'status_reason', 'error', 'managed', 'read_only', 'allowed_actions']) assert.deepEqual(run[key], expected[key], `Live ledger ownership changed for ${key}`);
 }
 async function registered() {
   const runs = await api('/api/runs');
@@ -203,6 +203,8 @@ try {
   const initialActivity = await api(`/api/desktop/runs/${selected}/activity`);
   assert.equal(initial.observed.event_count, EVENTS_PER_HISTORY + 5);
   assert.equal(initial.observed.last_event.event, 'run_finished');
+  assert.deepEqual(initial.event_tail, { valid_event_limit: 5000, valid_event_count: 5000, terminal_event: 'run_finished', reason_code: null });
+  assert.equal(initial.status_reason, null);
   assert.equal(initial.observed.results.count, RESULT_ROWS);
   assert.equal(initial.observed.results.best_metric, 0.02);
   assert.equal(initial.observed.results.latest.metric, 'nan');
@@ -252,6 +254,7 @@ try {
   await refresh(); await expectSummary(42, RESULT_ROWS);
   const conflicting = await api(endpoint());
   assert.equal(conflicting.terminal_event, 'run_failed');
+  assert.deepEqual(conflicting.event_tail, { valid_event_limit: 5000, valid_event_count: 5000, terminal_event: 'run_failed', reason_code: null });
   assert.equal(conflicting.observed.last_event.event, 'run_failed');
   assertLedgerOwnership(conflicting, ledger);
   checks.push('new-terminal-file-observation-never-rewrites-persisted-ledger-lifecycle-or-controls');
@@ -259,9 +262,11 @@ try {
   await writeRows(first('events.jsonl'), 5001, row => jsonl(event('tool_observation', { step: row, message: `Tail-boundary observation ${row}` })), { append: true, suffix: jsonl(event('round_finished', { completed_steps: 43, message: 'LONG_HISTORY_AFTER_TAIL_BOUNDARY' })) });
   await timed('append-beyond-catalog-tail-refresh', refresh); await expectSummary(43, RESULT_ROWS);
   const beyondTail = await api(endpoint());
-  // A missing observed terminal leaves the persisted ledger field in the
-  // public enriched record; it must not retain the newer cached failure.
-  assert.equal(beyondTail.terminal_event, ledger.terminal_event);
+  // Terminal observations describe only the current tail. Missing evidence
+  // cannot replace the ledger's successful lifecycle or its explanation.
+  assert.equal(beyondTail.terminal_event, null);
+  assert.deepEqual(beyondTail.event_tail, { valid_event_limit: 5000, valid_event_count: 5000, terminal_event: null, reason_code: 'no_terminal_in_tail' });
+  assert.equal(beyondTail.status_reason, null);
   assert.equal(beyondTail.observed.event_count, EVENTS_PER_HISTORY + 5009);
   assert.equal(beyondTail.observed.last_event.message, 'LONG_HISTORY_AFTER_TAIL_BOUNDARY');
   assertLedgerOwnership(beyondTail, ledger);
@@ -300,7 +305,9 @@ try {
   const recovered = await api(endpoint());
   assert.deepEqual(recovered.observed, final.observed);
   assertLedgerOwnership(recovered, ledger);
-  assert.equal(recovered.terminal_event, ledger.terminal_event);
+  assert.equal(recovered.terminal_event, null);
+  assert.deepEqual(recovered.event_tail, beyondTail.event_tail);
+  assert.equal(recovered.status_reason, null);
   const recoveredActivity = await api(`/api/desktop/runs/${selected}/activity`);
   assert.notEqual(recoveredActivity.source_id, beforeRelaunch.source_id, 'A new service process must own a new source identity');
   assert.deepEqual(recoveredActivity.events.map(item => item.data), beforeRelaunch.events.map(item => item.data));

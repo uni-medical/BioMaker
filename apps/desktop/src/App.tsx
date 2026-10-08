@@ -49,6 +49,7 @@ import { datasetAdmissionCode, datasetInspectionMessage, useDatasetInspection } 
 import { reuseDraft, type Draft } from "./experimentDraft";
 import DraftLibrary, { draftEntryTitle } from "./DraftLibrary";
 import { useDraftWorkspace } from "./useDraftWorkspace";
+import { useToast } from "./useToast";
 import { decorateRun, defaultMetadata, isCurrentRun, mergeMetadata, type MetadataMap, type RunMetadata } from "./runMetadata";
 import type { ServiceState } from "./bridge";
 import {
@@ -191,7 +192,9 @@ export default function App() {
     action: "stop" | "cancel";
     run: Run;
   } | null>(null);
-  const [toastMessage, setToastMessage] = useState("");
+  const [runNotice, setRunNotice] = useState<{
+    runId: string; navigation: number; lang: Language; serviceRevision: number; scope: object; message: string;
+  } | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(
     new Set(),
   );
@@ -212,8 +215,31 @@ export default function App() {
   const languageEdited = useRef(false);
   const notificationsEdited = useRef(false);
   const alive = useRef(true);
-  const toast = useCallback((message: string) => setToastMessage(message), []);
+  // These transitions must invalidate target-view feedback even after A -> B
+  // -> A. Run navigation has its own epoch; confirmation close is intentional.
+  const noticeContext = JSON.stringify([lang, serviceState.status, serviceState.revision, settings, searchOpen, templatesOpen, importOpen, advanced]);
+  const noticeScope = useRef({ context: noticeContext, token: {} });
+  if (noticeScope.current.context !== noticeContext) noticeScope.current = { context: noticeContext, token: {} };
+  const toastContext = JSON.stringify([
+    lang, serviceState.status, serviceState.revision,
+    history ? "history" : draftLibrary ? "drafts" : selectedId ? `run:${selectedId}` : `draft:${drafts.activeId || ""}`,
+    settings, searchOpen, templatesOpen, importOpen, advanced, confirmation?.run.id, confirmation?.action,
+  ]);
+  const { toast, systemToast, dismissToast, toastMessage } = useToast(toastContext);
   const datasetInspection = useDatasetInspection(draft.dataset, drafts.ready && !selectedId && !history && !draftLibrary, serviceState, drafts.activeId || '');
+
+  useEffect(() => {
+    if (!runNotice) return;
+    // Submission navigates, and stop/cancel closes a confirmation. Publish
+    // only after the intended run view has rendered, without making other
+    // old async completions eligible to notify a new view.
+    if (selectedId === runNotice.runId && !history && !draftLibrary && !settings && !searchOpen && !importOpen &&
+        navigationEpoch.current === runNotice.navigation && noticeScope.current.token === runNotice.scope && lang === runNotice.lang &&
+        serviceState.status === "ready" && serviceState.revision === runNotice.serviceRevision) {
+      toast(runNotice.message);
+    }
+    setRunNotice(null);
+  }, [runNotice, selectedId, history, draftLibrary, settings, searchOpen, importOpen, lang, serviceState, toast]);
 
   useEffect(() => {
     if (drafts.ready && !drafts.activeId && !selectedId && !history) setDraftLibrary(true);
@@ -256,21 +282,21 @@ export default function App() {
     setNotificationsEnabled(value);
     void window.biomaker
       .setPreferences?.({ notifications: value })
-      .catch((e) => toast(errorMessage(e)));
+      .catch((e) => systemToast(errorMessage(e)));
   };
   const changeLanguage = (value: Language) => {
     languageEdited.current = true;
     setLang(value);
     void window.biomaker
       .setPreferences?.({ language: value })
-      .catch((e) => toast(errorMessage(e)));
+      .catch((e) => systemToast(errorMessage(e)));
   };
   const changeTheme = (value: Theme) => {
     themeEdited.current = true;
     setTheme(value);
     void window.biomaker
       .setPreferences?.({ theme: value })
-      .catch((e) => toast(errorMessage(e)));
+      .catch((e) => systemToast(errorMessage(e)));
   };
   const openNotificationRun = useCallback((runId: string) => {
     if (typeof runId !== "string" || !runId.trim()) return;
@@ -299,13 +325,13 @@ export default function App() {
         if (valid && !receivedLiveEvent && runId) openNotificationRun(runId);
       })
       .catch((e) => {
-        if (valid) toast(errorMessage(e));
+        if (valid) systemToast(errorMessage(e));
       });
     return () => {
       valid = false;
       unsubscribe?.();
     };
-  }, [openNotificationRun, toast]);
+  }, [openNotificationRun, systemToast]);
   useEffect(() => {
     if (
       !notificationRunToAcknowledge ||
@@ -316,13 +342,13 @@ export default function App() {
     const runId = notificationRunToAcknowledge;
     void window.biomaker
       .acknowledgeOpenRun?.(runId)
-      .catch((e) => toast(errorMessage(e)))
+      .catch((e) => systemToast(errorMessage(e)))
       .finally(() => {
         setNotificationRunToAcknowledge((current) =>
           current === runId ? null : current,
         );
       });
-  }, [selectedId, notificationRunToAcknowledge, toast]);
+  }, [selectedId, notificationRunToAcknowledge, systemToast]);
   useEffect(() => {
     persist("biomaker.language", lang);
     document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
@@ -337,12 +363,6 @@ export default function App() {
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
   }, [theme]);
-  useEffect(() => {
-    if (!toastMessage) return;
-    const timeout = setTimeout(() => setToastMessage(""), 6000);
-    return () => clearTimeout(timeout);
-  }, [toastMessage]);
-
   useEffect(() => {
     const compact = matchMedia("(max-width: 1050px)");
     const narrow = matchMedia("(max-width: 580px)");
@@ -873,6 +893,7 @@ export default function App() {
     }
     const snapshot = structuredClone(draft);
     const submittedDraftId = drafts.currentId()!;
+    const submittedNoticeScope = noticeScope.current.token;
     const epoch = draftEpoch.current;
     const settingsEpoch = environmentEpoch.current;
     const serviceRevision = serviceRef.current.revision;
@@ -937,10 +958,14 @@ export default function App() {
         ...previous.filter((item) => item.id !== run.id),
       ]);
       selectRun(run.id);
+      const destinationNavigation = navigationEpoch.current;
       draftEpoch.current += 1;
       const consumed = await drafts.remove(submittedDraftId);
-      toast(consumed ? t("实验已加入队列", "Experiment added to the queue")
-        : t("实验已加入队列，但未能移除已提交草稿。请查看此实验，避免重复提交。", "The experiment was queued, but its draft could not be removed. Review this experiment before submitting it again."));
+      if (alive.current) setRunNotice({
+        runId: run.id, navigation: destinationNavigation, lang, serviceRevision, scope: submittedNoticeScope,
+        message: consumed ? t("实验已加入队列", "Experiment added to the queue")
+          : t("实验已加入队列，但未能移除已提交草稿。请查看此实验，避免重复提交。", "The experiment was queued, but its draft could not be removed. Review this experiment before submitting it again."),
+      });
       await refresh();
     } catch (e) {
       if (alive.current) {
@@ -974,12 +999,18 @@ export default function App() {
     }
     setBusy(action);
     setConfirmation(null);
+    const actionNavigation = navigationEpoch.current;
+    const actionServiceRevision = serviceRef.current.revision;
+    const actionNoticeScope = noticeScope.current.token;
+    const notify = (message: string) => {
+      if (alive.current) setRunNotice({ runId: run.id, navigation: actionNavigation, lang, serviceRevision: actionServiceRevision, scope: actionNoticeScope, message });
+    };
     try {
       await request<Run>(
         `/api/runs/${encodeURIComponent(run.id)}/${action}`,
         "POST",
       );
-      toast(
+      notify(
         action === "stop"
             ? t("正在停止实验", "Stopping experiment")
             : t("已取消排队", "Queued run cancelled"),
@@ -989,7 +1020,7 @@ export default function App() {
     } catch (e) {
       const message = errorMessage(e);
       const datasetCode = datasetAdmissionCode(message);
-      toast(datasetCode ? datasetInspectionMessage(datasetCode, t) : message);
+      notify(datasetCode ? datasetInspectionMessage(datasetCode, t) : message);
     } finally {
       setBusy("");
     }
@@ -2180,6 +2211,7 @@ export default function App() {
           env={env}
           version={version}
           initialSection={settings}
+          onSectionChange={setSettings}
           onClose={closeSettings}
           onReturnToExperiment={
             settingsReturnToExperiment ? returnToExperiment : undefined
@@ -2404,11 +2436,11 @@ export default function App() {
         </Modal>
       )}
       {toastMessage && (
-        <div className="toast" role="status">
-          <span>{toastMessage}</span>
+        <div key={toastMessage.id} className="toast" role="status">
+          <span>{toastMessage.message}</span>
           <IconButton
             label={t("关闭提示", "Dismiss")}
-            onClick={() => setToastMessage("")}
+            onClick={() => dismissToast(toastMessage.id)}
           >
             <X size={14} />
           </IconButton>

@@ -745,7 +745,9 @@ def test_cli_lifecycle_events_drive_status_and_special_names_are_routable(settin
         assert runs[running_name]["status"] == "incomplete"
         assert runs[running_name]["detailed_status"] == "orphaned"
         assert runs[running_name]["terminal_event"] is None
-        assert "no terminal lifecycle event" in runs[running_name]["status_reason"]
+        assert "No terminal lifecycle event was found" in runs[running_name]["status_reason"]
+        assert "does not determine" in runs[running_name]["status_reason"]
+        assert runs[running_name]["event_tail"]["reason_code"] == "no_terminal_in_tail"
         assert runs[failed_name]["status"] == "incomplete"
         assert runs[failed_name]["detailed_status"] == "failed"
         assert runs[failed_name]["terminal_event"] == "run_failed"

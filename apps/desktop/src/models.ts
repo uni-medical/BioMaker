@@ -112,6 +112,12 @@ export interface Run {
   archived?: boolean;
   history_import?: { mode: "copy"; source_id: string; source_path: string; name: string; imported_at: string };
   status_reason?: string;
+  event_tail?: {
+    valid_event_limit: number;
+    valid_event_count: number;
+    terminal_event: "run_finished" | "run_failed" | "run_interrupted" | null;
+    reason_code: "no_terminal_in_tail" | null;
+  };
   error?: string;
   allowed_actions?: string[];
   options?: Partial<Options> & { main_model?: string };

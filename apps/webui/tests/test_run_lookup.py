@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from webui import server
+from webui.run_catalog import run_from_log_dir
 
 
 def history(settings, name):
@@ -111,3 +112,152 @@ def test_update_signal_detects_replacement_with_retained_size_and_mtime(settings
         assert detail["observed"]["last_event"]["completed_steps"] == 7
     finally:
         app.state.run_store.close()
+
+
+@pytest.mark.parametrize(
+    "state,read_only,reason,error,canonical,actions,expected_reason",
+    [
+        ("succeeded", True, None, None, "complete", [], None),
+        ("running", False, None, None, "running", ["stop"], None),
+        ("queued", False, None, None, "queued", ["cancel"], None),
+        ("failed", False, "ledger failure", "original failure", "incomplete", ["requeue"], "ledger failure"),
+        ("failed", False, None, "original failure", "incomplete", ["requeue"], "original failure"),
+        ("stopped", False, None, None, "incomplete", ["requeue"], "Stopped by the user."),
+        ("succeeded", True, "retained ledger note", None, "complete", [], "retained ledger note"),
+    ],
+)
+def test_tail_evidence_never_supplies_ledger_lifecycle_reason(
+    settings, state, read_only, reason, error, canonical, actions, expected_reason
+):
+    app = server.create_app(settings)
+    record = history(settings, "owned-lifecycle")
+    record.update(status=state, read_only=read_only, status_reason=reason, error=error,
+                  terminal_event="run_finished")
+    store = app.state.run_store
+    store.add_record("runs", record)
+    persisted = store.get_record("runs", record["id"])
+    source = settings.logs_root / record["id"] / "events.jsonl"
+    client = TestClient(app)
+    try:
+        # Both missing terminal evidence and a contradictory terminal error are
+        # observations. Neither becomes a ledger-owned lifecycle explanation.
+        for text, terminal in [
+            ('{"event":"observation"}\n', None),
+            ('{"event":"run_failed","error":"tail failure"}\n', "run_failed"),
+        ]:
+            source.write_text(text)
+            detail = client.get(f'/api/runs/{record["id"]}').json()
+            assert detail["status"] == canonical
+            assert detail["detailed_status"] == state
+            assert detail["status_source"] == "ledger"
+            assert detail["read_only"] is read_only
+            assert detail["allowed_actions"] == actions
+            assert detail.get("status_reason") == expected_reason
+            assert detail.get("error") == error
+            assert detail["terminal_event"] == terminal
+            assert detail["event_tail"] == {
+                "valid_event_limit": 5000, "valid_event_count": 1,
+                "terminal_event": terminal,
+                "reason_code": "no_terminal_in_tail" if terminal is None else None,
+            }
+            assert client.get("/api/runs").json() == [
+                {key: value for key, value in detail.items() if key not in {"observed", "artifacts"}}
+            ]
+            assert store.get_record("runs", record["id"]) == persisted
+    finally:
+        store.close()
+
+
+def test_completed_history_keeps_lifecycle_when_terminal_leaves_tail(settings):
+    app = server.create_app(settings)
+    record = history(settings, "long-completed-history")
+    directory = settings.logs_root / record["id"]
+    store = app.state.run_store
+    imported = app.state.manager.import_log_record(run_from_log_dir(settings, directory))
+    source = directory / "events.jsonl"
+    client = TestClient(app)
+    try:
+        before = client.get(f'/api/runs/{record["id"]}').json()
+        assert before["status"] == "complete"
+        assert before["event_tail"]["valid_event_count"] == 1
+        with source.open("a") as handle:
+            handle.write('{"event":"observation"}\n' * 4999)
+            handle.write('not-json\n[]\n\n')
+        boundary = client.get(f'/api/runs/{record["id"]}').json()
+        assert boundary["event_tail"]["valid_event_count"] == 5000
+        assert boundary["event_tail"]["terminal_event"] == "run_finished"
+        assert boundary["observed"]["event_count"] == 5002
+        with source.open("a") as handle:
+            handle.write('{"event":"observation"}\n')
+        after = client.get(f'/api/runs/{record["id"]}').json()
+        assert after["event_tail"] == {
+            "valid_event_limit": 5000, "valid_event_count": 5000,
+            "terminal_event": None, "reason_code": "no_terminal_in_tail",
+        }
+        assert after["terminal_event"] is None  # Never retain the imported observation.
+        assert after["observed"]["event_count"] == 5003
+        for key in ("status", "detailed_status", "status_source", "read_only",
+                    "managed", "status_reason", "error", "allowed_actions"):
+            assert after[key] == before[key]
+        assert after["status_reason"] is None
+        assert store.get_record("runs", record["id"]) == imported
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("missing", ["events.jsonl", "run_manifest.json"])
+def test_missing_history_observations_do_not_resurrect_imported_tail(settings, missing):
+    app = server.create_app(settings)
+    record = history(settings, "missing-observation")
+    directory = settings.logs_root / record["id"]
+    store = app.state.run_store
+    imported = app.state.manager.import_log_record(run_from_log_dir(settings, directory))
+    client = TestClient(app)
+    try:
+        assert client.get(f'/api/runs/{record["id"]}').json()["terminal_event"] == "run_finished"
+        source = directory / missing
+        saved = source.read_bytes()
+        source.unlink()
+        missing_detail = client.get(f'/api/runs/{record["id"]}').json()
+        assert missing_detail["status"] == "complete"
+        assert missing_detail["status_reason"] is None
+        assert missing_detail["terminal_event"] is None
+        if missing == "run_manifest.json":
+            assert "event_tail" not in missing_detail  # No current catalog, not an empty tail.
+        else:
+            assert missing_detail["event_tail"] == {
+                "valid_event_limit": 5000, "valid_event_count": 0,
+                "terminal_event": None, "reason_code": "no_terminal_in_tail",
+            }
+        source.write_bytes(saved)
+        restored = client.get(f'/api/runs/{record["id"]}').json()
+        assert restored["event_tail"]["terminal_event"] == "run_finished"
+        assert restored["event_tail"]["reason_code"] is None
+        assert restored["terminal_event"] == "run_finished"
+        assert store.get_record("runs", record["id"]) == imported
+    finally:
+        store.close()
+
+
+def test_legacy_import_reason_stays_a_ledger_record_when_tail_changes(settings):
+    app = server.create_app(settings)
+    record = history(settings, "legacy-incomplete-history")
+    legacy_reason = (
+        "The process is not known to be alive and no terminal lifecycle event was recorded."
+    )
+    record.update(status="incomplete", detailed_status="orphaned", managed=False,
+                  status_reason=legacy_reason, error=legacy_reason)
+    store = app.state.run_store
+    store.add_record("runs", record)
+    persisted = store.get_record("runs", record["id"])
+    try:
+        detail = TestClient(app).get(f'/api/runs/{record["id"]}').json()
+        assert detail["status"] == "incomplete"
+        assert detail["detailed_status"] == "orphaned"
+        assert detail["status_source"] == "ledger"
+        assert detail["status_reason"] == detail["error"] == legacy_reason
+        assert detail["event_tail"]["terminal_event"] == "run_finished"
+        assert detail["allowed_actions"] == []
+        assert store.get_record("runs", record["id"]) == persisted
+    finally:
+        store.close()

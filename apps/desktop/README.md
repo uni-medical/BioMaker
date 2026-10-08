@@ -157,6 +157,11 @@ cd ../webui
 uv run --group dev pytest
 ```
 
+Version 0.1.16 is a candidate with 932 source checks and 202 development checks
+across 16 distinct suites passed. Its source is not yet frozen, and package,
+upgrade, installed workflow, offline engine and normal native launch acceptance
+remain pending. See the [0.1.16 candidate record](docs/ACCEPTANCE-0.1.16.md).
+
 Version 0.1.15 has passed 918 source checks, 113 development checks, 206 packaged
 checks and four offline engine checks. Package verification, the actual upgrade,
 independent engine setup, retained drafts/configuration/run records, installed

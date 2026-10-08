@@ -1,5 +1,5 @@
-import { historyMessage } from "./historyMessages";
-import { useEffect, useRef, useState } from "react";
+import { runStatusExplanation, runTailExplanation } from "./runEvidence";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import Candidates from "./Candidates";
 import RunActivity from "./RunActivity";
@@ -114,6 +114,10 @@ export default function RunView({
   const [tab, setTab] = useState<RunTab>(() => isActive(run) ? "activity" : "results");
   const [requestedCandidate, setRequestedCandidate] = useState<string | null>(null);
   const tabButtons = useRef<Partial<Record<RunTab, HTMLButtonElement | null>>>({});
+  const tabList = useRef<HTMLDivElement>(null);
+  const detailPanel = useRef<HTMLDivElement>(null);
+  const previousTab = useRef(tab);
+  const focusScrollFrame = useRef<number | null>(null);
   const [promptOpen, setPromptOpen] = useState(false);
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewError, setPreviewError] = useState("");
@@ -124,15 +128,72 @@ export default function RunView({
   const current = useRef({ run, serviceReady, serviceRevision, preview });
   current.current = { run, serviceReady, serviceRevision, preview };
   useEffect(() => { alive.current = true; return () => { alive.current = false; fileSequence.current++; }; }, []);
+  useEffect(() => () => {
+    if (focusScrollFrame.current !== null) cancelAnimationFrame(focusScrollFrame.current);
+  }, []);
+  useLayoutEffect(() => {
+    const scroller = detailPanel.current?.closest<HTMLElement>(".workspace-content");
+    if (scroller) scroller.scrollTop = 0;
+  }, [run.id]);
+  useLayoutEffect(() => {
+    if (previousTab.current === tab) return;
+    previousTab.current = tab;
+    const panel = detailPanel.current;
+    const tabs = tabList.current;
+    const scroller = panel?.closest<HTMLElement>(".workspace-content");
+    if (!panel || !tabs || !scroller) return;
+    // A different panel should open at its start, not inherit a deep offset
+    // from the previous panel. Initial opens and ordinary refreshes keep their
+    // position, and a visible introduction is not scrolled out of view.
+    const revealStart = () => {
+      const offset = panel.getBoundingClientRect().top - tabs.getBoundingClientRect().bottom;
+      if (offset < 0) scroller.scrollTop += offset;
+    };
+    revealStart();
+    // Chromium can clamp or anchor the scroller after a shorter panel replaces
+    // the previous one. Correct that one navigation frame, never later refreshes.
+    const frame = requestAnimationFrame(revealStart);
+    return () => cancelAnimationFrame(frame);
+  }, [tab]);
   const results = run.observed?.results;
+  const statusExplanation = runStatusExplanation(run, t);
+  const tailExplanation = runTailExplanation(run, t);
   const artifacts = run.artifacts || [];
   const actions = run.allowed_actions || [];
   const currentPreviewFile = preview ? artifacts.find(file => file.name === preview.name) : undefined;
   const previewStale = !!preview && (!serviceReady || preview.serviceRevision !== serviceRevision
     || !currentPreviewFile || fileRevision(currentPreviewFile) !== preview.listedRevision);
   function switchTab(next: RunTab, focus = false) {
+    if (next !== tab) {
+      const panel = detailPanel.current;
+      const tabs = tabList.current;
+      const scroller = panel?.closest<HTMLElement>(".workspace-content");
+      // Set the reading position while the old, possibly much taller panel
+      // still exists. Replacing it first can clamp and anchor the viewport.
+      if (panel && tabs && scroller) {
+        const offset = panel.getBoundingClientRect().top - tabs.getBoundingClientRect().bottom;
+        if (offset < 0) scroller.scrollTop += offset;
+      }
+    }
     setTab(next);
-    if (focus) tabButtons.current[next]?.focus();
+    if (focus) tabButtons.current[next]?.focus({ preventScroll: true });
+  }
+  function revealFocusedControl(target: HTMLElement) {
+    if (focusScrollFrame.current !== null) cancelAnimationFrame(focusScrollFrame.current);
+    // Let native keyboard/programmatic focus finish scrolling first. It knows
+    // the viewport, but can leave the focused control underneath sticky tabs.
+    focusScrollFrame.current = requestAnimationFrame(() => {
+      focusScrollFrame.current = null;
+      const panel = detailPanel.current;
+      const tabs = tabList.current;
+      const scroller = panel?.closest<HTMLElement>(".workspace-content");
+      if (!panel || !tabs || !scroller || document.activeElement !== target || !panel.contains(target)) return;
+      const controlBox = target.getBoundingClientRect();
+      const tabsBox = tabs.getBoundingClientRect();
+      if (controlBox.top < tabsBox.bottom) {
+        scroller.scrollTop += controlBox.top - tabsBox.bottom - 8;
+      }
+    });
   }
   function closePreview() {
     // Closing the preview abandons an in-flight read, but an approved export
@@ -301,11 +362,12 @@ export default function RunView({
             </div>
           </div>
         )}
-        {(run.status_reason || run.error) && (
+        {statusExplanation && (
           <Notice danger={run.detailed_status === "failed"}>
-            {run.history_import ? historyMessage(run.status_reason || run.error || "", t) : run.status_reason || run.error}
+            {statusExplanation}
           </Notice>
         )}
+        {tailExplanation && <div className="run-evidence-note"><Notice>{tailExplanation}</Notice></div>}
         {run.read_only && (
           <p className="read-only-note">
             {t(
@@ -338,6 +400,7 @@ export default function RunView({
         ) : null}
       </div>
       <div
+        ref={tabList}
         className="run-tabs"
         role="tablist"
         aria-label={t("实验详情", "Experiment details")}
@@ -392,10 +455,12 @@ export default function RunView({
         </div>
       </div>
       <div
+        ref={detailPanel}
         id="run-detail-panel"
         role="tabpanel"
         aria-labelledby={`run-tab-${tab}`}
         className={`run-tab-content ${tab === "log" ? "log-panel" : ""}`}
+        onFocusCapture={event => revealFocusedControl(event.target)}
       >
         {detailError && (
           <Notice danger>

@@ -10,6 +10,7 @@ from .artifacts import read_event_tail
 from .settings import Settings
 
 MAX_MANIFEST_BYTES = 5_000_000
+CATALOG_EVENT_LIMIT = 5_000
 TERMINAL_EVENT_STATUSES = {
     "run_finished": "complete",
     "run_failed": "incomplete",
@@ -102,7 +103,7 @@ def run_from_log_dir(settings: Settings, log_dir: Path, *, strict: bool = False)
         return None
 
     run_stub = {"id": resolved.name, "log_dir": str(resolved)}
-    events = read_event_tail(settings, run_stub, tail=5_000, strict=strict)
+    events = read_event_tail(settings, run_stub, tail=CATALOG_EVENT_LIMIT, strict=strict)
     started = _event_value(events, "run_started")
     terminal_event = next(
         (
@@ -129,8 +130,9 @@ def run_from_log_dir(settings: Settings, log_dir: Path, *, strict: bool = False)
     }.get(terminal_event_name, "orphaned")
     if terminal_event is None:
         status_reason = (
-            "The process is not known to be alive and no terminal lifecycle "
-            "event was recorded."
+            "No terminal lifecycle event was found in the last up to 5,000 valid "
+            "event records. This does not determine whether the original process "
+            "is running."
         )
     else:
         status_reason = (terminal_event or {}).get("error") or (
@@ -183,6 +185,12 @@ def run_from_log_dir(settings: Settings, log_dir: Path, *, strict: bool = False)
         "detailed_status": detailed_status,
         "status_reason": status_reason,
         "terminal_event": terminal_event_name,
+        "event_tail": {
+            "valid_event_limit": CATALOG_EVENT_LIMIT,
+            "valid_event_count": len(events),
+            "terminal_event": terminal_event_name,
+            "reason_code": "no_terminal_in_tail" if terminal_event is None else None,
+        },
         "requested_exp_name": None,
         "actual_exp_name": resolved.name,
         "options": {
