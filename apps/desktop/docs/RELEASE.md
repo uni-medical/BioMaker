@@ -15,7 +15,10 @@
   against an installed engine. This denies Homebrew/MacPorts library paths and
   tests an isolated copy; it supplements, rather than replaces, separate-hardware
   acceptance. Use `tests/queue-lifecycle-smoke.py` for no-provider quit/reconnect/stop
-  verification through the real supervisor.
+  verification through the real supervisor. Run `tests/engine-workflow-smoke.py
+  --engine <installed-engine>` for a deterministic local-model fixture through
+  the actual split/evaluator/candidate/artifact workflow; keep that result distinct
+  from medical or model-provider performance.
 - Mount the DMG, check its Applications shortcut and app bundle, then generate
   SHA-256 checksums for the final artifacts.
 - For a public release, apply Developer ID signing and Apple notarization. Keep
