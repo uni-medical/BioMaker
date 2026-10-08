@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -80,20 +80,38 @@ export default function Settings({
   const [removeKey, setRemoveKey] = useState(false);
   const [optional, setOptional] = useState(false);
   const [confirmClose, setConfirmClose] = useState(false);
+  const closeState = useRef({ dirty: false, saving: false });
+  const saving = pending === "save";
   const configured = !!env?.values.OPENAI_API_KEY?.configured;
   const effectiveKey = !!key.trim() || (configured && !removeKey);
   const effectiveModel = !!model.trim() || !!modelOverride;
   const savedProviderReady =
     configured && !!(env?.values.BIOMAKER_MAIN_MODEL?.value || modelOverride);
   const changed = () => {
+    closeState.current.dirty = true;
     setDirty(true);
     setSaved(false);
     setError("");
   };
   const close = () => {
+    if (closeState.current.saving) {
+      toast(t("配置正在保存，请稍候。", "Settings are being saved. Please wait."));
+      return;
+    }
     if (dirty) setConfirmClose(true);
     else onClose();
   };
+  useEffect(() => {
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      const state = closeState.current;
+      if (!state.dirty && !state.saving) return;
+      event.preventDefault();
+      event.returnValue = "Unsaved model settings";
+      window.biomaker.reportCloseBlock(state.saving ? "saving" : "unsaved");
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    return () => window.removeEventListener("beforeunload", beforeUnload);
+  }, []);
   useEffect(() => {
     if (env && !dirty) {
       setBase(env.values.OPENAI_BASE_URL?.value || "");
@@ -106,7 +124,9 @@ export default function Settings({
 
   async function save() {
     if (pending || !env) return;
+    closeState.current.saving = true;
     setPending("save");
+    setConfirmClose(false);
     setError("");
     try {
       if (base.trim()) {
@@ -133,6 +153,7 @@ export default function Settings({
       setSerper("");
       setJina("");
       setRemoveKey(false);
+      closeState.current.dirty = false;
       setDirty(false);
       setSaved(true);
       toast(
@@ -151,6 +172,7 @@ export default function Settings({
     } catch (e) {
       setError(errorMessage(e));
     } finally {
+      closeState.current.saving = false;
       setPending("");
     }
   }
@@ -224,6 +246,7 @@ export default function Settings({
         >
           <button
             className={section === "provider" ? "selected" : ""}
+            disabled={saving}
             onClick={() => setSection("provider")}
           >
             <KeyRound size={16} />
@@ -231,6 +254,7 @@ export default function Settings({
           </button>
           <button
             className={section === "runtime" ? "selected" : ""}
+            disabled={saving}
             onClick={() => setSection("runtime")}
           >
             <Terminal size={16} />
@@ -238,6 +262,7 @@ export default function Settings({
           </button>
           <button
             className={section === "appearance" ? "selected" : ""}
+            disabled={saving}
             onClick={() => setSection("appearance")}
           >
             <Settings2 size={16} />
@@ -263,7 +288,7 @@ export default function Settings({
               <label className="field">
                 <span>{t("API 地址", "API base URL")}</span>
                 <input
-                  disabled={!env}
+                  disabled={!env || saving}
                   type="url"
                   value={base}
                   onChange={(e) => {
@@ -293,7 +318,7 @@ export default function Settings({
                 </span>
                 <div className="input-action">
                   <input
-                    disabled={!env}
+                    disabled={!env || saving}
                     type="password"
                     value={key}
                     onChange={(e) => {
@@ -319,6 +344,7 @@ export default function Settings({
                     <button
                       type="button"
                       className={`icon-button ${removeKey ? "danger-text" : ""}`}
+                      disabled={saving}
                       aria-label={t("移除已保存的密钥", "Remove saved key")}
                       title={t("移除已保存的密钥", "Remove saved key")}
                       onClick={() => {
@@ -357,7 +383,7 @@ export default function Settings({
                 </button>
               </div>
               <input
-                disabled={!env}
+                disabled={!env || saving}
                 id="provider-model"
                 value={model}
                 onChange={(e) => {
@@ -380,6 +406,7 @@ export default function Settings({
               {models.length > 0 && (
                 <select
                   className="model-select"
+                  disabled={saving}
                   aria-label={t("选择可用模型", "Choose available model")}
                   value={models.includes(model) ? model : ""}
                   onChange={(e) => {
@@ -457,7 +484,7 @@ export default function Settings({
                       )}
                     </span>
                     <input
-                      disabled={!env}
+                      disabled={!env || saving}
                       type="password"
                       value={serper}
                       onChange={(e) => {
@@ -479,7 +506,7 @@ export default function Settings({
                       )}
                     </span>
                     <input
-                      disabled={!env}
+                      disabled={!env || saving}
                       type="password"
                       value={jina}
                       onChange={(e) => {
@@ -504,7 +531,9 @@ export default function Settings({
               {error && <Notice danger>{error}</Notice>}
               <div className="settings-footer">
                 <span className="muted">
-                  {saved
+                  {saving
+                    ? t("正在保存…", "Saving…")
+                    : saved
                     ? t("所有更改已保存", "All changes saved")
                     : dirty
                       ? t("有未保存的更改", "Unsaved changes")
@@ -778,7 +807,7 @@ export default function Settings({
           >
             {t("继续编辑", "Keep editing")}
           </button>
-          <button className="secondary-button" onClick={onClose}>
+          <button className="secondary-button" disabled={saving} onClick={onClose}>
             {t("放弃更改", "Discard changes")}
           </button>
         </div>

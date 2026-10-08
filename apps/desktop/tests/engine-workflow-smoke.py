@@ -343,8 +343,15 @@ def environment(home: Path, port: int, source: Path) -> dict[str, str]:
     return result
 
 
-def verify(home: Path, fixture: FixtureServer, proof: dict) -> None:
-    manifests = list((home / "logs").glob("*/run_manifest.json"))
+def verify(
+    home: Path,
+    fixture: FixtureServer,
+    proof: dict,
+    *,
+    logs_root: Path | None = None,
+    python_network_guard: bool = True,
+) -> None:
+    manifests = list((logs_root or home / "logs").glob("*/run_manifest.json"))
     assert len(manifests) == 1, manifests
     log = manifests[0].parent
     manifest = json.loads(manifests[0].read_text())
@@ -404,21 +411,24 @@ def verify(home: Path, fixture: FixtureServer, proof: dict) -> None:
     assert ast.dump(ast.parse((log / "best_solution.py").read_text())) == ast.dump(
         ast.parse(CANDIDATE)
     )
-    network = [
-        json.loads(line) for line in (home / "network.jsonl").read_text().splitlines()
-    ]
-    assert not [
-        item for item in network if item["event"].startswith("blocked")
-    ], network
-    assert fit["candidate_pid"] in {
-        item["pid"] for item in network if item["event"] == "guard_started"
-    }
-    assert all(
-        item["address"][0] in ("127.0.0.1", "::1")
-        and item["address"][1] == fixture.server_port
-        for item in network
-        if item["event"] == "connect"
-    )
+    network = []
+    if python_network_guard:
+        network = [
+            json.loads(line)
+            for line in (home / "network.jsonl").read_text().splitlines()
+        ]
+        assert not [
+            item for item in network if item["event"].startswith("blocked")
+        ], network
+        assert fit["candidate_pid"] in {
+            item["pid"] for item in network if item["event"] == "guard_started"
+        }
+        assert all(
+            item["address"][0] in ("127.0.0.1", "::1")
+            and item["address"][1] == fixture.server_port
+            for item in network
+            if item["event"] == "connect"
+        )
     stages = [request["stage"] for request in fixture.requests_seen]
     for stage in ("split_builder", "draft_plan", "candidate", "report"):
         assert stages.count(stage) == 1, stages

@@ -17,8 +17,9 @@ function validateEngineOverlay(project) {
   if (source.baseRequirementsSha256 !== baseRequirementsSha256 || source.basePyprojectSha256 !== basePyprojectSha256) throw new Error('The research dependency manifest changed. Regenerate and audit the desktop engine overlay before packaging.');
   return { baseRequirementsSha256, basePyprojectSha256, desktopEngineLockSha256: sha(path.join(overlay, 'uv.lock')), desktopEngineRequirementsSha256: sha(path.join(overlay, 'requirements.txt')) };
 }
-function validateRuntime(runtime, platform, architecture, requirements, overlay) {
+function validateRuntime(runtime, platform, architecture, requirements, overlay, applicationVersion) {
   const manifest = JSON.parse(readFileSync(path.join(runtime, 'manifest.json'), 'utf8'));
+  if (applicationVersion !== undefined && manifest.applicationVersion !== applicationVersion) throw new Error(`Portable runtime application version is ${manifest.applicationVersion ?? 'missing'}, but package version is ${applicationVersion}. Run npm run prepare:runtime again before packaging.`);
   const target = `${platform}-${architecture}`;
   if (manifest.target !== target) throw new Error(`Portable runtime is ${manifest.target}, but package target is ${target}. Run prepare:runtime on a ${target} build host; cross-platform runtime reuse is not supported.`);
   const executable = platform === 'win32' ? 'python/python.exe' : 'python/bin/python3';
@@ -52,8 +53,10 @@ function validateRuntime(runtime, platform, architecture, requirements, overlay)
 module.exports = async function beforePack(context) {
   const arch = typeof context.arch === 'string' ? context.arch : ['ia32', 'x64', 'armv7l', 'arm64', 'universal'][context.arch];
   const project = context.packager.projectDir;
+  const { version } = JSON.parse(readFileSync(path.join(project, 'package.json'), 'utf8'));
+  if (typeof version !== 'string' || !version.trim()) throw new Error('Application package.json must declare a non-empty version before packaging.');
   const overlay = validateEngineOverlay(project);
-  validateRuntime(path.join(project, 'build/runtime'), context.electronPlatformName, arch, path.join(project, 'service/requirements.txt'), overlay);
+  validateRuntime(path.join(project, 'build/runtime'), context.electronPlatformName, arch, path.join(project, 'service/requirements.txt'), overlay, version);
 };
 module.exports.validateRuntime = validateRuntime;
 module.exports.validateEngineOverlay = validateEngineOverlay;

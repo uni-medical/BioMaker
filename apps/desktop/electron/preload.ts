@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('biomaker', Object.freeze({
   setPreferences: (preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications?: boolean }) => invoke('biomaker:set-preferences', preferences),
   getPendingRun: () => invoke('biomaker:get-pending-run'),
   acknowledgeOpenRun: (id: string) => invoke('biomaker:acknowledge-open-run', id),
+  reportCloseBlock: (reason: 'unsaved' | 'saving') => ipcRenderer.sendSync('biomaker:close-block', reason),
   onOpenRun: (callback: (id: string) => void) => {
     if (typeof callback !== 'function') throw new TypeError('Expected a callback');
     const listener = (_event: Electron.IpcRendererEvent, id: string) => callback(id);

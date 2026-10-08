@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3 — 2026-10-08
+
+Protects unsaved model settings when closing the native window or quitting the
+application. Keep editing preserves the form and local service; discarding must
+be explicit. In-flight saves cannot be discarded, configuration fields stay
+locked until the response arrives, and failed saves retain edits for retry.
+Unsaved credentials remain only in memory.
+
+Packaging now rejects a portable runtime prepared for a different application
+version and gives the command needed to refresh it. This desktop-only update
+keeps the engine source and scientific dependency contract unchanged.
+
 ## 0.1.2 — 2026-10-08
 
 Fixes a real first-task startup failure: OmegaConf rejected populated compute-slot

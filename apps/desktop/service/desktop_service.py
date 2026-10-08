@@ -26,7 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, provision_native_runtime
 
-VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.2")
+VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.3")
 
 
 @dataclass(frozen=True)

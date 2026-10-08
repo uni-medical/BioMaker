@@ -11,6 +11,11 @@
   queue state, reconnect, failure recovery, keyboard navigation, themes and layout.
 - Test the packaged `.app`, not only the Vite development window. Verify that it
   starts with a minimal PATH and does not depend on the source checkout or system Python.
+- Run `tests/native-close-smoke.mjs` against the packaged executable to verify
+  unsaved-settings close/quit cancellation, explicit discard, in-flight saves,
+  failed-save recovery, and continued service availability after a canceled quit.
+- Prepare the runtime after updating the application version. Packaging rejects
+  a missing or mismatched `manifest.applicationVersion`.
 - On macOS, verify native dependencies with `tests/native-portability-smoke.py`
   against an installed engine. This denies Homebrew/MacPorts library paths and
   tests an isolated copy; it supplements, rather than replaces, separate-hardware

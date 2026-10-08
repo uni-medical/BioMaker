@@ -8,6 +8,7 @@ import { Sidecar } from './sidecar';
 import { externalURL, isWithin, validateArtifact, validateRequest, validTheme } from './security';
 import { readResponse } from './response';
 import { RunNotifications, type RunCompletion } from './run-notifications';
+import { CloseGuard, type CloseBlockReason } from './close-guard';
 
 app.setName('BioMaker');
 // Test/review installs can use a separate profile without touching real projects.
@@ -25,7 +26,30 @@ let notificationTimer: NodeJS.Timeout | null = null;
 let notificationPollRunning = false;
 let pendingRunId: string | null = null;
 const visibleNotifications = new Set<Electron.Notification>();
+let closeBlockReason: CloseBlockReason = 'unsaved';
 const t = (zh: string, en: string) => preferences.language === 'en' ? en : zh;
+const closeGuard = new CloseGuard({
+  windowId: () => mainWindow?.id ?? null,
+  closeWindow: () => mainWindow?.close(),
+  confirmClose: reason => {
+    const saving = reason === 'saving';
+    const response = dialog.showMessageBoxSync(mainWindow!, {
+      type: 'warning', title: t('模型配置', 'Model settings'),
+      message: saving ? t('配置正在保存，请稍候。', 'Settings are being saved. Please wait.') : t('模型配置尚未保存。', 'Model settings have not been saved.'),
+      detail: saving ? t('保存完成后可以关闭窗口或退出。', 'You can close the window or quit after saving finishes.') : t('放弃更改后，未保存的内容将丢失。', 'Discarding changes will lose the settings you have not saved.'),
+      buttons: saving ? [t('继续等待', 'Keep waiting')] : [t('继续编辑', 'Keep editing'), t('放弃更改', 'Discard changes')],
+      defaultId: 0, cancelId: 0, noLink: true,
+    });
+    return !saving && response === 1;
+  },
+  stop: async () => {
+    quitting = true;
+    if (notificationTimer) clearTimeout(notificationTimer);
+    for (const notification of visibleNotifications) notification.close();
+    await sidecar?.stop();
+  },
+  quit: () => app.quit(),
+});
 const desktopRoot = path.resolve(__dirname, '..');
 const indexPath = path.join(desktopRoot, 'dist', 'index.html');
 const devURL = !app.isPackaged && process.env.BIOMAKER_DESKTOP_DEV_URL === 'http://127.0.0.1:5173' ? process.env.BIOMAKER_DESKTOP_DEV_URL : null;
@@ -108,6 +132,16 @@ function installMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 function setupIPC() {
+  // Synchronous only at beforeunload: the reason must arrive before Electron's
+  // will-prevent-unload event. No form values or secrets cross this channel.
+  ipcMain.on('biomaker:close-block', (event, reason) => {
+    try {
+      senderAllowed(event);
+      if (reason !== 'unsaved' && reason !== 'saving') throw new Error('Invalid close protection');
+      closeBlockReason = reason;
+      event.returnValue = true;
+    } catch { event.returnValue = false; }
+  });
   handle('biomaker:request', async (rawPath, options) => {
     const request = validateRequest(rawPath, options);
     if (!sidecar || !serviceReady) throw new Error(t('BioMaker 服务正在启动，请稍后重试。', 'BioMaker is starting. Please try again shortly.'));
@@ -171,8 +205,11 @@ async function createWindow() {
   window.webContents.setWindowOpenHandler(({ url }) => { try { void shell.openExternal(externalURL(url)); } catch { /* Unapproved windows stay closed. */ } return { action: 'deny' }; });
   window.webContents.on('will-navigate', (event, url) => { if (!isRendererURL(url)) event.preventDefault(); });
   window.webContents.on('will-attach-webview', event => event.preventDefault());
+  window.webContents.on('will-prevent-unload', event => {
+    if (closeGuard.blockedUnload(closeBlockReason)) event.preventDefault();
+  });
   window.on('close', () => { if (!window.isMaximized() && !window.isFullScreen()) { preferences.bounds = window.getBounds(); savePreferences(); } });
-  window.on('closed', () => { if (mainWindow === window) mainWindow = null; });
+  window.on('closed', () => { if (mainWindow === window) mainWindow = null; closeGuard.windowClosed(); });
   window.once('ready-to-show', () => window.show());
   if (devURL) await window.loadURL(devURL); else await window.loadFile(indexPath);
 }
@@ -181,11 +218,9 @@ app.on('second-instance', showWindow);
 app.on('activate', () => { if (app.isReady()) showWindow(); });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', event => {
-  if (quitting) return;
-  event.preventDefault(); quitting = true;
-  if (notificationTimer) clearTimeout(notificationTimer);
-  for (const notification of visibleNotifications) notification.close();
-  void (sidecar?.stop() ?? Promise.resolve()).finally(() => app.quit());
+  if (closeGuard.readyToQuit) return;
+  event.preventDefault();
+  closeGuard.requestQuit();
 });
 if (locked) void app.whenReady().then(async () => {
   mkdirSync(app.getPath('userData'), { recursive: true, mode: 0o700 });

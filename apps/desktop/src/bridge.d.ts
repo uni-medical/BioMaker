@@ -12,6 +12,7 @@ declare global {
       setPreferences(preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications?: boolean }): Promise<{ theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications: boolean }>;
       getPendingRun(): Promise<string | null>;
       acknowledgeOpenRun(id: string): Promise<void>;
+      reportCloseBlock(reason: 'unsaved' | 'saving'): boolean;
       onOpenRun(callback: (id: string) => void): () => void;
       openExternal(url: string): Promise<void>;
       onMenuAction(callback: (action: string) => void): () => void;
