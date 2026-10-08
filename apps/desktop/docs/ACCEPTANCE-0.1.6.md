@@ -1,12 +1,14 @@
 # BioMaker Desktop 0.1.6 acceptance
 
 Date: 2026-10-09. Host: macOS, Apple silicon / arm64.
-Release source commit: **Pending**.
+Release source commit: `b3f19fe4b79d52f2f8702ef3b00b761c52a277a1`, recorded clean
+in the bundled manifest.
 
-Source validation and expanded development recovery passed. Packaged acceptance,
-installation and the installed training workflow remain **Pending**.
+Source validation, expanded development recovery, packaged acceptance, final
+artifact verification, installation and the installed synthetic training workflow
+passed.
 
-## Changes under acceptance
+## Verified changes
 
 - A native service construction failure leaves the application window and its
   draft available. Users can retry the local service or export diagnostics
@@ -100,45 +102,106 @@ installed-application acceptance.
 
 ## Packaged executable acceptance
 
-**Pending.** Build from the final recorded source commit and run the packaged
-recovery and regression workflows. Record results, renderer errors, profile
-isolation and any differences from development behavior.
+The packaged 0.1.6 executable passed all six workflows with isolated synthetic
+profiles:
+
+| Workflow | Passed checks |
+| --- | --- |
+| Service recovery | 7 / 7 |
+| Native-close protection | 6 / 6 |
+| History import | 10 / 10 |
+| Run organization | 8 / 8 |
+| Experiment reuse | 8 / 8 |
+| General Electron acceptance | 22 / 22 |
+
+Packaged recovery reproduced a real construction failure while keeping the
+window, draft, retry and native diagnostic export available. The report identified
+the synthetic regular-file obstruction at the logs location without including
+private content. Concurrent exports shared one dialog and result; cancellation,
+write failure, retry, service replacement and unsaved provider-field preservation
+passed. The compact 960 by 680 window had no horizontal overflow.
+
+Regression workflows retained native-close safeguards, history-import exclusions
+and source-file preservation, revision-aware organization, and explicit draft
+replacement without starting an experiment. General acceptance covered the real
+sidecar, renderer sandbox, IPC boundaries, settings, onboarding, theme, language,
+restart, artifacts, compact layout and notification interactions. No renderer
+errors were observed. Native notification display was intercepted in QA; actual
+OS banner delivery is not established by these checks.
 
 ## Installation and final artifact verification
 
-**Pending.** Record final DMG and ZIP hashes, read-only DMG mount verification,
-Applications shortcut, bundled version and source identity, complete bundle
-comparison and final signature verification after packaged QA.
+The DMG was mounted read-only and its Applications shortcut resolved correctly.
+Deep strict signature verification passed on the unpacked application, DMG
+application and extracted ZIP application. Their complete 2,809-file bundle
+fingerprints, including symlink targets, matched. The bundled manifest recorded
+version 0.1.6 and the clean source commit above.
 
-**Pending.** Record installation at `/Applications/BioMaker.app`, the previous
-application backup, preservation of the actual user's configuration and run
-records, and the installed engine selection result. Do not infer preservation
-or engine reuse from an earlier release.
+The upgrade is installed at `/Applications/BioMaker.app`. The previous app is
+preserved under `release/installed-backups/BioMaker-0.1.5-20261009-002600.app`.
+The actual user profile opened with its existing engine ready and requested no
+installation. Its configuration file and complete run records matched the
+pre-upgrade snapshot, with no synthetic fixtures added. This profile contained
+zero run records before and after the upgrade; this particular check does not
+establish migration of a populated history.
+
+Engine selection reported `reused=true`, and the installed application confirmed
+reuse. The engine source SHA-256 remains
+`56d274eec3df1d02eefb52dbe5cc894ff4a5eabe066f483046462e4e021e9fa2`.
+After the installed workflow, both installed and packaged signatures passed
+again. The installed application's complete bundle fingerprint matched the
+verified package:
+`8df6b5ab0e72a7f780dcfb6c2b1b8bf3ee31c351a541065bd1082c91edb2fdea`.
 
 ## Installed desktop workflow
 
-**Pending.** Exercise the installed 0.1.6 application through UI submission,
-durable queue execution, actual CPU training, frozen evaluation, result
-inspection and native report export. Record elapsed time, terminal status, exit
-code, renderer errors, fixture/provider behavior, installed fingerprints and
-final process cleanup. Development recovery checks do not establish this result.
+The installed 0.1.6 executable completed UI submission, durable queue execution,
+actual CPU training, frozen evaluation, result inspection and native report
+export in **15.234 seconds**. The run reached `succeeded` with exit code 0 and no
+renderer errors. A scikit-learn logistic regression model was fitted on synthetic
+data using the installed engine, with no installed-source override. Five model
+requests went to a deterministic localhost fixture; there were no external
+provider calls. Final retraining was disabled.
+
+The test-only spawn wrapper restricted the Python sidecar and its queue, uv and
+training descendants to localhost. Only the exact `/bin/ps` executable was exempt
+for read-only process identity inspection. The candidate confirmed that an
+external-address connection was denied with `EPERM`. The production Chromium
+sandbox and source were unchanged.
+
+Installed engine/runtime fingerprints remained unchanged. The actual user
+profile was unchanged after QA, and no matching QA processes remained. Durable
+synthetic evidence, including preserved symlinks, is saved under
+`output/qa/desktop-workflow-0.1.6/`. This verifies the installed software workflow;
+it does not measure external-provider quality, multi-round biomedical search or
+scientific model performance.
 
 ## Artifacts and evidence
 
 | Artifact | SHA-256 |
 | --- | --- |
-| BioMaker-0.1.6-mac-arm64.dmg | **Pending** |
-| BioMaker-0.1.6-mac-arm64.zip | **Pending** |
+| BioMaker-0.1.6-mac-arm64.dmg | `9d2953f900eba68dbefd8d63fc0068902bab5be68e568e83e782ad8b11a0abbd` |
+| BioMaker-0.1.6-mac-arm64.zip | `cd5ba96731764d6749cb86cb806fb4dd253d79f8154b670a78daa347716c5816` |
 
-Current development receipts under `apps/desktop/output/`:
+Machine-readable receipts and durable evidence under `apps/desktop/output/`:
 
 - `service-recovery/acceptance.json`
 - `native-service-state/acceptance.json`
 - `service-ui/acceptance.json`
 - `experiment-reuse/acceptance.json`
-
-Final source, packaged recovery, package verification, installation and installed
-training receipts: **Pending**.
+- `service-recovery-packaged-0.1.6/acceptance.json`
+- `native-close-packaged-0.1.6/acceptance.json`
+- `history-import-packaged-0.1.6/acceptance.json`
+- `run-organization-packaged-0.1.6/acceptance.json`
+- `experiment-reuse-packaged-0.1.6/acceptance.json`
+- `electron-packaged-0.1.6/acceptance.json`
+- `package-verification-0.1.6.json`
+- `package-installation-0.1.6.json`
+- `engine-upgrade-0.1.6.json`
+- `installed-engine-acceptance-0.1.6.json`
+- `desktop-workflow-acceptance-0.1.6.json`
+- `post-workflow-verification-0.1.6.json`
+- `qa/desktop-workflow-0.1.6/` (durable fixture, logs, screenshots and outputs)
 
 ## Boundaries
 
