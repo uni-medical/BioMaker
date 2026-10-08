@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.2 — 2026-10-08
+
+Fixes a real first-task startup failure: OmegaConf rejected populated compute-slot
+metadata because its structured mapping used `object`. Runtime assignments now
+use `Any`, with a focused regression and full synthetic workflow acceptance.
+
+Reuses compatible scientific environments across UI-only upgrades by comparing
+all bundled source bytes, platform and exact Python provenance. Existing venvs
+remain at their original paths. Changed, partial, or modified engines are preserved
+and isolated; dependency/native receipts remain the readiness authority. This
+release contains an engine fix, so it correctly creates a separate environment.
+
+Adds optional native completion/failure notifications while BioMaker runs in the
+background, including after closing its window. Clicks reopen the matching run
+without losing the experiment draft. Notification preferences persist; old history,
+manual stops/cancellations, and repeated observations remain quiet. Native banners
+omit task and dataset names. Delivery depends on OS permission and stops after
+quitting the application.
+
+A deterministic local API fixture now exercises the actual split builder, frozen
+evaluator, CPU classifier, scoring, journal, best solution, and report pipeline.
+It uses synthetic data and makes no external model-provider call or medical claim.
+
 ## 0.1.1 — 2026-10-08
 
 Makes first-use configuration actionable: the primary action opens missing setup,

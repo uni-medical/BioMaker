@@ -1,6 +1,9 @@
 from pathlib import Path
 
+from omegaconf import OmegaConf
+
 from biomaker.utils import config as config_module
+from biomaker.utils.compute import ComputeSlot
 
 
 def _config_for_test(tmp_path: Path):
@@ -52,3 +55,24 @@ def test_model_for_all_agents_overrides_every_role(tmp_path, monkeypatch):
     prepared = config_module.prep_cfg(cfg)
 
     assert _configured_models(prepared) == {"task-selected-model"}
+
+
+def test_prepared_config_accepts_detected_compute_slots(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_module, "load_local_env", lambda: tmp_path / ".env")
+    prepared = config_module.prep_cfg(_config_for_test(tmp_path))
+    slots = [
+        ComputeSlot(index=0, backend="cpu"),
+        ComputeSlot(index=1, backend="mps"),
+        ComputeSlot(index=2, backend="cuda", selector="GPU-test-device"),
+    ]
+
+    # These runtime assignments occur at the start of _run, after prep_cfg has
+    # merged the defaults with its structured OmegaConf schema.
+    prepared.exec.requested_parallel_workers = "auto"
+    prepared.exec.effective_parallel_workers = len(slots)
+    prepared.exec.compute_slots = [slot.as_dict() for slot in slots]
+
+    serialized = OmegaConf.to_container(prepared.exec, resolve=True)
+    assert serialized["compute_slots"] == [slot.as_dict() for slot in slots]
+    assert serialized["effective_parallel_workers"] == 3
+    assert serialized["requested_parallel_workers"] == "auto"

@@ -32,6 +32,8 @@ export default function Settings({
   setLang,
   theme,
   setTheme,
+  notificationsEnabled,
+  setNotificationsEnabled,
   engine,
   env,
   version,
@@ -48,6 +50,8 @@ export default function Settings({
   setLang: (v: Language) => void;
   theme: Theme;
   setTheme: (v: Theme) => void;
+  notificationsEnabled: boolean;
+  setNotificationsEnabled: (enabled: boolean) => void;
   engine: EngineStatus | null;
   env: EnvConfig | null;
   version: string;
@@ -712,6 +716,29 @@ export default function Settings({
                   <option value="en">English</option>
                 </select>
               </SettingRow>
+              <div className="setting-row notification-setting">
+                <div>
+                  <label className="setting-title" htmlFor="run-notifications">
+                    {t(
+                      "实验完成或失败时通知我",
+                      "Notify when experiments finish or fail",
+                    )}
+                  </label>
+                  <p id="run-notifications-help">
+                    {t(
+                      "应用在后台运行时提醒；完全退出后不会通知。通知还需获得系统允许。",
+                      "Notify while BioMaker is running in the background; unavailable after quitting the app. Notifications also require system permission.",
+                    )}
+                  </p>
+                </div>
+                <input
+                  id="run-notifications"
+                  type="checkbox"
+                  checked={notificationsEnabled}
+                  onChange={(e) => setNotificationsEnabled(e.target.checked)}
+                  aria-describedby="run-notifications-help"
+                />
+              </div>
               <div className="keyboard-help">
                 <h4>{t("键盘快捷键", "Keyboard shortcuts")}</h4>
                 {[

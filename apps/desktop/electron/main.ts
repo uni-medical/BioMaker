@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
 import { createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +7,7 @@ import { pipeline } from 'node:stream/promises';
 import { Sidecar } from './sidecar';
 import { externalURL, isWithin, validateArtifact, validateRequest, validTheme } from './security';
 import { readResponse } from './response';
+import { RunNotifications, type RunCompletion } from './run-notifications';
 
 app.setName('BioMaker');
 // Test/review installs can use a separate profile without touching real projects.
@@ -18,7 +19,12 @@ let mainWindow: BrowserWindow | null = null;
 let sidecar: Sidecar | null = null;
 let quitting = false;
 let serviceReady = false;
-let preferences: { theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; directories: string[]; bounds?: Electron.Rectangle } = { theme: 'system', directories: [] };
+let preferences: { theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications: boolean; directories: string[]; bounds?: Electron.Rectangle } = { theme: 'system', notifications: true, directories: [] };
+const runNotifications = new RunNotifications();
+let notificationTimer: NodeJS.Timeout | null = null;
+let notificationPollRunning = false;
+let pendingRunId: string | null = null;
+const visibleNotifications = new Set<Electron.Notification>();
 const t = (zh: string, en: string) => preferences.language === 'en' ? en : zh;
 const desktopRoot = path.resolve(__dirname, '..');
 const indexPath = path.join(desktopRoot, 'dist', 'index.html');
@@ -40,6 +46,56 @@ function handle(channel: string, callback: (...args: any[]) => unknown) {
 }
 function action(name: string) { mainWindow?.webContents.send('biomaker:menu-action', name); }
 function showWindow() { if (!app.isReady()) { app.once('ready', showWindow); return; } if (!mainWindow) void createWindow(); else { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.show(); mainWindow.focus(); } }
+function notifyCompletion(completion: RunCompletion) {
+  if (quitting || !preferences.notifications || mainWindow?.isFocused() || !Notification.isSupported()) return;
+  // System notifications can appear on a lock screen: omit task names, datasets,
+  // provider errors and metrics, while retaining an internal navigation target.
+  const notification = new Notification({
+    title: completion.outcome === 'complete' ? t('实验已完成', 'Experiment complete') : completion.outcome === 'failed' ? t('实验运行失败', 'Experiment failed') : t('实验已中断', 'Experiment interrupted'),
+    body: t('点击打开 BioMaker，查看实验结果与日志。', 'Open BioMaker to view the experiment results and logs.'),
+    silent: true,
+  });
+  notification.on('click', () => {
+    pendingRunId = completion.id;
+    showWindow();
+    mainWindow?.webContents.send('biomaker:open-run', completion.id);
+  });
+  const release = () => visibleNotifications.delete(notification);
+  notification.on('close', release);
+  notification.on('failed', release);
+  visibleNotifications.add(notification);
+  if (visibleNotifications.size > 20) {
+    const oldest = visibleNotifications.values().next().value!;
+    oldest.close(); visibleNotifications.delete(oldest);
+  }
+  try { notification.show(); } catch { release(); }
+}
+function observeRuns(payload: unknown, ticket: number) {
+  const hadActiveRuns = runNotifications.activeCount > 0;
+  for (const completion of runNotifications.observe(payload, ticket)) notifyCompletion(completion);
+  if (!hadActiveRuns && runNotifications.activeCount) scheduleRunMonitor(1000);
+}
+function scheduleRunMonitor(delay: number) {
+  if (quitting) return;
+  if (notificationTimer) clearTimeout(notificationTimer);
+  notificationTimer = setTimeout(() => { void pollNotificationRuns(); }, delay);
+  notificationTimer.unref();
+}
+async function pollNotificationRuns() {
+  if (quitting || notificationPollRunning) return;
+  notificationPollRunning = true;
+  try {
+    if (sidecar && serviceReady) {
+      const ticket = runNotifications.issue();
+      const response = await fetch(`${sidecar.origin}/api/runs`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(10_000) });
+      observeRuns(await readResponse(response, true), ticket);
+    }
+  } catch { /* Preserve known active runs across temporary service failures. */ }
+  finally {
+    notificationPollRunning = false;
+    scheduleRunMonitor(runNotifications.activeCount ? 5000 : 30000);
+  }
+}
 function installMenu() {
   const template: MenuItemConstructorOptions[] = [
     ...(process.platform === 'darwin' ? [{ label: 'BioMaker', submenu: [{ role: 'about', label: t('关于 BioMaker', 'About BioMaker') }, { type: 'separator' }, { label: t('设置…', 'Settings…'), accelerator: 'CmdOrCtrl+,', click: () => action('settings') }, { type: 'separator' }, { role: 'hide', label: t('隐藏 BioMaker', 'Hide BioMaker') }, { role: 'hideOthers', label: t('隐藏其它应用', 'Hide Others') }, { role: 'unhide', label: t('显示全部', 'Show All') }, { type: 'separator' }, { role: 'quit', label: t('退出 BioMaker', 'Quit BioMaker') }] } as MenuItemConstructorOptions] : []),
@@ -55,8 +111,12 @@ function setupIPC() {
   handle('biomaker:request', async (rawPath, options) => {
     const request = validateRequest(rawPath, options);
     if (!sidecar || !serviceReady) throw new Error(t('BioMaker 服务正在启动，请稍后重试。', 'BioMaker is starting. Please try again shortly.'));
+    const isRunResponse = /^\/api\/runs(?:\/[^/]+(?:\/(?:requeue|stop|cancel))?)?$/.test(request.path.split('?')[0]);
+    const ticket = isRunResponse ? runNotifications.issue() : 0;
     const response = await fetch(`${sidecar.origin}${request.path}`, { method: request.method, body: request.body, headers: { Authorization: `Bearer ${sidecar.token}`, ...(request.body === undefined ? {} : { 'Content-Type': 'application/json' }) }, redirect: 'error', signal: AbortSignal.timeout(45_000) });
-    return readResponse(response, request.path.startsWith('/api/'));
+    const result = await readResponse(response, request.path.startsWith('/api/'));
+    if (isRunResponse) observeRuns(result, ticket);
+    return result;
   });
   handle('biomaker:choose-directory', async () => {
     const result = await dialog.showOpenDialog(mainWindow!, { title: t('选择数据目录', 'Choose a dataset folder'), properties: ['openDirectory', 'createDirectory'], buttonLabel: t('选择此目录', 'Choose folder') });
@@ -85,16 +145,21 @@ function setupIPC() {
     return result.filePath;
   });
   handle('biomaker:app-info', () => ({ version: app.getVersion(), platform: process.platform }));
-  handle('biomaker:get-preferences', () => ({ theme: preferences.theme, language: preferences.language }));
+  handle('biomaker:get-preferences', () => ({ theme: preferences.theme, language: preferences.language, notifications: preferences.notifications }));
   handle('biomaker:set-preferences', (value) => {
-    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['theme', 'language'].includes(key))) throw new Error('Invalid preferences');
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['theme', 'language', 'notifications'].includes(key))) throw new Error('Invalid preferences');
     if ('theme' in value && !validTheme(value.theme)) throw new Error('Invalid theme');
     if ('language' in value && value.language !== 'zh' && value.language !== 'en') throw new Error('Invalid language');
+    if ('notifications' in value && typeof value.notifications !== 'boolean') throw new Error('Invalid notification preference');
     if ('theme' in value) { preferences.theme = value.theme; nativeTheme.themeSource = value.theme; }
     if ('language' in value) preferences.language = value.language;
+    if ('notifications' in value) preferences.notifications = value.notifications;
+    if (!preferences.notifications) for (const notification of visibleNotifications) notification.close();
     savePreferences(); installMenu();
-    return { theme: preferences.theme, language: preferences.language };
+    return { theme: preferences.theme, language: preferences.language, notifications: preferences.notifications };
   });
+  handle('biomaker:get-pending-run', () => pendingRunId);
+  handle('biomaker:acknowledge-open-run', (id) => { if (typeof id !== 'string' || id.length > 180) throw new Error('Invalid run identifier'); if (id === pendingRunId) pendingRunId = null; });
   handle('biomaker:open-external', (url) => shell.openExternal(externalURL(url)));
 }
 async function createWindow() {
@@ -118,11 +183,13 @@ app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(
 app.on('before-quit', event => {
   if (quitting) return;
   event.preventDefault(); quitting = true;
+  if (notificationTimer) clearTimeout(notificationTimer);
+  for (const notification of visibleNotifications) notification.close();
   void (sidecar?.stop() ?? Promise.resolve()).finally(() => app.quit());
 });
 if (locked) void app.whenReady().then(async () => {
   mkdirSync(app.getPath('userData'), { recursive: true, mode: 0o700 });
-  try { const saved = JSON.parse(readFileSync(preferencesPath(), 'utf8')); preferences = { theme: validTheme(saved?.theme) ? saved.theme : 'system', language: saved?.language === 'en' || saved?.language === 'zh' ? saved.language : undefined, directories: Array.isArray(saved?.directories) ? saved.directories.filter((item: unknown) => typeof item === 'string' && path.isAbsolute(item)).slice(-100) : [], bounds: saved?.bounds && ['x', 'y', 'width', 'height'].every(key => Number.isFinite(saved.bounds[key])) ? saved.bounds : undefined }; } catch { /* Fresh profile. */ }
+  try { const saved = JSON.parse(readFileSync(preferencesPath(), 'utf8')); preferences = { theme: validTheme(saved?.theme) ? saved.theme : 'system', language: saved?.language === 'en' || saved?.language === 'zh' ? saved.language : undefined, notifications: saved?.notifications !== false, directories: Array.isArray(saved?.directories) ? saved.directories.filter((item: unknown) => typeof item === 'string' && path.isAbsolute(item)).slice(-100) : [], bounds: saved?.bounds && ['x', 'y', 'width', 'height'].every(key => Number.isFinite(saved.bounds[key])) ? saved.bounds : undefined }; } catch { /* Fresh profile. */ }
   nativeTheme.themeSource = preferences.theme;
   app.setAboutPanelOptions({ applicationName: 'BioMaker', applicationVersion: app.getVersion(), copyright: 'BioMaker · Biomedical AI research workspace', website: 'https://github.com/uni-medical/BioMaker' });
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
@@ -142,7 +209,7 @@ if (locked) void app.whenReady().then(async () => {
   sidecar = new Sidecar({ runtime: app.isPackaged ? path.join(process.resourcesPath, 'runtime') : path.join(desktopRoot, 'build', 'runtime'), service: app.isPackaged ? path.join(process.resourcesPath, 'service', 'main.py') : path.join(desktopRoot, 'service', 'main.py'), data: app.getPath('userData'), version: app.getVersion(), onFailure: message => { serviceReady = false; void dialog.showMessageBox({ type: 'error', title: t('BioMaker 服务', 'BioMaker service'), message, buttons: [t('重新启动', 'Restart'), t('打开诊断日志', 'Open diagnostic logs'), t('稍后', 'Later')], defaultId: 0, cancelId: 2 }).then(async result => { if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) await shell.openPath(path.join(app.getPath('userData'), 'logs')); }); } });
   // Render early so users see progress while the bundled service initializes.
   await createWindow();
-  try { await sidecar.start(); serviceReady = true; action('refresh'); } catch (error) {
+  try { await sidecar.start(); serviceReady = true; action('refresh'); scheduleRunMonitor(0); } catch (error) {
     const result = await dialog.showMessageBox(mainWindow!, { type: 'error', title: t('BioMaker 启动失败', 'BioMaker could not start'), message: String(error), detail: t('你的实验数据保存在应用工作目录中。可以重试启动，或打开诊断日志。', 'Your experiments are saved in the application workspace. Retry or open the diagnostic logs.'), buttons: [t('重试', 'Retry'), t('打开日志', 'Open logs'), t('退出', 'Quit')], defaultId: 0, cancelId: 2 });
     if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) { await shell.openPath(path.join(app.getPath('userData'), 'logs')); } else app.quit();
   }

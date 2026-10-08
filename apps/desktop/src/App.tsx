@@ -127,6 +127,9 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(() =>
     readStored("biomaker.theme", "system"),
   );
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  const [notificationRunToAcknowledge, setNotificationRunToAcknowledge] =
+    useState<string | null>(null);
   const t: Translate = useCallback(
     (zh, en) => (lang === "zh" ? zh : en),
     [lang],
@@ -191,6 +194,7 @@ export default function App() {
   const configLoaded = useRef({ env: false, templates: false });
   const themeEdited = useRef(false);
   const languageEdited = useRef(false);
+  const notificationsEdited = useRef(false);
   const alive = useRef(true);
   const toast = useCallback((message: string) => setToastMessage(message), []);
 
@@ -207,6 +211,12 @@ export default function App() {
       .getPreferences?.()
       .then((preferences) => {
         if (valid && !themeEdited.current) setTheme(preferences.theme);
+        if (
+          valid &&
+          !notificationsEdited.current &&
+          typeof preferences.notifications === "boolean"
+        )
+          setNotificationsEnabled(preferences.notifications);
         if (valid && !languageEdited.current) {
           if (preferences.language) setLang(preferences.language);
           else
@@ -220,6 +230,13 @@ export default function App() {
       valid = false;
     };
   }, []);
+  const changeNotifications = (value: boolean) => {
+    notificationsEdited.current = true;
+    setNotificationsEnabled(value);
+    void window.biomaker
+      .setPreferences?.({ notifications: value })
+      .catch((e) => toast(errorMessage(e)));
+  };
   const changeLanguage = (value: Language) => {
     languageEdited.current = true;
     setLang(value);
@@ -234,6 +251,54 @@ export default function App() {
       .setPreferences?.({ theme: value })
       .catch((e) => toast(errorMessage(e)));
   };
+  const openNotificationRun = useCallback((runId: string) => {
+    if (typeof runId !== "string" || !runId.trim()) return;
+    setSelectedId(runId);
+    setHistory(false);
+    setSearchOpen(false);
+    setTemplatesOpen(false);
+    setConfirmation(null);
+    // Keep the current draft and any unsaved provider settings intact.
+    setNotificationRunToAcknowledge(runId);
+  }, []);
+  useEffect(() => {
+    if (!window.biomaker) return;
+    let valid = true;
+    let receivedLiveEvent = false;
+    const unsubscribe = window.biomaker.onOpenRun?.((runId) => {
+      receivedLiveEvent = true;
+      if (valid) openNotificationRun(runId);
+    });
+    void window.biomaker
+      .getPendingRun?.()
+      .then((runId) => {
+        if (valid && !receivedLiveEvent && runId) openNotificationRun(runId);
+      })
+      .catch((e) => {
+        if (valid) toast(errorMessage(e));
+      });
+    return () => {
+      valid = false;
+      unsubscribe?.();
+    };
+  }, [openNotificationRun, toast]);
+  useEffect(() => {
+    if (
+      !notificationRunToAcknowledge ||
+      selectedId !== notificationRunToAcknowledge ||
+      !window.biomaker
+    )
+      return;
+    const runId = notificationRunToAcknowledge;
+    void window.biomaker
+      .acknowledgeOpenRun?.(runId)
+      .catch((e) => toast(errorMessage(e)))
+      .finally(() => {
+        setNotificationRunToAcknowledge((current) =>
+          current === runId ? null : current,
+        );
+      });
+  }, [selectedId, notificationRunToAcknowledge, toast]);
   useEffect(() => {
     persist("biomaker.language", lang);
     document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
@@ -1849,6 +1914,8 @@ export default function App() {
           setLang={changeLanguage}
           theme={theme}
           setTheme={changeTheme}
+          notificationsEnabled={notificationsEnabled}
+          setNotificationsEnabled={changeNotifications}
           engine={engine}
           env={env}
           version={version}

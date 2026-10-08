@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { prepareSelectedEngine, selectEngine, type EngineSelection } from './engine-selection';
 
 export interface SidecarOptions { runtime: string; service: string; data: string; version: string; onFailure: (message: string) => void }
 export class Sidecar {
@@ -14,11 +15,11 @@ export class Sidecar {
   private restarting: Promise<void> | null = null;
   private restartCount = 0;
   private logPath: string;
+  private engineSelection: EngineSelection;
   constructor(private options: SidecarOptions) {
-    let hash = 'development';
     const manifest = path.join(options.runtime, 'manifest.json');
-    if (existsSync(manifest)) hash = JSON.parse(readFileSync(manifest, 'utf8')).engineSha256.slice(0, 12);
-    this.engine = path.join(options.data, 'engines', `${options.version}-${hash}`);
+    this.engineSelection = selectEngine(options.runtime, options.data);
+    this.engine = this.engineSelection.directory;
     const identity = createHash('sha256');
     if (existsSync(manifest)) identity.update(readFileSync(manifest));
     const serviceDirectory = path.dirname(options.service);
@@ -44,16 +45,7 @@ export class Sidecar {
     } catch { /* A full disk must not turn a recoverable service error into an application crash. */ }
   }
   private prepareEngine() {
-    if (existsSync(path.join(this.engine, '.desktop-engine-ready'))) return;
-    const source = path.join(this.options.runtime, 'engine');
-    if (!existsSync(source)) throw new Error('缺少 BioMaker 引擎。请重新安装应用。开发环境请先运行 npm run prepare:runtime。');
-    mkdirSync(path.dirname(this.engine), { recursive: true, mode: 0o700 });
-    const stage = `${this.engine}.staging-${process.pid}`;
-    rmSync(stage, { recursive: true, force: true });
-    cpSync(source, stage, { recursive: true });
-    writeFileSync(path.join(stage, '.desktop-engine-ready'), this.options.version);
-    if (existsSync(this.engine)) rmSync(this.engine, { recursive: true, force: true });
-    renameSync(stage, this.engine);
+    prepareSelectedEngine(this.engineSelection);
   }
   private prepareRuntime() {
     if (existsSync(path.join(this.runtimeDirectory, '.desktop-runtime-ready'))) return;

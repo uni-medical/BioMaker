@@ -1,5 +1,6 @@
 import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -18,7 +19,7 @@ const launch = () => electron.launch({ ...(executablePath ? { executablePath, ar
 let app;
 const errors = [];
 console.log(JSON.stringify({ profile, output, executablePath: executablePath || 'development Electron' }));
-async function ready() {
+async function ready(requireComposer = true) {
   const page = await app.firstWindow();
   page.on('pageerror', error => errors.push(error.message));
   let healthy = false;
@@ -29,7 +30,7 @@ async function ready() {
     await new Promise(resolve => setTimeout(resolve, 200));
   }
   assert(healthy, 'The real desktop service must become healthy within 60 seconds');
-  await page.waitForFunction(() => document.querySelector('textarea'));
+  await page.waitForFunction(composer => document.querySelector(composer ? 'textarea' : '.app-header'), requireComposer);
   return page;
 }
 try {
@@ -76,6 +77,9 @@ try {
   assert.deepEqual(await page.evaluate(() => window.biomaker.request('/api/runs')), []);
   await page.locator('.sidebar-settings').click();
   await page.getByRole('button', { name: '通用', exact: true }).click();
+  assert.equal(await page.getByLabel('实验完成或失败时通知我', { exact: true }).isChecked(), true);
+  await page.getByLabel('实验完成或失败时通知我', { exact: true }).uncheck();
+  assert.equal((await page.evaluate(() => window.biomaker.getPreferences())).notifications, false);
   await page.getByRole('button', { name: '深色', exact: true }).click();
   assert.equal((await page.evaluate(() => window.biomaker.getPreferences())).theme, 'dark');
   await page.getByLabel('界面语言', { exact: true }).selectOption('en');
@@ -111,7 +115,7 @@ try {
   await writeFile(path.join(logdir, 'results.tsv'), 'step\tmetric\tmaximize\tstatus\n0\tnan\ttrue\tfailed\n1\t0.7\ttrue\tsucceeded\n');
   await writeFile(path.join(logdir, 'desktop-acceptance-fixture.log'), 'Desktop acceptance fixture log. No model was trained.\n');
   app = await launch(); page = await ready();
-  assert.deepEqual(await page.evaluate(() => window.biomaker.getPreferences()), { theme: 'light', language: 'zh' });
+  assert.deepEqual(await page.evaluate(() => window.biomaker.getPreferences()), { theme: 'light', language: 'zh', notifications: false });
   const records = await page.evaluate(() => window.biomaker.request('/api/runs'));
   assert.equal(records.length, 1); assert.equal(records[0].status, 'complete');
   const detail = await page.evaluate(id => window.biomaker.request(`/api/runs/${id}`), records[0].id);
@@ -138,13 +142,61 @@ try {
   await page.waitForTimeout(200);
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
   await page.screenshot({ path: path.join(output, '06-compact.png') });
+  if (process.platform === 'darwin') {
+    // Only this synthetic QA ledger is mutated. No engine task is launched.
+    // Intercept native show() to verify dispatch/click without sending test banners.
+    const python = executablePath ? path.resolve(path.dirname(executablePath), '../Resources/runtime/python/bin/python3') : path.join(root, 'build/runtime/python/bin/python3');
+    const fixtureStatus = (value) => {
+      const result = spawnSync(python, ['-I', '-c', `import json,sqlite3,sys\nc=sqlite3.connect(sys.argv[1])\nwith c:\n q=json.loads(c.execute('SELECT record_json FROM queue_control WHERE singleton=1').fetchone()[0]);q['paused']=True;q['reason']='Synthetic notification acceptance'\n c.execute('UPDATE queue_control SET record_json=? WHERE singleton=1',(json.dumps(q),))\n r=json.loads(c.execute('SELECT record_json FROM runs WHERE run_id=?',(sys.argv[2],)).fetchone()[0]);r.update(status=sys.argv[3],detailed_status=sys.argv[3],read_only=True)\n c.execute('UPDATE runs SET record_json=? WHERE run_id=?',(json.dumps(r),sys.argv[2]))`, path.join(profile, 'state/runs.sqlite3'), records[0].id, value], { encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+    };
+    await app.evaluate(({ Notification, BrowserWindow }) => {
+      globalThis.__qaNotices = [];
+      Notification.prototype.show = function () { globalThis.__qaNotices.push(this); };
+      BrowserWindow.getAllWindows()[0].hide();
+    });
+    const transition = async () => {
+      fixtureStatus('queued');
+      await page.evaluate(() => window.biomaker.request('/api/runs'));
+      fixtureStatus('succeeded');
+      await page.evaluate(() => window.biomaker.request('/api/runs'));
+    };
+    await transition();
+    assert.equal(await app.evaluate(() => globalThis.__qaNotices.length), 0, 'Muted notifications stay quiet');
+    await page.evaluate(() => window.biomaker.setPreferences({ notifications: true }));
+    await page.evaluate(() => window.biomaker.request('/api/runs'));
+    assert.equal(await app.evaluate(() => globalThis.__qaNotices.length), 0, 'Unmuting does not replay completed history');
+    fixtureStatus('queued');
+    await page.evaluate(() => window.biomaker.request('/api/runs'));
+    const closed = page.waitForEvent('close');
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
+    await closed;
+    fixtureStatus('succeeded');
+    const notifyDeadline = Date.now() + 15000;
+    while (!(await app.evaluate(() => globalThis.__qaNotices.length)) && Date.now() < notifyDeadline) await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(await app.evaluate(() => globalThis.__qaNotices.length), 1, 'Background monitor dispatches after the window has closed');
+    const notice = await app.evaluate(() => ({ title: globalThis.__qaNotices[0].title, body: globalThis.__qaNotices[0].body }));
+    assert.equal(notice.title, '实验已完成');
+    assert(!notice.body.includes('desktop-acceptance-fixture'), 'Native banners omit dataset and task names');
+    const reopened = app.waitForEvent('window');
+    await app.evaluate(() => globalThis.__qaNotices[0].emit('click'));
+    page = await reopened;
+    page = await ready(false);
+    await page.locator('.run-intro').waitFor();
+    await page.waitForTimeout(100);
+    assert.equal(await page.evaluate(() => window.biomaker.getPendingRun()), null, 'Recreated renderer acknowledges the notification target');
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.send('biomaker:menu-action', 'new-experiment'));
+    await page.getByLabel('实验任务', { exact: true }).waitFor();
+    assert.equal(await page.getByLabel('实验任务', { exact: true }).inputValue(), draftTask, 'Notification navigation preserves the draft');
+  }
   assert.deepEqual(errors, []);
-  const report = { passed: true, executablePath: executablePath || 'development Electron', platform: process.platform, arch: process.arch, profile, output, checks: ['real-sidecar', 'isolated-profile', 'renderer-sandbox', 'IPC-path-boundaries', 'missing-engine-preflight', 'settings-persistence', 'partial-provider-guidance', 'onboarding-draft-preservation', 'secret-masking', 'theme', 'language-and-native-menus', 'preference-validation', 'restart', 'history-import', 'candidates-and-nonfinite-metrics', 'native-artifact-export', 'console', 'compact-layout', 'no-renderer-errors'] };
+  const report = { passed: true, executablePath: executablePath || 'development Electron', platform: process.platform, arch: process.arch, profile, output, checks: ['real-sidecar', 'isolated-profile', 'renderer-sandbox', 'IPC-path-boundaries', 'missing-engine-preflight', 'settings-persistence', 'partial-provider-guidance', 'onboarding-draft-preservation', 'secret-masking', 'theme', 'language-and-native-menus', 'preference-validation', 'restart', 'history-import', 'candidates-and-nonfinite-metrics', 'native-artifact-export', 'console', 'compact-layout', 'notification-preference-persistence', 'background-native-notification-after-window-close', 'notification-click-recreates-window-and-preserves-draft', 'no-renderer-errors'] };
   await writeFile(path.join(output, 'electron-acceptance.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {
-  if (app) {
-    const page = await app.firstWindow();
+  console.error('Acceptance error:', error);
+  if (app && app.windows().length) {
+    const page = app.windows()[0];
     await page.screenshot({ path: path.join(output, 'failure.png') }).catch(() => {});
     console.error((await page.locator('body').innerText()).slice(-4500));
     console.error('Renderer errors:', errors);

@@ -8,7 +8,15 @@ contextBridge.exposeInMainWorld('biomaker', Object.freeze({
   saveArtifact: (artifact: { runId: string; name: string }) => invoke('biomaker:save-artifact', artifact),
   getAppInfo: () => invoke('biomaker:app-info'),
   getPreferences: () => invoke('biomaker:get-preferences'),
-  setPreferences: (preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en' }) => invoke('biomaker:set-preferences', preferences),
+  setPreferences: (preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications?: boolean }) => invoke('biomaker:set-preferences', preferences),
+  getPendingRun: () => invoke('biomaker:get-pending-run'),
+  acknowledgeOpenRun: (id: string) => invoke('biomaker:acknowledge-open-run', id),
+  onOpenRun: (callback: (id: string) => void) => {
+    if (typeof callback !== 'function') throw new TypeError('Expected a callback');
+    const listener = (_event: Electron.IpcRendererEvent, id: string) => callback(id);
+    ipcRenderer.on('biomaker:open-run', listener);
+    return () => ipcRenderer.removeListener('biomaker:open-run', listener);
+  },
   openExternal: (url: string) => invoke('biomaker:open-external', url),
   onMenuAction: (callback: (action: string) => void) => {
     if (typeof callback !== 'function') throw new TypeError('Expected a callback');

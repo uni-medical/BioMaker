@@ -2907,3 +2907,29 @@ kbd {
     flex-basis: 100%;
   }
 }
+
+.notification-setting {
+  align-items: flex-start;
+}
+.notification-setting .setting-title {
+  display: block;
+  cursor: pointer;
+  line-height: 1.6;
+}
+.notification-setting > input {
+  flex-shrink: 0;
+  width: 17px;
+  height: 17px;
+  margin: 2px 0 0;
+  cursor: pointer;
+}
+@media (max-width: 760px) {
+  .notification-setting {
+    flex-direction: row;
+  }
+}
+@media (max-width: 580px) {
+  .notification-setting > div:first-child {
+    max-width: none;
+  }
+}

@@ -53,6 +53,12 @@ their existing persistent lifecycle, and run history is available on reopening.
 Use the experiment's Stop action to stop training. macOS sleep still suspends local
 compute: a desktop application cannot make a sleeping Mac continue training.
 
+Completion/failure notifications continue while the macOS app runs in the
+background, including with its window closed. Their General setting is separate
+from OS notification permission. Clicking a notification opens its experiment.
+UI-only upgrades reuse a source- and Python-compatible engine without moving its
+virtual environment; engine changes are isolated and preserve older environments.
+
 ## Development
 
 Use Node.js 22.12+ (or 24+) and a host `uv` for the one-time runtime build. These are
