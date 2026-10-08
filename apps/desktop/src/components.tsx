@@ -79,6 +79,9 @@ export function Modal({
     const previous = document.activeElement as HTMLElement | null;
     const dialog = container.current;
     const frame = requestAnimationFrame(() => {
+      // Do not steal focus if a user (or an autofocus control) already chose a
+      // field before the first animation frame of the dialog.
+      if (dialog?.contains(document.activeElement)) return;
       const target =
         dialog?.querySelector<HTMLElement>("[autofocus], [data-modal-autofocus]") ||
         dialog?.querySelector<HTMLElement>(

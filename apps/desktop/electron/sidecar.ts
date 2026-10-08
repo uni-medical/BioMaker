@@ -216,14 +216,46 @@ export class Sidecar {
     this.stopping = true;
     const child = this.child;
     this.port = null;
-    if (!child || child.exitCode !== null) return;
+    if (!child) return;
+    const hasExited = () => child.exitCode !== null || child.signalCode !== null;
+    if (hasExited()) { if (this.child === child) this.child = null; return; }
     // Stop only our HTTP sidecar. The existing experiment supervisor is detached
     // and deliberately survives closing/quitting the desktop client.
-    await new Promise<void>(resolve => {
-      const timeout = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 4000);
-      child.once('exit', () => { clearTimeout(timeout); resolve(); });
-      child.kill('SIGTERM');
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let signalFailed = false;
+      let gracefulTimeout: NodeJS.Timeout | undefined;
+      let forcedTimeout: NodeJS.Timeout | undefined;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(gracefulTimeout); clearTimeout(forcedTimeout);
+        child.off('exit', onExit); child.off('error', onError);
+        if (error) reject(error); else resolve();
+      };
+      const onExit = () => finish();
+      // Kill errors can be emitted as events or thrown. Keep the listener while
+      // awaiting exit; a failed signal never counts as confirmed termination.
+      const onError = () => { signalFailed = true; };
+      const signal = (name: NodeJS.Signals) => {
+        try { if (!child.kill(name)) signalFailed = true; }
+        catch { signalFailed = true; }
+        if (hasExited()) finish();
+      };
+      child.once('exit', onExit);
+      child.on('error', onError);
+      gracefulTimeout = setTimeout(() => {
+        if (hasExited()) { finish(); return; }
+        forcedTimeout = setTimeout(() => {
+          if (hasExited()) finish();
+          else finish(new Error(signalFailed ? '未能终止 BioMaker 本地服务。' : '无法确认 BioMaker 本地服务已退出。'));
+        }, 2000);
+        signal('SIGKILL');
+      }, 4000);
+      signal('SIGTERM');
     });
-    this.child = null;
+    // Rejection deliberately retains ownership so the controller cannot start
+    // a replacement while this process may still be alive.
+    if (this.child === child) this.child = null;
   }
 }

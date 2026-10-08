@@ -1,10 +1,13 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
 import { createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { Sidecar, type ServiceState } from './sidecar';
+import { ServiceController } from './service-controller';
+import { collectDiagnostics } from './diagnostics';
 import { externalURL, isWithin, validateArtifact, validateRequest, validTheme } from './security';
 import { readResponse } from './response';
 import { RunNotifications, type RunCompletion } from './run-notifications';
@@ -17,7 +20,8 @@ if (customData) app.setPath('userData', path.resolve(customData));
 const locked = app.requestSingleInstanceLock();
 if (!locked) app.quit();
 let mainWindow: BrowserWindow | null = null;
-let sidecar: Sidecar | null = null;
+let serviceController: ServiceController<Sidecar> | null = null;
+let diagnosticsExport: Promise<string | null> | null = null;
 let quitting = false;
 let serviceState: ServiceState = { status: 'starting', revision: 0 };
 let preferences: { theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications: boolean; directories: string[]; bounds?: Electron.Rectangle } = { theme: 'system', notifications: true, directories: [] };
@@ -46,7 +50,7 @@ const closeGuard = new CloseGuard({
     quitting = true;
     if (notificationTimer) clearTimeout(notificationTimer);
     for (const notification of visibleNotifications) notification.close();
-    await sidecar?.stop();
+    await serviceController?.stop();
   },
   quit: () => app.quit(),
 });
@@ -75,7 +79,7 @@ function publishServiceState(state: ServiceState) {
   if (state.status === 'ready') scheduleRunMonitor(0);
 }
 async function fetchService(url: string, options: RequestInit): Promise<Response> {
-  const current = sidecar;
+  const current = serviceController?.getService();
   const revision = serviceState.revision;
   try { return await fetch(url, options); }
   catch (error) {
@@ -84,7 +88,7 @@ async function fetchService(url: string, options: RequestInit): Promise<Response
     // a healthy local service into a disconnected UI.
     // A request from a previous service generation must not disturb one that
     // has already reconnected while that request was still settling.
-    if (sidecar === current && serviceState.revision === revision) void current?.checkConnection();
+    if (serviceController?.getService() === current && serviceState.revision === revision) void current?.checkConnection();
     throw error;
   }
 }
@@ -128,6 +132,7 @@ async function pollNotificationRuns() {
   if (quitting || notificationPollRunning) return;
   notificationPollRunning = true;
   try {
+    const sidecar = serviceController?.getService();
     if (sidecar && serviceState.status === 'ready') {
       const ticket = runNotifications.issue();
       const response = await fetchService(`${sidecar.origin}/api/runs`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(10_000) });
@@ -139,6 +144,35 @@ async function pollNotificationRuns() {
     scheduleRunMonitor(runNotifications.activeCount ? 5000 : 30000);
   }
 }
+const runtimePath = () => app.isPackaged ? path.join(process.resourcesPath, 'runtime') : path.join(desktopRoot, 'build', 'runtime');
+const servicePath = () => app.isPackaged ? path.join(process.resourcesPath, 'service', 'main.py') : path.join(desktopRoot, 'service', 'main.py');
+function exportDiagnostics(): Promise<string | null> {
+  if (diagnosticsExport) return diagnosticsExport;
+  const operation = (async () => {
+    const options: Electron.SaveDialogOptions = {
+      title: t('导出诊断', 'Export diagnostics'),
+      defaultPath: path.join(app.getPath('downloads'), `BioMaker-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`),
+      buttonLabel: t('保存', 'Save'),
+      filters: [{ name: t('诊断报告', 'Diagnostic report'), extensions: ['json'] }],
+      message: t('仅包含应用版本、运行环境与服务状态。不含原始日志、任务、API Key 或数据文件。', 'Includes application versions, runtime availability and service state. Excludes raw logs, tasks, API keys and data files.'),
+    };
+    const result = mainWindow && !mainWindow.isDestroyed() ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath) return null;
+    const report = await collectDiagnostics({ appVersion: app.getVersion(), packaged: app.isPackaged, runtimeDirectory: runtimePath(), servicePath: servicePath(), dataDirectory: app.getPath('userData'), serviceState, events: serviceController?.getDiagnostics() ?? [] });
+    const temporary = `${result.filePath}.biomaker-${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, JSON.stringify(report, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+      renameSync(temporary, result.filePath);
+    } catch {
+      try { rmSync(temporary, { force: true }); } catch { /* Preserve the export failure. */ }
+      throw new Error(t('无法保存诊断文件，请选择可写的位置后重试。', 'Could not save diagnostics. Choose a writable location and try again.'));
+    }
+    return result.filePath;
+  })();
+  diagnosticsExport = operation;
+  void operation.finally(() => { if (diagnosticsExport === operation) diagnosticsExport = null; }).catch(() => {});
+  return operation;
+}
 function installMenu() {
   const template: MenuItemConstructorOptions[] = [
     ...(process.platform === 'darwin' ? [{ label: 'BioMaker', submenu: [{ role: 'about', label: t('关于 BioMaker', 'About BioMaker') }, { type: 'separator' }, { label: t('设置…', 'Settings…'), accelerator: 'CmdOrCtrl+,', click: () => action('settings') }, { type: 'separator' }, { role: 'hide', label: t('隐藏 BioMaker', 'Hide BioMaker') }, { role: 'hideOthers', label: t('隐藏其它应用', 'Hide Others') }, { role: 'unhide', label: t('显示全部', 'Show All') }, { type: 'separator' }, { role: 'quit', label: t('退出 BioMaker', 'Quit BioMaker') }] } as MenuItemConstructorOptions] : []),
@@ -146,7 +180,7 @@ function installMenu() {
     { label: t('编辑', 'Edit'), submenu: [{ role: 'undo', label: t('撤销', 'Undo') }, { role: 'redo', label: t('重做', 'Redo') }, { type: 'separator' }, { role: 'cut', label: t('剪切', 'Cut') }, { role: 'copy', label: t('复制', 'Copy') }, { role: 'paste', label: t('粘贴', 'Paste') }, { role: 'selectAll', label: t('全选', 'Select All') }] },
     { label: t('显示', 'View'), submenu: [{ label: t('切换侧边栏', 'Toggle sidebar'), accelerator: 'CmdOrCtrl+B', click: () => action('toggle-sidebar') }, { label: t('刷新数据', 'Refresh data'), accelerator: 'CmdOrCtrl+R', click: () => action('refresh') }, { type: 'separator' }, { role: 'resetZoom', label: t('实际大小', 'Actual Size') }, { role: 'zoomIn', label: t('放大', 'Zoom In') }, { role: 'zoomOut', label: t('缩小', 'Zoom Out') }, { type: 'separator' }, { role: 'togglefullscreen', label: t('切换全屏', 'Toggle Full Screen') }, ...(!app.isPackaged ? [{ role: 'toggleDevTools', label: t('开发者工具', 'Developer Tools') } as MenuItemConstructorOptions] : [])] },
     { label: t('窗口', 'Window'), submenu: [{ role: 'minimize', label: t('最小化', 'Minimize') }, { role: 'zoom', label: t('缩放窗口', 'Zoom') }, { label: t('显示 BioMaker', 'Show BioMaker'), click: showWindow }] },
-    { label: t('帮助', 'Help'), submenu: [{ label: t('BioMaker 使用文档', 'BioMaker documentation'), click: () => { void shell.openExternal('https://github.com/uni-medical/BioMaker'); } }, { label: t('打开诊断日志', 'Open diagnostic logs'), click: () => { void shell.openPath(path.join(app.getPath('userData'), 'logs')); } }, ...(process.platform !== 'darwin' ? [{ role: 'about', label: t('关于 BioMaker', 'About BioMaker') } as MenuItemConstructorOptions] : [])] },
+    { label: t('帮助', 'Help'), submenu: [{ label: t('BioMaker 使用文档', 'BioMaker documentation'), click: () => { void shell.openExternal('https://github.com/uni-medical/BioMaker'); } }, { label: t('导出诊断…', 'Export diagnostics…'), click: () => { void exportDiagnostics().catch(error => dialog.showErrorBox(t('诊断导出失败', 'Diagnostic export failed'), String(error))); } }, { label: t('打开本地日志文件夹', 'Open local log folder'), click: () => { void shell.openPath(path.join(app.getPath('userData'), 'logs')); } }, ...(process.platform !== 'darwin' ? [{ role: 'about', label: t('关于 BioMaker', 'About BioMaker') } as MenuItemConstructorOptions] : [])] },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
@@ -174,7 +208,8 @@ function setupIPC() {
       if (!statSync(resolved).isDirectory() || !authorized) throw new Error(t('请先通过目录选择器授权访问此实验文件夹。', 'Choose this experiment folder using the folder picker to grant access first.'));
       request.body = JSON.stringify({ ...body, path: resolved });
     }
-    if (!sidecar || serviceState.status !== 'ready') throw new Error(serviceState.message ?? (serviceState.status === 'reconnecting' ? t('正在重新连接 BioMaker 服务，请稍后重试。', 'BioMaker is reconnecting. Please try again shortly.') : t('BioMaker 服务正在启动，请稍后重试。', 'BioMaker is starting. Please try again shortly.')));
+    const sidecar = serviceController?.getService();
+    if (!sidecar || serviceState.status !== 'ready') throw new Error(serviceState.message ?? (serviceState.status === 'failed' ? t('本地服务不可用。请重试本地服务，或导出诊断。', 'The local service is unavailable. Retry the service or export diagnostics.') : serviceState.status === 'reconnecting' ? t('正在重新连接 BioMaker 服务，请稍后重试。', 'BioMaker is reconnecting. Please try again shortly.') : t('BioMaker 服务正在启动，请稍后重试。', 'BioMaker is starting. Please try again shortly.')));
     const isRunResponse = /^\/api\/runs(?:\/[^/]+(?:\/(?:requeue|stop|cancel))?)?$/.test(request.path.split('?')[0]);
     const ticket = isRunResponse ? runNotifications.issue() : 0;
     const response = await fetchService(`${sidecar.origin}${request.path}`, { method: request.method, body: request.body, headers: { Authorization: `Bearer ${sidecar.token}`, ...(request.body === undefined ? {} : { 'Content-Type': 'application/json' }) }, redirect: 'error', signal: AbortSignal.timeout(45_000) });
@@ -201,6 +236,7 @@ function setupIPC() {
   });
   handle('biomaker:save-artifact', async (artifact) => {
     const { runId, name } = validateArtifact(artifact?.runId, artifact?.name);
+    const sidecar = serviceController?.getService();
     if (!sidecar || serviceState.status !== 'ready') throw new Error(t('本地服务不可用。', 'The local service is unavailable.'));
     const result = await dialog.showSaveDialog(mainWindow!, { title: t('导出实验产物', 'Export experiment output'), defaultPath: path.join(app.getPath('downloads'), name), buttonLabel: t('导出', 'Export') });
     if (result.canceled || !result.filePath) return null;
@@ -212,6 +248,11 @@ function setupIPC() {
   });
   handle('biomaker:app-info', () => ({ version: app.getVersion(), platform: process.platform }));
   handle('biomaker:get-service-state', () => ({ ...serviceState }));
+  handle('biomaker:retry-service', () => {
+    if (quitting || !serviceController) throw new Error(t('应用正在退出，请稍后重新打开。', 'The application is quitting. Open it again shortly.'));
+    return serviceController.retry();
+  });
+  handle('biomaker:export-diagnostics', () => exportDiagnostics());
   handle('biomaker:get-preferences', () => ({ theme: preferences.theme, language: preferences.language, notifications: preferences.notifications }));
   handle('biomaker:set-preferences', (value) => {
     if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['theme', 'language', 'notifications'].includes(key))) throw new Error('Invalid preferences');
@@ -274,11 +315,11 @@ if (locked) void app.whenReady().then(async () => {
   });
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => callback({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [CSP], 'X-Content-Type-Options': ['nosniff'] } }));
   installMenu(); setupIPC();
-  sidecar = new Sidecar({ runtime: app.isPackaged ? path.join(process.resourcesPath, 'runtime') : path.join(desktopRoot, 'build', 'runtime'), service: app.isPackaged ? path.join(process.resourcesPath, 'service', 'main.py') : path.join(desktopRoot, 'service', 'main.py'), data: app.getPath('userData'), version: app.getVersion(), onState: publishServiceState, onFailure: message => { void dialog.showMessageBox({ type: 'error', title: t('BioMaker 服务', 'BioMaker service'), message, buttons: [t('重新启动', 'Restart'), t('打开诊断日志', 'Open diagnostic logs'), t('稍后', 'Later')], defaultId: 0, cancelId: 2 }).then(async result => { if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) await shell.openPath(path.join(app.getPath('userData'), 'logs')); }); } });
-  // Render early so users see progress while the bundled service initializes.
+  serviceController = new ServiceController<Sidecar>({
+    factory: callbacks => new Sidecar({ runtime: runtimePath(), service: servicePath(), data: app.getPath('userData'), version: app.getVersion(), ...callbacks }),
+    onState: publishServiceState,
+  });
+  // Window and IPC remain usable even if service construction or startup fails.
   await createWindow();
-  try { await sidecar.start(); } catch (error) {
-    const result = await dialog.showMessageBox(mainWindow!, { type: 'error', title: t('BioMaker 启动失败', 'BioMaker could not start'), message: String(error), detail: t('你的实验数据保存在应用工作目录中。可以重试启动，或打开诊断日志。', 'Your experiments are saved in the application workspace. Retry or open the diagnostic logs.'), buttons: [t('重试', 'Retry'), t('打开日志', 'Open logs'), t('退出', 'Quit')], defaultId: 0, cancelId: 2 });
-    if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) { await shell.openPath(path.join(app.getPath('userData'), 'logs')); } else app.quit();
-  }
+  await serviceController.start();
 }).catch(error => { dialog.showErrorBox(t('BioMaker 无法启动', 'BioMaker could not start'), String(error)); app.quit(); });

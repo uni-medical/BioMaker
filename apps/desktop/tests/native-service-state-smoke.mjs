@@ -62,11 +62,15 @@ try {
     window.__nativeStates = [];
     window.__unsubscribeNativeStates = window.biomaker.onServiceState(state => window.__nativeStates.push(state));
   });
-  assert.deepEqual(await page.evaluate(() => window.biomaker.getServiceState()), { status: 'starting', revision: 0 });
+  const initialState = await page.evaluate(() => window.biomaker.getServiceState());
+  assert.equal(initialState.status, 'starting');
+  assert.deepEqual(Object.keys(initialState).sort(), ['revision', 'status']);
+  assert.equal(Number.isSafeInteger(initialState.revision) && initialState.revision >= 0, true);
   await assert.rejects(page.evaluate(() => window.biomaker.request('/api/health')), /正在启动|starting/);
   await waitUntil(() => application.evaluate(() => typeof globalThis.__releaseStartupHealth === 'function'), 'Native startup did not reach its health check');
   await application.evaluate(() => { globalThis.__releaseStartupHealth(); });
   await waitUntil(async () => (await page.evaluate(() => window.biomaker.getServiceState())).status === 'ready', 'Native service did not become ready');
+  assert.equal((await page.evaluate(() => window.biomaker.getServiceState())).revision, initialState.revision + 1);
   assert.equal((await page.evaluate(() => window.biomaker.request('/api/health'))).status, 'ok');
   assert.deepEqual(await page.evaluate(() => window.__nativeStates.map(state => state.status)), ['ready']);
   assert.deepEqual(Object.keys(await page.evaluate(() => window.biomaker.getServiceState())).sort(), ['revision', 'status']);

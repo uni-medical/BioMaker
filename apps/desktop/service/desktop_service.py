@@ -30,7 +30,7 @@ from history_import import HistoryImporter, HistoryImportError
 from run_metadata import RunMetadataStore, RunMetadataUpdate, RunMetadataError
 from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, provision_native_runtime
 
-VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.5")
+VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.6")
 
 
 class HistoryPreviewRequest(BaseModel):

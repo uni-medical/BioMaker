@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.6 — 2026-10-09
+
+Keeps the desktop window usable when constructing or starting the local service
+fails. Manual retry replaces only the service, preserving the renderer, draft and
+unsaved provider settings. Lifecycle revisions remain monotonic across process
+replacement; concurrent retries cannot create duplicate services.
+
+Adds native diagnostic export from failure prompts, runtime settings and Help.
+Reports use a bounded whitelist of versions, resource availability and lifecycle
+codes. They exclude raw logs, tasks, credentials, data and user paths, and can be
+saved even when the service has never started. Nothing is uploaded automatically.
+
+Fixes first-frame modal focus stealing from a field the user already selected.
+
 ## 0.1.5 — 2026-10-08
 
 Adds Unicode display names and reversible experiment archiving. Organization

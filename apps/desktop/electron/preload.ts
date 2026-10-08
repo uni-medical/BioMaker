@@ -9,6 +9,8 @@ contextBridge.exposeInMainWorld('biomaker', Object.freeze({
   saveArtifact: (artifact: { runId: string; name: string }) => invoke('biomaker:save-artifact', artifact),
   getAppInfo: () => invoke('biomaker:app-info'),
   getServiceState: () => invoke('biomaker:get-service-state'),
+  retryService: () => invoke('biomaker:retry-service'),
+  exportDiagnostics: () => invoke('biomaker:export-diagnostics'),
   onServiceState: (callback: (state: ServiceState) => void) => {
     if (typeof callback !== 'function') throw new TypeError('Expected a callback');
     const listener = (_event: Electron.IpcRendererEvent, state: ServiceState) => callback(state);

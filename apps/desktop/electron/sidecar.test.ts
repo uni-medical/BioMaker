@@ -13,11 +13,12 @@ class ControlledChild extends EventEmitter {
   stdout = new PassThrough();
   stderr = new PassThrough();
   exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
   private exited = false;
   announce(port = 43210) { this.stdout.write(`${JSON.stringify({ type: 'ready', port })}\n`); }
   exit(code: number | null = 1, signal: NodeJS.Signals | null = null) {
     if (this.exited) return;
-    this.exited = true; this.exitCode = code;
+    this.exited = true; this.exitCode = code; this.signalCode = signal;
     this.emit('exit', code, signal);
   }
   kill(signal: NodeJS.Signals = 'SIGTERM') { queueMicrotask(() => this.exit(null, signal)); return true; }
@@ -77,7 +78,7 @@ test('startup retries remain starting and only exhausted retries publish failure
   assert.equal(f.states.length, 1);
   assert.equal(f.states[0].status, 'failed');
   assert.match(f.states[0].message!, /服务退出/);
-  assert.deepEqual(f.failures, [], 'initial failure remains owned by the startup dialog');
+  assert.deepEqual(f.failures, [], 'initial failure remains owned by the calling controller');
   assert.throws(() => f.service.origin);
 });
 
@@ -147,4 +148,99 @@ test('stopping during a pending health check never publishes ready or retries', 
   assert.deepEqual(f.states, []);
   assert.equal(f.children.length, 1);
   assert.throws(() => f.service.origin);
+});
+
+test('stop observes synchronous exit because listeners precede the termination signal', async t => {
+  const f = fixture(t, { onSpawn: child => child.announce() });
+  await f.service.start();
+  const child = f.children[0];
+  const signals: NodeJS.Signals[] = [];
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(child, 'kill', (signal: NodeJS.Signals) => { signals.push(signal); child.exit(null, signal); return true; });
+  await f.service.stop();
+  t.mock.timers.tick(10_000);
+  assert.deepEqual(signals, ['SIGTERM']);
+  assert.equal(child.signalCode, 'SIGTERM');
+  assert.equal(f.children.length, 1);
+});
+
+test('stop escalates after four seconds and waits for the forced process exit', async t => {
+  const f = fixture(t, { onSpawn: child => child.announce() });
+  await f.service.start();
+  const child = f.children[0];
+  const signals: NodeJS.Signals[] = [];
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(child, 'kill', (signal: NodeJS.Signals) => { signals.push(signal); return true; });
+  let finished = false;
+  const stopped = f.service.stop().then(() => { finished = true; });
+  assert.deepEqual(signals, ['SIGTERM']);
+  t.mock.timers.tick(3999);
+  assert.deepEqual(signals, ['SIGTERM']);
+  t.mock.timers.tick(1);
+  await Promise.resolve();
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(finished, false, 'sending SIGKILL alone does not release process ownership');
+  t.mock.timers.tick(1999);
+  assert.equal(finished, false);
+  child.exit(null, 'SIGKILL');
+  await stopped;
+  t.mock.timers.tick(10_000);
+  assert.equal(finished, true);
+  assert.equal(f.children.length, 1);
+});
+
+test('unconfirmed forced exit rejects within six seconds and retains the child for another stop', async t => {
+  const f = fixture(t, { onSpawn: child => child.announce() });
+  await f.service.start();
+  const child = f.children[0];
+  const signals: NodeJS.Signals[] = [];
+  const priorExitListeners = child.listenerCount('exit');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const kill = t.mock.method(child, 'kill', (signal: NodeJS.Signals) => { signals.push(signal); return true; });
+  const rejection = assert.rejects(f.service.stop(), /无法确认.*已退出/);
+  t.mock.timers.tick(4000);
+  t.mock.timers.tick(2000);
+  await rejection;
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(child.listenerCount('exit'), priorExitListeners);
+  assert.throws(() => f.service.origin);
+  kill.mock.mockImplementation((signal: NodeJS.Signals) => { signals.push(signal); child.exit(null, signal); return true; });
+  await f.service.stop();
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL', 'SIGTERM']);
+  assert.equal(f.children.length, 1);
+});
+
+test('kill throws, false returns, and error events remain bounded failures without unhandled errors', async t => {
+  const f = fixture(t, { onSpawn: child => child.announce() });
+  await f.service.start();
+  const child = f.children[0];
+  const signals: NodeJS.Signals[] = [];
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(child, 'kill', (signal: NodeJS.Signals) => {
+    signals.push(signal);
+    if (signal === 'SIGTERM') throw new Error('synthetic signal failure');
+    child.emit('error', new Error('synthetic kill error'));
+    return false;
+  });
+  const rejection = assert.rejects(f.service.stop(), /未能终止/);
+  t.mock.timers.tick(4000);
+  t.mock.timers.tick(2000);
+  await rejection;
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  child.exit(null, 'SIGKILL');
+  await f.service.stop();
+  t.mock.timers.tick(10_000);
+  assert.equal(f.children.length, 1);
+});
+
+test('an already signaled exit is confirmed even when exitCode is null', async t => {
+  const f = fixture(t, { onSpawn: child => child.announce() });
+  await f.service.start();
+  const child = f.children[0];
+  child.signalCode = 'SIGKILL';
+  const kill = t.mock.method(child, 'kill', () => { throw new Error('must not signal an exited process'); });
+  await f.service.stop();
+  assert.equal(kill.mock.callCount(), 0);
+  assert.throws(() => f.service.origin);
+  child.exit(null, 'SIGKILL');
 });

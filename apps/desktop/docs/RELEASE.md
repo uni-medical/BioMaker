@@ -22,6 +22,11 @@
   authenticated readiness, genuine sidecar crash/recovery and stale-response
   protection. Their instrumented startup checks run from the built source;
   report that scope separately from packaged-executable acceptance.
+- Run `tests/service-recovery-smoke.mjs` against the packaged executable. Induce
+  real constructor and restart failures only within an isolated QA profile;
+  verify the native window survives, manual retry preserves drafts and unsaved
+  settings, and diagnostics export works without a live service. Verify cancel,
+  save failures, sensitive sentinel exclusion and original configuration bytes.
 - Prepare the runtime after updating the application version. Packaging rejects
   a missing or mismatched `manifest.applicationVersion`.
 - On macOS, verify native dependencies with `tests/native-portability-smoke.py`

@@ -564,6 +564,19 @@ kbd {
 .service-banner small { color: var(--subtle); }
 .service-banner details { width: 100%; }
 .service-banner details p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.service-recovery { width: 100%; min-width: 0; }
+.service-recovery-advice { margin: 0 0 10px; color: var(--text); font-size: 12px; line-height: 1.75; }
+.service-recovery-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.service-recovery-actions .secondary-button { font-size: 11px; }
+.service-diagnostics-note { margin: 9px 0 0; color: var(--muted); font-size: 11px; line-height: 1.75; }
+.service-recovery-error { margin-top: 10px; color: var(--danger); font-size: 12px; line-height: 1.75; }
+.service-recovery-error p { margin: 5px 0; }
+.service-recovery-error details, .service-local-details { font-size: 11px; }
+.service-recovery-error details p, .service-local-details p { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow-y: auto; }
+.settings-content .notice .service-recovery { margin-top: 12px; }
+.runtime-diagnostics { border-top: 1px solid var(--border); margin-top: 22px; padding-top: 18px; }
+.runtime-diagnostics h4 { font-size: 12px; font-weight: 550; margin-bottom: 12px; }
+.service-local-details { color: var(--muted); margin-top: 12px; }
 .history-heading-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .modal.history-import-modal { width: min(760px, calc(100vw - 40px)); max-height: min(850px, calc(100dvh - 64px)); display: flex; flex-direction: column; }
 .history-import-body { padding: 0 24px 20px; overflow-y: auto; min-height: 0; }

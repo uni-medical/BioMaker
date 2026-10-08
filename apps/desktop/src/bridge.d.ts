@@ -1,4 +1,4 @@
-export interface ServiceState { status: 'starting' | 'ready' | 'reconnecting' | 'failed'; revision: number; message?: string }
+export interface ServiceState { status: 'starting' | 'ready' | 'reconnecting' | 'failed'; revision: number; message?: string; code?: string }
 
 declare global {
   interface Window {
@@ -9,6 +9,8 @@ declare global {
       saveArtifact(artifact: { runId: string; name: string }): Promise<string | null>;
       getAppInfo(): Promise<{ version: string; platform: string }>;
       getServiceState(): Promise<ServiceState>;
+      retryService(): Promise<ServiceState>;
+      exportDiagnostics(): Promise<string | null>;
       onServiceState(callback: (state: ServiceState) => void): () => void;
       getPreferences(): Promise<{ theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications: boolean }>;
       setPreferences(preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications?: boolean }): Promise<{ theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications: boolean }>;

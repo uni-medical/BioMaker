@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { Modal, Notice, SettingRow, Spinner } from "./components";
 import type { ServiceState } from "./bridge";
+import ServiceRecovery from "./ServiceRecovery";
 import {
   errorMessage,
   request,
@@ -38,6 +39,7 @@ export default function Settings({
   setNotificationsEnabled,
   engine,
   serviceState,
+  onServiceState,
   env,
   version,
   initialSection,
@@ -57,6 +59,7 @@ export default function Settings({
   setNotificationsEnabled: (enabled: boolean) => void;
   engine: EngineStatus | null;
   serviceState: ServiceState;
+  onServiceState: (state: ServiceState) => void;
   env: EnvConfig | null;
   version: string;
   initialSection?: Section;
@@ -277,7 +280,10 @@ export default function Settings({
           <span className="settings-version">BioMaker {version}</span>
         </nav>
         <div className="settings-content">
-          {!serviceReady && <Notice danger={serviceState.status === "failed"}>{serviceStatusLabel(serviceState, t)}</Notice>}
+          {!serviceReady && <Notice danger={serviceState.status === "failed"}>
+            {serviceStatusLabel(serviceState, t)}
+            {section !== "runtime" && <ServiceRecovery state={serviceState} onState={onServiceState} t={t} toast={toast} />}
+          </Notice>}
           {section === "provider" && (
             <>
               {!env && serviceReady && (
@@ -659,6 +665,11 @@ export default function Settings({
                   {t("刷新", "Refresh")}
                 </button>
               </div>
+              <section className="runtime-diagnostics" aria-label={t("本地服务诊断", "Local service diagnostics")}>
+                <h4>{t("本地服务诊断", "Local service diagnostics")}</h4>
+                <ServiceRecovery state={serviceState} onState={onServiceState} t={t} toast={toast} />
+                {serviceState.status === "failed" && serviceState.message && <details className="service-local-details"><summary>{t("本地错误详情", "Local error details")}</summary><p>{serviceState.message}</p></details>}
+              </section>
               {(engine?.engine.error || error) && (
                 <Notice danger>{error || engine?.engine.error}</Notice>
               )}

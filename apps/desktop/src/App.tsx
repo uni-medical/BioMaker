@@ -43,6 +43,7 @@ import {
 import Settings from "./Settings";
 import RunView, { ResourcesView } from "./RunView";
 import HistoryImport from "./HistoryImport";
+import ServiceRecovery from "./ServiceRecovery";
 import { emptyDraft, hasDraft, reuseDraft, type Draft } from "./experimentDraft";
 import { decorateRun, defaultMetadata, isCurrentRun, mergeMetadata, type MetadataMap, type RunMetadata } from "./runMetadata";
 import type { ServiceState } from "./bridge";
@@ -477,38 +478,40 @@ export default function App() {
     return task;
   }, [loadDetail]);
 
+  const receiveServiceState = useCallback((next: ServiceState) => {
+    if (!alive.current || next.revision <= serviceRef.current.revision) return;
+    serviceRef.current = next;
+    setServiceState(next);
+    // Detach requests from an older process generation. Their responses are
+    // ignored, and their finally handlers cannot clear the new request slot.
+    refreshPromise.current = null;
+    detailSequence.current += 1;
+    setDetailLoading(false);
+    setConnectionError("");
+    setDetailError("");
+    setMetadataLoaded(false);
+    setMetadataError("");
+    pollState.current.failures = 0;
+    if (next.status === "ready") {
+      configLoaded.current = { env: false, templates: false };
+      revisions.current = null;
+      void refresh();
+    } else if (next.status === "failed") {
+      setLoading(false);
+    }
+  }, [refresh]);
+
   useEffect(() => {
     if (!window.biomaker) return;
     let stopped = false;
-    const receive = (next: ServiceState) => {
-      if (stopped || next.revision <= serviceRef.current.revision) return;
-      serviceRef.current = next;
-      setServiceState(next);
-      // Detach requests from an older process generation. Their responses are
-      // ignored, and their finally handlers cannot clear the new request slot.
-      refreshPromise.current = null;
-      detailSequence.current += 1;
-      setDetailLoading(false);
-      setConnectionError("");
-      setDetailError("");
-      setMetadataLoaded(false);
-      setMetadataError("");
-      pollState.current.failures = 0;
-      if (next.status === "ready") {
-        configLoaded.current = { env: false, templates: false };
-        revisions.current = null;
-        void refresh();
-      } else if (next.status === "failed") {
-        setLoading(false);
-      }
-    };
+    const receive = (next: ServiceState) => { if (!stopped) receiveServiceState(next); };
     const unsubscribe = window.biomaker.onServiceState(receive);
     void window.biomaker.getServiceState().then(receive).catch((error) => {
       if (!stopped && serviceRef.current.revision < 0)
         receive({ status: "failed", revision: 0, message: errorMessage(error) });
     });
     return () => { stopped = true; unsubscribe(); };
-  }, [refresh]);
+  }, [receiveServiceState]);
 
   const activelyPolling = !!engine?.engine.installing || runs.some(isActive);
   useEffect(() => {
@@ -1154,7 +1157,8 @@ export default function App() {
             {serviceState.status !== "failed" && <Spinner size={15} />}
             <span>{serviceStatusLabel(serviceState, t)}</span>
             {serviceState.status === "reconnecting" && <small>{t("连接恢复后将自动更新。", "Your workspace will update when the connection returns.")}</small>}
-            {serviceState.status === "failed" && serviceState.message && <details><summary>{t("详情", "Details")}</summary><p>{serviceState.message}</p></details>}
+            <ServiceRecovery state={serviceState} onState={receiveServiceState} t={t} toast={toast} />
+            {serviceState.status === "failed" && serviceState.message && <details><summary>{t("本地错误详情", "Local error details")}</summary><p>{serviceState.message}</p></details>}
           </div>
         )}
         {serviceReady && connectionError && (
@@ -1987,6 +1991,7 @@ export default function App() {
           setNotificationsEnabled={changeNotifications}
           engine={engine}
           serviceState={serviceState}
+          onServiceState={receiveServiceState}
           env={env}
           version={version}
           initialSection={settings}
