@@ -2,11 +2,11 @@
 
 当前安装包适用于 Apple 芯片的 Mac（M1 / M2 / M3 / M4 等）。
 
-本页包含下一迭代 0.1.12 已实现的多草稿使用方式；0.1.12 的安装包、安装及实际升级验收尚待完成。上一版 0.1.11 在 Apple 芯片 Mac 上的安装包、实际升级、环境复用和安装后合成训练流程已通过验证，详情见 [验收记录](ACCEPTANCE-0.1.11.md)。多草稿功能不属于该旧版验收范围。
+本页对应 0.1.12。Apple 芯片 Mac 上的安装包、实际升级、原草稿迁移、环境复用和安装后合成训练流程均已通过验证，详情见 [验收记录](ACCEPTANCE-0.1.12.md)。
 
 ## 安装与首次配置
 
-1. 打开对应版本的 `BioMaker-<版本>-mac-arm64.dmg`，将 BioMaker 拖入 Applications。
+1. 打开 `BioMaker-0.1.12-mac-arm64.dmg`，将 BioMaker 拖入 Applications。
 2. 从应用程序文件夹打开 BioMaker。
 3. 在首次引导中点击「安装」准备运行环境。Python 已随应用提供，训练依赖会自动下载；无需自行安装 Python、Node 或 Homebrew。
 4. 打开「设置 → 模型服务」，填写你的 API 地址、API Key 和模型名称。可以获取模型列表，或手动填写模型 ID；使用 OpenAI 时 API 地址可留空。

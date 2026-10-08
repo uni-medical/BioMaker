@@ -205,14 +205,14 @@ sidecar; confirmed submission removes only its entry, while failures or uncertai
 outcomes preserve it. Persistence errors expose retry and content-recovery actions,
 and pending edits participate in native close protection.
 
-Eight development regression suites have passed 99 checks, and their isolated
-profile processes have exited. The aggregate receipt is
-`output/development-regressions-0.1.12.json`. It covers a development snapshot using
-synthetic data, local provider fixtures and explicitly intercepted runtime,
-submission or notification states. It is not proof of a real experiment, engine
-installation, or the final source after subsequent changes.
+The final release source is `6cd2f2d7f642f1317466ada6a69dfd9237d870ae`.
+There are 745 passing source checks, 115 development checks, 168 packaged checks
+and four offline engine checks. The final package was verified across DMG, ZIP
+and installed application. The actual upgrade preserved the legacy draft exactly,
+reused the existing engine, and retained configuration and complete run records.
+Installed synthetic CPU training, Results/candidate navigation, report export,
+final bundle/profile checks and normal native launch passed.
 
-The 0.1.12 final-source freeze, packaged acceptance, bundle verification, actual
-installation/upgrade and retained-profile workflow still require their own final
-receipts. The completed 0.1.11 acceptance above remains the previous-release record
-and must not be used as acceptance of the new multiple-draft workflow.
+See [ACCEPTANCE-0.1.12.md](ACCEPTANCE-0.1.12.md) for receipts and limitations.
+The previous 0.1.11 record remains separate. A synthetic workflow establishes
+software behavior, not biomedical model performance or external-provider access.
