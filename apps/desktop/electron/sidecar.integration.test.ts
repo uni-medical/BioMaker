@@ -5,20 +5,23 @@ import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
-import { Sidecar } from './sidecar';
+import { Sidecar, type ServiceState } from './sidecar';
 
 test('portable sidecar authenticates, restarts after a crash, and exits without an orphan', { skip: process.env.BIOMAKER_TEST_RUNTIME !== '1', timeout: 30_000 }, async () => {
   const desktop = path.resolve(__dirname, '..');
   const directory = mkdtempSync(path.join(os.tmpdir(), 'BioMaker native test '));
   const failures: string[] = [];
+  const states: ServiceState[] = [];
   const bundle = path.join(directory, 'Application bundle');
   cpSync(path.join(desktop, 'build/runtime'), path.join(bundle, 'runtime'), { recursive: true, verbatimSymlinks: true });
   cpSync(path.join(desktop, 'service'), path.join(bundle, 'service'), { recursive: true });
-  const service = new Sidecar({ runtime: path.join(bundle, 'runtime'), service: path.join(bundle, 'service/main.py'), data: path.join(directory, 'profile'), version: 'test', onFailure: message => failures.push(message) });
+  const service = new Sidecar({ runtime: path.join(bundle, 'runtime'), service: path.join(bundle, 'service/main.py'), data: path.join(directory, 'profile'), version: 'test', onFailure: message => failures.push(message), onState: state => states.push(state) });
   const getChild = () => (service as unknown as { child: ChildProcess | null }).child;
   let latest: ChildProcess | null = null;
   try {
+    assert.equal(service.getState().status, 'starting');
     await service.start();
+    assert.equal(service.getState().status, 'ready');
     const first = getChild();
     assert.ok(first?.pid);
     assert.equal((await fetch(`${service.origin}/api/health`)).status, 401);
@@ -44,6 +47,8 @@ test('portable sidecar authenticates, restarts after a crash, and exits without 
     assert.ok(latest?.pid && latest.pid !== first.pid, 'a replacement service started after the original application bundle moved');
     const origin = service.origin;
     assert.equal((await fetch(`${origin}/api/health`, { headers: { Authorization: `Bearer ${service.token}` } })).status, 200);
+    assert.deepEqual(states.map(state => state.status), ['ready', 'reconnecting', 'ready']);
+    assert.deepEqual(states.map(state => state.revision), [1, 2, 3]);
     await service.stop();
     assert.equal(getChild(), null);
     assert.throws(() => process.kill(latest!.pid!, 0), { code: 'ESRCH' });

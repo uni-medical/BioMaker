@@ -549,6 +549,68 @@ kbd {
   font-size: 12px;
   line-height: 1.6;
 }
+.service-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 24px;
+  color: var(--muted);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.service-banner.failed { color: var(--danger); }
+.service-banner small { color: var(--subtle); }
+.service-banner details { width: 100%; }
+.service-banner details p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.history-heading-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.modal.history-import-modal { width: min(760px, calc(100vw - 40px)); max-height: min(850px, calc(100dvh - 64px)); display: flex; flex-direction: column; }
+.history-import-body { padding: 0 24px 20px; overflow-y: auto; min-height: 0; }
+.history-import-body > .notice { margin: 12px 0; }
+.history-import-footer { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--border); padding: 16px 24px; flex-shrink: 0; }
+.history-import-footer > .muted { margin-right: auto; font-size: 12px; }
+.import-source { display: flex; align-items: center; gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 10px; margin: 18px 0; }
+.import-source > div { flex: 1; min-width: 0; }
+.import-source strong { display: block; font-size: 12px; font-weight: 550; overflow-wrap: anywhere; }
+.import-source small { display: block; color: var(--muted); font-size: 11px; margin-top: 5px; line-height: 1.6; }
+.import-source > button { flex-shrink: 0; }
+.import-selection-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 22px 0 10px; }
+.import-selection-heading strong { font-size: 12px; }
+.import-run-list { display: flex; flex-direction: column; gap: 9px; }
+.import-run { padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
+.import-run.unavailable { background: var(--background); }
+.import-run-choice { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+.import-run-choice input { margin: 3px 0 0; width: 15px; height: 15px; }
+.import-run-choice > span:nth-child(2) { flex: 1; min-width: 0; }
+.import-run-choice strong { display: block; overflow-wrap: anywhere; font-weight: 550; }
+.import-run-choice small { display: block; color: var(--muted); font-size: 11px; margin-top: 5px; }
+.import-readonly { border: 1px solid var(--border); border-radius: 5px; padding: 2px 6px; font-size: 10px; white-space: nowrap; color: var(--muted); }
+.import-capabilities { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0 8px 25px; }
+.import-capabilities > span { background: var(--hover); color: var(--muted); padding: 2px 6px; font-size: 10px; border-radius: 4px; }
+.import-warning { color: var(--warning); margin: 8px 0 8px 25px; line-height: 1.6; font-size: 11px; overflow-wrap: anywhere; }
+.import-run > .text-button { margin-left: 25px; }
+.import-run details { margin: 8px 0 0 25px; font-size: 11px; color: var(--muted); }
+.import-run summary { cursor: pointer; }
+.import-files { list-style: none; margin: 8px 0 0; padding: 0; }
+.import-files li { display: flex; gap: 12px; justify-content: space-between; padding: 4px 0; }
+.import-files span { overflow-wrap: anywhere; min-width: 0; }
+.import-files small { white-space: nowrap; }
+.import-progress { display: flex; align-items: center; gap: 14px; padding: 20px 0; color: var(--accent); }
+.import-progress strong { font-size: 14px; font-weight: 550; }
+.import-progress p { color: var(--muted); font-size: 12px; margin: 6px 0 0; overflow-wrap: anywhere; }
+.import-result-summary { font-size: 12px; color: var(--muted); }
+.import-result-list { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.import-result-list button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 12px; text-align: left; }
+.import-result-list button:hover { background: var(--hover); }
+.import-result-list button + button { border-top: 1px solid var(--border); }
+.import-result-list button > span:first-of-type { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.import-result-list .muted { font-size: 11px; }
+.import-result-note { margin: 12px 0; padding: 12px; background: var(--background); border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }
+.import-result-note p { margin: 5px 0; color: var(--muted); overflow-wrap: anywhere; }
+.import-recovery { margin: 12px 0; font-size: 12px; }
+.import-recovery button + button { margin-left: 10px; }
+.import-empty { padding: 25px; text-align: center; color: var(--muted); line-height: 1.7; }
 .connection-banner > span {
   flex: 1;
 }

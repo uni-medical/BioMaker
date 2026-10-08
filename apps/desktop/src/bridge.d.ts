@@ -1,13 +1,15 @@
-export {};
+export interface ServiceState { status: 'starting' | 'ready' | 'reconnecting' | 'failed'; revision: number; message?: string }
 
 declare global {
   interface Window {
     biomaker: {
       request<T = unknown>(path: string, options?: { method?: 'GET' | 'POST' | 'PUT'; body?: unknown }): Promise<T>;
-      chooseDirectory(): Promise<string | null>;
+      chooseDirectory(options?: { purpose?: 'dataset' | 'history' }): Promise<string | null>;
       openPath(path: string): Promise<void>;
       saveArtifact(artifact: { runId: string; name: string }): Promise<string | null>;
       getAppInfo(): Promise<{ version: string; platform: string }>;
+      getServiceState(): Promise<ServiceState>;
+      onServiceState(callback: (state: ServiceState) => void): () => void;
       getPreferences(): Promise<{ theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications: boolean }>;
       setPreferences(preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications?: boolean }): Promise<{ theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications: boolean }>;
       getPendingRun(): Promise<string | null>;

@@ -15,6 +15,7 @@ import {
   Folder,
   FolderOpen,
   History,
+  Import,
   Layers3,
   KeyRound,
   MoreHorizontal,
@@ -41,6 +42,8 @@ import {
 } from "./components";
 import Settings from "./Settings";
 import RunView, { ResourcesView } from "./RunView";
+import HistoryImport from "./HistoryImport";
+import type { ServiceState } from "./bridge";
 import {
   basename,
   dateText,
@@ -51,6 +54,7 @@ import {
   readStored,
   request,
   runTitle,
+  serviceStatusLabel,
   statusLabel,
   type EngineStatus,
   type EnvConfig,
@@ -157,6 +161,9 @@ export default function App() {
   const [version, setVersion] = useState("…");
   const [loading, setLoading] = useState(true);
   const [connectionError, setConnectionError] = useState("");
+  const [serviceState, setServiceState] = useState<ServiceState>({ status: "starting", revision: -1 });
+  const serviceRef = useRef(serviceState);
+  const serviceReady = serviceState.status === "ready";
   const [submitError, setSubmitError] = useState("");
   const [busy, setBusy] = useState("");
   const [sidebar, setSidebar] = useState(() => window.innerWidth > 580);
@@ -165,6 +172,7 @@ export default function App() {
   const [history, setHistory] = useState(false);
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyFilter, setHistoryFilter] = useState("all");
+  const [importOpen, setImportOpen] = useState(false);
   const [settings, setSettings] = useState<
     "provider" | "runtime" | "appearance" | null
   >(null);
@@ -339,7 +347,10 @@ export default function App() {
   }, []);
 
   const loadDetail = useCallback(async (id: string, force = false) => {
+    if (serviceRef.current.status !== "ready") return;
+    const serviceRevision = serviceRef.current.revision;
     const sequence = ++detailSequence.current;
+    const current = () => selectedRef.current === id && alive.current && sequence === detailSequence.current && serviceRef.current.status === "ready" && serviceRef.current.revision === serviceRevision;
     if (force) {
       setDetailLoading(true);
       setDetailError("");
@@ -348,12 +359,7 @@ export default function App() {
       const next = await request<Revisions>(
         `/api/runs/${encodeURIComponent(id)}/updates`,
       );
-      if (
-        selectedRef.current !== id ||
-        !alive.current ||
-        sequence !== detailSequence.current
-      )
-        return;
+      if (!current()) return;
       const previous = force ? null : revisions.current;
       const detailChanged =
         !previous ||
@@ -377,12 +383,7 @@ export default function App() {
           ? request<string>(`/api/runs/${encodeURIComponent(id)}/log?tail=400`)
           : Promise.resolve(null),
       ]);
-      if (
-        selectedRef.current !== id ||
-        !alive.current ||
-        sequence !== detailSequence.current
-      )
-        return;
+      if (!current()) return;
       if (results[0].status === "fulfilled" && results[0].value)
         setDetail(results[0].value);
       if (results[1].status === "fulfilled" && results[1].value)
@@ -399,24 +400,17 @@ export default function App() {
         setDetailError("");
       }
     } catch (e) {
-      if (
-        selectedRef.current === id &&
-        alive.current &&
-        sequence === detailSequence.current
-      )
-        setDetailError(errorMessage(e));
+      if (current()) setDetailError(errorMessage(e));
     } finally {
-      if (
-        selectedRef.current === id &&
-        alive.current &&
-        sequence === detailSequence.current
-      )
-        setDetailLoading(false);
+      if (current()) setDetailLoading(false);
     }
   }, []);
 
   const refresh = useCallback((): Promise<void> => {
+    if (serviceRef.current.status !== "ready") return Promise.resolve();
     if (refreshPromise.current) return refreshPromise.current;
+    const serviceRevision = serviceRef.current.revision;
+    const current = () => alive.current && serviceRef.current.status === "ready" && serviceRef.current.revision === serviceRevision;
     const task = (async () => {
       const result = await Promise.allSettled([
         request<Run[]>("/api/runs"),
@@ -424,7 +418,7 @@ export default function App() {
         request<EngineStatus>("/api/desktop/status"),
         request<Resources>("/api/system/resources"),
       ]);
-      if (!alive.current) return;
+      if (!current()) return;
       if (result[0].status === "fulfilled") setRuns(result[0].value);
       if (result[1].status === "fulfilled") setHealth(result[1].value);
       if (result[2].status === "fulfilled") setEngine(result[2].value);
@@ -454,7 +448,7 @@ export default function App() {
             ? Promise.resolve(null)
             : request<Template[]>("/api/task-templates"),
         ]);
-        if (!alive.current) return;
+        if (!current()) return;
         if (config[0].status === "fulfilled" && config[0].value) {
           setEnv(config[0].value);
           configLoaded.current.env = true;
@@ -470,14 +464,45 @@ export default function App() {
         }
       }
       if (selectedRef.current) await loadDetail(selectedRef.current);
-      setLoading(false);
+      if (current()) setLoading(false);
     })();
     refreshPromise.current = task;
     void task.finally(() => {
-      refreshPromise.current = null;
+      if (refreshPromise.current === task) refreshPromise.current = null;
     });
     return task;
   }, [loadDetail]);
+
+  useEffect(() => {
+    if (!window.biomaker) return;
+    let stopped = false;
+    const receive = (next: ServiceState) => {
+      if (stopped || next.revision <= serviceRef.current.revision) return;
+      serviceRef.current = next;
+      setServiceState(next);
+      // Detach requests from an older process generation. Their responses are
+      // ignored, and their finally handlers cannot clear the new request slot.
+      refreshPromise.current = null;
+      detailSequence.current += 1;
+      setDetailLoading(false);
+      setConnectionError("");
+      setDetailError("");
+      pollState.current.failures = 0;
+      if (next.status === "ready") {
+        configLoaded.current = { env: false, templates: false };
+        revisions.current = null;
+        void refresh();
+      } else if (next.status === "failed") {
+        setLoading(false);
+      }
+    };
+    const unsubscribe = window.biomaker.onServiceState(receive);
+    void window.biomaker.getServiceState().then(receive).catch((error) => {
+      if (!stopped && serviceRef.current.revision < 0)
+        receive({ status: "failed", revision: 0, message: errorMessage(error) });
+    });
+    return () => { stopped = true; unsubscribe(); };
+  }, [refresh]);
 
   const activelyPolling = !!engine?.engine.installing || runs.some(isActive);
   useEffect(() => {
@@ -496,7 +521,7 @@ export default function App() {
       .catch(() => {});
     const tick = async () => {
       clearTimeout(timer);
-      if (stopped || running) return;
+      if (stopped || running || serviceRef.current.status !== "ready") return;
       running = true;
       try {
         await refresh();
@@ -524,7 +549,7 @@ export default function App() {
       clearTimeout(timer);
       document.removeEventListener("visibilitychange", visible);
     };
-  }, [refresh, activelyPolling]);
+  }, [refresh, activelyPolling, serviceState.revision]);
 
   useEffect(() => {
     revisions.current = null;
@@ -578,6 +603,7 @@ export default function App() {
         event.key === "Enter" &&
         !selectedRef.current &&
         !settings &&
+        !importOpen &&
         !searchOpen &&
         !templatesOpen
       ) {
@@ -590,7 +616,7 @@ export default function App() {
       stop?.();
       document.removeEventListener("keydown", key);
     };
-  }, [startNew, openSearch, refresh, settings, searchOpen, templatesOpen]);
+  }, [startNew, openSearch, refresh, settings, searchOpen, templatesOpen, importOpen]);
 
   const openTaskSettings = (section: "provider" | "runtime") => {
     setSettingsReturnToExperiment(true);
@@ -644,8 +670,8 @@ export default function App() {
     : !providerReady
       ? "provider"
       : null;
-  const primaryNeedsSetup = draftReady && !!preparation;
-  const canContinue = draftReady && !busy && !loading && !connectionError;
+  const primaryNeedsSetup = serviceReady && draftReady && !!preparation;
+  const canContinue = serviceReady && draftReady && !busy && !loading && !connectionError;
   const canSubmit = canContinue && !preparation;
   const selectedRun =
     detail?.id === selectedId
@@ -684,7 +710,7 @@ export default function App() {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (busy) return;
+    if (busy || serviceRef.current.status !== "ready") return;
     setSubmitError("");
     if (!draft.task.trim()) {
       textarea.current?.focus();
@@ -800,7 +826,7 @@ export default function App() {
     run: Run,
     confirmed = false,
   ) {
-    if (busy) return;
+    if (busy || serviceRef.current.status !== "ready") return;
     if (action === "requeue") {
       if (!engineReady) {
         openTaskSettings("runtime");
@@ -846,7 +872,7 @@ export default function App() {
     }
   }
   async function resumeQueue() {
-    if (busy) return;
+    if (busy || serviceRef.current.status !== "ready") return;
     setBusy("resume");
     try {
       const queue = await request<QueueState>("/api/queue");
@@ -862,11 +888,9 @@ export default function App() {
     }
   }
   async function refreshAll() {
-    await Promise.all([
-      refresh(),
-      request<EnvConfig>("/api/env").then(setEnv),
-      request<Template[]>("/api/task-templates").then(setTemplates),
-    ]).catch((e) => toast(errorMessage(e)));
+    if (serviceRef.current.status !== "ready") return;
+    configLoaded.current = { env: false, templates: false };
+    await refresh();
   }
 
   if (!window.biomaker)
@@ -965,6 +989,7 @@ export default function App() {
                     "Your experiments appear here, grouped by dataset.",
                   )}
                 </p>
+                <button className="text-button" disabled={!serviceReady} onClick={() => setImportOpen(true)}>{t("导入已有实验", "Import existing experiments")}</button>
               </div>
             ) : (
               groups.map(([name, groupRuns]) => (
@@ -1039,11 +1064,13 @@ export default function App() {
               onClick={() => setSettings("runtime")}
             >
               <span
-                className={`connection-dot ${connectionError ? "error" : engineReady ? "ready" : engine?.engine.installing ? "installing" : ""}`}
+                className={`connection-dot ${serviceState.status === "failed" ? "error" : !serviceReady ? "installing" : engineReady ? "ready" : engine?.engine.installing ? "installing" : ""}`}
               />
               <span>
-                {connectionError
-                  ? t("连接已断开", "Disconnected")
+                {!serviceReady
+                  ? serviceStatusLabel(serviceState, t)
+                  : !engine
+                    ? t("正在读取运行环境…", "Loading runtime status…")
                   : engine?.engine.installing
                     ? t("正在安装运行环境", "Installing runtime")
                     : engineReady
@@ -1097,6 +1124,7 @@ export default function App() {
             <IconButton
               label={t("刷新", "Refresh")}
               onClick={() => void refreshAll()}
+              disabled={!serviceReady}
             >
               <RefreshCw size={16} />
             </IconButton>
@@ -1115,12 +1143,20 @@ export default function App() {
             )}
           </div>
         </header>
-        {connectionError && (
+        {!serviceReady && (
+          <div className={`service-banner ${serviceState.status === "failed" ? "failed" : ""}`} role={serviceState.status === "failed" ? "alert" : "status"}>
+            {serviceState.status !== "failed" && <Spinner size={15} />}
+            <span>{serviceStatusLabel(serviceState, t)}</span>
+            {serviceState.status === "reconnecting" && <small>{t("连接恢复后将自动更新。", "Your workspace will update when the connection returns.")}</small>}
+            {serviceState.status === "failed" && serviceState.message && <details><summary>{t("详情", "Details")}</summary><p>{serviceState.message}</p></details>}
+          </div>
+        )}
+        {serviceReady && connectionError && (
           <div className="connection-banner" role="alert">
             <span>
               {t(
-                "无法连接本地服务，正在尝试重新连接。",
-                "Cannot reach the local service. Reconnecting automatically.",
+                "部分工作区数据未能读取，正在重试。",
+                "Some workspace data could not be loaded. Retrying.",
               )}
             </span>
             <button onClick={() => void refreshAll()}>
@@ -1147,7 +1183,7 @@ export default function App() {
             </div>
             <button
               className="secondary-button"
-              disabled={!!busy}
+              disabled={!!busy || !serviceReady}
               onClick={resumeQueue}
             >
               {busy === "resume" ? <Spinner size={13} /> : <Play size={13} />}
@@ -1168,10 +1204,10 @@ export default function App() {
                     )}
                   </p>
                 </div>
-                <button className="primary-button" onClick={startNew}>
-                  <Plus size={15} />
-                  {t("新建实验", "New experiment")}
-                </button>
+                <div className="history-heading-actions">
+                  <button className="secondary-button" disabled={!serviceReady} onClick={() => setImportOpen(true)}><Import size={15} />{t("导入已有实验", "Import existing experiments")}</button>
+                  <button className="primary-button" onClick={startNew}><Plus size={15} />{t("新建实验", "New experiment")}</button>
+                </div>
               </div>
               <div className="history-toolbar">
                 <div className="search-input">
@@ -1268,16 +1304,20 @@ export default function App() {
                 detailError={detailError}
                 lang={lang}
                 t={t}
-                busy={busy}
+                busy={busy || (!serviceReady ? "service" : "")}
+                serviceReady={serviceReady}
+                serviceRevision={serviceState.revision}
                 onAction={runAction}
                 onRetryLoad={() => void loadDetail(selectedId, true)}
                 toast={toast}
               />
             ) : (
               <div className="detail-empty">
-                {detailLoading ? <Spinner size={24} /> : <FileText size={26} />}
+                {detailLoading || !serviceReady ? <Spinner size={24} /> : <FileText size={26} />}
                 <h3>
-                  {detailLoading
+                  {!serviceReady
+                    ? serviceStatusLabel(serviceState, t)
+                    : detailLoading
                     ? t("正在读取实验", "Loading experiment")
                     : t("实验暂时无法读取", "Experiment unavailable")}
                 </h3>
@@ -1285,6 +1325,7 @@ export default function App() {
                 <button
                   className="secondary-button"
                   onClick={() => void loadDetail(selectedId, true)}
+                  disabled={!serviceReady}
                 >
                   {t("重试", "Retry")}
                 </button>
@@ -1373,7 +1414,9 @@ export default function App() {
                             : t("开始实验", "Start experiment")
                         }
                         title={
-                          canSubmit
+                          !serviceReady
+                            ? serviceStatusLabel(serviceState, t)
+                            : canSubmit
                             ? t("开始实验 ⌘ ↵", "Start experiment ⌘ ↵")
                             : !draft.task.trim()
                               ? t(
@@ -1623,7 +1666,7 @@ export default function App() {
                 )}
                 {submitError && <Notice danger>{submitError}</Notice>}
               </form>
-              {!loading && (!engineReady || !keyReady || !modelReady) && (
+              {serviceReady && !loading && engine && env && (!engineReady || !keyReady || !modelReady) && (
                 <section className="onboarding">
                   <div className="onboarding-heading">
                     <h2>
@@ -1747,14 +1790,18 @@ export default function App() {
         <footer className="workspace-statusbar">
           <span>
             <span
-              className={`connection-dot ${connectionError ? "error" : "ready"}`}
+              className={`connection-dot ${serviceState.status === "failed" || connectionError ? "error" : serviceReady ? "ready" : "installing"}`}
             />
-            {connectionError
-              ? t("服务连接中断", "Service disconnected")
+            {!serviceReady
+              ? serviceStatusLabel(serviceState, t)
+              : connectionError
+                ? t("数据更新失败", "Data update failed")
               : t("本地工作区", "Local workspace")}
           </span>
           <span>
-            {health?.queue.running
+            {!serviceReady
+              ? ""
+              : health?.queue.running
               ? t(
                   `${health.queue.running} 个实验运行中`,
                   `${health.queue.running} running`,
@@ -1766,7 +1813,7 @@ export default function App() {
                   : !providerReady
                     ? t("等待配置模型", "Model setup needed")
                     : t("就绪", "Ready")}
-            {(health?.queue.queued || 0) > 0 &&
+            {serviceReady && (health?.queue.queued || 0) > 0 &&
               ` · ${health?.queue.queued} ${t("排队中", "queued")}`}
           </span>
         </footer>
@@ -1917,6 +1964,7 @@ export default function App() {
           notificationsEnabled={notificationsEnabled}
           setNotificationsEnabled={changeNotifications}
           engine={engine}
+          serviceState={serviceState}
           env={env}
           version={version}
           initialSection={settings}
@@ -1939,6 +1987,7 @@ export default function App() {
           toast={toast}
         />
       )}
+      {importOpen && <HistoryImport t={t} lang={lang} serviceState={serviceState} onClose={() => setImportOpen(false)} onImported={() => void refreshAll()} onOpenRun={id => { selectRun(id); setImportOpen(false); }} />}
       {searchOpen && (
         <Modal
           title={t("搜索实验", "Search experiments")}

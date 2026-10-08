@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { Sidecar } from './sidecar';
+import { Sidecar, type ServiceState } from './sidecar';
 import { externalURL, isWithin, validateArtifact, validateRequest, validTheme } from './security';
 import { readResponse } from './response';
 import { RunNotifications, type RunCompletion } from './run-notifications';
@@ -19,7 +19,7 @@ if (!locked) app.quit();
 let mainWindow: BrowserWindow | null = null;
 let sidecar: Sidecar | null = null;
 let quitting = false;
-let serviceReady = false;
+let serviceState: ServiceState = { status: 'starting', revision: 0 };
 let preferences: { theme: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications: boolean; directories: string[]; bounds?: Electron.Rectangle } = { theme: 'system', notifications: true, directories: [] };
 const runNotifications = new RunNotifications();
 let notificationTimer: NodeJS.Timeout | null = null;
@@ -69,6 +69,25 @@ function handle(channel: string, callback: (...args: any[]) => unknown) {
   ipcMain.handle(channel, (event, ...args) => { senderAllowed(event); return callback(...args); });
 }
 function action(name: string) { mainWindow?.webContents.send('biomaker:menu-action', name); }
+function publishServiceState(state: ServiceState) {
+  serviceState = state;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('biomaker:service-state', state);
+  if (state.status === 'ready') scheduleRunMonitor(0);
+}
+async function fetchService(url: string, options: RequestInit): Promise<Response> {
+  const current = sidecar;
+  const revision = serviceState.revision;
+  try { return await fetch(url, options); }
+  catch (error) {
+    // HTTP errors are handled by the caller. Only a transport failure needs a
+    // health probe, so invalid settings or an unavailable artifact never turn
+    // a healthy local service into a disconnected UI.
+    // A request from a previous service generation must not disturb one that
+    // has already reconnected while that request was still settling.
+    if (sidecar === current && serviceState.revision === revision) void current?.checkConnection();
+    throw error;
+  }
+}
 function showWindow() { if (!app.isReady()) { app.once('ready', showWindow); return; } if (!mainWindow) void createWindow(); else { if (mainWindow.isMinimized()) mainWindow.restore(); mainWindow.show(); mainWindow.focus(); } }
 function notifyCompletion(completion: RunCompletion) {
   if (quitting || !preferences.notifications || mainWindow?.isFocused() || !Notification.isSupported()) return;
@@ -109,9 +128,9 @@ async function pollNotificationRuns() {
   if (quitting || notificationPollRunning) return;
   notificationPollRunning = true;
   try {
-    if (sidecar && serviceReady) {
+    if (sidecar && serviceState.status === 'ready') {
       const ticket = runNotifications.issue();
-      const response = await fetch(`${sidecar.origin}/api/runs`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(10_000) });
+      const response = await fetchService(`${sidecar.origin}/api/runs`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(10_000) });
       observeRuns(await readResponse(response, true), ticket);
     }
   } catch { /* Preserve known active runs across temporary service failures. */ }
@@ -144,16 +163,29 @@ function setupIPC() {
   });
   handle('biomaker:request', async (rawPath, options) => {
     const request = validateRequest(rawPath, options);
-    if (!sidecar || !serviceReady) throw new Error(t('BioMaker 服务正在启动，请稍后重试。', 'BioMaker is starting. Please try again shortly.'));
+    const pathname = decodeURIComponent(request.path.split('?')[0]).replace(/\/+$/, '');
+    if (request.method === 'POST' && pathname === '/api/desktop/history/preview') {
+      const body = request.body ? JSON.parse(request.body) : null;
+      if (!body || typeof body.path !== 'string' || !path.isAbsolute(body.path) || !existsSync(body.path)) throw new Error(t('请选择已有实验文件夹。', 'Choose an existing experiment folder.'));
+      const resolved = realpathSync(body.path);
+      const authorized = preferences.directories.some(root => {
+        try { return realpathSync(root) === root && isWithin(resolved, root); } catch { return false; }
+      });
+      if (!statSync(resolved).isDirectory() || !authorized) throw new Error(t('请先通过目录选择器授权访问此实验文件夹。', 'Choose this experiment folder using the folder picker to grant access first.'));
+      request.body = JSON.stringify({ ...body, path: resolved });
+    }
+    if (!sidecar || serviceState.status !== 'ready') throw new Error(serviceState.message ?? (serviceState.status === 'reconnecting' ? t('正在重新连接 BioMaker 服务，请稍后重试。', 'BioMaker is reconnecting. Please try again shortly.') : t('BioMaker 服务正在启动，请稍后重试。', 'BioMaker is starting. Please try again shortly.')));
     const isRunResponse = /^\/api\/runs(?:\/[^/]+(?:\/(?:requeue|stop|cancel))?)?$/.test(request.path.split('?')[0]);
     const ticket = isRunResponse ? runNotifications.issue() : 0;
-    const response = await fetch(`${sidecar.origin}${request.path}`, { method: request.method, body: request.body, headers: { Authorization: `Bearer ${sidecar.token}`, ...(request.body === undefined ? {} : { 'Content-Type': 'application/json' }) }, redirect: 'error', signal: AbortSignal.timeout(45_000) });
+    const response = await fetchService(`${sidecar.origin}${request.path}`, { method: request.method, body: request.body, headers: { Authorization: `Bearer ${sidecar.token}`, ...(request.body === undefined ? {} : { 'Content-Type': 'application/json' }) }, redirect: 'error', signal: AbortSignal.timeout(45_000) });
     const result = await readResponse(response, request.path.startsWith('/api/'));
     if (isRunResponse) observeRuns(result, ticket);
     return result;
   });
-  handle('biomaker:choose-directory', async () => {
-    const result = await dialog.showOpenDialog(mainWindow!, { title: t('选择数据目录', 'Choose a dataset folder'), properties: ['openDirectory', 'createDirectory'], buttonLabel: t('选择此目录', 'Choose folder') });
+  handle('biomaker:choose-directory', async (options) => {
+    if (options !== undefined && (!options || typeof options !== 'object' || Array.isArray(options) || Object.keys(options).some(key => key !== 'purpose') || (options.purpose !== undefined && options.purpose !== 'dataset' && options.purpose !== 'history'))) throw new Error('Invalid directory purpose');
+    const history = options?.purpose === 'history';
+    const result = await dialog.showOpenDialog(mainWindow!, { title: history ? t('选择已有实验文件夹', 'Choose an existing experiment folder') : t('选择数据目录', 'Choose a dataset folder'), properties: history ? ['openDirectory'] : ['openDirectory', 'createDirectory'], buttonLabel: history ? t('选择此文件夹', 'Choose folder') : t('选择此目录', 'Choose folder') });
     if (result.canceled || !result.filePaths[0]) return null;
     const selected = realpathSync(result.filePaths[0]);
     preferences.directories = [...new Set([...preferences.directories, selected])].slice(-100); savePreferences();
@@ -169,16 +201,17 @@ function setupIPC() {
   });
   handle('biomaker:save-artifact', async (artifact) => {
     const { runId, name } = validateArtifact(artifact?.runId, artifact?.name);
-    if (!sidecar) throw new Error(t('本地服务不可用。', 'The local service is unavailable.'));
+    if (!sidecar || serviceState.status !== 'ready') throw new Error(t('本地服务不可用。', 'The local service is unavailable.'));
     const result = await dialog.showSaveDialog(mainWindow!, { title: t('导出实验产物', 'Export experiment output'), defaultPath: path.join(app.getPath('downloads'), name), buttonLabel: t('导出', 'Export') });
     if (result.canceled || !result.filePath) return null;
-    const response = await fetch(`${sidecar.origin}/artifacts/runs/${encodeURIComponent(runId)}/${encodeURIComponent(name)}`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(300_000) });
+    const response = await fetchService(`${sidecar.origin}/artifacts/runs/${encodeURIComponent(runId)}/${encodeURIComponent(name)}`, { headers: { Authorization: `Bearer ${sidecar.token}` }, redirect: 'error', signal: AbortSignal.timeout(300_000) });
     if (!response.ok || !response.body) throw new Error(`${t('导出失败', 'Export failed')} (${response.status}).`);
     const temporary = `${result.filePath}.biomaker-${process.pid}.part`;
     try { await pipeline(Readable.fromWeb(response.body as any), createWriteStream(temporary, { flags: 'wx', mode: 0o600 })); renameSync(temporary, result.filePath); } catch (error) { rmSync(temporary, { force: true }); throw error; }
     return result.filePath;
   });
   handle('biomaker:app-info', () => ({ version: app.getVersion(), platform: process.platform }));
+  handle('biomaker:get-service-state', () => ({ ...serviceState }));
   handle('biomaker:get-preferences', () => ({ theme: preferences.theme, language: preferences.language, notifications: preferences.notifications }));
   handle('biomaker:set-preferences', (value) => {
     if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['theme', 'language', 'notifications'].includes(key))) throw new Error('Invalid preferences');
@@ -241,10 +274,10 @@ if (locked) void app.whenReady().then(async () => {
   });
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => callback({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [CSP], 'X-Content-Type-Options': ['nosniff'] } }));
   installMenu(); setupIPC();
-  sidecar = new Sidecar({ runtime: app.isPackaged ? path.join(process.resourcesPath, 'runtime') : path.join(desktopRoot, 'build', 'runtime'), service: app.isPackaged ? path.join(process.resourcesPath, 'service', 'main.py') : path.join(desktopRoot, 'service', 'main.py'), data: app.getPath('userData'), version: app.getVersion(), onFailure: message => { serviceReady = false; void dialog.showMessageBox({ type: 'error', title: t('BioMaker 服务', 'BioMaker service'), message, buttons: [t('重新启动', 'Restart'), t('打开诊断日志', 'Open diagnostic logs'), t('稍后', 'Later')], defaultId: 0, cancelId: 2 }).then(async result => { if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) await shell.openPath(path.join(app.getPath('userData'), 'logs')); }); } });
+  sidecar = new Sidecar({ runtime: app.isPackaged ? path.join(process.resourcesPath, 'runtime') : path.join(desktopRoot, 'build', 'runtime'), service: app.isPackaged ? path.join(process.resourcesPath, 'service', 'main.py') : path.join(desktopRoot, 'service', 'main.py'), data: app.getPath('userData'), version: app.getVersion(), onState: publishServiceState, onFailure: message => { void dialog.showMessageBox({ type: 'error', title: t('BioMaker 服务', 'BioMaker service'), message, buttons: [t('重新启动', 'Restart'), t('打开诊断日志', 'Open diagnostic logs'), t('稍后', 'Later')], defaultId: 0, cancelId: 2 }).then(async result => { if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) await shell.openPath(path.join(app.getPath('userData'), 'logs')); }); } });
   // Render early so users see progress while the bundled service initializes.
   await createWindow();
-  try { await sidecar.start(); serviceReady = true; action('refresh'); scheduleRunMonitor(0); } catch (error) {
+  try { await sidecar.start(); } catch (error) {
     const result = await dialog.showMessageBox(mainWindow!, { type: 'error', title: t('BioMaker 启动失败', 'BioMaker could not start'), message: String(error), detail: t('你的实验数据保存在应用工作目录中。可以重试启动，或打开诊断日志。', 'Your experiments are saved in the application workspace. Retry or open the diagnostic logs.'), buttons: [t('重试', 'Retry'), t('打开日志', 'Open logs'), t('退出', 'Quit')], defaultId: 0, cancelId: 2 });
     if (result.response === 0) { app.relaunch(); app.quit(); } else if (result.response === 1) { await shell.openPath(path.join(app.getPath('userData'), 'logs')); } else app.quit();
   }

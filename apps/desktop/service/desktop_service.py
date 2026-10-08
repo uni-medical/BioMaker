@@ -22,11 +22,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
+from history_import import HistoryImporter, HistoryImportError
 from native_runtime import NATIVE_RUNTIME_REVISION, native_receipt_is_current, provision_native_runtime
 
-VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.3")
+VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.4")
+
+
+class HistoryPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str = Field(min_length=1, max_length=8192)
+
+
+class HistoryImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    preview_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    source_ids: list[str] = Field(min_length=1, max_length=100)
 
 
 @dataclass(frozen=True)
@@ -393,18 +406,47 @@ def create_desktop_app(
     settings = Settings.default()
     app = create_app(settings)
     engine = installer or EngineInstaller(config)
+    history = HistoryImporter(settings, app.state.manager)
     original_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
     async def lifespan(application):
         try:
             async with original_lifespan(application):
+                history.recover()
                 yield
         finally:
+            history.close()
             engine.close()
 
     app.router.lifespan_context = lifespan
     app.state.desktop_engine = engine
+    app.state.history_importer = history
+
+    @app.post("/api/desktop/history/preview")
+    def preview_history(payload: HistoryPreviewRequest):
+        try:
+            return history.preview(payload.path)
+        except HistoryImportError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=422, detail="The selected folder could not be read. Check access and scan again.") from exc
+
+    @app.post("/api/desktop/history/import", status_code=202)
+    def import_history(payload: HistoryImportRequest):
+        try:
+            return history.submit(payload.preview_id, payload.source_ids)
+        except HistoryImportError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=422, detail="The import could not start. Check local disk space and folder access.") from exc
+
+    @app.get("/api/desktop/history/imports/{job_id}")
+    def history_import_status(job_id: str):
+        try:
+            return history.get_job(job_id)
+        except HistoryImportError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     @app.get("/api/desktop/status")
     def desktop_status():
@@ -450,6 +492,11 @@ def create_desktop_app(
     @app.middleware("http")
     async def preflight(request: Request, call_next):
         path = request.url.path
+        control = re.fullmatch(r"/api/runs/([^/]+)/(?:stop|cancel|requeue)", path)
+        if request.method == "POST" and control:
+            record = app.state.run_store.get_record("runs", control.group(1))
+            if record and (record.get("read_only") or not record.get("managed", True)):
+                return JSONResponse({"detail": "Imported experiment records are view-only and cannot be controlled."}, status_code=409)
         is_create = request.method == "POST" and path == "/api/runs"
         is_requeue = (
             request.method == "POST"

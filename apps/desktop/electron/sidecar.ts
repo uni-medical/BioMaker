@@ -4,7 +4,8 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSyn
 import path from 'node:path';
 import { prepareSelectedEngine, selectEngine, type EngineSelection } from './engine-selection';
 
-export interface SidecarOptions { runtime: string; service: string; data: string; version: string; onFailure: (message: string) => void }
+export interface ServiceState { status: 'starting' | 'ready' | 'reconnecting' | 'failed'; revision: number; message?: string }
+export interface SidecarOptions { runtime: string; service: string; data: string; version: string; onFailure: (message: string) => void; onState?: (state: ServiceState) => void }
 export class Sidecar {
   readonly token = randomBytes(32).toString('hex');
   readonly engine: string;
@@ -13,7 +14,9 @@ export class Sidecar {
   private port: number | null = null;
   private stopping = false;
   private restarting: Promise<void> | null = null;
+  private probing: Promise<void> | null = null;
   private restartCount = 0;
+  private state: ServiceState = { status: 'starting', revision: 0 };
   private logPath: string;
   private engineSelection: EngineSelection;
   constructor(private options: SidecarOptions) {
@@ -33,6 +36,13 @@ export class Sidecar {
   get origin(): string {
     if (!this.port) throw new Error('BioMaker 服务正在启动，请稍后重试。');
     return `http://127.0.0.1:${this.port}`;
+  }
+  getState(): ServiceState { return { ...this.state }; }
+  private setState(status: ServiceState['status'], message?: string) {
+    const safeMessage = message?.replaceAll(this.token, '[redacted]');
+    if (this.state.status === status && this.state.message === safeMessage) return;
+    this.state = { status, revision: this.state.revision + 1, ...(safeMessage ? { message: safeMessage } : {}) };
+    this.options.onState?.(this.getState());
   }
   private log(message: string) {
     const sanitized = message.replaceAll(this.token, '[redacted]');
@@ -68,15 +78,23 @@ export class Sidecar {
     // Python binary or native libraries after the desktop app is upgraded.
   }
   async start(): Promise<void> {
-    this.prepareRuntime();
-    this.prepareEngine();
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (this.stopping) return;
-      try { await this.launch(); return; } catch (error) {
-        this.log(`Startup attempt ${attempt + 1}: ${String(error)}`);
-        if (attempt === 2) throw error;
-        await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+    if (this.stopping) return;
+    this.setState(this.state.status === 'reconnecting' ? 'reconnecting' : 'starting');
+    try {
+      this.prepareRuntime();
+      this.prepareEngine();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (this.stopping) return;
+        try { await this.launch(); return; } catch (error) {
+          if (this.stopping) return;
+          this.log(`Startup attempt ${attempt + 1}: ${String(error)}`);
+          if (attempt === 2) throw error;
+          await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+        }
       }
+    } catch (error) {
+      if (!this.stopping) this.setState('failed', String(error));
+      throw error;
     }
   }
   private async launch(): Promise<void> {
@@ -99,11 +117,14 @@ export class Sidecar {
     let didBecomeReady = false;
     await new Promise<void>((resolve, reject) => {
       let settled = false;
+      let checkingHealth = false;
       let output = '';
       const timeout = setTimeout(() => fail(new Error('BioMaker 本地服务启动超时。')), 30_000);
       const fail = (error: Error) => {
         if (settled) return;
-        settled = true; clearTimeout(timeout); child.kill();
+        settled = true; clearTimeout(timeout);
+        if (this.child === child) this.port = null;
+        child.kill();
         setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 2000).unref();
         reject(error);
       };
@@ -115,12 +136,16 @@ export class Sidecar {
           const line = output.slice(0, newline); output = output.slice(newline + 1);
           try {
             const status = JSON.parse(line);
-            if (!settled && status.type === 'ready' && Number.isInteger(status.port) && status.port > 0 && status.port < 65536) {
-              this.port = status.port;
+            if (!settled && !checkingHealth && status.type === 'ready' && Number.isInteger(status.port) && status.port > 0 && status.port < 65536) {
+              checkingHealth = true;
               // The announced socket must answer authenticated health before renderer access.
-              void this.waitForHealth().then(() => {
+              void this.waitForHealth(`http://127.0.0.1:${status.port}`, child).then(() => {
                 if (settled) return;
-                settled = true; didBecomeReady = true; clearTimeout(timeout); resolve();
+                if (this.stopping || this.child !== child) { fail(new Error('Service startup was cancelled')); return; }
+                settled = true; didBecomeReady = true; clearTimeout(timeout);
+                this.port = status.port;
+                this.setState('ready');
+                resolve();
               }).catch(error => fail(error));
             } else this.log(line);
           } catch { this.log(line); }
@@ -129,17 +154,18 @@ export class Sidecar {
       child.stderr?.on('data', (buffer: Buffer) => this.log(buffer.toString('utf8')));
       child.once('error', error => fail(new Error(`无法启动本地服务：${error.message}`)));
       child.once('exit', (code, signal) => {
-        if (this.child === child) { this.child = null; this.port = null; }
+        const current = this.child === child;
+        if (current) { this.child = null; this.port = null; }
         if (!settled) fail(new Error(`BioMaker 服务退出（${code ?? signal}）。诊断日志：${this.logPath}`));
-        else if (didBecomeReady && !this.stopping) this.recover();
+        else if (current && didBecomeReady && !this.stopping) this.recover();
       });
     });
   }
-  private async waitForHealth(): Promise<void> {
+  private async waitForHealth(origin: string, child: ChildProcess): Promise<void> {
     let lastError: unknown;
-    for (let attempt = 0; attempt < 30 && !this.stopping; attempt++) {
+    for (let attempt = 0; attempt < 30 && !this.stopping && this.child === child; attempt++) {
       try {
-        const response = await fetch(`${this.origin}/api/health`, { headers: { Authorization: `Bearer ${this.token}` }, signal: AbortSignal.timeout(1000) });
+        const response = await fetch(`${origin}/api/health`, { headers: { Authorization: `Bearer ${this.token}` }, redirect: 'error', signal: AbortSignal.timeout(1000) });
         if (!response.ok) throw new Error(`Health check failed (${response.status})`);
         return;
       } catch (error) { lastError = error; }
@@ -147,14 +173,44 @@ export class Sidecar {
     }
     throw lastError ?? new Error('Service startup was cancelled');
   }
+  /** A transport failure is distinct from a valid HTTP error response. Probe
+   * authenticated health before replacing a possibly still healthy service. */
+  checkConnection(): Promise<void> {
+    if (this.probing) return this.probing;
+    if (this.stopping || this.state.status !== 'ready' || !this.child) return Promise.resolve();
+    const child = this.child;
+    const origin = this.origin;
+    this.setState('reconnecting');
+    this.probing = (async () => {
+      try {
+        const response = await fetch(`${origin}/api/health`, { headers: { Authorization: `Bearer ${this.token}` }, redirect: 'error', signal: AbortSignal.timeout(1000) });
+        if (!response.ok) throw new Error(`Health check failed (${response.status})`);
+        if (!this.stopping && this.child === child) this.setState('ready');
+      } catch (error) {
+        if (this.stopping || this.child !== child) return;
+        this.log(`Connection health check failed: ${String(error)}`);
+        child.kill();
+        setTimeout(() => { if (this.child === child) child.kill('SIGKILL'); }, 2000).unref();
+      }
+    })().finally(() => { this.probing = null; });
+    return this.probing;
+  }
   private recover() {
-    if (this.restarting || this.restartCount >= 3) {
-      this.options.onFailure('BioMaker 本地服务已停止。请重新启动应用；运行中的实验由独立进程管理。'); return;
+    if (this.stopping) return;
+    this.setState('reconnecting');
+    if (this.restarting) return;
+    if (this.restartCount >= 3) {
+      const message = 'BioMaker 本地服务已停止。请重新启动应用；运行中的实验由独立进程管理。';
+      this.setState('failed', message);
+      this.options.onFailure(message); return;
     }
     this.restartCount++;
     this.restarting = new Promise<void>(resolve => setTimeout(resolve, 1000 * this.restartCount))
-      .then(() => this.start()).catch(error => this.options.onFailure(String(error)))
-      .finally(() => { this.restarting = null; });
+      .then(() => this.start()).catch(error => { if (!this.stopping) this.options.onFailure(String(error)); })
+      .finally(() => {
+        this.restarting = null;
+        if (!this.stopping && this.state.status === 'reconnecting' && !this.child) this.recover();
+      });
   }
   async stop(): Promise<void> {
     this.stopping = true;

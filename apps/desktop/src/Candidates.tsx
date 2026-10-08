@@ -13,7 +13,7 @@ interface Candidate {
 }
 interface Journal { nodes: Candidate[]; node2parent: Record<string, string> }
 
-export default function Candidates({ run, t }: { run: Run; t: Translate }) {
+export default function Candidates({ run, t, serviceReady, serviceRevision }: { run: Run; t: Translate; serviceReady: boolean; serviceRevision: number }) {
   const artifact = run.artifacts?.find(file => file.name === 'journal.json');
   const [journal, setJournal] = useState<Journal | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -23,8 +23,9 @@ export default function Candidates({ run, t }: { run: Run; t: Translate }) {
   const [section, setSection] = useState<'summary' | 'code' | 'output'>('summary');
   useEffect(() => {
     let valid = true;
-    setJournal(null); setError('');
-    if (!artifact) return;
+    if (!serviceReady) { setBusy(false); return; }
+    setError('');
+    if (!artifact) { setJournal(null); return; }
     if (artifact.size > 12 * 1024 * 1024) { setError(t('候选记录较大，请在文件标签中导出 journal.json 查看。', 'This journal is large. Export journal.json from Files to inspect it.')); return; }
     setBusy(true);
     request<unknown>(artifact.url).then(raw => {
@@ -37,7 +38,7 @@ export default function Candidates({ run, t }: { run: Run; t: Translate }) {
       if (valid) { setJournal({ nodes, node2parent }); setSelected(current => nodes.some(node => node.id === current) ? current : nodes.at(-1)?.id || null); }
     }).catch(e => { if (valid) setError(errorMessage(e)); }).finally(() => { if (valid) setBusy(false); });
     return () => { valid = false; };
-  }, [run.id, artifact?.revision, artifact?.url, reload]);
+  }, [run.id, artifact?.revision, artifact?.url, reload, serviceReady, serviceRevision]);
   const rows = useMemo(() => {
     if (!journal) return [];
     const byId = new Map(journal.nodes.map(node => [node.id, node]));
@@ -53,7 +54,8 @@ export default function Candidates({ run, t }: { run: Run; t: Translate }) {
   const metric = (node: Candidate) => typeof node.metric?.value === 'number' && Number.isFinite(node.metric.value) ? Number(node.metric.value.toPrecision(6)).toString() : '—';
   const number = (node: Candidate) => node.step !== null && node.step !== undefined ? `#${node.step + 1}` : node.id.slice(0, 6);
   if (!artifact) return <div className="detail-empty"><GitBranch size={28}/><h3>{t('候选方案会随着实验展开', 'Candidates appear as the experiment develops')}</h3><p>{t('这里展示每个候选方案的来源、代码、执行结果与记录指标。', 'Explore each candidate’s lineage, code, execution output, and recorded metric.')}</p></div>;
-  if (error) return <Notice danger>{error}<button className="text-button" onClick={() => setReload(value => value + 1)}><RefreshCw size={13}/>{t('重试', 'Retry')}</button></Notice>;
+  if (!serviceReady && !journal) return <div className="detail-empty"><Spinner size={24}/><p>{t('等待本地服务恢复后读取候选方案', 'Candidates will load when the local service is available')}</p></div>;
+  if (error) return <Notice danger>{error}<button className="text-button" disabled={!serviceReady} onClick={() => setReload(value => value + 1)}><RefreshCw size={13}/>{t('重试', 'Retry')}</button></Notice>;
   if (busy && !journal) return <div className="detail-empty"><Spinner size={24}/><p>{t('正在读取候选方案', 'Loading candidates')}</p></div>;
   if (!journal?.nodes.length) return <div className="detail-empty"><GitBranch size={28}/><h3>{t('尚未记录候选方案', 'No candidates recorded yet')}</h3></div>;
   return <div className="candidates-view">

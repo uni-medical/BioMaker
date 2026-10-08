@@ -1,6 +1,16 @@
+import type { ServiceState } from "./bridge";
+
 export type Language = "zh" | "en";
 export type Theme = "system" | "light" | "dark";
 export type Translate = (zh: string, en: string) => string;
+export function serviceStatusLabel(state: ServiceState, t: Translate): string {
+  switch (state.status) {
+    case "starting": return t("正在启动本地服务…", "Starting the local service…");
+    case "reconnecting": return t("正在恢复本地服务…", "Reconnecting to the local service…");
+    case "failed": return t("本地服务不可用", "Local service unavailable");
+    case "ready": return t("本地服务已就绪", "Local service ready");
+  }
+}
 export interface Options {
   model_for_all_agents: string | null;
   agent_steps: number;
@@ -26,6 +36,7 @@ export interface Run {
   dataset_name?: string;
   dataset_path?: string;
   read_only?: boolean;
+  history_import?: { mode: "copy"; source_id: string; source_path: string; name: string; imported_at: string };
   status_reason?: string;
   error?: string;
   allowed_actions?: string[];
@@ -160,6 +171,7 @@ export function errorMessage(error: unknown): string {
 }
 export function runTitle(run: Run): string {
   return (
+    run.history_import?.name ||
     run.requested_exp_name ||
     run.actual_exp_name ||
     run.project_snapshot?.task_body
@@ -202,6 +214,8 @@ export function statusLabel(run: Run, t: Translate): string {
     interrupted: ["已中断", "Interrupted"],
     incomplete: ["未完成", "Incomplete"],
     orphaned: ["未完成", "Incomplete"],
+    snapshot: ["历史快照", "Historical snapshot"],
+    unknown: ["状态未知", "Unknown status"],
   };
   return labels[status] ? t(...labels[status]) : status;
 }

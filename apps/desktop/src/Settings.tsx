@@ -15,9 +15,11 @@ import {
   Trash2,
 } from "lucide-react";
 import { Modal, Notice, SettingRow, Spinner } from "./components";
+import type { ServiceState } from "./bridge";
 import {
   errorMessage,
   request,
+  serviceStatusLabel,
   type EngineStatus,
   type EnvConfig,
   type Language,
@@ -35,6 +37,7 @@ export default function Settings({
   notificationsEnabled,
   setNotificationsEnabled,
   engine,
+  serviceState,
   env,
   version,
   initialSection,
@@ -53,6 +56,7 @@ export default function Settings({
   notificationsEnabled: boolean;
   setNotificationsEnabled: (enabled: boolean) => void;
   engine: EngineStatus | null;
+  serviceState: ServiceState;
   env: EnvConfig | null;
   version: string;
   initialSection?: Section;
@@ -82,6 +86,7 @@ export default function Settings({
   const [confirmClose, setConfirmClose] = useState(false);
   const closeState = useRef({ dirty: false, saving: false });
   const saving = pending === "save";
+  const serviceReady = serviceState.status === "ready";
   const configured = !!env?.values.OPENAI_API_KEY?.configured;
   const effectiveKey = !!key.trim() || (configured && !removeKey);
   const effectiveModel = !!model.trim() || !!modelOverride;
@@ -123,7 +128,7 @@ export default function Settings({
   }, []);
 
   async function save() {
-    if (pending || !env) return;
+    if (pending || !env || !serviceReady) return;
     closeState.current.saving = true;
     setPending("save");
     setConfirmClose(false);
@@ -177,7 +182,7 @@ export default function Settings({
     }
   }
   async function discover() {
-    if (pending || !env) return;
+    if (pending || !env || !serviceReady) return;
     setPending("discover");
     setError("");
     setDiscovery("");
@@ -213,6 +218,7 @@ export default function Settings({
     }
   }
   async function engineAction(action: "install" | "cancel") {
+    if (!serviceReady || pending) return;
     setPending(action);
     setError("");
     try {
@@ -271,9 +277,10 @@ export default function Settings({
           <span className="settings-version">BioMaker {version}</span>
         </nav>
         <div className="settings-content">
+          {!serviceReady && <Notice danger={serviceState.status === "failed"}>{serviceStatusLabel(serviceState, t)}</Notice>}
           {section === "provider" && (
             <>
-              {!env && (
+              {!env && serviceReady && (
                 <Notice>
                   {t("正在读取已保存的配置…", "Loading saved settings…")}
                 </Notice>
@@ -372,7 +379,7 @@ export default function Settings({
                 <button
                   className="text-button"
                   onClick={discover}
-                  disabled={!!pending || !(key.trim() || configured)}
+                  disabled={!!pending || !serviceReady || !(key.trim() || configured)}
                 >
                   {pending === "discover" ? (
                     <Spinner size={13} />
@@ -549,7 +556,7 @@ export default function Settings({
                 )}
                 <button
                   className="primary-button"
-                  disabled={!!pending || !dirty || !env}
+                  disabled={!!pending || !dirty || !env || !serviceReady}
                   onClick={save}
                 >
                   {pending === "save" ? <Spinner /> : <Check size={15} />}
@@ -571,7 +578,9 @@ export default function Settings({
                 <span
                   className={`runtime-icon ${engine?.engine.ready ? "ready" : ""}`}
                 >
-                  {engine?.engine.installing ? (
+                  {!serviceReady || !engine ? (
+                    serviceState.status === "failed" ? <Terminal size={23} /> : <Spinner size={23} />
+                  ) : engine?.engine.installing ? (
                     <Spinner size={23} />
                   ) : engine?.engine.ready ? (
                     <Check size={23} />
@@ -581,7 +590,11 @@ export default function Settings({
                 </span>
                 <div>
                   <strong>
-                    {engine?.engine.installing
+                    {!serviceReady
+                      ? serviceStatusLabel(serviceState, t)
+                      : !engine
+                        ? t("正在读取运行环境…", "Loading runtime status…")
+                        : engine?.engine.installing
                       ? t("正在安装运行环境", "Installing runtime")
                       : engine?.engine.ready
                         ? t("运行环境已就绪", "Runtime ready")
@@ -591,7 +604,9 @@ export default function Settings({
                           )}
                   </strong>
                   <p>
-                    {engine?.engine.ready
+                    {!serviceReady || !engine
+                      ? t("连接就绪后将更新运行环境状态。", "Runtime status will update when the service is ready.")
+                      : engine?.engine.ready
                       ? t(
                           "可以在此电脑创建和运行实验。",
                           "Ready to create and run experiments on this computer.",
@@ -607,7 +622,7 @@ export default function Settings({
                 {engine?.engine.installing ? (
                   <button
                     className="secondary-button"
-                    disabled={!!pending}
+                    disabled={!!pending || !serviceReady}
                     onClick={() => engineAction("cancel")}
                   >
                     {pending === "cancel" && <Spinner />}
@@ -616,7 +631,7 @@ export default function Settings({
                 ) : (
                   <button
                     className="primary-button"
-                    disabled={!!pending || !!engine?.engine.ready}
+                    disabled={!!pending || !serviceReady || !engine || !!engine?.engine.ready}
                     onClick={() => engineAction("install")}
                   >
                     {pending === "install" ? (
@@ -624,7 +639,9 @@ export default function Settings({
                     ) : (
                       <Download size={15} />
                     )}
-                    {engine?.engine.ready
+                    {!serviceReady || !engine
+                      ? t("等待本地服务", "Waiting for the local service")
+                      : engine?.engine.ready
                       ? t("已安装", "Installed")
                       : engine?.engine.error
                         ? t("重新安装", "Retry installation")
@@ -633,6 +650,7 @@ export default function Settings({
                 )}
                 <button
                   className="secondary-button"
+                  disabled={!serviceReady}
                   onClick={() =>
                     onRefresh().catch((e) => setError(errorMessage(e)))
                   }

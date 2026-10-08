@@ -14,6 +14,14 @@
 - Run `tests/native-close-smoke.mjs` against the packaged executable to verify
   unsaved-settings close/quit cancellation, explicit discard, in-flight saves,
   failed-save recovery, and continued service availability after a canceled quit.
+- Run `tests/history-import-smoke.mjs` against the packaged executable for native
+  directory selection, preview, changed-source rejection, read-only copies,
+  candidates/logs/export, duplicate handling, draft preservation and restart.
+  Sources and app profiles must be synthetic and isolated from research records.
+- Run `tests/native-service-state-smoke.mjs` and `tests/service-ui-smoke.mjs` for
+  authenticated readiness, genuine sidecar crash/recovery and stale-response
+  protection. Their instrumented startup checks run from the built source;
+  report that scope separately from packaged-executable acceptance.
 - Prepare the runtime after updating the application version. Packaging rejects
   a missing or mismatched `manifest.applicationVersion`.
 - On macOS, verify native dependencies with `tests/native-portability-smoke.py`

@@ -1,3 +1,4 @@
+import { historyMessage } from "./historyMessages";
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import Candidates from "./Candidates";
@@ -136,6 +137,8 @@ export default function RunView({
   lang,
   t,
   busy,
+  serviceReady,
+  serviceRevision,
   onAction,
   onRetryLoad,
   toast,
@@ -148,6 +151,8 @@ export default function RunView({
   lang: Language;
   t: Translate;
   busy: string;
+  serviceReady: boolean;
+  serviceRevision: number;
   onAction: (action: "stop" | "cancel" | "requeue", run: Run) => void;
   onRetryLoad: () => void;
   toast: (message: string) => void;
@@ -171,6 +176,7 @@ export default function RunView({
       ? Math.max(0, Math.min(100, (done / steps) * 100))
       : null;
   async function save(artifact: Artifact) {
+    if (!serviceReady) return;
     setFileBusy(artifact.name);
     try {
       const path = await window.biomaker.saveArtifact({
@@ -185,6 +191,7 @@ export default function RunView({
     }
   }
   async function showPreview(artifact: Artifact) {
+    if (!serviceReady) return;
     if (artifact.size > 500_000) {
       toast(
         t("文件较大，请保存后查看。", "This file is large. Save it to view."),
@@ -287,7 +294,7 @@ export default function RunView({
         )}
         {(run.status_reason || run.error) && (
           <Notice danger={run.detailed_status === "failed"}>
-            {run.status_reason || run.error}
+            {run.history_import ? historyMessage(run.status_reason || run.error || "", t) : run.status_reason || run.error}
           </Notice>
         )}
         {run.read_only && (
@@ -456,7 +463,7 @@ export default function RunView({
             )}
           </>
         )}
-        {tab === "candidates" && <Candidates run={run} t={t} />}
+        {tab === "candidates" && <Candidates run={run} t={t} serviceReady={serviceReady} serviceRevision={serviceRevision} />}
         {tab === "artifacts" && (
           <>
             {artifacts.length > 0 ? (
@@ -489,7 +496,7 @@ export default function RunView({
                         <button
                           className="text-button"
                           onClick={() => showPreview(artifact)}
-                          disabled={!!fileBusy}
+                          disabled={!!fileBusy || !serviceReady}
                         >
                           {t("预览", "Preview")}
                         </button>
@@ -499,7 +506,7 @@ export default function RunView({
                           `保存 ${artifact.name}`,
                           `Save ${artifact.name}`,
                         )}
-                        disabled={!!fileBusy}
+                        disabled={!!fileBusy || !serviceReady}
                         onClick={() => save(artifact)}
                       >
                         {fileBusy === artifact.name ? (
@@ -577,7 +584,7 @@ export default function RunView({
                 const artifact = artifacts.find((a) => a.name === preview.name);
                 if (artifact) void save(artifact);
               }}
-              disabled={!!fileBusy}
+              disabled={!!fileBusy || !serviceReady}
             >
               <ArrowDownToLine size={14} />
               {t("保存文件", "Save file")}

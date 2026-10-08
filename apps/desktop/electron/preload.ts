@@ -1,12 +1,20 @@
 import { contextBridge, ipcRenderer } from 'electron';
+import type { ServiceState } from './sidecar';
 
 const invoke = (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args);
 contextBridge.exposeInMainWorld('biomaker', Object.freeze({
   request: (path: string, options?: { method?: string; body?: unknown }) => invoke('biomaker:request', path, options),
-  chooseDirectory: () => invoke('biomaker:choose-directory'),
+  chooseDirectory: (options?: { purpose?: 'dataset' | 'history' }) => invoke('biomaker:choose-directory', options),
   openPath: (path: string) => invoke('biomaker:open-path', path),
   saveArtifact: (artifact: { runId: string; name: string }) => invoke('biomaker:save-artifact', artifact),
   getAppInfo: () => invoke('biomaker:app-info'),
+  getServiceState: () => invoke('biomaker:get-service-state'),
+  onServiceState: (callback: (state: ServiceState) => void) => {
+    if (typeof callback !== 'function') throw new TypeError('Expected a callback');
+    const listener = (_event: Electron.IpcRendererEvent, state: ServiceState) => callback(state);
+    ipcRenderer.on('biomaker:service-state', listener);
+    return () => ipcRenderer.removeListener('biomaker:service-state', listener);
+  },
   getPreferences: () => invoke('biomaker:get-preferences'),
   setPreferences: (preferences: { theme?: 'system' | 'light' | 'dark'; language?: 'zh' | 'en'; notifications?: boolean }) => invoke('biomaker:set-preferences', preferences),
   getPendingRun: () => invoke('biomaker:get-pending-run'),
