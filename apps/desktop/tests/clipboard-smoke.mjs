@@ -1,14 +1,17 @@
 // Production native clipboard IPC, real Electron and sidecar, isolated history.
 // No clipboard, permission, IPC, provider, or lifecycle mocking. Previous native
-// clipboard formats stay only in main-process memory and are restored on exit.
+// clipboard formats stay only in main-process memory; a failed restoration keeps
+// Electron alive for recovery instead of destroying the only original snapshot.
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { _electron as electron } from '@playwright/test';
+import { createInterface } from 'node:readline';
+import { captureClipboard, restoreClipboard } from './clipboard-preservation.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const profile = await mkdtemp(path.join(os.tmpdir(), 'biomaker-native-clipboard-'));
@@ -29,7 +32,16 @@ await writeFile(path.join(history, 'events.jsonl'), JSON.stringify({ event: 'run
 await writeFile(path.join(history, 'report.md'), report);
 await writeFile(path.join(history, `${runId}.log`), log);
 const checks = [], rendererErrors = [], requests = [], forbiddenRequests = [];
-let application, page, failure, clipboardRestored = false;
+const helperPath = new URL('./clipboard-preservation.mjs', import.meta.url);
+const helperSha256 = async () => createHash('sha256').update(await readFile(helperPath)).digest('hex');
+const preservationHelperSha256AtStart = await helperSha256();
+let preservationHelperSha256 = preservationHelperSha256AtStart;
+let application, page, failure, electronMainPid, clipboardRestored = false, restorationTrace, snapshotRetained = false;
+const canonicalProfile = await realpath(profile);
+let remainingProcesses = [];
+const processRows = () => execFileSync('/bin/ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).split('\n').filter(line => line.includes(profile) || line.includes(canonicalProfile));
+const receipt = () => ({ passed: !failure && clipboardRestored && !snapshotRetained, scope: 'Actual native clipboard writes and production IPC; isolated synthetic records and real sidecar only, no engine or provider execution.', executablePath: executablePath || 'development Electron', profile, testRunnerPid: process.pid, electronMainPid, checks, preservationHelperSha256AtStart, preservationHelperSha256, clipboardRestored, snapshotRetained, restorationTrace, clipboardTextNormalization: 'Electron native text clipboard omits the leading UTF-8 encoding BOM; Unicode content and CRLF line endings are unchanged. File export verifies original bytes separately.', requests, forbiddenRequests, rendererErrors, remainingProcesses, ...(failure ? { error: String(failure), stack: failure.stack } : {}) });
+const writeReceipt = async () => writeFile(path.join(output, failure || snapshotRetained ? 'failure.json' : 'acceptance.json'), JSON.stringify(receipt(), null, 2) + '\n');
 async function until(test, message, timeout = 30_000) {
   const end = Date.now() + timeout;
   while (!(await test())) { if (Date.now() > end) throw new Error(message); await new Promise(resolve => setTimeout(resolve, 50)); }
@@ -38,17 +50,12 @@ const nativeText = () => application.evaluate(({ clipboard }) => clipboard.readT
 const writeNative = text => page.evaluate(text => window.biomaker.writeClipboardText(text), text);
 try {
   application = await electron.launch({ ...(executablePath ? { executablePath, args: [] } : { args: [root] }), env, timeout: 60_000 });
+  electronMainPid = application.process().pid;
   page = await application.firstWindow();
   page.setDefaultTimeout(20_000);
   page.on('pageerror', error => rendererErrors.push(error.message));
-  await application.evaluate(async ({ clipboard, ClipboardItem }) => {
-    const saved = [];
-    for (const item of await clipboard.read()) {
-      const types = {};
-      for (const type of item.types) types[type] = await item.getType(type);
-      saved.push(new ClipboardItem(types));
-    }
-    globalThis.__nativeClipboardQA = { saved, requests: [], forbidden: [] };
+  await application.evaluate(captureClipboard);
+  await application.evaluate(() => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (input, options) => {
       const url = new URL(String(input));
@@ -138,34 +145,54 @@ try {
   if (page && !page.isClosed()) await page.screenshot({ path: path.join(output, 'failure.png') }).catch(() => {});
 } finally {
   if (application) {
-    const trace = await application.evaluate(async ({ clipboard }) => {
-      const qa = globalThis.__nativeClipboardQA;
-      if (!qa) return null;
-      if (qa.saved.length) await clipboard.write(qa.saved); else clipboard.clear();
-      const after = await clipboard.read();
-      let restored = after.length === qa.saved.length;
-      for (let index = 0; index < qa.saved.length; index++) {
-        const old = qa.saved[index], current = after[index];
-        for (const type of old.types) {
-          if (!current?.types.includes(type)) { restored = false; continue; }
-          const beforeData = await old.getType(type), afterData = await current.getType(type);
-          restored &&= type === 'electron application/bookmark' ? JSON.stringify(beforeData) === JSON.stringify(afterData) : Buffer.from(await beforeData.arrayBuffer()).equals(Buffer.from(await afterData.arrayBuffer()));
-        }
-      }
-      const result = { restored, requests: qa.requests, forbidden: qa.forbidden };
-      delete globalThis.__nativeClipboardQA;
-      return result;
-    }).catch(error => { failure ||= error; return null; });
-    if (trace) { clipboardRestored = trace.restored; requests.push(...trace.requests); forbiddenRequests.push(...trace.forbidden); }
-    await application.evaluate(({ BrowserWindow }) => { for (const window of BrowserWindow.getAllWindows()) window.destroy(); }).catch(() => {});
-    await application.close().catch(error => { failure ||= error; });
+    const attemptRestore = async callback => {
+      restorationTrace = await application.evaluate(callback).catch(error => ({ restored: false, snapshotRetained: true, restorationError: String(error) }));
+      clipboardRestored = restorationTrace.restored;
+      snapshotRetained = restorationTrace.snapshotRetained === true;
+      requests.splice(0, requests.length, ...(restorationTrace.requests || []));
+      forbiddenRequests.splice(0, forbiddenRequests.length, ...(restorationTrace.forbidden || []));
+    };
+    await attemptRestore(restoreClipboard);
+    if (!clipboardRestored) {
+      const functionalFailure = failure;
+      failure ||= new Error(restorationTrace.restorationError || 'Original system clipboard could not be confirmed restored');
+      remainingProcesses = processRows();
+      await writeReceipt(); // Preserve the real failure before entering recovery.
+      await writeFile(path.join(output, 'restoration-first-failure.json'), JSON.stringify(receipt(), null, 2) + '\n');
+      console.error(JSON.stringify({ passed: false, profile, snapshotRetained, error: String(failure), recovery: 'Original clipboard remains in Electron main memory. Keep this process alive. Commands: status, retry.' }));
+      const input = createInterface({ input: process.stdin });
+      let pending = Promise.resolve();
+      await new Promise(resolve => {
+        input.on('line', command => {
+          pending = pending.then(async () => {
+            if (command.trim() === 'status') console.error(JSON.stringify({ profile, snapshotRetained, clipboardRestored, restorationTrace }));
+            else if (command.trim() === 'retry') {
+              preservationHelperSha256 = await helperSha256();
+              const fresh = await import(`./clipboard-preservation.mjs?retry=${Date.now()}`);
+              await attemptRestore(fresh.restoreClipboard);
+              if (clipboardRestored) { failure = functionalFailure; input.close(); resolve(); }
+              else { remainingProcesses = processRows(); await writeReceipt(); console.error(JSON.stringify({ clipboardRestored, snapshotRetained, restorationTrace })); }
+            }
+          }).catch(async error => { failure ||= error; await writeReceipt(); console.error(JSON.stringify({ recoveryError: String(error), snapshotRetained })); });
+        });
+        // EOF does not authorize discarding the only snapshot. Electron and its
+        // transport remain alive so an operator can recover the original in memory.
+        input.on('close', () => { if (!clipboardRestored) console.error('Recovery input closed; original snapshot remains retained in the running Electron process.'); });
+      });
+      await pending;
+    }
+    if (clipboardRestored) {
+      // Releasing main memory is safe only after exact restoration succeeded.
+      await application.evaluate(() => { delete globalThis.__nativeClipboardQA; });
+      snapshotRetained = false;
+      await application.evaluate(({ BrowserWindow }) => { for (const window of BrowserWindow.getAllWindows()) window.destroy(); }).catch(() => {});
+      await application.close().catch(error => { failure ||= error; });
+    }
   }
 }
 if (!clipboardRestored) failure ||= new Error('Original system clipboard could not be confirmed restored');
 if (forbiddenRequests.length) failure ||= new Error('Forbidden request attempted');
-const canonicalProfile = await realpath(profile);
-let remainingProcesses = [];
-await until(() => { remainingProcesses = execFileSync('/bin/ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).split('\n').filter(line => line.includes(profile) || line.includes(canonicalProfile)); return remainingProcesses.length === 0; }, 'Isolated QA process remains', 15_000).catch(error => { failure ||= error; });
-await writeFile(path.join(output, failure ? 'failure.json' : 'acceptance.json'), JSON.stringify({ passed: !failure, scope: 'Actual native clipboard writes and production IPC; isolated synthetic records and real sidecar only, no engine or provider execution.', executablePath: executablePath || 'development Electron', profile, checks, clipboardRestored, clipboardTextNormalization: 'Electron native text clipboard omits the leading UTF-8 encoding BOM; Unicode content and CRLF line endings are unchanged. File export verifies original bytes separately.', requests, forbiddenRequests, rendererErrors, remainingProcesses, ...(failure ? { error: String(failure), stack: failure.stack } : {}) }, null, 2) + '\n');
+await until(() => { remainingProcesses = processRows(); return remainingProcesses.length === 0; }, 'Isolated QA process remains', 15_000).catch(error => { failure ||= error; });
+await writeReceipt();
 if (failure) throw failure;
 console.log(JSON.stringify({ passed: true, checks, clipboardRestored, output }, null, 2));
