@@ -30,6 +30,8 @@ def check_result(value, scoring):
             raise ValueError('primary metric must be a finite number')
         if not isinstance(value.get('maximize', True), bool):
             raise ValueError('maximize must be a boolean when declared')
+        if 'maximize' in SPEC and value.get('maximize', True) != SPEC['maximize']:
+            raise ValueError('score_val maximize disagrees with the admitted metric contract')
         if has_fallback(value) or value.get('error') or value.get('valid') is False:
             raise ValueError('primary metric must not be a fallback or error result')
     elif value is not True:

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .metric_registry import metric_maximize
+from .metric_registry import canonical_metric_name, metric_maximize
 from .prediction_contract import (
     PredictionContract,
     artifact_path_from_spec,
@@ -202,7 +202,7 @@ def _load_prediction_spec(workspace_dir: Path) -> dict[str, Any]:
 def _manifest_primary_metric(split_manifest: dict[str, Any]) -> str | None:
     metric_contract = _nested_dict(split_manifest, "metric_contract")
     value = metric_contract.get("primary_metric")
-    return str(value).strip().lower() if value else None
+    return canonical_metric_name(str(value)) if value else None
 
 
 def _manifest_maximize(
@@ -244,12 +244,12 @@ def _build_prediction_contract(
     primary_metric = (
         primary_metric_from_spec(spec)
         or (
-            str(manifest_metric.get("primary_metric")).strip().lower()
+            canonical_metric_name(str(manifest_metric.get("primary_metric")))
             if manifest_metric.get("primary_metric")
             else None
         )
         or (
-            str(split_plan.get("primary_metric")).strip().lower()
+            canonical_metric_name(str(split_plan.get("primary_metric")))
             if split_plan.get("primary_metric")
             else None
         )

@@ -192,8 +192,9 @@ def test_macro_auroc_registry_preserves_auc_classification_semantics(metric):
     assert not is_segmentation_metric_supported(metric)
 
 
+@pytest.mark.parametrize("metric", ["macro_auroc", "macro_one_vs_rest_auroc"])
 @pytest.mark.parametrize("missing_class", [False, True])
-def test_private_macro_auroc_scores_seven_class_probabilities(tmp_path, missing_class):
+def test_private_macro_auroc_scores_seven_class_probabilities(tmp_path, missing_class, metric):
     from sklearn.metrics import accuracy_score, roc_auc_score
 
     workspace = tmp_path / "workspace"
@@ -223,7 +224,7 @@ def test_private_macro_auroc_scores_seven_class_probabilities(tmp_path, missing_
         "class_labels": list(range(7)),
         "answer_columns": ["label"],
         "task_type": "multiclass",
-        "primary_metric": "macro_auroc",
+        "primary_metric": metric,
         "maximize": True,
     }))
     if missing_class:
@@ -258,4 +259,12 @@ def test_trusted_contract_rejects_string_metric_direction(tmp_path):
     evaluator_path = workspace / "evaluator.py"
     evaluator_path.write_text(evaluator_path.read_text() + "\n_original_score = score_val\ndef score_val():\n    result = _original_score()\n    result['maximize'] = 'false'\n    return result\n")
     with pytest.raises(evaluator.EvaluatorSetupError, match="maximize must be a boolean"):
+        _contract_check(workspace, hidden, spec)
+
+
+def test_trusted_contract_rejects_opposite_scoring_direction(tmp_path):
+    workspace, hidden, spec = _classification_workspace(tmp_path)
+    evaluator_path = workspace / "evaluator.py"
+    evaluator_path.write_text(evaluator_path.read_text() + "\n_original_score = score_val\ndef score_val():\n    result = _original_score()\n    result['maximize'] = False\n    return result\n")
+    with pytest.raises(evaluator.EvaluatorSetupError, match="maximize disagrees"):
         _contract_check(workspace, hidden, spec)

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .metric_registry import canonical_metric_name
+
 
 def _nested_dict(spec: dict[str, Any], key: str) -> dict[str, Any]:
     value = spec.get(key)
@@ -67,10 +69,10 @@ def primary_metric_from_spec(spec: dict[str, Any]) -> str | None:
     for container in [spec, submission_spec]:
         value = container.get("primary_metric")
         if isinstance(value, str) and value.strip():
-            return value.strip().lower()
+            return canonical_metric_name(value)
     metrics = spec.get("metrics")
     if isinstance(metrics, list) and metrics:
-        return str(metrics[0]).strip().lower()
+        return canonical_metric_name(str(metrics[0]))
     return None
 
 

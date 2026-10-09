@@ -34,6 +34,7 @@ from .split_manifest import (
     write_split_manifest,
 )
 from .response import extract_code
+from .metric_registry import METRIC_CONTRACT_REQUIREMENTS
 
 TABLE_SUFFIXES = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".jsonl"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
@@ -42,7 +43,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 4
+SPLIT_BUILDER_CACHE_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -405,6 +406,7 @@ def _builder_user_prompt(
             "visibility: object listing agent_visible, evaluator_only, and forbidden columns/files.",
             "prediction_contract: object describing required candidate output files/columns and probability/file-path semantics.",
             "metric_contract: object with primary_metric and maximize.",
+            METRIC_CONTRACT_REQUIREMENTS,
             "hidden_answers: object mirroring private_gt/private_gt.json answer_columns.",
         ],
         "Optional split_manifest.json Fields": [

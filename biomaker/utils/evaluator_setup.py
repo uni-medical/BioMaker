@@ -39,9 +39,12 @@ from .exp_guide import (
 )
 from .experiment_contract import load_experiment_contract
 from .metric_registry import (
+    METRIC_CONTRACT_REQUIREMENTS,
+    canonical_metric_name,
     is_classification_metric_supported,
     is_segmentation_metric_supported,
     metric_maximize,
+    require_supported_metric,
 )
 from .process_tree import (
     ProcessTreeInspectionError,
@@ -57,7 +60,7 @@ _RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
 _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 _SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
-_EVALUATOR_CACHE_VERSION = 3
+_EVALUATOR_CACHE_VERSION = 4
 
 
 class EvaluatorSetupError(RuntimeError):
@@ -187,6 +190,7 @@ def _evaluator_prompt(
             "Do not use Python eval() or exec(). Parse serialized values with json.loads or ast.literal_eval.",
             "Use the Experiment guide as the source of truth for public splits, hidden answers, visibility boundaries, and output paths.",
             "Define prediction_spec() returning a concise JSON-serializable dict with these top-level keys: validation_artifact, test_submission, key_columns, prediction_columns, primary_metric. key_columns may be [] only when row order is the contract.",
+            METRIC_CONTRACT_REQUIREMENTS,
             "test_submission must be exactly './working/submission.csv'.",
             "prediction_columns means the CSV columns containing predictions or referenced prediction files. Do not include key columns in prediction_columns.",
             "The candidate validation artifact must contain predictions for rows in the Experiment guide's score validation split, usually ./input/biomaker_splits/score_val.csv and sometimes legacy ./input/biomaker_splits/agent_val.csv.",
@@ -447,7 +451,12 @@ def _primary_metric_from_raw_spec(spec: dict[str, Any]) -> str | None:
     return None
 
 
-def _normalize_prediction_spec_json(prediction_spec: str) -> str:
+def _normalize_prediction_spec_json(
+    prediction_spec: str,
+    *,
+    workspace_dir: Path | None = None,
+    requested_metric: str | None = None,
+) -> str:
     """Validate and normalize the evaluator's public artifact contract."""
     try:
         spec = json.loads(prediction_spec)
@@ -501,6 +510,65 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
     if "maximize" in spec and not isinstance(spec["maximize"], bool):
         raise EvaluatorSetupError("prediction_spec() maximize must be a boolean when declared.")
 
+    # Admission precedes freezing/training. A generated scorer supporting some
+    # arbitrary name is insufficient: final user-only evaluation must support
+    # the exact same metric and task, without substituting another objective.
+    task_types = [str(spec["task_type"])] if spec.get("task_type") else []
+    requested_metrics = [requested_metric] if requested_metric else []
+    requested_directions = []
+    if workspace_dir is not None:
+        split_dir = workspace_dir / "input" / "biomaker_splits"
+        manifest = _split_manifest(split_dir)
+        plan = _json_dict(split_dir / "split_plan.json")
+        task_types.extend(
+            _manifest_head_types(manifest)
+            or ([str(plan["task_type"])] if plan.get("task_type") else [])
+        )
+        declared_metric = _manifest_primary_metric(manifest) or plan.get("primary_metric")
+        if declared_metric:
+            requested_metrics.append(str(declared_metric))
+        metric_contract = _nested_dict(manifest, "metric_contract")
+        for container in [
+            metric_contract, _nested_dict(metric_contract, "primary_metric"), plan
+        ]:
+            if "maximize" in container:
+                requested_directions.append(container["maximize"])
+    if file_reference_columns or spec.get("prediction_type") == "mask_file_path":
+        task_types.append("segmentation")
+    elif (not task_types or set(task_types) == {"classification"}) and isinstance(
+        spec.get("class_labels"), list
+    ):
+        task_types.append("single_label_classification")
+    try:
+        info = require_supported_metric(primary_metric)
+        if not task_types:
+            raise ValueError(
+                "prediction_spec() must declare task_type when the public split "
+                "contract does not establish a supported task family."
+            )
+        for task_type in task_types:
+            require_supported_metric(primary_metric, task_type)
+        for requested in requested_metrics:
+            expected = require_supported_metric(requested)
+            if expected.name != info.name:
+                raise ValueError(
+                    f"prediction_spec() primary_metric {primary_metric!r} differs "
+                    f"from requested metric {requested!r}; do not substitute objectives."
+                )
+        if "maximize" in spec and spec["maximize"] != info.maximize:
+            raise ValueError(f"prediction_spec() maximize disagrees with primary_metric {primary_metric!r}.")
+        if any(
+            not isinstance(value, bool) or value != info.maximize
+            for value in requested_directions
+        ):
+            raise ValueError(
+                "Split metric contract maximize must be a boolean consistent "
+                f"with primary_metric {primary_metric!r}."
+            )
+        primary_metric = info.name
+    except ValueError as exc:
+        raise EvaluatorSetupError(str(exc)) from exc
+
     normalized: dict[str, Any] = {
         "validation_artifact": validation_artifact
         or "./working/validation_predictions.csv",
@@ -508,6 +576,7 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         "key_columns": key_columns,
         "prediction_columns": prediction_columns,
         "primary_metric": primary_metric,
+        "maximize": info.maximize,
     }
     if file_reference_columns:
         normalized["file_reference_columns"] = [
@@ -515,8 +584,7 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
             for column in file_reference_columns
             if column not in set(key_columns)
         ]
-    metric_lower = primary_metric.lower()
-    if any(token in metric_lower for token in ["aji", "dice", "mask", "segmentation"]):
+    if info.task_family == "segmentation":
         normalized.setdefault("prediction_type", "mask_file_path")
     for optional_key in [
         "metrics",
@@ -1405,20 +1473,7 @@ def _primary_metric_from_task_desc(task_desc: Any, task_type: str) -> str | None
     if not match:
         return None
     metric = match.group(1).strip().strip("`*_ ")
-    lower = metric.lower()
-    if "aji" in lower:
-        return "aji"
-    if "dice" in lower:
-        return "binary_dice"
-    if "hd95" in lower or "hausdorff" in lower:
-        return "hd95"
-    if "auc" in lower:
-        return "mean_roc_auc" if task_type == "multilabel" else "auc"
-    if "balanced" in lower and "accuracy" in lower:
-        return "balanced_accuracy"
-    if "accuracy" in lower or lower in {"acc"}:
-        return "mean_binary_accuracy" if task_type == "multilabel" else "accuracy"
-    return metric.replace(" ", "_").lower()
+    return canonical_metric_name(metric)
 
 
 def _fixed_classification_metric_supported(metric: str) -> bool:
@@ -1440,11 +1495,11 @@ def _write_fixed_evaluator(
     evaluator_code = template.replace("__BIOMAKER_SPEC__", repr(spec)).lstrip()
     evaluator_path.write_text(evaluator_code, encoding="utf-8")
     try:
+        prediction_spec = _normalize_prediction_spec_json(
+            _load_prediction_spec(workspace_dir), workspace_dir=workspace_dir
+        )
         _run_self_test(
             workspace_dir, timeout=timeout, hidden_score_path=hidden_score_path
-        )
-        prediction_spec = _normalize_prediction_spec_json(
-            _load_prediction_spec(workspace_dir)
         )
         _run_public_artifact_contract_test(
             workspace_dir,
@@ -1661,7 +1716,7 @@ def _write_fixed_segmentation_evaluator(
         metric = _primary_metric_from_task_desc(
             task_desc, str(spec.get("task_type", ""))
         )
-        if metric is not None and metric != "accuracy":
+        if metric is not None:
             spec["primary_metric"] = metric
     if not is_segmentation_metric_supported(str(spec.get("primary_metric", ""))):
         return None
@@ -1702,6 +1757,7 @@ def _evaluator_input_fingerprints(
     fingerprints: dict[str, str | None] = {}
     for name in [
         "split_plan.json",
+        "split_manifest.json",
         "agent_train.csv",
         "score_val.csv",
         "agent_val.csv",
@@ -1726,6 +1782,9 @@ def _evaluator_cache_metadata(
         "evaluator_templates.py": _sha256_file(utils_dir / "evaluator_templates.py"),
         "exp_guide.py": _sha256_file(utils_dir / "exp_guide.py"),
         "data_summary.py": _sha256_file(utils_dir / "data_summary.py"),
+        "metric_registry.py": _sha256_file(utils_dir / "metric_registry.py"),
+        "prediction_contract.py": _sha256_file(utils_dir / "prediction_contract.py"),
+        "experiment_contract.py": _sha256_file(utils_dir / "experiment_contract.py"),
     }
     runtime_versions = {
         "python": f"{sys.version_info.major}.{sys.version_info.minor}",
@@ -1774,6 +1833,7 @@ def _try_reuse_cached_evaluator(
     log_dir: Path,
     timeout: int,
     hidden_score_path: Path,
+    requested_metric: str | None = None,
 ) -> PreparedEvaluator | None:
     cached_evaluator = cache_entry / "evaluator.py"
     cached_spec = cache_entry / "evaluator_prediction_spec.json"
@@ -1793,7 +1853,18 @@ def _try_reuse_cached_evaluator(
     prediction_spec_path = workspace_dir / "evaluator_prediction_spec.json"
     try:
         shutil.copy2(cached_evaluator, evaluator_path)
-        prediction_spec = cached_spec.read_text(encoding="utf-8")
+        prediction_spec = _normalize_prediction_spec_json(
+            cached_spec.read_text(encoding="utf-8"),
+            workspace_dir=workspace_dir,
+            requested_metric=requested_metric,
+        )
+        actual_spec = _normalize_prediction_spec_json(
+            _load_prediction_spec(workspace_dir),
+            workspace_dir=workspace_dir,
+            requested_metric=requested_metric,
+        )
+        if actual_spec != prediction_spec:
+            raise EvaluatorSetupError("Cached contract differs from evaluator prediction_spec().")
         prediction_spec_path.write_text(prediction_spec, encoding="utf-8")
         _run_self_test(
             workspace_dir,
@@ -1956,6 +2027,7 @@ def prepare_evaluator(
             log_dir=log_dir,
             timeout=timeout,
             hidden_score_path=hidden_score_path,
+            requested_metric=_primary_metric_from_task_desc(task_desc, ""),
         )
         if reused is not None:
             return reused
@@ -2016,13 +2088,15 @@ def prepare_evaluator(
         clean_candidate_outputs(workspace_dir)
         evaluator_path.write_text(code, encoding="utf-8")
         try:
+            prediction_spec = _normalize_prediction_spec_json(
+                _load_prediction_spec(workspace_dir),
+                workspace_dir=workspace_dir,
+                requested_metric=_primary_metric_from_task_desc(task_desc, ""),
+            )
             _run_self_test(
                 workspace_dir,
                 timeout=timeout,
                 hidden_score_path=hidden_score_path,
-            )
-            prediction_spec = _normalize_prediction_spec_json(
-                _load_prediction_spec(workspace_dir)
             )
             _run_public_artifact_contract_test(
                 workspace_dir,
