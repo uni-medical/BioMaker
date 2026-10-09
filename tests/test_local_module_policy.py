@@ -30,6 +30,109 @@ def _check(code, tmp_path):
     return validate_code_environment(code, working_dir=tmp_path)
 
 
+def _text_written(source="VALUE = 42\n", *, pathlib=False, mode="w", body=None):
+    path = "Path(WORK_DIR).joinpath('inference.py')" if pathlib else "os.path.join(WORK_DIR, 'inference.py')"
+    opener = f"inference_path.open({mode!r}, encoding='utf-8')" if pathlib else f"open(inference_path, {mode!r})"
+    body = body or "f.write(inference_src)"
+    return (
+        "import os, sys, importlib\nfrom pathlib import Path\n"
+        "WORK_DIR = './working'\n"
+        "def main():\n"
+        "    os.makedirs(WORK_DIR, exist_ok=True)\n"
+        f"    inference_src = {source!r}\n"
+        f"    inference_path = {path}\n"
+        f"    with {opener} as f:\n"
+        + "".join(f"        {line}\n" for line in body.splitlines())
+        + "    try:\n"
+        "        sys.path.insert(0, os.path.abspath(WORK_DIR))\n"
+        "        inf = importlib.import_module('inference')\n"
+        "        importlib.reload(inf)\n"
+        "        print(inf.VALUE)\n"
+        "    except ImportError:\n"
+        "        raise\n"
+        "main()\n"
+    )
+
+
+@pytest.mark.parametrize("pathlib", [False, True])
+@pytest.mark.parametrize("mode", ["w", "wt"])
+def test_proven_closed_text_module_is_admitted_without_writes(tmp_path, pathlib, mode):
+    result = _check(_text_written(pathlib=pathlib, mode=mode), tmp_path)
+    assert result.ok, result.message
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("pathlib", [False, True])
+def test_interpreter_executes_closed_text_module(tmp_path, monkeypatch, pathlib):
+    from biomaker import interpreter
+    monkeypatch.setattr(interpreter, "_sample_cuda_total_gpu_memory_mb", lambda: None)
+    monkeypatch.setattr(interpreter, "_sample_process_usage", lambda *a, **k: None)
+    result = Interpreter(tmp_path, timeout=10).run(
+        "import time\ntime.sleep(0.5)\n" + _text_written(pathlib=pathlib)
+    )
+    assert result.exc_type is None, result.term_out
+    assert "42" in result.stdout
+    assert (tmp_path / "working/inference.py").read_text() == "VALUE = 42\n"
+
+
+@pytest.mark.parametrize("pathlib", [False, True])
+@pytest.mark.parametrize("source", ["import cv2", "import helper", "import os\nos.setsid()", "def broken(:"])
+def test_text_written_source_is_recursively_checked(tmp_path, pathlib, source):
+    result = _check(_text_written(source, pathlib=pathlib), tmp_path)
+    assert not result.ok and "local module" in result.message
+
+
+def test_multiple_literal_text_writes_are_checked_as_complete_source(tmp_path):
+    result = _check(_text_written(body="f.write('VALUE = ')\nf.write('42\\n')"), tmp_path)
+    assert result.ok, result.message
+    result = _check(_text_written(body="f.write('import c')\nf.write('v2\\n')"), tmp_path)
+    assert not result.ok and "cv2" in result.message
+
+
+@pytest.mark.parametrize("body", [
+    "f.write(input())", "f.write(inference_src)\nf.write(input())",
+    "if input():\n    f.write(inference_src)",
+    "f.write(inference_src)\nf.seek(0)",
+    "f.write(inference_src)\nf.truncate(1)",
+    "g = f\ng.write(inference_src)",
+    "f.write('import cv2')\nPath(inference_path).write_text(inference_src)",
+])
+def test_uncertain_text_writer_cannot_trust_existing_source(tmp_path, body):
+    (tmp_path / "working").mkdir()
+    (tmp_path / "working/inference.py").write_text("VALUE=42")
+    result = _check(_text_written(body=body), tmp_path)
+    assert not result.ok and "not statically verifiable" in result.message
+
+
+@pytest.mark.parametrize("mode", ["a", "x", "wb", "w+", "a+"])
+def test_unproven_text_modes_are_not_admitted(tmp_path, mode):
+    result = _check(_text_written(mode=mode), tmp_path)
+    assert not result.ok
+
+
+def test_unknown_join_or_source_and_path_escape_remain_blocked(tmp_path):
+    assert not _check(_text_written().replace("WORK_DIR = './working'", "WORK_DIR = input()"), tmp_path).ok
+    assert not _check(_text_written().replace("inference_src = 'VALUE = 42\\n'", "inference_src = input()"), tmp_path).ok
+    assert not _check(_text_written().replace("WORK_DIR = './working'", "WORK_DIR = '../outside'"), tmp_path).ok
+
+
+def test_conditional_closed_writer_is_not_proven_after_branch(tmp_path):
+    code = (
+        "if input():\n"
+        "    with open('helper.py', 'w') as f:\n"
+        "        f.write('VALUE=42')\n"
+        "import helper\n"
+    )
+    assert not _check(code, tmp_path).ok
+
+
+def test_custom_opener_cannot_claim_to_write_the_named_module(tmp_path):
+    code = _text_written().replace(
+        "open(inference_path, 'w')", "open(inference_path, 'w', opener=custom_opener)"
+    )
+    assert not _check(code, tmp_path).ok
+
+
 def test_literal_module_is_admitted_without_preflight_writes(tmp_path):
     result = _check(_generated(), tmp_path)
     assert result.ok, result.message

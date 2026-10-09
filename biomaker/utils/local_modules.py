@@ -8,6 +8,7 @@ third-party policy. This is a dependency preflight, not a Python sandbox.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 
@@ -40,6 +41,15 @@ class LocalModuleDiscovery(ast.NodeVisitor):
                     return left + right
         if isinstance(node, ast.Call):
             name = ast.unparse(node.func)
+            if name == "os.path.join" and node.args and not node.keywords:
+                parts = [self.value(arg) for arg in node.args]
+                if all(part is not None for part in parts):
+                    return os.path.join(*parts)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "joinpath" and not node.keywords:
+                base = self.value(node.func.value)
+                parts = [self.value(arg) for arg in node.args]
+                if base is not None and all(part is not None for part in parts):
+                    return Path(base).joinpath(*parts)
             if name in {"Path", "pathlib.Path", "str", "os.path.abspath"} and len(node.args) == 1:
                 value = self.value(node.args[0])
                 if value is not None:
@@ -72,11 +82,9 @@ class LocalModuleDiscovery(ast.NodeVisitor):
         if isinstance(node.target, ast.Name):
             self.bindings[node.target.id] = self.value(node.value)
 
-    def visit_Call(self, node):
-        self.generic_visit(node)
+    def _opened_file(self, node):
+        """Resolve a known open call without opening or evaluating anything."""
         name = ast.unparse(node.func)
-        # A file opened for writing may replace previously inspected source.
-        # We only admit statically verifiable Path.write_text source creation.
         value, mode = None, "r"
         if name == "open" and node.args:
             value = self.value(node.args[0])
@@ -90,6 +98,14 @@ class LocalModuleDiscovery(ast.NodeVisitor):
             if keyword.arg == "mode":
                 mode = self.value(keyword.value)
         path = self.path(value) if value is not None else None
+        return path, mode
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        name = ast.unparse(node.func)
+        # Opening for writing invalidates existing source. A proven text-write
+        # context below restores it only after all writes have been inspected.
+        path, mode = self._opened_file(node)
         if path is not None and path.suffix == ".py" and (not isinstance(mode, str) or any(c in mode for c in "wax+")):
             self.sources[path] = None
         if name in {"__import__", "importlib.import_module"} and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
@@ -108,6 +124,52 @@ class LocalModuleDiscovery(ast.NodeVisitor):
                 # A nonliteral overwrite invalidates even an existing file.
                 source = self.value(node.args[0]) if node.args and node.func.attr == "write_text" else None
                 self.sources[path] = source if isinstance(source, str) else None
+
+    def visit_With(self, node):
+        # Recognize the ordinary closed text-file form. Keeping this restricted
+        # to direct writes prevents seek/truncate, handle aliases, conditional
+        # writes or unknown source from accidentally trusting stale file bytes.
+        if len(node.items) != 1:
+            self.generic_visit(node)
+            return
+        item = node.items[0]
+        call = item.context_expr
+        if not isinstance(call, ast.Call) or not isinstance(item.optional_vars, ast.Name):
+            self.generic_visit(node)
+            return
+        path, mode = self._opened_file(call)
+        self.visit(call)
+        parts = []
+        proven = path is not None and path.suffix == ".py" and mode in {"w", "wt"}
+        # A custom opener can redirect the descriptor away from the named file.
+        opener_nodes = [kw.value for kw in call.keywords if kw.arg == "opener"]
+        if ast.unparse(call.func) == "open" and len(call.args) > 7:
+            opener_nodes.append(call.args[7])
+        if any(not isinstance(value, ast.Constant) or value.value is not None for value in opener_nodes):
+            proven = False
+        for statement in node.body:
+            write = statement.value if isinstance(statement, ast.Expr) else None
+            if (
+                isinstance(write, ast.Call)
+                and isinstance(write.func, ast.Attribute)
+                and isinstance(write.func.value, ast.Name)
+                and write.func.value.id == item.optional_vars.id
+                and write.func.attr == "write"
+                and len(write.args) == 1
+                and not write.keywords
+            ):
+                source = self.value(write.args[0])
+                if isinstance(source, str):
+                    parts.append(source)
+                else:
+                    proven = False
+            else:
+                proven = False
+            self.visit(statement)
+        if path is not None and path.suffix == ".py" and (
+            not isinstance(mode, str) or any(c in mode for c in "wax+")
+        ):
+            self.sources[path] = "".join(parts) if proven else None
 
     def _isolated_body(self, body, *, argument_names=()):
         bindings, paths, sources = self.bindings, self.paths, self.sources
