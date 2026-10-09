@@ -18,6 +18,7 @@ SUPPORTED_METRICS: dict[str, MetricInfo] = {
     "auc": MetricInfo("auc", True, "classification"),
     "roc_auc": MetricInfo("auc", True, "classification"),
     "macro_auc": MetricInfo("auc", True, "classification"),
+    "macro_auroc": MetricInfo("auc", True, "classification"),
     "ovr_auc": MetricInfo("auc", True, "classification"),
     "macro_auroc_ovr": MetricInfo("auc", True, "classification"),
     "macro_roc_auc": MetricInfo("auc", True, "classification"),

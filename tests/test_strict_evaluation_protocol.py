@@ -11,6 +11,12 @@ import pytest
 from biomaker.utils import evaluator_setup as evaluator
 from biomaker.utils import private_evaluation as private
 from biomaker.utils.evaluator_templates import _FIXED_CLASSIFICATION_EVALUATOR
+from biomaker.utils.metric_registry import (
+    is_classification_metric_supported,
+    is_segmentation_metric_supported,
+    metric_info,
+    metric_maximize,
+)
 
 
 def _classification_workspace(tmp_path, *, metric="auc"):
@@ -166,12 +172,77 @@ def test_private_multilabel_rejects_undefined_or_invalid_truth(labels):
         private._multilabel_metrics_from_submission(truth, submission, ["a", "b"], None, ["prob_a", "prob_b"], [], "auc")
 
 
-@pytest.mark.parametrize("metric", ["auc", "auroc", "macro_auroc_ovr", "macro_roc_auc", "mean_roc_auc"])
+@pytest.mark.parametrize("metric", ["auc", "auroc", "macro_auroc", "macro_auroc_ovr", "macro_roc_auc", "mean_roc_auc"])
 def test_private_auc_aliases_keep_requested_auc_as_primary(tmp_path, metric):
     workspace, private_dir = _private_workspace(tmp_path, metric=metric)
     result = private.evaluate_private_outputs(workspace, private_dir)["results"][0]
     assert result["metric_name"] == "private_auc"
     assert result["value"] == 1.0
+
+
+@pytest.mark.parametrize("metric", ["macro_auroc", "  MACRO_AUROC  "])
+def test_macro_auroc_registry_preserves_auc_classification_semantics(metric):
+    info = metric_info(metric)
+    assert info is not None
+    assert info.name == "auc"
+    assert info.task_family == "classification"
+    assert info.maximize is True
+    assert metric_maximize(metric, default=False) is True
+    assert is_classification_metric_supported(metric)
+    assert not is_segmentation_metric_supported(metric)
+
+
+@pytest.mark.parametrize("missing_class", [False, True])
+def test_private_macro_auroc_scores_seven_class_probabilities(tmp_path, missing_class):
+    from sklearn.metrics import accuracy_score, roc_auc_score
+
+    workspace = tmp_path / "workspace"
+    working = workspace / "working"
+    working.mkdir(parents=True)
+    private_dir = tmp_path / "synthetic_private_gt"
+    private_dir.mkdir()
+    labels = np.repeat(np.arange(7), np.arange(2, 9))
+    if missing_class:
+        labels = labels[labels != 6]
+    scores = np.random.default_rng(29).uniform(0.01, 1.0, (len(labels), 7))
+    scores[np.arange(len(labels)), labels] += np.linspace(0.0, 0.8, len(labels))
+    scores /= scores.sum(axis=1, keepdims=True)
+    prediction_columns = [f"prob_{index}" for index in range(7)]
+    keys = pd.DataFrame({"id": np.arange(len(labels)), "split": "test"})
+    keys.assign(label=labels).to_csv(private_dir / "test.csv", index=False)
+    predictions = pd.concat([keys, pd.DataFrame(scores, columns=prediction_columns)], axis=1)
+    # Private scoring must align declared keys, not rely on submission row order.
+    predictions.iloc[::-1].to_csv(working / "submission.csv", index=False)
+    (private_dir / "private_gt.json").write_text(json.dumps({
+        "test": {"file": "test.csv", "answer_columns": ["label"]},
+    }))
+    (workspace / "evaluator_prediction_spec.json").write_text(json.dumps({
+        "test_submission": "./working/submission.csv",
+        "key_columns": ["id", "split"],
+        "prediction_columns": prediction_columns,
+        "class_labels": list(range(7)),
+        "answer_columns": ["label"],
+        "task_type": "multiclass",
+        "primary_metric": "macro_auroc",
+        "maximize": True,
+    }))
+    if missing_class:
+        with pytest.raises(ValueError, match="every declared class needs positive and negative examples"):
+            private.evaluate_private_outputs(workspace, private_dir)
+        return
+
+    result = private.evaluate_private_outputs(workspace, private_dir)
+    assert result["visible_to_agent"] is False
+    assert len(result["results"]) == 1
+    score = result["results"][0]
+    expected = roc_auc_score(labels, scores, labels=list(range(7)), multi_class="ovr", average="macro")
+    assert score["metric_name"] == "private_auc"
+    assert score["value"] == pytest.approx(expected)
+    assert score["metrics"]["auc"] == pytest.approx(expected)
+    assert score["metrics"]["accuracy"] == pytest.approx(accuracy_score(labels, scores.argmax(axis=1)))
+    assert score["value"] != pytest.approx(score["metrics"]["accuracy"])
+    assert score["maximize"] is True
+    assert score["n"] == len(labels)
 
 
 @pytest.mark.parametrize("prediction", [float("nan"), "unknown"])
