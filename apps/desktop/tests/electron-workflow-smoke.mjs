@@ -151,7 +151,8 @@ try {
   await page.locator('.candidate-row').waitFor();
   assert.equal(await page.locator('.candidate-row').count(), 1);
   await page.getByRole('tab', { name: '代码', exact: true }).click();
-  await page.getByText('LogisticRegression', { exact: false }).last().waitFor();
+  // Live stdout now also contains this class name in the hidden log tab.
+  await page.locator('.candidate-content').getByText('LogisticRegression', { exact: false }).waitFor();
   await snapshot('05-real-candidate-code');
   await page.getByRole('tab', { name: /^文件/ }).click();
   const destination = path.join(config.home, 'ui-export-report.md');
