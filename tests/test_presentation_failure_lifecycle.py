@@ -322,6 +322,54 @@ def _set_execution_workspace(node, workspace):
     return workspace
 
 
+@pytest.mark.parametrize("retrain_enabled", [False, True])
+@pytest.mark.parametrize("invalid_kind", ["exception", "nan", "missing_metric", "fallback", "empty"])
+def test_no_valid_candidate_saves_failure_report_and_emits_failed(
+    tmp_path, monkeypatch, retrain_enabled, invalid_kind
+):
+    cfg, events, order, _live = _install_minimal_run(
+        monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False,
+    )
+    cfg.final_retrain.enabled = retrain_enabled
+
+    class InvalidWorkflow(_MinimalWorkflow):
+        def parse_round_result(self, round_node, exec_result, **kwargs):
+            super().parse_round_result(round_node, exec_result, **kwargs)
+            node = round_node.node
+            if invalid_kind == "exception":
+                node.is_buggy = True
+                node.exc_type = "DependencyPolicyError"
+            elif invalid_kind == "nan":
+                node.metric = MetricValue(float("nan"), maximize=True)
+            elif invalid_kind == "missing_metric":
+                node.metric = MetricValue(None, maximize=True)
+            elif invalid_kind == "fallback":
+                node.evaluator_details = {"fallback_used": True}
+
+    monkeypatch.setattr(run_module, "BioMakerWorkflow", InvalidWorkflow)
+    if invalid_kind == "empty":
+        monkeypatch.setattr(_SelectingProposalAgent, "select_round_tasks", lambda self: [])
+    # Use the actual deterministic report renderer and actual terminal wrapper.
+    from biomaker.journal2report import journal2report
+    monkeypatch.setattr(run_module, "journal2report", journal2report)
+    monkeypatch.setattr(
+        run_module, "_evaluate_selected_private_outputs",
+        lambda *a, **k: pytest.fail("invalid candidates must not reach private scoring"),
+    )
+    with pytest.raises(RuntimeError, match="No valid scored candidate"):
+        run_module.run()
+    report = (cfg.log_dir / "report.md").read_text()
+    assert "No valid scored candidate is recorded" in report
+    assert "Valid scored attempts: **0**" in report
+    assert "final_retrain" not in order
+    assert order == ["generation_shutdown", "execution_shutdown"]
+    names = [event for event, _payload in events]
+    assert names.index("report_finished") < names.index("run_failed")
+    assert "selection_failed" in names
+    assert "selection_finalized" not in names
+    assert [n for n in names if n in {"run_finished", "run_failed", "run_interrupted"}] == ["run_failed"]
+
+
 def test_broken_pipe_during_final_live_stop_does_not_skip_terminal_work(
     tmp_path, monkeypatch
 ):

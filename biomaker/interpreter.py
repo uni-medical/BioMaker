@@ -588,7 +588,8 @@ class Interpreter:
 
         preflight = (
             validate_code_environment(
-                code, include_medical=self.include_medical_packages
+                code, include_medical=self.include_medical_packages,
+                working_dir=self.working_dir,
             )
             if self.enforce_environment
             else validate_process_containment(code)

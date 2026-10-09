@@ -1509,6 +1509,20 @@ def _run(cfg: Config) -> int:
             finally:
                 executor.shutdown(wait=True)
     best_node = journal.get_best_node(only_good=True)
+    if best_node is None and not end_with_exception:
+        append_event(
+            cfg.log_dir, "selection_failed", reason="no_valid_candidate",
+            completed_steps=global_step, candidate_count=len(journal.nodes),
+        )
+        if cfg.final_retrain.enabled:
+            append_event(cfg.log_dir, "final_retrain_skipped", reason="no_best_node")
+        # The deterministic report includes every failed attempt. Keep it before
+        # raising so the queue receives a nonzero exit without losing evidence.
+        agent_loop_exit_handler(end_with_exception=False)
+        raise RuntimeError(
+            "No valid scored candidate exists after solution search. "
+            "See the saved candidate journal and failure report for details."
+        )
     selected_workspace = Path(best_node.execution_workspace) if best_node is not None and best_node.execution_workspace else None
     if best_node is not None and not end_with_exception:
         append_event(cfg.log_dir, "selection_finalized", node_id=best_node.id,
@@ -1554,9 +1568,6 @@ def _run(cfg: Config) -> int:
                 + (retrain_result.error or "unknown error")
             )
         selected_workspace = retrain_result.workspace_dir
-    elif cfg.final_retrain.enabled and best_node is None and not end_with_exception:
-        append_event(cfg.log_dir, "final_retrain_skipped", reason="no_best_node")
-        raise RuntimeError("Final retrain is enabled but no valid best node exists.")
     if best_node is not None and not end_with_exception:
         _evaluate_selected_private_outputs(cfg, best_node, private_dir, selected_workspace,
                                           compute_pool, final_retrained=cfg.final_retrain.enabled)

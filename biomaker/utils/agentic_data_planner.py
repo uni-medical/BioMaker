@@ -43,7 +43,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 5
+SPLIT_BUILDER_CACHE_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -389,7 +389,7 @@ def _builder_user_prompt(
         "Task Description": task_text,
         "Observed Data Facts": json.dumps(facts, indent=2, ensure_ascii=False),
         "Required Output Files": [
-            "biomaker_splits/agent_train.csv: public training rows; may include training answers.",
+            "biomaker_splits/agent_train.csv: public training rows with all required training answers retained. Every answer column declared for score_val/test must exist here with a non-missing training answer in every row; use consistent target column names across splits.",
             "biomaker_splits/score_val.csv: public validation-input rows; must not include validation answers.",
             "biomaker_splits/agent_test.csv: public test-input rows when a test source exists; must not include private test answers.",
             "private_gt/score_val.csv: validation rows with the hidden answers retained.",
@@ -423,6 +423,7 @@ def _builder_user_prompt(
         "Principles": [
             "Treat tables and directories as equally valid sample sources.",
             "If a folder level, table column, or referenced file is evidence of an answer, keep it in agent_train.csv but hide it from score_val.csv and agent_test.csv.",
+            "Training is supervised by agent_train.csv: preserve genuine training labels, target vectors, reports, or mask/annotation paths from the source. Do not drop training targets, fabricate placeholders, or rely on original source label tables remaining visible after input sanitization. Normalize target column names consistently across training and hidden-answer tables.",
             "If an answer is stored as a file path, hide that path from public score/test files and retain it in hidden answers.",
             "If a column is computed from the answer, hide it from public score/test files too.",
             "Make your semantic assumptions explicit in split_manifest.json; do not leave task type, key columns, sample unit, or class/mask/box schema implicit.",
@@ -657,10 +658,56 @@ def _check_generated_public_does_not_copy_inputs(
         )
 
 
+def validate_training_answers(
+    train_df: pd.DataFrame | None,
+    hidden_answers: dict[str, Any],
+    errors: list[str],
+) -> list[str]:
+    """Require usable training targets without exposing held-out answer values.
+
+    The builder already declares the target columns in its hidden-answer index.
+    These same targets supervise training; only score/test answers are hidden.
+    Keeping a common schema also covers vector targets and file-based masks.
+    """
+    required_columns: set[str] = set()
+    for split in ("score_val", "test"):
+        entry = hidden_answers.get(split)
+        columns = entry.get("answer_columns") if isinstance(entry, dict) else None
+        if isinstance(columns, list):
+            required_columns.update(column for column in columns if isinstance(column, str) and column.strip())
+    required = sorted(required_columns)
+    if not required:
+        errors.append("Training supervision requires declared non-empty answer_columns in private_gt/private_gt.json.")
+        return required
+    if train_df is None:
+        return required  # The required CSV read already reports this failure.
+    missing = sorted(set(required) - set(train_df.columns))
+    if missing:
+        errors.append(
+            "agent_train.csv is missing required training answer columns: "
+            f"{missing}. Retain genuine training answers; hide answers only in "
+            "score_val.csv and agent_test.csv."
+        )
+    for column in required:
+        if column not in train_df:
+            continue
+        values = train_df[column]
+        missing_count = int((values.isna() | values.astype(str).str.strip().eq("")).sum())
+        if missing_count:
+            errors.append(
+                f"agent_train.csv training answer column {column!r} has "
+                f"{missing_count} missing/blank rows. Preserve source training "
+                "answers; do not fill placeholders or copy held-out answers."
+            )
+    return required
+
+
 def verify_split_package(
     output_dir: Path,
     source_input_dir: Path | None = None,
     facts: dict[str, Any] | None = None,
+    *,
+    write_legacy_manifest: bool = True,
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -690,6 +737,7 @@ def verify_split_package(
         manifest = {}
 
     split_manifest = load_split_manifest(output_dir)
+    training_answer_columns = validate_training_answers(train_df, manifest, errors)
 
     if train_df is not None and len(train_df) == 0:
         errors.append("agent_train.csv has zero rows.")
@@ -811,7 +859,8 @@ def verify_split_package(
         split_manifest = legacy_manifest(
             output_dir, private_gt=manifest, row_counts=row_counts
         )
-        write_split_manifest(output_dir, split_manifest)
+        if write_legacy_manifest:
+            write_split_manifest(output_dir, split_manifest)
     validate_split_manifest(
         split_manifest,
         output_dir=output_dir,
@@ -827,6 +876,7 @@ def verify_split_package(
         "row_counts": row_counts,
         "hidden_answers": manifest,
         "private_gt": manifest,
+        "training_answer_columns": training_answer_columns,
         "split_manifest": _manifest_summary_for_verifier(split_manifest),
     }
 

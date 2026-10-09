@@ -15,6 +15,8 @@ from .agentic_data_planner import (
     build_dataset_facts,
     run_agentic_split_builder_probe,
     split_builder_cache_key,
+    validate_training_answers,
+    verify_split_package,
 )
 from .split_manifest import MANIFEST_NAME
 
@@ -528,13 +530,35 @@ def _copy_split_package_from_cache(
         or not cached_verifier.is_file()
     ):
         return None
+    # A persisted "ok" is not admission evidence for the current source and
+    # contract. Recheck the bytes before copying or exposing a cached package.
+    try:
+        verifier = verify_split_package(
+            cache_entry, source_input_dir=input_dir, write_legacy_manifest=False
+        )
+    except Exception:
+        return None  # A malformed cache entry is a miss, never admission.
+    if not verifier.get("ok"):
+        return None
     _copytree_replace(cached_split, split_dir)
     _copytree_replace(cached_private, private_dir)
     cached_manifest = cache_entry / MANIFEST_NAME
     if cached_manifest.is_file():
         shutil.copy2(cached_manifest, split_dir / MANIFEST_NAME)
     _copy_generated_public_assets(cache_entry, input_dir)
-    return json.loads(cached_verifier.read_text(encoding="utf-8"))
+    return verifier
+
+
+def _require_visible_training_answers(split_dir: Path, private_dir: Path) -> None:
+    """Admission guard for installed splits, including cache and sanitization."""
+    train_df = pd.read_csv(split_dir / "agent_train.csv")
+    hidden_answers = json.loads((private_dir / "private_gt.json").read_text(encoding="utf-8"))
+    if not isinstance(hidden_answers, dict):
+        raise RuntimeError("Invalid hidden-answer index for training supervision.")
+    errors: list[str] = []
+    validate_training_answers(train_df, hidden_answers, errors)
+    if errors:
+        raise RuntimeError("Invalid supervised training split: " + "; ".join(errors))
 
 
 def _store_split_package_cache(
@@ -659,9 +683,11 @@ def prepare_split_protocol(
             )
 
     _normalize_split_paths_in_dir(split_dir, input_dir)
+    _require_visible_training_answers(split_dir, private_dir)
     _make_private_paths_evaluator_visible(private_dir, input_dir)
     _hide_private_file_answers(input_dir, private_dir)
     agent_visible_input = sanitize_agent_visible_input(input_dir, split_dir)
+    _require_visible_training_answers(split_dir, private_dir)
 
     hidden_answers_plan = (
         result_verifier.get("hidden_answers")

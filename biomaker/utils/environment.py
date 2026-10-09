@@ -10,6 +10,9 @@ import platform
 import re
 import sys
 from dataclasses import dataclass
+from pathlib import Path
+
+from .local_modules import LocalModuleDiscovery, LocalModuleError
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,7 @@ def environment_manifest_text(include_medical: bool = True) -> str:
             "",
             "Allowed local generated modules:",
             "- `evaluator`: frozen BioMaker evaluator generated before solution search. Candidate code may import it for validation monitoring and artifact-format guidance when it exists.",
+            "- Your own Python modules inside the candidate workspace. For generated modules, write literal Python source with Path.write_text before importing and explicitly add its directory to sys.path if needed. Local modules must follow the same dependency policy; unknown source strings or paths cannot be verified.",
             "",
             "Dependency policy:",
             "- Use only the allowed third-party packages above and the Python standard library.",
@@ -173,13 +177,16 @@ def _handler_catches_import_error(handler: ast.ExceptHandler) -> bool:
 
 
 class _ImportCollector(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, local_nodes=()) -> None:
         self.required: set[str] = set()
         self.optional: set[str] = set()
         self.opaque_dynamic_import_lines: list[int] = []
         self._optional_depth = 0
+        self.local_nodes = local_nodes
 
-    def _add(self, name: str) -> None:
+    def _add(self, name: str, node: ast.AST) -> None:
+        if (id(node), name.split(".", 1)[0]) in self.local_nodes:
+            return
         target = self.optional if self._optional_depth else self.required
         target.add(name.split(".", 1)[0])
 
@@ -187,17 +194,17 @@ class _ImportCollector(ast.NodeVisitor):
         if isinstance(name_node, ast.Constant) and isinstance(name_node.value, str):
             module_name = name_node.value.lstrip(".")
             if module_name:
-                self._add(module_name)
+                self._add(module_name, node)
             return
         self.opaque_dynamic_import_lines.append(getattr(node, "lineno", 0))
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            self._add(alias.name)
+            self._add(alias.name, node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.level == 0 and node.module:
-            self._add(node.module)
+            self._add(node.module, node)
 
     def visit_Call(self, node: ast.Call) -> None:
         call_name = _call_name(node.func)
@@ -224,8 +231,8 @@ class _ImportCollector(ast.NodeVisitor):
             self.visit(child)
 
 
-def _top_level_imports(tree: ast.AST) -> tuple[set[str], set[str], list[int]]:
-    collector = _ImportCollector()
+def _top_level_imports(tree: ast.AST, local_nodes=()) -> tuple[set[str], set[str], list[int]]:
+    collector = _ImportCollector(local_nodes)
     collector.visit(tree)
     return (
         collector.required,
@@ -630,9 +637,19 @@ def _portable_device_violation(tree: ast.AST) -> tuple[str, int] | None:
 
 
 def validate_code_environment(
-    code: str, include_medical: bool = True
+    code: str, include_medical: bool = True, *, working_dir: Path | str | None = None
 ) -> PreflightResult:
     """Validate generated code against the environment contract before execution."""
+    local = None
+    if working_dir is not None:
+        local = LocalModuleDiscovery(
+            Path(working_dir).resolve(),
+            lambda source, child: _validate_code_environment(source, include_medical, child),
+        )
+    return _validate_code_environment(code, include_medical, local)
+
+
+def _validate_code_environment(code, include_medical, local) -> PreflightResult:
     try:
         tree = ast.parse(code)
     except SyntaxError as e:
@@ -683,8 +700,17 @@ def validate_code_environment(
         )
 
     allowed_imports = allowed_import_names(include_medical)
+    if local is not None:
+        try:
+            local.visit(tree)
+        except LocalModuleError as exc:
+            return PreflightResult(
+                ok=False, error_type="DependencyPolicyError",
+                message=f"DependencyPolicyError: {exc}",
+                exc_info={"reason": str(exc)},
+            )
     required_imports, optional_imports, opaque_dynamic_import_lines = (
-        _top_level_imports(tree)
+        _top_level_imports(tree, local.local_nodes if local is not None else ())
     )
     if opaque_dynamic_import_lines:
         line = opaque_dynamic_import_lines[0]
