@@ -319,6 +319,111 @@ def test_literal_module_is_admitted_without_preflight_writes(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def _unused_artifact_wrapper(*, source="VALUE = 42\n", wrapper_body=None):
+    code = _generated(source).removesuffix("main()\n")
+    body = wrapper_body or (
+        "sys.path.insert(0, str(Path(artifact_dir).resolve()))\n"
+        "import inference as saved\n"
+        "return saved.VALUE"
+    )
+    return code + (
+        "def read_artifact(artifact_dir=str(WORK_DIR)):\n"
+        + "".join("    " + line + "\n" for line in body.splitlines())
+        + "main()\n"
+    )
+
+
+def test_unused_default_path_wrapper_keeps_local_dependency_proof_without_writes(tmp_path):
+    code = _unused_artifact_wrapper()
+    assert _check(code, tmp_path).ok
+    # Normal attribute inspection must not look like dynamic function lookup.
+    assert _check(code + "getattr(sys, 'platform', None)\n", tmp_path).ok
+    assert _check(code + "from PIL import Image\ndef read_image(path):\n    with Image.open(path) as image:\n        return image.size\n", tmp_path).ok
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_real_subprocess_still_writes_and_imports_module_with_unused_wrapper(tmp_path, monkeypatch):
+    from biomaker import interpreter
+    monkeypatch.setattr(interpreter, "_sample_cuda_total_gpu_memory_mb", lambda: None)
+    monkeypatch.setattr(interpreter, "_sample_process_usage", lambda *a, **k: None)
+    result = Interpreter(tmp_path, timeout=10).run("import time\ntime.sleep(0.5)\n" + _unused_artifact_wrapper())
+    assert result.exc_type is None, result.term_out
+    assert "42" in result.stdout
+    assert (tmp_path / "working/inference.py").read_text() == "VALUE = 42\n"
+
+
+@pytest.mark.parametrize("reference", [
+    "read_artifact()", "read_artifact('/outside')", "read_artifact(artifact_dir='working')",
+    "read_artifact(*args)", "read_artifact(**kwargs)", "alias = read_artifact",
+    "consume(read_artifact)", "def escape():\n    return read_artifact",
+    "globals()[name]()", "lookup = getattr\nlookup(module, name)()",
+    "getattr(module, 'read_artifact')()", "getattr(module, name)()",
+    "sys.modules[__name__].read_artifact()", "exec(dynamic_code)",
+    "import builtins as namespace\nnamespace.globals()[name]()",
+    "from builtins import globals as namespace\nnamespace()[name]()",
+    "import sys as system\ngetattr(system.modules[__name__], name)()",
+])
+def test_default_path_does_not_prove_any_referenced_or_reflective_function(tmp_path, reference):
+    assert not _check(_unused_artifact_wrapper() + reference + "\n", tmp_path).ok
+
+
+@pytest.mark.parametrize("mutation", [
+    "Path('working/inference.py').write_text(input())",
+    "Path('working/inference.py').write_text('VALUE = 7')",
+    "Path('working/inference.py').unlink()",
+    "Path(unknown_path).write_text('VALUE = 42')",
+    "with Path(unknown_path).open('w') as file:\n    file.write('VALUE = 42')",
+    "path = Path(unknown_path)\nalias = path\nwith alias.open(dynamic_mode) as file:\n    file.write(source)",
+    "from pathlib import Path as P\nwith P(unknown_path).open(dynamic_mode) as file:\n    file.write(source)",
+    "P = Path\nwith P(unknown_path).open(dynamic_mode) as file:\n    file.write(source)",
+    "import pathlib as paths\npath = paths.Path(unknown_path)\nwith path.open(dynamic_mode) as file:\n    file.write(source)",
+    "import pathlib\nconstructor = pathlib.Path\npath = constructor(unknown_path)\nwith path.open(dynamic_mode) as file:\n    file.write(source)",
+    "with open('working/inference.py', 'w') as file:\n    file.write(input())",
+    "if condition:\n    Path('working/inference.py').write_text(input())",
+])
+def test_deferred_source_proof_rejects_conflicting_or_unknown_writes(tmp_path, mutation):
+    assert not _check(_unused_artifact_wrapper() + mutation + "\n", tmp_path).ok
+
+
+@pytest.mark.parametrize("extra", [
+    "import cv2", "import os\nos.setsid()", "import torch\ntorch.zeros(1).cuda()",
+    "import subprocess\nsubprocess.run(['pip', 'install', 'cv2'])",
+    "import importlib\nimportlib.import_module(module_name)",
+])
+def test_unused_wrapper_still_checks_every_dependency_and_execution_policy(tmp_path, extra):
+    body = "sys.path.insert(0, str(Path(artifact_dir).resolve()))\nimport inference\n" + extra
+    assert not _check(_unused_artifact_wrapper(wrapper_body=body), tmp_path).ok
+
+
+@pytest.mark.parametrize("shadow", [
+    "str = unknown", "Path = unknown", "def override(str):\n    pass",
+    "try:\n    operation()\nexcept Exception as str:\n    pass",
+    "match value:\n    case Path:\n        pass",
+    "match value:\n    case [*str]:\n        pass",
+    "match value:\n    case {**Path}:\n        pass",
+    "from .pathlib import Path",
+])
+def test_deferred_path_proof_requires_unshadowed_path_constructors(tmp_path, shadow):
+    assert not _check(_unused_artifact_wrapper() + shadow + "\n", tmp_path).ok
+
+
+def test_deferred_defaults_are_definition_time_paths_and_do_not_leak(tmp_path):
+    code = _unused_artifact_wrapper()
+    assert _check(code + "WORK_DIR = Path('other')\n", tmp_path).ok
+    other_default = code.replace("artifact_dir=str(WORK_DIR)", "artifact_dir='other'")
+    other_default += "Path('other/inference.py').write_text('import cv2')\n"
+    assert not _check(other_default, tmp_path).ok
+    # A successful unused-body check cannot make a future main() write into a
+    # proven current file for an unrelated top-level import.
+    assert not _check(code + "import inference\n", tmp_path).ok
+
+
+def test_default_proof_rejects_decorated_function_and_requires_an_inspected_source(tmp_path):
+    code = _unused_artifact_wrapper()
+    assert not _check(code.replace("def read_artifact", "@decorator\ndef read_artifact"), tmp_path).ok
+    assert not _check(code.replace("    import inference as inference_mod\n", ""), tmp_path).ok
+
+
 def test_interpreter_executes_generated_module(tmp_path, monkeypatch):
     from biomaker import interpreter
     monkeypatch.setattr(interpreter, "_sample_cuda_total_gpu_memory_mb", lambda: None)

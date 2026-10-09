@@ -3,7 +3,10 @@
 Only workspace files, literal source writes, and fixed source templates with
 proven numeric assignment slots on the import's execution path count as local
 modules. Unknown paths/source strings remain subject to the normal third-party
-policy. This is a dependency preflight, not a Python sandbox.
+policy. An unused, non-escaping top-level wrapper may also inspect an already
+verified artifact through its definition-time default directory; that fact is
+never applied to a real call or propagated to the module scope. This is a
+dependency preflight, not a Python sandbox.
 """
 
 from __future__ import annotations
@@ -74,8 +77,19 @@ class LocalModuleDiscovery(ast.NodeVisitor):
         # Retain the objects as well as their ids: proof invalidation follows
         # aliases and nested lists, including mutations in an isolated body.
         self.invalidated_data: dict[int, list] = {}
+        self._source_writes: dict[int, tuple[Path | None, object]] = {}
+        self._validated_sources: set[tuple[Path, object]] = set()
+        self._deferred_functions = []
+        self._module_function_ids: set[int] = set()
+        self._possible_path_names: set[str] = set()
+        self._possible_path_constructors: set[str] = set()
+        self._checking_deferred = False
 
     def visit_Module(self, node):
+        self._module_function_ids = {
+            id(child) for child in node.body if isinstance(child, ast.FunctionDef)
+        }
+        self._possible_path_names, self._possible_path_constructors = self._path_object_names(node)
         numeric_builtins = {"repr", "float", "int", "len", "print"}
         for child in ast.walk(node):
             bound = None
@@ -112,6 +126,158 @@ class LocalModuleDiscovery(ast.NodeVisitor):
             if isinstance(child, ast.Call) and ast.unparse(child.func) in {"__import__", "importlib.import_module"} and child.args and isinstance(child.args[0], ast.Constant) and child.args[0].value == "builtins":
                 self.shadowed_builtins.update(numeric_builtins)
         self.generic_visit(node)
+        self._check_unused_default_paths(node)
+
+    @staticmethod
+    def _unreferenced_function(node, tree):
+        """Limit default-path reasoning to ordinary, unused local definitions.
+
+        A default is not a proof about an actual call. Any reference, including
+        aliases/callbacks or reflection, keeps the ordinary argument-unknown
+        analysis. This is dependency inspection, not general call-graph proof.
+        """
+        if node.decorator_list or sum(
+            isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and child.name == node.name for child in ast.walk(tree)
+        ) != 1:
+            return False
+        direct_callees = {id(child.func) for child in ast.walk(tree) if isinstance(child, ast.Call)}
+        reflection = {"globals", "locals", "vars", "eval", "exec", "getattr", "hasattr", "setattr", "delattr"}
+        sys_names = {"sys"} | {
+            alias.asname or alias.name for child in ast.walk(tree) if isinstance(child, ast.Import)
+            for alias in child.names if alias.name == "sys"
+        }
+        for child in ast.walk(tree):
+            if isinstance(child, ast.Name) and child.id in {node.name, "__builtins__"}:
+                return False
+            if isinstance(child, ast.Constant) and child.value == node.name:
+                return False
+            if isinstance(child, ast.Name) and child.id in reflection and id(child) not in direct_callees:
+                return False
+            if isinstance(child, ast.Attribute) and (
+                child.attr in {"__dict__", "__globals__", "__getattribute__", "__builtins__"}
+                or child.attr == "modules" and isinstance(child.value, ast.Name) and child.value.id in sys_names
+            ):
+                return False
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                if (
+                    getattr(child, "module", None) in {"__main__", "builtins"}
+                    or any(alias.name in {"__main__", "builtins"} for alias in child.names)
+                    or isinstance(child, ast.ImportFrom) and child.module == "sys" and any(alias.name == "modules" for alias in child.names)
+                ):
+                    return False
+            if isinstance(child, ast.Call):
+                name = ast.unparse(child.func)
+                leaf = name.rsplit(".", 1)[-1]
+                if leaf in {"globals", "locals", "vars", "eval", "exec", "__import__", "import_module"}:
+                    return False
+                if leaf in {"getattr", "hasattr", "setattr", "delattr"} and (
+                    len(child.args) < 2
+                    or not isinstance(child.args[1], ast.Constant)
+                    or child.args[1].value == node.name
+                ):
+                    return False
+                if name.endswith("attrgetter"):
+                    return False
+        return True
+
+    @staticmethod
+    def _path_object_names(tree):
+        """Find possible Path aliases only to invalidate unknown file writes.
+
+        This syntactic type hint never supplies a directory or positive module
+        proof. In particular, Path(unknown).open(unknown_mode) remains a write
+        risk while Image.open(unknown_image) is not mistaken for Path.open.
+        """
+        constructors = {"Path", "pathlib.Path"}
+        assignments = []
+        names = set()
+        for child in ast.walk(tree):
+            if isinstance(child, ast.Import):
+                constructors.update((alias.asname or alias.name) + ".Path" for alias in child.names if alias.name == "pathlib")
+            if isinstance(child, ast.ImportFrom) and child.level == 0 and child.module == "pathlib":
+                constructors.update(alias.asname or alias.name for alias in child.names if alias.name == "Path")
+            if isinstance(child, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                targets = {part.id for target in targets for part in ast.walk(target) if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store)}
+                assignments.append((targets, child.value))
+            if isinstance(child, ast.arg) and child.annotation is not None and ast.unparse(child.annotation) in constructors:
+                names.add(child.arg)
+        changed = True
+        while changed:
+            previous = len(names), len(constructors)
+            for targets, value in assignments:
+                if isinstance(value, (ast.Name, ast.Attribute)) and ast.unparse(value) in constructors:
+                    constructors.update(targets)
+                if (
+                    isinstance(value, ast.Call) and ast.unparse(value.func) in constructors
+                    or isinstance(value, ast.Name) and value.id in names
+                    or isinstance(value, ast.BinOp) and isinstance(value.op, ast.Div)
+                    and any(isinstance(part, ast.Name) and part.id in names for part in ast.walk(value))
+                ):
+                    names.update(targets)
+            changed = previous != (len(names), len(constructors))
+        return names, constructors
+
+    @staticmethod
+    def _path_names_unshadowed(tree):
+        names = {"Path", "pathlib", "str", "os", "sys"}
+        for child in ast.walk(tree):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)) and child.id in names:
+                return False
+            if isinstance(child, ast.arg) and child.arg in names:
+                return False
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and child.name in names:
+                return False
+            if isinstance(child, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and child.name in names:
+                return False
+            if isinstance(child, ast.MatchMapping) and child.rest in names:
+                return False
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                for alias in child.names:
+                    binding = alias.asname or alias.name.split(".", 1)[0]
+                    if alias.name == "*":
+                        return False
+                    if binding in names and not (
+                        isinstance(child, ast.Import) and alias.name == binding and binding in {"pathlib", "os", "sys"}
+                        or isinstance(child, ast.ImportFrom) and child.level == 0 and child.module == "pathlib" and alias.name == binding == "Path"
+                    ):
+                        return False
+        return True
+
+    def _check_unused_default_paths(self, tree):
+        if not self._deferred_functions or not self._path_names_unshadowed(tree):
+            return
+        if any(path is None for path, _source in self._source_writes.values()):
+            return
+        sources = {}
+        for path, source in self._validated_sources:
+            alternatives = {value for candidate, value in self._validated_sources if candidate == path}
+            writes = [value for candidate, value in self._source_writes.values() if candidate == path]
+            if len(alternatives) == 1 and all(value == source for value in writes):
+                sources[path] = source
+        if not sources:
+            return
+        for node, bindings, paths, defaults in self._deferred_functions:
+            if not defaults or not self._unreferenced_function(node, tree):
+                continue
+            # The default directory only applies to this unused function's
+            # dependency inspection. It never becomes a caller/global fact.
+            old = self.bindings, self.paths, self.sources
+            self.bindings, self.paths, self.sources = dict(bindings), list(paths), dict(sources)
+            args = node.args
+            arguments = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            arguments += [arg for arg in (args.vararg, args.kwarg) if arg is not None]
+            for arg in arguments:
+                self.bindings.pop(arg.arg, None)
+            self.bindings.update(defaults)
+            self._checking_deferred = True
+            try:
+                for child in node.body:
+                    self.visit(child)
+            finally:
+                self._checking_deferred = False
+                self.bindings, self.paths, self.sources = old
 
     @staticmethod
     def _mutable_values(value):
@@ -332,6 +498,17 @@ class LocalModuleDiscovery(ast.NodeVisitor):
         # Opening for writing invalidates existing source. A proven text-write
         # context below restores it only after all writes have been inspected.
         path, mode = self._opened_file(node)
+        path_open = isinstance(node.func, ast.Attribute) and node.func.attr == "open" and (
+            path is not None
+            or isinstance(node.func.value, ast.Call) and ast.unparse(node.func.value.func) in self._possible_path_constructors
+            or isinstance(node.func.value, ast.Name) and node.func.value.id in self._possible_path_names
+            or isinstance(mode, str) and mode in {"w", "wt", "wb", "a", "at", "ab", "x", "xt", "xb", "r+", "w+", "a+", "x+", "rb+", "wb+", "ab+", "xb+"}
+        )
+        # Image.open(path), for example, is an image reader, not Path.open(mode).
+        is_open = name == "open" or path_open
+        if is_open and (not isinstance(mode, str) or any(c in mode for c in "wax+")):
+            if path is None or path.suffix == ".py":
+                self._source_writes[id(node)] = (path, None)
         if path is not None and path.suffix == ".py" and (not isinstance(mode, str) or any(c in mode for c in "wax+")):
             self.sources[path] = None
         if name in {"__import__", "importlib.import_module"} and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
@@ -346,10 +523,13 @@ class LocalModuleDiscovery(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute) and node.func.attr in {"write_text", "write_bytes", "unlink"}:
             value = self.value(node.func.value)
             path = self.path(value) if value is not None else None
+            if path is None:
+                self._source_writes[id(node)] = (None, None)
             if path is not None and path.suffix == ".py":
                 # A nonliteral overwrite invalidates even an existing file.
                 source = self.value(node.args[0]) if node.args and node.func.attr == "write_text" else None
                 self.sources[path] = source if _source_value(source) else None
+                self._source_writes[id(node)] = (path, self.sources[path])
 
     def visit_With(self, node):
         # Recognize the ordinary closed text-file form. Keeping this restricted
@@ -401,6 +581,7 @@ class LocalModuleDiscovery(ast.NodeVisitor):
             elif proven and len(parts) == 1:
                 source = parts[0]
             self.sources[path] = source
+            self._source_writes[id(call)] = (path, source)
 
     def _isolated_body(self, body, *, argument_names=()):
         bindings, paths, sources = self.bindings, self.paths, self.sources
@@ -415,6 +596,16 @@ class LocalModuleDiscovery(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node):
         args = node.args
+        if id(node) in self._module_function_ids and not self._checking_deferred:
+            positional = [*args.posonlyargs, *args.args]
+            defaults = list(zip(positional[-len(args.defaults):], args.defaults)) if args.defaults else []
+            defaults += list(zip(args.kwonlyargs, args.kw_defaults))
+            values = {}
+            for arg, expression in defaults:
+                value = self.value(expression)
+                if isinstance(value, (str, Path)) and self.path(value) is not None:
+                    values[arg.arg] = value
+            self._deferred_functions.append((node, dict(self.bindings), list(self.paths), values))
         names = [a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]]
         names += [a.arg for a in [args.vararg, args.kwarg] if a is not None]
         self._isolated_body(node.body, argument_names=names)
@@ -531,6 +722,7 @@ class LocalModuleDiscovery(ast.NodeVisitor):
             source_text = source
         key = path, source
         if key in self.checked:
+            self._validated_sources.add(key)
             return
         if len(self.checked) >= 128 or len(source_text) > 1_000_000 or self.depth >= 16:
             raise LocalModuleError("local Python imports exceed the preflight inspection limit")
@@ -539,3 +731,4 @@ class LocalModuleDiscovery(ast.NodeVisitor):
         result = self.validate(source_text, child)
         if not result.ok:
             raise LocalModuleError(f"local module `{path.relative_to(self.root)}`: {result.message}")
+        self._validated_sources.add(key)
