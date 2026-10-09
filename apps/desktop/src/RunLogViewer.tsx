@@ -1,5 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowDownToLine, ArrowUp, Check, ChevronDown, ChevronUp, Copy, Pause, RefreshCw, Search, Terminal, WrapText, X } from "lucide-react";
+import { ArrowDown, ArrowDownToLine, ArrowUp, ArrowUpToLine, Check, ChevronDown, ChevronUp, Copy, Pause, RefreshCw, Search, Terminal, WrapText, X } from "lucide-react";
 import { IconButton, Spinner } from "./components";
 import { formatBytes, type Language, type Translate } from "./models";
 import type { LogWindow } from "./runStreams";
@@ -156,6 +156,11 @@ function LogReader({ runId, lang, t, connected, active, snapshot, loading, error
     setSearchOpen(true);
     requestAnimationFrame(() => { search.current?.focus(); search.current?.select(); });
   }
+  function showWindowStart() {
+    pause();
+    scrollTarget.current = "top";
+    setJump(value => value + 1);
+  }
   function closeSearch() {
     invalidateOlder();
     setSearchOpen(false);
@@ -289,7 +294,7 @@ function LogReader({ runId, lang, t, connected, active, snapshot, loading, error
 
   return <section className="run-log-reader" ref={root} aria-label={t("日志阅读器", "Log reader")} data-run-id={runId} data-following={following} data-older-page={olderPage}>
     <div className="run-log-toolbar">
-      <div className="run-log-heading"><Terminal size={15} aria-hidden="true" /><strong>{olderPage ? t("此前片段", "Earlier window") : t("当前片段", "Current window")}</strong>
+      <div className="run-log-heading"><Terminal size={15} aria-hidden="true" /><strong>{olderPage ? t("较早的运行日志", "Earlier run log") : t("运行日志", "Run log")}</strong>
         <span className={`run-log-follow-state ${following && connected ? "is-following" : ""}`} role="status">
           {following ? connected ? active ? t("自动跟随", "Following") : t("已到最新", "At latest") : t("等待连接", "Waiting for connection") : t("已暂停跟随", "Following paused")}
         </span>
@@ -317,8 +322,11 @@ function LogReader({ runId, lang, t, connected, active, snapshot, loading, error
       <IconButton label={t("关闭日志搜索", "Close log search")} onClick={closeSearch}><X size={15} /></IconButton>
     </div>}
     <div className="run-log-scope" id={scopeId}>
-      <span>{t("搜索和复制仅包含当前显示片段。", "Search and copy include only the displayed window.")}</span>
-      {visible?.status === "ready" && <span>{formatBytes(Math.max(0, visible.end - visible.start))}{observedTime && <> · <time dateTime={visible.observed_at}>{t("读取于 ", "Read at ")}{observedTime}</time></>}</span>}
+      <span>{visible?.status === "ready" ? visible.start === 0 && visible.end === visible.source_size && !clipped
+        ? t(`已载入全部 ${formatBytes(visible.source_size)} 日志，可在下方滚动查看。`, `All ${formatBytes(visible.source_size)} of the log is loaded. Scroll below to read it.`)
+        : t(`已载入 ${formatBytes(Math.max(0, visible.end - visible.start))} / 共 ${formatBytes(visible.source_size)}；可查看更早内容或保存完整日志。`, `${formatBytes(Math.max(0, visible.end - visible.start))} loaded of ${formatBytes(visible.source_size)}. Read earlier output or save the full log.`)
+        : t("日志会在运行时持续写入。", "Output is written as the experiment runs.")}</span>
+      {observedTime && <time dateTime={visible?.observed_at}>{t("读取于 ", "Read at ")}{observedTime}</time>}
     </div>
     {(sourceChanged || sourceNotice) && <div className="run-log-notice" role="status">{sourceChanged ? t("日志来源已更新，仍显示此前片段。点击「跟随最新」查看最新内容。", "The log source changed. The earlier window is still shown. Choose Follow latest to read the current source.") : t("日志来源已更新，当前显示新来源的片段。", "The log source changed. A window from the current source is shown.")}</div>}
     {!connected && <div className="run-log-notice" role="status">{text ? t("本地服务未连接，保留上次读取的内容。", "The local service is disconnected. Previously read text is kept.") : t("等待本地服务连接后读取日志。", "Waiting for the local service to read the log.")}</div>}
@@ -332,7 +340,11 @@ function LogReader({ runId, lang, t, connected, active, snapshot, loading, error
     {matches.capped && <div className="run-log-boundary">{t("仅高亮前 1,000 处匹配，请增加关键词以缩小范围。", "Only the first 1,000 matches are highlighted. Use a longer search to narrow the results.")}</div>}
     <div className="run-log-page-actions">
       <button type="button" className="run-log-action" disabled={!canLoadOlder} onClick={() => void loadOlder()}>{olderBusy ? <Spinner size={13} /> : <ArrowUp size={13} aria-hidden="true" />}{olderBusy ? t("读取此前片段…", "Loading earlier window…") : t("查看此前片段", "Earlier window")}</button>
-      <span>{visible?.has_older ? t("每次查看一个片段，不自动拼接。", "One window at a time; windows are not merged.") : visible?.status === "ready" ? t("已到日志开头", "Start of log") : ""}</span>
+      <span>{visible?.has_older ? t("搜索和复制限于已载入内容。", "Search and copy cover the loaded text.") : visible?.status === "ready" ? t("已载入日志开头", "The start of the log is loaded") : ""}</span>
+      <div className="run-log-jump-actions">
+        <button type="button" className="run-log-action" disabled={!text} onClick={showWindowStart}><ArrowUpToLine size={13} aria-hidden="true" />{t("跳到片段开头", "Top of window")}</button>
+        <button type="button" className="run-log-action" disabled={snapshot?.status !== "ready"} onClick={followLatest}><ArrowDownToLine size={13} aria-hidden="true" />{t("跳到最新", "Jump to latest")}</button>
+      </div>
     </div>
     <div ref={viewport} className={`console-log run-log-viewport ${wrap ? "is-wrapped" : ""}`} tabIndex={0} role="region" aria-label={t("日志内容", "Log contents")} aria-describedby={scopeId}
       data-source-id={visible?.source_id || ""} data-revision={visible?.revision || ""} data-stale={showingSavedText} data-start={visible?.start ?? ""} data-end={visible?.end ?? ""}

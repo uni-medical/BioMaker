@@ -6,12 +6,16 @@ Supports:
 - limits execution time
 """
 
+import codecs
+import io
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +32,158 @@ from .utils.process_tree import (
 )
 
 logger = logging.getLogger("biomaker")
+
+
+def _decode_process_output(value: bytes | str | None) -> str:
+    """Keep the universal-newline behavior previously supplied by Popen(text=True)."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return (value or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+class _StreamingLogRedactor:
+    """Redact before logging, including secrets divided between pipe reads.
+
+    Only a possible secret prefix is held back; progress without a newline is
+    emitted immediately. Long API/Bearer tokens are consumed without buffering.
+    The original candidate output remains in its existing execution record.
+    """
+
+    def __init__(self, environment: Mapping[str, str]):
+        self.secrets = sorted(
+            {
+                value
+                for key, value in environment.items()
+                if re.search(
+                    r"(?:API_?KEY|TOKEN|PASSWORD|SECRET|CREDENTIAL)", key, re.I
+                )
+                and len(value) >= 6
+            },
+            key=len,
+            reverse=True,
+        )
+        self.pending = ""
+        self.token_kind: str | None = None
+
+    @staticmethod
+    def _token_character(character: str, kind: str) -> bool:
+        alphabet = "._~+/=-" if kind == "bearer" else "_-"
+        return character.isascii() and (
+            character.isalnum() or character in alphabet
+        )
+
+    def feed(self, value: str, *, final: bool = False) -> str:
+        value = self.pending + value
+        self.pending = ""
+        output = []
+        position = 0
+        while position < len(value):
+            remaining_length = len(value) - position
+            matched = False
+            # Known credentials may contain punctuation outside the generic token
+            # alphabet. Match (or retain) them before consuming any generic prefix,
+            # including credentials embedded in an already-redacted token.
+            for secret in self.secrets:
+                if value.startswith(secret, position):
+                    if self.token_kind is None:
+                        output.append("[REDACTED]")
+                    position += len(secret)
+                    # A known short key may prefix a longer unknown API token.
+                    # Continue consuming that token without retaining its body.
+                    for marker, kind in (("sk-", "api"), ("bearer ", "bearer")):
+                        if secret.lower().startswith(marker) and all(
+                            self._token_character(character, kind)
+                            for character in secret[len(marker) :]
+                        ):
+                            self.token_kind = kind
+                            break
+                    matched = True
+                    break
+                if (
+                    not final
+                    and remaining_length < len(secret)
+                    and secret.startswith(value[position:])
+                ):
+                    self.pending = value[position:]
+                    return "".join(output)
+            if matched:
+                continue
+            if self.token_kind is not None:
+                if self._token_character(value[position], self.token_kind):
+                    position += 1
+                    continue
+                self.token_kind = None
+            for marker, kind in (("sk-", "api"), ("bearer ", "bearer")):
+                lowered = value[position : position + len(marker)].lower()
+                if lowered == marker:
+                    output.append(
+                        "Bearer [REDACTED]" if kind == "bearer" else "[REDACTED]"
+                    )
+                    position += len(marker)
+                    self.token_kind = kind
+                    matched = True
+                    break
+                if not final and marker.startswith(lowered):
+                    self.pending = value[position:]
+                    return "".join(output)
+            if matched:
+                continue
+            output.append(value[position])
+            position += 1
+        if final:
+            self.token_kind = None
+        return "".join(output)
+
+
+class _LiveProcessOutput:
+    """Forward only the new bytes in communicate()'s cumulative snapshots."""
+
+    def __init__(self, label: str, channel: str, environment: Mapping[str, str]):
+        self.label = label
+        self.channel = channel
+        self.offset = 0
+        self.decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder("utf-8")(errors="replace"), translate=True
+        )
+        self.redactor = _StreamingLogRedactor(environment)
+
+    def update(self, captured: bytes | str | None, *, final: bool = False) -> None:
+        data = (
+            captured.encode("utf-8") if isinstance(captured, str) else captured or b""
+        )
+        fresh = data[self.offset :]
+        self.offset = len(data)
+        # Bound each decode/redaction/logging operation even for very noisy scripts.
+        for offset in range(0, len(fresh), 4096):
+            self._emit(self.decoder.decode(fresh[offset : offset + 4096]))
+        if final:
+            self._emit(self.decoder.decode(b"", final=True), final=True)
+
+    def _emit(self, value: str, *, final: bool = False) -> None:
+        safe = self.redactor.feed(value, final=final)
+        lines = (
+            part
+            for line in safe.splitlines(keepends=True)
+            for part in (
+                line[index : index + 4096] for index in range(0, len(line), 4096)
+            )
+        )
+        for line in lines:
+            logger.info(
+                "[candidate %s %s] %s",
+                self.label,
+                self.channel,
+                line.rstrip("\n"),
+                extra={
+                    "markup": False,
+                    "highlighter": None,
+                    "biomaker_candidate_output": True,
+                    "candidate_output": line,
+                    "candidate_output_label": self.label,
+                    "candidate_output_stream": self.channel,
+                },
+            )
+
 
 _IPYTHON_TRACEBACK_WRAPPER = r"""
 import runpy
@@ -379,6 +535,7 @@ class Interpreter:
         enforce_environment: bool = True,
         include_medical_packages: bool = True,
         environment: Mapping[str, str] | None = None,
+        output_label: str | None = None,
     ):
         """
         Simulates a standalone Python REPL with an execution time limit.
@@ -401,6 +558,9 @@ class Interpreter:
         self.enforce_environment = enforce_environment
         self.include_medical_packages = include_medical_packages
         self.environment = dict(environment or {})
+        self.output_label = re.sub(
+            r"[^A-Za-z0-9_.-]", "_", output_label or uuid.uuid4().hex
+        )[:12]
 
     def run(self, code: str, reset_session=True) -> ExecutionResult:
         """
@@ -446,21 +606,31 @@ class Interpreter:
         usage_samples: list[dict] = []
         gpu_baseline_mb = _sample_cuda_total_gpu_memory_mb()
         command = (
-            [sys.executable, "-c", _IPYTHON_TRACEBACK_WRAPPER, self.agent_file_name]
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                _IPYTHON_TRACEBACK_WRAPPER,
+                self.agent_file_name,
+            ]
             if self.format_tb_ipython
-            else [sys.executable, self.agent_file_name]
+            else [sys.executable, "-u", self.agent_file_name]
         )
-        process: subprocess.Popen[str] | None = None
+        environment = {**os.environ, **self.environment, "PYTHONUNBUFFERED": "1"}
+        live_stdout = _LiveProcessOutput(self.output_label, "stdout", environment)
+        live_stderr = _LiveProcessOutput(self.output_label, "stderr", environment)
+        process: subprocess.Popen[bytes] | None = None
         process_tree: ProcessTreeTracker | None = None
         try:
             popen_kwargs: dict[str, Any] = {
                 "cwd": self.working_dir,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
-                "text": True,
-                "env": (
-                    {**os.environ, **self.environment} if self.environment else None
-                ),
+                # TimeoutExpired always exposes bytes; binary mode makes cumulative
+                # offsets consistent with the final communicate() result, including
+                # CRLF and multibyte characters split over multiple reads.
+                "text": False,
+                "env": environment,
             }
             if os.name == "posix":
                 # A candidate-owned PGID survives leader exit, while remaining in the
@@ -517,9 +687,15 @@ class Interpreter:
                         timeout=min(0.5, max(0.05, remaining))
                     )
                     break
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as pending:
+                    live_stdout.update(pending.output)
+                    live_stderr.update(pending.stderr)
                     continue
 
+            live_stdout.update(stdout, final=True)
+            live_stderr.update(stderr, final=True)
+            stdout = _decode_process_output(stdout)
+            stderr = _decode_process_output(stderr)
             exec_time = time.time() - start_time
             resource_usage = _summarize_usage(
                 usage_samples, gpu_baseline_mb=gpu_baseline_mb
@@ -590,10 +766,14 @@ class Interpreter:
                 failure_phase="candidate_run",
             )
         except subprocess.TimeoutExpired as e:
+            live_stdout.update(e.stdout, final=True)
+            live_stderr.update(e.stderr, final=True)
+            stdout = _decode_process_output(e.stdout)
+            stderr = _decode_process_output(e.stderr)
             resource_usage = _summarize_usage(
                 usage_samples, gpu_baseline_mb=gpu_baseline_mb
             )
-            output_text = (e.stdout or "") + (e.stderr or "")
+            output_text = stdout + stderr
             output = [
                 output_text,
                 f"TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(self.timeout)}",
@@ -608,8 +788,8 @@ class Interpreter:
                 {"timeout": str(self.timeout)},
                 None,
                 resource_usage,
-                stdout=e.stdout or "",
-                stderr=e.stderr or "",
+                stdout=stdout,
+                stderr=stderr,
                 candidate_output=output_text,
                 candidate_exec_time=float(self.timeout),
                 candidate_exc_type="TimeoutError",

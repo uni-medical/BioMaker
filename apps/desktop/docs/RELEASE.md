@@ -123,6 +123,32 @@
 - For a public release, apply Developer ID signing and Apple notarization. Keep
   signing credentials in the release environment and never in source files.
 
+## Live progress repair in 0.1.17
+
+Candidates combine an atomic public lifecycle snapshot and public events with
+saved journal records. Generating, queued, executing and evaluating rows appear
+before the journal is saved. Only saved journal facts provide validity and
+metrics; interrupted or unconfirmed records remain distinct. Polling preserves
+selection and the open detail tab, uses bounded cached file reads and retains the
+last view on disconnection. Results and saved candidates use the same numbering.
+
+Candidate Python processes run unbuffered. New stdout/stderr bytes are forwarded
+to the console during execution, with candidate/channel labels and streaming
+credential redaction. The original execution record remains intact. Captured
+file logs no longer receive terminal-width wrapping for ordinary text and paths.
+Existing logs cannot gain output that the previous engine never forwarded.
+
+The log tab occupies the available window height, with its toolbar and footer
+inside the viewport. Task details can still be expanded. Top/latest actions,
+loaded-byte scope, paused reading, earlier windows and full export remain explicit.
+
+Run `tests/candidate-live-smoke.mjs` and `tests/log-reader-smoke.mjs` against
+both source and packaged Electron. Verify live phase transitions before journal
+creation, selected candidate preservation, invalid-source recovery, no transient
+metric claims, long task/path layout, automatic log polling and paused reading.
+Use an installed-engine run to distinguish deterministic UI fixtures from actual
+model execution. Record the release evidence in `output/live-progress-0.1.17/`.
+
 ## Data and upgrades
 
 The macOS app stores its own workspace, settings, run ledger and writable engine

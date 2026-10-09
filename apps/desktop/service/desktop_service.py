@@ -36,6 +36,7 @@ from provider_settings import ProviderSettings, provider_settings_request
 from dataset_inspection import DatasetInspector, inspect_request, ADMISSION_MESSAGES
 from artifact_preview import ArtifactPreviewError, preview_artifact
 from result_overview import build_result_overview
+from candidate_records import build_candidate_records
 from run_streams import RunStreams, StreamError
 
 VERSION = os.environ.get("BIOMAKER_DESKTOP_VERSION", "0.1.11")
@@ -702,6 +703,13 @@ def create_desktop_app(
         if record is None:
             return JSONResponse({"detail": "Run not found."}, status_code=404, headers={"Cache-Control": "no-store"})
         return JSONResponse(build_result_overview(record, logs_root=settings.logs_root), headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/desktop/runs/{run_id}/candidates")
+    def candidate_records(run_id: str, requested_id: str | None = None):
+        record = app.state.run_store.get_record("runs", run_id)
+        if record is None:
+            return JSONResponse({"detail": "Run not found."}, status_code=404, headers={"Cache-Control": "no-store"})
+        return JSONResponse(build_candidate_records(record, logs_root=settings.logs_root, requested_id=requested_id), headers={"Cache-Control": "no-store"})
 
     streams = RunStreams(settings.logs_root, settings.state_dir, app.state.run_store)
     app.state.run_streams = streams

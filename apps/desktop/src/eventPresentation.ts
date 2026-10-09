@@ -15,6 +15,8 @@ const eventNames: Record<string, [string, string]> = {
   node_queued_for_execution: ["候选方案等待执行", "Candidate queued for execution"],
   node_submitted: ["候选方案已提交执行", "Candidate submitted for execution"],
   execution_started: ["开始执行与校验候选方案", "Candidate execution and validation started"],
+  candidate_validation_started: ["开始校验候选产物", "Candidate artifact validation started"],
+  candidate_evaluation_started: ["开始评估候选方案", "Candidate evaluation started"],
   execution_finished: ["候选方案执行与校验结束", "Candidate execution and validation ended"],
   context_built: ["上下文已准备", "Context prepared"],
   draft_plan_batch_generated: ["候选计划已生成", "Candidate plans generated"],

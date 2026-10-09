@@ -20,7 +20,7 @@ if (executablePath && process.platform === 'darwin') env.PATH = '/usr/bin:/bin:/
 const names = ['qa-log-reader-first', 'qa-log-reader-second'];
 const directories = names.map(name => path.join(profile, 'workspace/logs', name));
 const logFiles = directories.map((directory, index) => path.join(directory, `${names[index]}.log`));
-const dataset = path.join(temporary, 'synthetic-dataset');
+const dataset = path.join(temporary, 'synthetic-dataset', ...Array(4).fill('long-dataset-path-for-compact-window-acceptance'));
 const checks = [];
 const errors = [];
 const restarts = [];
@@ -39,7 +39,7 @@ const activity = [
   event('run_finished', { completed_steps: 3 }),
 ];
 for (let index = 0; index < directories.length; index++) {
-  await writeFile(path.join(directories[index], 'run_manifest.json'), JSON.stringify({ created_at: '2026-10-09T10:00:00Z', data_dir: dataset, task_description: `Synthetic log reader ${index}; no model training.`, config: { agent_steps: 3, model_for_all_agents: 'qa-never-called' } }));
+  await writeFile(path.join(directories[index], 'run_manifest.json'), JSON.stringify({ created_at: '2026-10-09T10:00:00Z', data_dir: dataset, task_description: `Synthetic log reader ${index}; no model training.\n\n${'A long task remains available without pushing the terminal out of view. '.repeat(40)}`, config: { agent_steps: 3, model_for_all_agents: 'qa-never-called' } }));
   await writeFile(path.join(directories[index], 'events.jsonl'), activity.map(value => JSON.stringify(value)).join('\n') + '\nnot valid json\n{"unfinished":');
 }
 const initialText = Array.from({ length: 6_000 }, (_, index) => `[${String(index).padStart(5, '0')}] Synthetic output ${index % 57 === 0 ? 'needle' : 'plain'} · 仅供软件验收 ${'x'.repeat(30)}\n`).join('') + 'INITIAL_LATEST_SENTINEL\n';
@@ -82,11 +82,24 @@ async function pause() {
   assert.equal(await reader().getAttribute('data-following'), 'false');
 }
 async function screenshot(name) {
-  await reader().evaluate(element => {
-    const scroller = element.closest('.workspace-content');
-    if (scroller) scroller.scrollTop += element.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 65;
-  });
   await page.screenshot({ path: path.join(output, name) });
+}
+async function assertReadingSurfaceFits() {
+  const geometry = await reader().evaluate(element => {
+    const rect = node => { const b = node.getBoundingClientRect(); return { top: b.top, bottom: b.bottom, height: b.height }; };
+    const shell = document.querySelector('.app-shell');
+    const workspace = element.closest('.workspace-content');
+    return { reader: rect(element), viewport: rect(element.querySelector('.run-log-viewport')),
+      footer: rect(element.querySelector('.run-log-footer')), header: rect(document.querySelector('.app-header')),
+      statusbar: rect(document.querySelector('.workspace-statusbar')), workspace: rect(workspace),
+      shellScroll: shell.scrollTop, workspaceScroll: workspace.scrollTop,
+      overflow: workspace.scrollHeight - workspace.clientHeight };
+  });
+  assert.equal(geometry.shellScroll, 0, JSON.stringify(geometry));
+  assert.equal(geometry.workspaceScroll, 0, JSON.stringify(geometry));
+  assert(geometry.header.top >= 0 && geometry.overflow <= 2, JSON.stringify(geometry));
+  assert(geometry.viewport.height >= 120, JSON.stringify(geometry));
+  assert(geometry.reader.top >= geometry.workspace.top && geometry.footer.bottom <= geometry.statusbar.top, JSON.stringify(geometry));
 }
 async function releaseHeld() {
   await application.evaluate(() => { const qa = globalThis.__logReaderQA; for (const held of qa.held.splice(0)) held.release(); });
@@ -153,6 +166,20 @@ try {
   await until(() => viewport().evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop < 4), 'Visible following reader did not start at the bottom');
   assert.equal(await text(), (await api(`/api/desktop/runs/${runIds[0]}/console`)).text);
   checks.push('real-bounded-tail-renders-exact-text-and-initially-follows-when-revealed');
+
+  await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1180, 780));
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await assertReadingSurfaceFits();
+  await reader().getByRole('button', { name: '跳到片段开头', exact: true }).click();
+  await until(() => viewport().evaluate(element => element.scrollTop < 2), 'Jump to window start did not reveal the first line');
+  assert.equal(await reader().getAttribute('data-following'), 'false');
+  await reader().getByRole('button', { name: '跳到最新', exact: true }).click();
+  await until(() => viewport().evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop < 4), 'Jump to latest did not reveal the last line');
+  await appendFile(logFiles[0], 'AUTOMATIC_POLL_VISIBLE_SENTINEL\n');
+  await until(async () => (await text()).includes('AUTOMATIC_POLL_VISIBLE_SENTINEL'), 'Background polling did not show new logs without a refresh click');
+  await assertReadingSurfaceFits();
+  await screenshot('00-visible-terminal-and-footer.png');
+  checks.push('compact-long-task-and-path-keep-header-last-line-footer-visible-with-automatic-append-and-jump-controls');
 
   await appendFile(logFiles[0], 'FOLLOWED_APPEND_SENTINEL\n'); await refresh();
   await until(async () => (await text()).includes('FOLLOWED_APPEND_SENTINEL'), 'Appended text was not followed');
@@ -323,6 +350,7 @@ try {
   assert.equal(await reader().getByRole('button', { name: '自动换行', exact: true }).getAttribute('aria-pressed'), 'false');
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
   await screenshot('02-compact-dark-search.png');
+  await assertReadingSurfaceFits();
   await reader().getByRole('button', { name: '自动换行', exact: true }).click();
   await screenshot('03-compact-dark-wrap.png');
   checks.push('compact-dark-and-light-reader-search-wrap-keyboard-and-controls-fit-without-page-overflow');

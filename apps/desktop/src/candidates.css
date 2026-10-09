@@ -4,3 +4,12 @@
   grid-column: 1 / -1;
 }
 .candidate-window-note { color: var(--muted); font-size: 12px; line-height: 1.7; margin: 0 0 16px; }
+.candidate-list { min-width: 0; max-height: min(62vh, 720px); overflow: auto; }
+.candidate-verdict { flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; max-width: 125px; }
+.candidate-verdict > span { display: flex; align-items: center; gap: 4px; font-size: 10px; }
+.candidate-verdict small { font-size: 11px; font-variant-numeric: tabular-nums; }
+.candidate-verdict.generating, .candidate-verdict.queued, .candidate-verdict.running, .candidate-verdict.evaluating { color: var(--muted); }
+.candidate-status { font-size: 11px; color: var(--muted); background: var(--hover); border-radius: 6px; padding: 4px 8px; }
+.candidate-status.valid { color: var(--accent); background: var(--accent-soft); }
+.candidate-status.failed { color: var(--danger); }
+.candidate-update-error { display: block; font-size: 11px; margin-top: 5px; }

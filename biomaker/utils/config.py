@@ -42,6 +42,38 @@ class RichLogHandler(RichHandler):
         super().__init__(*args, **kwargs)
 
     def emit(self, record):
+        if not self.console.is_terminal:
+            # Desktop/file logs have their own scrolling and wrapping. Rich's
+            # terminal-width layout inserts 80-column line breaks into long paths
+            # and makes a captured log look truncated. Preserve plain text here.
+            try:
+                if isinstance(record.msg, Text):
+                    message = record.msg.plain
+                elif isinstance(record.msg, Tree):
+                    from rich.segment import Segment
+
+                    message = "".join(
+                        segment.text
+                        for segment in Segment.filter_control(
+                            self.console.render(record.msg)
+                        )
+                    ).rstrip("\n")
+                else:
+                    message = record.getMessage()
+                timestamp = (
+                    self.formatter.formatTime(record, "[%H:%M:%S]")
+                    if self.formatter
+                    else logging.Formatter().formatTime(record, "[%H:%M:%S]")
+                )
+                self.console.file.write(f"{timestamp} {record.levelname} {message}\n")
+                if record.exc_info:
+                    self.console.file.write(
+                        logging.Formatter().formatException(record.exc_info) + "\n"
+                    )
+                self.console.file.flush()
+            except Exception:
+                self.handleError(record)
+            return
         # Check if the message is a Rich object
         if isinstance(record.msg, (Tree, Text)):
             # Add padding to match the log message indentation (11 spaces)

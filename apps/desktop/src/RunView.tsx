@@ -295,7 +295,7 @@ export default function RunView({
     }
   }
   return (
-    <div className="run-view">
+    <div className={`run-view ${tab === "log" ? "is-log-view" : ""}`}>
       <div className="run-intro">
         <div className="run-title-row">
           <div>
@@ -553,7 +553,7 @@ export default function RunView({
             )}
           </>
         )}
-        <div hidden={tab !== "log"}>
+        <div className="run-log-slot" hidden={tab !== "log"}>
           <RunLogViewer key={run.id} visible={tab === "log"} runId={run.id} snapshot={log} loading={loading} error={logError || null}
             connected={connected} active={isActive(run)} lang={lang} t={t}
             onLoadOlder={onLoadOlderLog} onRefresh={onRetryLoad} onCopy={copy}

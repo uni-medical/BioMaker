@@ -41,6 +41,7 @@ from .utils.config import (
     sync_node_working_to_run_workspace,
 )
 from .utils.compute import ComputePool
+from .utils.candidate_snapshot import write_candidate_snapshot
 from .utils.evaluator_setup import (
     clean_candidate_outputs,
     prepare_evaluator,
@@ -778,9 +779,11 @@ def _run(cfg: Config) -> int:
                     execution_workspace,
                     **_interpreter_kwargs(cfg),
                     environment=slot.env_overrides,
+                    output_label=node.id if node is not None else None,
                 )
                 res = node_interpreter.run(*args, **kwargs)
                 if res.exc_type is None:
+                    append_event(cfg.log_dir, "candidate_validation_started", node_id=node.id if node is not None else None)
                     normalization_messages = normalize_working_outputs(
                         execution_workspace, str(agent_task_desc)
                     )
@@ -799,6 +802,7 @@ def _run(cfg: Config) -> int:
                         failure_reason="generated artifacts failed validation",
                     )
                 if res.exc_type is None:
+                    append_event(cfg.log_dir, "candidate_evaluation_started", node_id=node.id if node is not None else None)
                     evaluator_result = score_candidate_with_evaluator(
                         execution_workspace,
                         timeout=min(180, cfg.exec.timeout),
@@ -879,6 +883,10 @@ def _run(cfg: Config) -> int:
     def save_live_tree(extra_nodes: list[Node] | None = None) -> Journal:
         """Best-effort tree export for completed and transient nodes."""
         display_journal = live_display_journal(extra_nodes)
+        try:
+            write_candidate_snapshot(cfg.log_dir, display_journal.nodes)
+        except Exception as exc:
+            record_presentation_warning("candidate_snapshot", exc)
         try:
             tree_export.generate(
                 cfg,
