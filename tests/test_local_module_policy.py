@@ -133,6 +133,186 @@ def test_custom_opener_cannot_claim_to_write_the_named_module(tmp_path):
     assert not _check(code, tmp_path).ok
 
 
+def _numeric_template_code(*, template=None, conversion="float", pathlib=False):
+    template = template or (
+        "VALUE = __SIZE__\nLABELS = __LABELS__\n"
+        "MEAN = __MEAN__\nSTD = __STD__\n"
+    )
+    code = _text_written(source=template, pathlib=pathlib)
+    return code.replace(
+        f"    inference_src = {template!r}\n",
+        f"    template = {template!r}\n"
+        "    LABELS = [0, 1, 2]\n"
+        "    SIZE = 42\n"
+        "    samples = [sum([1, 2, 3]) / 3, sum([4, 5, 6]) / 3]\n"
+        "    inference_src = (template.replace('__LABELS__', repr(LABELS))\n"
+        "        .replace('__SIZE__', repr(SIZE))\n"
+        f"        .replace('__MEAN__', repr([{conversion}(v) for v in samples]))\n"
+        f"        .replace('__STD__', repr([{conversion}(v) for v in samples])))\n",
+    )
+
+
+@pytest.mark.parametrize("conversion", ["float", "int"])
+@pytest.mark.parametrize("pathlib", [False, True])
+def test_runtime_numeric_template_is_proven_without_fabricated_parameters(tmp_path, conversion, pathlib):
+    from biomaker.utils.local_modules import LocalModuleDiscovery, _SourceTemplate
+    import ast
+    code = _numeric_template_code(conversion=conversion, pathlib=pathlib)
+    inspected = []
+
+    def record(source, child):
+        assert any(isinstance(value, _SourceTemplate) for value in child.sources.values())
+        inspected.append(source)
+        return _check(source, tmp_path)
+
+    discovery = LocalModuleDiscovery(tmp_path.resolve(), record)
+    discovery.visit(ast.parse(code))
+    assert inspected and "MEAN = __MEAN__" in inspected[0]
+    assert "STD = __STD__" in inspected[0]
+    # The fixed AST preserves unknown-value identifiers; no invented 0 data.
+    assert "VALUE = 42" in inspected[0] and "LABELS = [0, 1, 2]" in inspected[0]
+    assert _check(code, tmp_path).ok
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("pathlib", [False, True])
+def test_real_subprocess_writes_runtime_numeric_parameters_then_imports(tmp_path, monkeypatch, pathlib):
+    from biomaker import interpreter
+    monkeypatch.setattr(interpreter, "_sample_cuda_total_gpu_memory_mb", lambda: None)
+    monkeypatch.setattr(interpreter, "_sample_process_usage", lambda *a, **k: None)
+    result = Interpreter(tmp_path, timeout=10).run(
+        "import time\ntime.sleep(0.5)\n" + _numeric_template_code(pathlib=pathlib)
+    )
+    assert result.exc_type is None, result.term_out
+    source = (tmp_path / "working/inference.py").read_text()
+    assert "MEAN = [2.0, 5.0]" in source
+    assert "STD = [2.0, 5.0]" in source
+    assert "42" in result.stdout
+
+
+@pytest.mark.parametrize("bad_source", [
+    "import cv2\n", "import importlib\nimportlib.import_module('cv2')\n",
+    "import subprocess\nsubprocess.run(['pip', 'install', 'cv2'])\n",
+    "import os\nos.setsid()\n", "x.cuda()\n",
+])
+def test_numeric_template_keeps_all_source_policies(tmp_path, bad_source):
+    template = bad_source + "VALUE = __SIZE__\nLABELS = __LABELS__\nMEAN = __MEAN__\nSTD = __STD__\n"
+    result = _check(_numeric_template_code(template=template), tmp_path)
+    assert not result.ok and "local module" in result.message
+
+
+@pytest.mark.parametrize("replacement", [
+    "repr(samples)", "repr(object())", "str(samples)",
+    "repr([v for v in samples])", "repr([str(v) for v in samples])",
+    "repr([helper(v) for v in samples])", "repr((float(v) for v in samples))",
+])
+def test_unproven_parameter_serialization_stays_blocked(tmp_path, replacement):
+    code = _numeric_template_code().replace("repr([float(v) for v in samples])", replacement)
+    result = _check(code, tmp_path)
+    assert not result.ok and "not statically verifiable" in result.message
+
+
+@pytest.mark.parametrize("shadow", [
+    "repr = lambda x: 'import cv2'", "float = lambda x: x", "int = lambda x: x",
+    "def repr(x):\n    return str(x)", "from os import path as float",
+    "import builtins", "globals()['float'] = lambda x: x",
+    "__builtins__['repr'] = str", "builtins = __import__('builtins')",
+    "from math import *", "import sys\nsys.__dict__['float'] = object()",
+    "import sys\nsys.modules['builtins'].float = object()",
+    "match object():\n    case float:\n        pass",
+])
+def test_shadowed_or_mutable_builtin_namespace_has_no_template_proof(tmp_path, shadow):
+    conversion = "int" if shadow.startswith("int =") else "float"
+    result = _check(shadow + "\n" + _numeric_template_code(conversion=conversion), tmp_path)
+    assert not result.ok
+
+
+def test_comprehension_target_and_function_parameter_cannot_shadow_conversion(tmp_path):
+    code = _numeric_template_code()
+    assert not _check(code.replace("for v in samples", "for float in samples"), tmp_path).ok
+    assert not _check(code.replace("def main():", "def main(float=None):"), tmp_path).ok
+
+
+@pytest.mark.parametrize("slot_line", [
+    "MEAN = '__MEAN__'", "import __MEAN__", "from __MEAN__ import x",
+    "__MEAN__ = 1", "MEAN = prefix__MEAN__", "MEAN = [__MEAN__]",
+    "MEAN = f'__MEAN__'", "PATH = 'working/__MEAN__.py'",
+    "MEAN = __MEAN__ # __MEAN__", "MEAN = __MEAN__\nOTHER = '__MEAN__'",
+])
+def test_dynamic_slots_are_only_complete_unquoted_assignment_expressions(tmp_path, slot_line):
+    template = "VALUE = __SIZE__\nLABELS = __LABELS__\n" + slot_line + "\nSTD = __STD__\n"
+    assert not _check(_numeric_template_code(template=template), tmp_path).ok
+
+
+@pytest.mark.parametrize("transform", [
+    ".replace('0', '__import__(\"cv2\")')",
+    ".replace('MEAN = ', 'import ')",
+    ".replace('__MEAN__', 'import cv2')", ".strip()", " + '\\n'",
+])
+def test_unknown_template_provenance_cannot_be_dropped_or_rewritten(tmp_path, transform):
+    code = _numeric_template_code().replace(
+        "    inference_path =", f"    inference_src = inference_src{transform}\n    inference_path ="
+    )
+    assert not _check(code, tmp_path).ok
+
+
+def test_template_cannot_be_used_as_a_path(tmp_path):
+    code = _numeric_template_code().replace(
+        "inference_path = os.path.join(WORK_DIR, 'inference.py')",
+        "inference_path = str(inference_src)",
+    )
+    assert not _check(code, tmp_path).ok
+
+
+def test_literal_repr_and_replace_are_exact_and_bounded(tmp_path):
+    code = (
+        "from pathlib import Path\nvalues = [-1, 2.5, True, None]\n"
+        "src = 'DATA = TOKEN'.replace('TOKEN', repr(values))\n"
+        "Path('helper.py').write_text(src)\nimport helper\n"
+    )
+    assert _check(code, tmp_path).ok
+    # This would expand to >1MB if evaluated; the proof must reject first.
+    code = (
+        "from pathlib import Path\n"
+        f"src = {'x' * 2000!r}.replace('x', {'y' * 2000!r})\n"
+        "Path('helper.py').write_text(src)\nimport helper\n"
+    )
+    assert not _check(code, tmp_path).ok
+
+
+@pytest.mark.parametrize("mutation", [
+    "values.append(object())", "values[0] = object()", "values += unknown",
+    "alias = values\nalias.append(object())", "mutate(values)",
+    "alias = values.append\nalias(object())", "del values[0]",
+    "holder.items = values", "holder['items'] = values",
+    "items, = (values,)\nitems.append(object())",
+    "holder = {'items': values}\nmutate(holder)",
+    "alias = [values]\nalias[0].append(object())",
+    "def mutate():\n    values.append(object())\nmutate()",
+    "def len(x):\n    x.append(object())\nlen(values)",
+    "def print(x):\n    x.append(object())\nprint(values)",
+])
+def test_mutable_literal_data_cannot_keep_a_stale_repr_proof(tmp_path, mutation):
+    code = (
+        "from pathlib import Path\nvalues = [0, 1, 2]\n" + mutation + "\n"
+        "src = 'DATA = TOKEN'.replace('TOKEN', repr(values))\n"
+        "Path('helper.py').write_text(src)\nimport helper\n"
+    )
+    result = _check(code, tmp_path)
+    assert not result.ok and "not statically verifiable" in result.message
+
+
+def test_readonly_builtin_uses_and_later_list_mutations_preserve_completed_source(tmp_path):
+    code = (
+        "from pathlib import Path\nvalues = [0, 1, 2]\n"
+        "print(values)\nsize = len(values)\n"
+        "src = 'DATA = TOKEN'.replace('TOKEN', repr(values))\n"
+        "values.append(object())\n"
+        "Path('helper.py').write_text(src)\nimport helper\n"
+    )
+    assert _check(code, tmp_path).ok
+
+
 def test_literal_module_is_admitted_without_preflight_writes(tmp_path):
     result = _check(_generated(), tmp_path)
     assert result.ok, result.message

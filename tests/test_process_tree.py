@@ -253,7 +253,8 @@ def test_uncaptured_group_is_not_released_until_every_member_is_gone(monkeypatch
     class Process:
         pid = 50
 
-        def wait(self):
+        def wait(self, timeout):
+            assert timeout > 0
             waits.append(True)
             processes.discard(50)
 

@@ -47,6 +47,7 @@ from .metric_registry import (
     require_supported_metric,
 )
 from .process_tree import (
+    ProcessTreeCleanupError,
     ProcessTreeInspectionError,
     ProcessTreeTracker,
     drain_uncaptured_process_group,
@@ -693,6 +694,7 @@ def _run_public_artifact_contract_test(
         tempfile.mkdtemp(prefix=".evaluator_contract_test_", dir=workspace_dir)
     )
     backup_working = backup_root / "working"
+    cleanup_failed = False
     try:
         if original_working_existed:
             shutil.move(str(working_dir), str(backup_working))
@@ -736,12 +738,18 @@ def _run_public_artifact_contract_test(
                 "key_columns plus prediction_columns from prediction_spec(); it should "
                 f"load hidden score labels from ${_SCORE_ENV_VAR}. Corrupted artifacts and undefined primary metrics must be rejected without modifying artifacts.\n" + output[-4000:]
             )
+    except ProcessTreeCleanupError:
+        cleanup_failed = True
+        raise
     finally:
-        if working_dir.exists():
-            shutil.rmtree(working_dir)
-        if original_working_existed:
-            shutil.move(str(backup_working), str(working_dir))
-        shutil.rmtree(backup_root, ignore_errors=True)
+        # An unverified evaluator may still write here. Retain both the backup
+        # and temporary artifacts for the outer session owner to drain first.
+        if not cleanup_failed:
+            if working_dir.exists():
+                shutil.rmtree(working_dir)
+            if original_working_existed:
+                shutil.move(str(backup_working), str(working_dir))
+            shutil.rmtree(backup_root, ignore_errors=True)
 
 
 def _resolve_candidate_path(

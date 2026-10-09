@@ -268,3 +268,18 @@ def test_trusted_contract_rejects_opposite_scoring_direction(tmp_path):
     evaluator_path.write_text(evaluator_path.read_text() + "\n_original_score = score_val\ndef score_val():\n    result = _original_score()\n    result['maximize'] = False\n    return result\n")
     with pytest.raises(evaluator.EvaluatorSetupError, match="maximize disagrees"):
         _contract_check(workspace, hidden, spec)
+
+
+def test_cleanup_fatal_preserves_contract_backup_and_stops_restoration(tmp_path, monkeypatch):
+    from biomaker.utils.process_tree import ProcessTreeCleanupError
+    workspace, hidden, spec = _classification_workspace(tmp_path)
+    originals = {p.name: p.read_bytes() for p in (workspace / "working").iterdir()}
+    def unverified(*args, **kwargs):
+        raise ProcessTreeCleanupError(50, (50,), "synthetic inspection failure")
+    monkeypatch.setattr(evaluator, "_run_python", unverified)
+    with pytest.raises(ProcessTreeCleanupError):
+        _contract_check(workspace, hidden, spec)
+    backups = list(workspace.glob(".evaluator_contract_test_*/working"))
+    assert len(backups) == 1
+    assert {p.name: p.read_bytes() for p in backups[0].iterdir()} == originals
+    assert (workspace / "working").is_dir()

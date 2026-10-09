@@ -22,6 +22,26 @@ class ProcessTreeInspectionError(RuntimeError):
     """Raised when a process group cannot be inspected safely."""
 
 
+class ProcessTreeCleanupError(BaseException):
+    """Fatal ownership failure; ordinary candidate retries must not swallow it.
+
+    The caller must retain/quarantine its compute lease. A managed desktop run
+    then relies on its outer session owner to drain or persist cleanup_pending.
+    This is deliberately outside Exception, like a cancellation of the run.
+    """
+
+    def __init__(self, pgid: int, pids: tuple[int, ...], reason: str):
+        self.pgid, self.pids, self.reason = pgid, pids, reason
+        super().__init__(
+            f"Process cleanup remains unverified for PGID {pgid}, "
+            f"known PIDs {list(pids)}: {reason}. The compute slot must not be reused."
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {"cleanup_unverified": True, "pgid": self.pgid,
+                "known_pids": list(self.pids), "reason": self.reason}
+
+
 @dataclass(frozen=True, slots=True)
 class ProcessTreeIdentity:
     """Facts that distinguish one PID incarnation inside a run session."""
@@ -233,48 +253,65 @@ def drain_uncaptured_process_group(
     group_signal_sender: SignalSender | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     poll_interval: float = 0.05,
+    timeout: float = 5.0,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     """Fail closed when identity capture fails immediately after ``Popen``.
 
     The unreaped ``Popen`` object still reserves its PID, and ``process_group=0``
     made that exact PID the new group's ID before exec.  It is therefore safe to
-    kill that group once.  The function does not return until the group is empty,
-    so callers cannot release a compute slot while an untracked child survives.
+    signal the group before reaping. Success requires a confirmed empty group;
+    an unverified cleanup raises a fatal error instead of releasing ownership.
     """
 
-    if poll_interval <= 0:
-        raise ValueError("poll_interval must be positive")
+    if poll_interval <= 0 or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("poll_interval and timeout must be positive")
     pid = getattr(process, "pid", None)
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         raise ProcessTreeInspectionError("uncaptured process has no valid pid")
+    deadline = monotonic() + timeout
+    last_error = "process group has not been confirmed empty"
+
+    def remaining():
+        value = deadline - monotonic()
+        if value <= 0:
+            raise ProcessTreeCleanupError(pid, (pid,), last_error)
+        return value
 
     if os.name != "posix":
         try:
             process.kill()
         except ProcessLookupError:
             pass
-        process.wait()
+        try:
+            process.wait(timeout=remaining())
+        except subprocess.TimeoutExpired as exc:
+            raise ProcessTreeCleanupError(pid, (pid,), "child did not exit after kill") from exc
         return
 
     sender = os.killpg if group_signal_sender is None else group_signal_sender
-    while True:
+    while getattr(process, "returncode", None) is None:
+        remaining()
         try:
             sender(pid, signal.SIGKILL)
             break
         except ProcessLookupError:
             break
-        except OSError:
-            sleeper(poll_interval)
-    process.wait()
+        except OSError as exc:
+            last_error = f"group signal failed: {exc}"
+            sleeper(min(poll_interval, remaining()))
+    try:
+        process.wait(timeout=remaining())
+    except subprocess.TimeoutExpired as exc:
+        raise ProcessTreeCleanupError(pid, (pid,), "child did not exit after group kill") from exc
     while True:
+        remaining()
         try:
             if not group_reader(pid):
                 return
-        except ProcessTreeInspectionError:
-            pass
-        except (OSError, ValueError):
-            pass
-        sleeper(poll_interval)
+        except (ProcessTreeInspectionError, OSError, ValueError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        sleeper(min(poll_interval, remaining()))
 
 
 class ProcessTreeTracker:
@@ -299,6 +336,9 @@ class ProcessTreeTracker:
         self._signal_sender = signal_sender
         self._sleeper = sleeper
         self._identities = {root.pid: root}
+        self._cleanup_complete = False
+        self._cleanup_failure: ProcessTreeCleanupError | None = None
+        self._cleanup_budget_check: Callable[[], None] | None = None
 
     @classmethod
     def capture(
@@ -326,7 +366,7 @@ class ProcessTreeTracker:
         self, expected: ProcessTreeIdentity
     ) -> ProcessTreeIdentity | None:
         try:
-            observed = self._identity_reader(expected.pid)
+            observed = self._read_identity(expected.pid)
         except ProcessLookupError:
             return None
         except ProcessTreeInspectionError:
@@ -344,15 +384,46 @@ class ProcessTreeTracker:
             return None
         return observed
 
+    def _read_identity(self, pid: int) -> ProcessTreeIdentity:
+        if self._cleanup_budget_check is not None:
+            self._cleanup_budget_check()
+        return self._identity_reader(pid)
+
+    def _read_group(self) -> list[int]:
+        if self._cleanup_budget_check is not None:
+            self._cleanup_budget_check()
+        return self._group_reader(self.pgid)
+
     def refresh(self) -> int:
         """Capture every current PGID member after verifying its run session."""
 
+        if self._cleanup_failure is not None:
+            raise self._cleanup_failure
+        if self._cleanup_complete:
+            return 0
+        members = self._read_group()
+        if not members:
+            return 0
+        # A newly allocated group in the same session is not our descendant.
+        root = self._identities[self.root_pid]
+        try:
+            observed_root = self._read_identity(self.root_pid)
+        except ProcessLookupError:
+            observed_root = None
+        if observed_root is not None and observed_root != root:
+            # Ownership cannot become trustworthy again if this new leader
+            # subsequently exits and leaves children in its recycled group.
+            self._cleanup_failure = ProcessTreeCleanupError(
+                self.pgid, self.tracked_pids,
+                "original process-group leader PID was reused",
+            )
+            raise self._cleanup_failure
         added = 0
-        for pid in self._group_reader(self.pgid):
+        for pid in members:
             if pid in self._identities:
                 continue
             try:
-                observed = self._identity_reader(pid)
+                observed = self._read_identity(pid)
             except ProcessLookupError:
                 continue
             except ProcessTreeInspectionError:
@@ -375,7 +446,7 @@ class ProcessTreeTracker:
         return True
 
     def _live_identities(self) -> list[ProcessTreeIdentity]:
-        current_members = set(self._group_reader(self.pgid))
+        current_members = set(self._read_group())
         return [
             identity
             for identity in self._identities.values()
@@ -406,35 +477,56 @@ class ProcessTreeTracker:
             return
 
     def _group_is_empty(self) -> bool:
-        return not self._group_reader(self.pgid)
+        return not self._read_group()
 
     def terminate_and_wait(
         self,
         *,
         root_process: Any | None = None,
         poll_interval: float = 0.05,
+        timeout: float = 5.0,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         """Freeze the PGID, kill exact members, and wait for it to disappear.
 
-        The method has no "give up and release" branch. A known live member must not
-        overlap the next owner of the same compute slot.
+        A deadline aborts the run with unverified ownership; it never declares
+        cleanup successful or permits the compute slot to be reused. Terminal
+        results are cached so a caller's finally cannot restart cleanup.
         """
 
-        if poll_interval <= 0:
-            raise ValueError("poll_interval must be positive")
+        if self._cleanup_failure is not None:
+            raise self._cleanup_failure
+        if self._cleanup_complete:
+            return
+        if poll_interval <= 0 or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("poll_interval and timeout must be positive")
+        deadline = monotonic() + timeout
+        last_error = "process group has not been confirmed empty"
+
+        def check_deadline():
+            if monotonic() >= deadline:
+                self._cleanup_failure = ProcessTreeCleanupError(
+                    self.pgid, self.tracked_pids, last_error
+                )
+                raise self._cleanup_failure
+        self._cleanup_budget_check = check_deadline
 
         stable_rounds = 0
         while stable_rounds < 2:
+            check_deadline()
             self._poll_root(root_process)
             try:
                 added_before = self.refresh()
                 live = self._live_identities()
                 if not live and self._group_is_empty():
+                    self._cleanup_complete = True
                     return
                 for identity in live:
+                    check_deadline()
                     self._signal_if_matching(identity, signal.SIGSTOP)
                 added_after = self.refresh()
-            except ProcessTreeInspectionError:
+            except (ProcessTreeInspectionError, OSError, ValueError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
                 self._sleeper(poll_interval)
                 continue
             stable_rounds = (
@@ -443,18 +535,22 @@ class ProcessTreeTracker:
 
         empty_rounds = 0
         while empty_rounds < 2:
+            check_deadline()
             self._poll_root(root_process)
             try:
                 self.refresh()
                 live = self._live_identities()
                 for identity in live:
+                    check_deadline()
                     self._signal_if_matching(identity, signal.SIGKILL)
                 self._poll_root(root_process)
                 empty = not live and self._group_is_empty()
-            except ProcessTreeInspectionError:
+            except (ProcessTreeInspectionError, OSError, ValueError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
                 empty_rounds = 0
                 self._sleeper(poll_interval)
                 continue
             empty_rounds = empty_rounds + 1 if empty else 0
             if empty_rounds < 2:
                 self._sleeper(poll_interval)
+        self._cleanup_complete = True

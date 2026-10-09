@@ -19,6 +19,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias
 
+from .process_tree import ProcessTreeCleanupError
+
 ComputeBackend: TypeAlias = Literal["cuda", "mps", "cpu"]
 WorkerRequest: TypeAlias = Literal["auto"] | int
 CommandRunner: TypeAlias = Callable[..., Any]
@@ -253,6 +255,8 @@ class ComputePool:
         self._leases: dict[ComputeSlot, Literal["candidate", "final"]] = {}
         self._final_pending = False
         self._final_active = False
+        self._cleanup_failure: ProcessTreeCleanupError | None = None
+        self._quarantined: set[ComputeSlot] = set()
 
     @classmethod
     def detect(
@@ -316,13 +320,24 @@ class ComputePool:
         with self._condition:
             return len(self._leases)
 
+    @property
+    def has_cleanup_failure(self) -> bool:
+        """Whether a quarantined lease still requires the outer owner's cleanup."""
+
+        with self._condition:
+            return self._cleanup_failure is not None
+
     def _wait_locked(
         self, predicate: Callable[[], bool], timeout: float | None
     ) -> None:
         if timeout is not None and timeout < 0:
             raise ValueError("timeout must be non-negative or None")
         deadline = None if timeout is None else time.monotonic() + timeout
-        while not predicate():
+        while True:
+            if self._cleanup_failure is not None:
+                raise self._cleanup_failure
+            if predicate():
+                return
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("timed out waiting for a compute slot")
@@ -365,6 +380,8 @@ class ComputePool:
         """Release a previously acquired slot; double releases are rejected."""
 
         with self._condition:
+            if slot in self._quarantined:
+                raise RuntimeError("cannot release a slot with unverified process cleanup")
             lease_kind = self._leases.pop(slot, None)
             if lease_kind is None:
                 raise ValueError("compute slot is not leased by this pool")
@@ -377,13 +394,20 @@ class ComputePool:
     def lease(
         self, *, final: bool = False, timeout: float | None = None
     ) -> Iterator[ComputeSlot]:
-        """Context-manager wrapper that always releases its slot."""
+        """Release clean leases; quarantine fatal cleanup failures and abort waiters."""
 
         slot = self.acquire_final(timeout) if final else self.acquire(timeout)
         try:
             yield slot
+        except ProcessTreeCleanupError as exc:
+            with self._condition:
+                self._quarantined.add(slot)
+                self._cleanup_failure = exc
+                self._condition.notify_all()
+            raise
         finally:
-            self.release(slot)
+            if slot not in self._quarantined:
+                self.release(slot)
 
     def metadata(self) -> dict[str, object]:
         """Return JSON-friendly detection and worker-resolution facts."""

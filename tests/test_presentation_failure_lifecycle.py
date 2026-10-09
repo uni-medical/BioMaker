@@ -14,6 +14,7 @@ from biomaker.utils import final_retrain as final_retrain_module
 from biomaker.utils import tree_export
 from biomaker.utils.compute import ComputePool, ComputeSlot
 from biomaker.utils.metric import MetricValue
+from biomaker.utils.process_tree import ProcessTreeCleanupError
 
 
 class _ImmediateFuture:
@@ -320,6 +321,54 @@ def _install_minimal_run(
 def _set_execution_workspace(node, workspace):
     node.execution_workspace = str(workspace)
     return workspace
+
+
+@pytest.mark.parametrize(
+    "broken_events",
+    [set(), {"execution_finished"}, {"run_failed"}, {"execution_finished", "run_failed"}],
+)
+def test_cleanup_failure_survives_event_sink_errors_and_preserves_workspace(
+    tmp_path, monkeypatch, broken_events
+):
+    cfg, events, order, _live = _install_minimal_run(
+        monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False,
+    )
+    failure = ProcessTreeCleanupError(50, (50, 51), "inspection unavailable")
+    pool = run_module.ComputePool.detect("auto")
+    exit_callbacks = []
+    monkeypatch.setattr(run_module.atexit, "register", exit_callbacks.append)
+    evidence = cfg.workspace_dir / "node_workspaces" / "candidate" / "run.py"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text("# retained while process cleanup remains unverified\n")
+
+    class UnverifiedInterpreter(_SuccessfulInterpreter):
+        def run(self, *_args, **_kwargs):
+            raise failure
+
+    monkeypatch.setattr(run_module, "Interpreter", UnverifiedInterpreter)
+
+    def append_event(_log_dir, event, **payload):
+        if event in broken_events:
+            raise OSError("event sink unavailable")
+        events.append((event, payload))
+
+    monkeypatch.setattr(run_module, "append_event", append_event)
+    monkeypatch.setattr(
+        run_module, "_evaluate_selected_private_outputs",
+        lambda *a, **k: pytest.fail("unverified cleanup must not reach private scoring"),
+    )
+    with pytest.raises(ProcessTreeCleanupError) as caught:
+        run_module.run()
+    assert caught.value is failure
+    assert pool.leased_count == 1
+    with pytest.raises(ProcessTreeCleanupError) as reacquired:
+        pool.acquire(timeout=0)
+    assert reacquired.value is failure
+    assert order == ["generation_shutdown", "execution_shutdown"]
+    assert "run_finished" not in [event for event, _payload in events]
+    assert len(exit_callbacks) == 1
+    exit_callbacks[0]()
+    assert evidence.read_text() == "# retained while process cleanup remains unverified\n"
 
 
 @pytest.mark.parametrize("retrain_enabled", [False, True])

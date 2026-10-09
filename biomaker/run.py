@@ -57,6 +57,7 @@ from .utils.exp_guide import write_exp_guide
 from .utils.experiment_contract import load_experiment_contract
 from .utils.final_retrain import run_final_retrain
 from .utils.private_evaluation import evaluate_private_outputs
+from .utils.process_tree import ProcessTreeCleanupError
 from .utils.run_manifest import write_run_manifest
 from .utils.split_protocol import prepare_split_protocol
 from .utils.timer import Timer
@@ -794,7 +795,11 @@ def _run(cfg: Config) -> int:
     global_step = len(journal)
 
     def cleanup():
-        if global_step == 0 and cfg.workspace_dir.exists():
+        if (
+            global_step == 0
+            and not compute_pool.has_cleanup_failure
+            and cfg.workspace_dir.exists()
+        ):
             shutil.rmtree(cfg.workspace_dir)
 
     atexit.register(cleanup)
@@ -878,17 +883,23 @@ def _run(cfg: Config) -> int:
                 )
                 return res
             except BaseException as exc:
-                append_event(
-                    cfg.log_dir,
-                    "execution_finished",
-                    node_id=node.id if node is not None else None,
-                    execution_workspace=str(execution_workspace),
-                    exec_time=time.monotonic() - node_start_time,
-                    exc_type=type(exc).__name__,
-                    error=str(exc),
-                    compute_backend=slot.backend,
-                    compute_slot=slot_payload,
-                )
+                try:
+                    append_event(
+                        cfg.log_dir,
+                        "execution_finished",
+                        node_id=node.id if node is not None else None,
+                        execution_workspace=str(execution_workspace),
+                        exec_time=time.monotonic() - node_start_time,
+                        exc_type=type(exc).__name__,
+                        error=str(exc),
+                        compute_backend=slot.backend,
+                        compute_slot=slot_payload,
+                    )
+                except BaseException:
+                    if not isinstance(exc, ProcessTreeCleanupError):
+                        raise
+                    # The lease must receive the fatal cleanup error even if
+                    # diagnostics fail, so its slot cannot be released.
                 raise
 
     def live_display_journal(extra_nodes: list[Node] | None = None) -> Journal:
@@ -1609,6 +1620,16 @@ def _run_direct_entry() -> None:
             completed_steps = _run(cfg)
         except KeyboardInterrupt:
             emit_terminal("run_interrupted", reason="keyboard_interrupt")
+            raise
+        except ProcessTreeCleanupError as exc:
+            try:
+                emit_terminal(
+                    "run_failed", exc_type=type(exc).__name__, error=str(exc),
+                    **exc.as_dict(),
+                )
+            except BaseException:
+                # Preserve the cleanup failure for the outer session owner.
+                pass
             raise
         except Exception as exc:
             emit_terminal(

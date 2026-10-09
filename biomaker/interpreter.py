@@ -26,6 +26,7 @@ from dataclasses_json import DataClassJsonMixin
 
 from .utils.environment import validate_code_environment, validate_process_containment
 from .utils.process_tree import (
+    ProcessTreeCleanupError,
     ProcessTreeInspectionError,
     ProcessTreeTracker,
     drain_uncaptured_process_group,
@@ -631,6 +632,7 @@ class Interpreter:
         live_stderr = _LiveProcessOutput(self.output_label, "stderr", environment)
         process: subprocess.Popen[bytes] | None = None
         process_tree: ProcessTreeTracker | None = None
+        cleanup_failed = False
         try:
             popen_kwargs: dict[str, Any] = {
                 "cwd": self.working_dir,
@@ -775,6 +777,9 @@ class Interpreter:
                 candidate_exc_info=exc_info,
                 failure_phase="candidate_run",
             )
+        except ProcessTreeCleanupError:
+            cleanup_failed = True
+            raise
         except subprocess.TimeoutExpired as e:
             live_stdout.update(e.stdout, final=True)
             live_stderr.update(e.stderr, final=True)
@@ -807,7 +812,11 @@ class Interpreter:
                 failure_phase="candidate_run",
             )
         finally:
-            if process_tree is not None:
+            if cleanup_failed:
+                # The fatal error retains ownership for the compute/session
+                # owner. Do not restart draining or delete its source evidence.
+                pass
+            elif process_tree is not None:
                 process_tree.terminate_and_wait(root_process=process)
             elif process is not None and process.poll() is None:
                 # Only used when identity capture itself failed. The unreaped Popen
@@ -817,7 +826,8 @@ class Interpreter:
                 except (OSError, ProcessLookupError):
                     pass
                 process.wait()
-            try:
-                script_path.unlink()
-            except FileNotFoundError:
-                pass
+            if not cleanup_failed:
+                try:
+                    script_path.unlink()
+                except FileNotFoundError:
+                    pass
