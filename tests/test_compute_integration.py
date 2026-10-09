@@ -461,7 +461,7 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monke
     monkeypatch.setattr(
         final_retrain_module,
         "validate_working_outputs",
-        lambda *_: SimpleNamespace(ok=True),
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True),
     )
     monkeypatch.setattr(
         final_retrain_module,
@@ -487,7 +487,7 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monke
         calls["private"] = (workspace, private_path, env_overrides)
         return {"metric": 0.9}
 
-    monkeypatch.setattr(final_retrain_module, "evaluate_private_outputs", private)
+    monkeypatch.setattr(final_retrain_module, "evaluate_private_outputs", private, raising=False)
     monkeypatch.setattr(final_retrain_module, "_write_result", lambda *_: None)
 
     result = final_retrain_module.run_final_retrain(
@@ -511,7 +511,9 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monke
         },
     )
     assert calls["evaluator"] == (retrain_workspace, 180, expected_env)
-    assert calls["private"] == (retrain_workspace, private_dir, expected_env)
+    assert "private" not in calls
+    assert result.private_metrics is None
+    assert result.to_json()["private_evaluation"]["performed_here"] is False
 
     monkeypatch.setattr(
         final_retrain_module,
@@ -527,25 +529,3 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(tmp_path, monke
     )
     assert copy_failure.ok is False
     assert copy_failure.error == "copy failed"
-
-    monkeypatch.setattr(
-        final_retrain_module, "_copy_retrain_outputs_to_log", lambda *_: None
-    )
-    monkeypatch.setattr(
-        final_retrain_module,
-        "evaluate_private_outputs",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("private evaluation failed")
-        ),
-    )
-    private_failure = final_retrain_module.run_final_retrain(
-        cfg,
-        best_node,
-        private_dir,
-        timeout=300,
-        env_overrides=expected_env,
-    )
-    assert private_failure.ok is False
-    assert private_failure.error == (
-        "Private evaluation failed after final retrain: private evaluation failed"
-    )

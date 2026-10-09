@@ -4,6 +4,7 @@ import { registerCloseProtection } from './closeProtection';
 import { emptyDraft, hasDraft, type Draft } from './experimentDraft';
 import type { DraftEntry } from './DraftLibrary';
 import type { Translate } from './models';
+import { draftErrorTitle, type DraftErrorOperation } from './draftErrors';
 
 const freshDraft = () => structuredClone(emptyDraft);
 function toStored(draft: Draft): DraftPayload {
@@ -25,7 +26,7 @@ function equalContent(left: unknown, right: unknown): boolean {
   const keys = Object.keys(a);
   return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && equalContent(a[key], b[key]));
 }
-export function draftStorageMessage(error: unknown, t: Translate): string {
+export function draftStorageMessage(error: unknown, t: Translate, operation: DraftErrorOperation = 'save'): string {
   const code = /\[drafts:([a-z_]+)\]/.exec(String(error))?.[1];
   switch (code) {
     case 'conflict': return t('本机保存的草稿已变化，当前编辑仍保留。可以将当前内容另存为新草稿。', 'The saved drafts changed. Your edits are retained; save this content as a new draft.');
@@ -33,7 +34,7 @@ export function draftStorageMessage(error: unknown, t: Translate): string {
     case 'unsupported': return t('草稿来自更新的版本，当前版本无法修改。请使用相应版本打开。', 'These drafts use a newer format. Open them with the corresponding application version.');
     case 'too_large': return t('草稿数量或内容超过本机保存上限，请缩短内容或整理已有草稿。', 'The draft count or content exceeds the storage limit. Shorten the content or organize existing drafts.');
     case 'invalid_request': return t('部分草稿内容无法保存。当前编辑仍保留，原文件未被覆盖。', 'Some draft content could not be saved. Your edits are retained and the original file was not overwritten.');
-    case 'save_failed': return t('未能确认草稿是否保存成功，当前编辑仍保留。请重试以确认保存状态。', 'The draft save could not be confirmed. Your edits are retained. Retry to confirm the saved state.');
+    case 'save_failed': return operation === 'save' ? t('未能确认草稿是否保存成功，当前编辑仍保留。请重试以确认保存状态。', 'The draft save could not be confirmed. Your edits are retained. Retry to confirm the saved state.') : t('未能确认本次草稿操作是否完成，当前编辑仍保留。请刷新草稿列表后确认。', 'The draft operation could not be confirmed. Your edits are retained. Refresh the draft library to check its state.');
     default: return t('无法确认本机草稿的保存状态。请检查存储权限和可用空间后重试，当前编辑仍保留。', 'The local draft state could not be confirmed. Check storage access and free space, then retry. Your edits are retained.');
   }
 }
@@ -49,6 +50,7 @@ export function useDraftWorkspace(t: Translate) {
   const [operating, setOperating] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState('');
+  const [errorOperation, setErrorOperation] = useState<DraftErrorOperation>('save');
   const [legacyRaw, setLegacyRaw] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const latest = useRef({ draft: freshDraft(), snapshot: null as DraftSnapshot | null, epoch: 0, dirty: false, operating: false, ready: false });
@@ -61,7 +63,9 @@ export function useDraftWorkspace(t: Translate) {
   const initialization = useRef<Promise<DraftSnapshot> | null>(null);
   const loadGeneration = useRef(0);
   const flushRef = useRef<() => Promise<boolean>>(async () => false);
-  const reportError = (failure: unknown) => { if (mounted.current) setError(draftStorageMessage(failure, translate.current)); };
+  const reportError = (failure: unknown, operation: DraftErrorOperation = 'save') => {
+    if (mounted.current) { setError(draftStorageMessage(failure, translate.current, operation)); setErrorOperation(operation); }
+  };
   const stopTimer = () => { if (timer.current) { clearTimeout(timer.current); timer.current = null; } };
   const mutation = (operation: DraftOperation): DraftMutation => {
     if (!latest.current.snapshot) throw new Error('[drafts:unavailable]');
@@ -118,7 +122,7 @@ export function useDraftWorkspace(t: Translate) {
     void initialization.current.then(value => {
       if (!valid || generation !== loadGeneration.current) return;
       apply(value, true); latest.current.ready = true; setReady(true); setError('');
-    }).catch(failure => { if (valid && generation === loadGeneration.current) reportError(failure); });
+    }).catch(failure => { if (valid && generation === loadGeneration.current) reportError(failure, 'load'); });
     return () => { valid = false; };
   }, [loadAttempt]);
 
@@ -201,14 +205,14 @@ export function useDraftWorkspace(t: Translate) {
     }
   }), []);
 
-  const act = useCallback(async (operation: () => DraftOperation): Promise<boolean> => {
+  const act = useCallback(async (operation: () => DraftOperation, errorKind: DraftErrorOperation = 'save'): Promise<boolean> => {
     if (latest.current.operating || !latest.current.ready) return false;
     latest.current.operating = true; setOperating(true);
     try {
       if (!await flushRef.current()) return false;
       const value = await window.biomaker.mutateDrafts(mutation(operation()));
       apply(value, true); setError(''); return true;
-    } catch (failure) { reportError(failure); return false; }
+    } catch (failure) { reportError(failure, errorKind); return false; }
     finally { latest.current.operating = false; if (mounted.current) setOperating(false); }
   }, []);
 
@@ -226,15 +230,15 @@ export function useDraftWorkspace(t: Translate) {
     // Returning to the same editor must remain possible when its contents are
     // too large to save; the user needs the form to shorten or copy that input.
     if (state.ready && !state.operating && state.snapshot?.activeId === id) return Promise.resolve(true);
-    return act(() => ({ type: 'activate', id }));
+    return act(() => ({ type: 'activate', id }), 'load');
   }, [act]);
-  const rename = useCallback((id: string, title: string) => act(() => ({ type: 'rename', id, title })), [act]);
-  const remove = useCallback((id: string) => act(() => ({ type: 'delete', id })), [act]);
+  const rename = useCallback((id: string, title: string) => act(() => ({ type: 'rename', id, title }), 'rename'), [act]);
+  const remove = useCallback((id: string) => act(() => ({ type: 'delete', id }), 'delete'), [act]);
   const duplicate = useCallback((id: string) => act(() => {
     const item = latest.current.snapshot?.drafts.find(item => item.id === id);
     if (!item) throw new Error('[drafts:conflict]');
     return { type: 'create', content: item.content, title: item.title ? `${Array.from(item.title).slice(0, 112).join('')} ${translate.current('副本', 'copy')}` : '' };
-  }), [act]);
+  }, 'copy'), [act]);
   const recoverAsCopy = useCallback(async (): Promise<boolean> => {
     if (latest.current.operating || pending.current || !latest.current.dirty) return false;
     latest.current.operating = true; setOperating(true); stopTimer();
@@ -265,7 +269,7 @@ export function useDraftWorkspace(t: Translate) {
       setError(''); return true;
     } catch (failure) {
       if (/\[drafts:(invalid_request|too_large)\]/.test(String(failure))) recovery.current = null;
-      reportError(failure); return false;
+      reportError(failure, 'copy'); return false;
     }
     finally { latest.current.operating = false; if (mounted.current) setOperating(false); }
   }, []);
@@ -275,7 +279,7 @@ export function useDraftWorkspace(t: Translate) {
       if (latest.current.dirty) { await flushRef.current(); return; }
       latest.current.operating = true; setOperating(true);
       try { apply(await window.biomaker.getDrafts(), true); setError(''); }
-      catch (failure) { reportError(failure); }
+      catch (failure) { reportError(failure, 'load'); }
       finally { latest.current.operating = false; if (mounted.current) setOperating(false); }
       return;
     }
@@ -283,6 +287,6 @@ export function useDraftWorkspace(t: Translate) {
   }, []);
   const items: DraftEntry[] = (snapshot?.drafts || []).map(item => ({ ...item, content: item.id === snapshot?.activeId ? draft : fromStored(item.content) }));
   const currentId = useCallback(() => latest.current.snapshot?.activeId || null, []);
-  return { draft, activeId: snapshot?.activeId || null, items, ready, saving, dirty, operating, error, legacyRaw,
+  return { draft, activeId: snapshot?.activeId || null, items, ready, saving, dirty, operating, error, errorTitle: draftErrorTitle(errorOperation, t), legacyRaw,
     update, flush, create, activate, rename, remove, duplicate, recoverAsCopy, retry, currentId };
 }

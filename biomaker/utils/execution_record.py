@@ -20,6 +20,10 @@ def attach_artifact_validation_result(
         "ok": artifact_check.ok,
         "messages": artifact_check.messages,
     }
+    if getattr(artifact_check, "model_artifact", None) is not None:
+        exec_result.artifact_validation["model_artifact"] = (
+            artifact_check.model_artifact
+        )
     if artifact_check.messages:
         exec_result.append_system_output(
             "artifact_validation",

@@ -13,6 +13,7 @@ declare global {
       previewArtifact(artifact: { runId: string; name: string }): Promise<ArtifactPreview>;
       saveArtifact(artifact: { runId: string; name: string; expectedSha256?: string; serviceRevision?: number }): Promise<string | null>;
       saveConsole(input: { runId: string; serviceRevision: number }): Promise<string | null>;
+      writeClipboardText(text: string): Promise<void>;
       getAppInfo(): Promise<{ version: string; platform: string }>;
       getServiceState(): Promise<ServiceState>;
       retryService(): Promise<ServiceState>;

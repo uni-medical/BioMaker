@@ -20,6 +20,7 @@ except Exception:
 
 from .evaluator_setup import validate_submission_with_evaluator
 from .experiment_contract import load_experiment_contract
+from .metric_registry import metric_info
 from .prediction_contract import key_columns_from_spec, resolve_artifact_path
 
 
@@ -142,7 +143,7 @@ def _macro_ovr_auc(y_true: np.ndarray, y_score: np.ndarray, n_classes: int) -> f
         positives = y_true == class_index
         negatives = ~positives
         if not positives.any() or not negatives.any():
-            continue
+            return float("nan")
         ranks = rankdata(y_score[:, class_index], method="average")
         n_pos = int(positives.sum())
         n_neg = int(negatives.sum())
@@ -229,6 +230,23 @@ def _classification_metrics_from_submission(
         scores_df = submission[prob_columns] if prob_columns else None
 
     class_values = _probability_class_values(prob_columns, prediction_spec)
+    if len(y_true) == 0 or y_true.isna().any():
+        raise ValueError("Private truth is empty or contains missing labels.")
+    declared_classes = prediction_spec.get("class_labels")
+    if isinstance(declared_classes, list) and declared_classes:
+        valid_classes = {str(label) for label in declared_classes}
+        if not y_true.astype(str).isin(valid_classes).all():
+            raise ValueError("Private truth contains an undeclared class.")
+    else:
+        valid_classes = set(y_true.astype(str))
+    if y_pred is not None and (y_pred.isna().any() or not y_pred.astype(str).isin(valid_classes).all()):
+        raise ValueError("Private predicted labels must be present and belong to declared classes.")
+    if scores_df is not None:
+        numeric = scores_df.to_numpy(dtype=float)
+        if not np.isfinite(numeric).all() or ((numeric < 0) | (numeric > 1)).any():
+            raise ValueError("Private predictions must be finite probabilities in [0, 1].")
+        if numeric.shape[1] > 1 and not np.allclose(numeric.sum(axis=1), 1.0, rtol=1e-5, atol=1e-5):
+            raise ValueError("Private class probabilities must sum to one.")
     if y_pred is None and scores_df is not None and not scores_df.empty:
         if scores_df.shape[1] == 1:
             positive_class = _positive_class_from_spec(
@@ -253,8 +271,13 @@ def _classification_metrics_from_submission(
     metrics: dict[str, float] = {"accuracy": accuracy}
     primary_name = "private_accuracy"
     primary_value = accuracy
-    requested_auc = primary_metric in {"auc", "roc_auc", "macro_auc", "ovr_auc"}
-    requested_accuracy = primary_metric in {"accuracy", "acc"}
+    info = metric_info(primary_metric)
+    requested_auc = bool(info and info.name in {"auc", "mean_roc_auc"})
+    requested_accuracy = bool(info and info.name in {"accuracy", "mean_binary_accuracy"})
+    if primary_metric is not None and not (requested_auc or requested_accuracy):
+        raise ValueError("The requested private classification metric is unsupported.")
+    if requested_auc and (scores_df is None or scores_df.empty):
+        raise ValueError("The requested private AUC requires probability predictions.")
     if scores_df is not None and not scores_df.empty:
         y_score = scores_df.to_numpy(dtype=float)
         if scores_df.shape[1] == 1:
@@ -287,9 +310,11 @@ def _classification_metrics_from_submission(
                 auc = float("nan")
         if np.isfinite(auc):
             metrics["auc"] = float(auc)
-            if requested_auc or not requested_accuracy:
+            if requested_auc:
                 primary_name = "private_auc"
                 primary_value = float(auc)
+        elif requested_auc:
+            raise ValueError("The requested private AUC is undefined; every declared class needs positive and negative examples.")
     return {
         "metric_name": primary_name,
         "value": primary_value,
@@ -344,16 +369,19 @@ def _multilabel_metrics_from_submission(
         merged = truth_view.merge(submission_view, on=merge_keys, how="inner")
         if len(merged) != len(truth_view):
             return None
-        y_true = merged[label_columns].to_numpy(dtype=int)
+        y_true = merged[label_columns].to_numpy(dtype=float)
         scores = merged[score_columns].to_numpy(dtype=float)
     else:
         if len(truth) != len(submission):
             return None
-        y_true = truth[label_columns].to_numpy(dtype=int)
+        y_true = truth[label_columns].to_numpy(dtype=float)
         scores = submission[score_columns].to_numpy(dtype=float)
 
-    if not np.isfinite(scores).all():
-        return None
+    if not len(y_true) or not np.isfinite(scores).all() or ((scores < 0) | (scores > 1)).any():
+        raise ValueError("Private multilabel predictions must be nonempty finite probabilities in [0, 1].")
+    if not np.isin(y_true, [0, 1]).all():
+        raise ValueError("Private multilabel truth must contain binary labels.")
+    y_true = y_true.astype(int)
     y_pred = (scores >= 0.5).astype(int)
     per_label_accuracy = (y_true == y_pred).mean(axis=0)
     mean_binary_accuracy = float(per_label_accuracy.mean())
@@ -366,18 +394,23 @@ def _multilabel_metrics_from_submission(
     }
     primary_name = "private_mean_binary_accuracy"
     primary_value = mean_binary_accuracy
-    if primary_metric in {"auc", "roc_auc", "mean_roc_auc", "macro_auc"}:
+    info = metric_info(primary_metric)
+    if info and info.name in {"auc", "mean_roc_auc"}:
         aucs = []
         for index, column in enumerate(label_columns):
             y_column = pd.Series(y_true[:, index])
             if len(set(y_column.astype(str))) < 2:
-                continue
+                raise ValueError("The requested private multilabel AUC is undefined for a label.")
             aucs.append(_binary_auc(y_column, scores[:, index], "1"))
-        if aucs:
+        if aucs and np.isfinite(aucs).all():
             auc = float(np.mean(aucs))
             metrics["mean_roc_auc"] = auc
             primary_name = "private_mean_roc_auc"
             primary_value = auc
+        else:
+            raise ValueError("The requested private multilabel AUC is not finite.")
+    elif primary_metric is not None and not (info and info.name in {"accuracy", "mean_binary_accuracy"}):
+        raise ValueError("The requested private multilabel metric is unsupported.")
     return {
         "metric_name": primary_name,
         "value": primary_value,
@@ -661,7 +694,12 @@ def evaluate_private_outputs(
     *,
     env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
-    """Evaluate private test metrics for user inspection only."""
+    """Score an already selected final artifact, never choose or rank candidates.
+
+    The run finalizer owns the single invocation after optional final retrain.
+    Absence of private truth is optional; invalid/undefined metrics raise rather
+    than substitute a different metric or a synthetic chance-level score.
+    """
     workspace_dir = Path(workspace_dir)
     private_dir = Path(private_dir)
     private_test = _load_private_test_plan(private_dir)
@@ -675,6 +713,8 @@ def evaluate_private_outputs(
     )
     prediction_columns = contract.prediction.prediction_columns
     primary_metric = contract.metric.primary_metric
+    if primary_metric is not None:
+        primary_metric = str(primary_metric).strip().lower()
     submission_path = contract.prediction.test_submission
     if not submission_path.is_file():
         return None
@@ -702,6 +742,22 @@ def evaluate_private_outputs(
         return None
 
     truth = pd.read_csv(truth_path)
+    required = list(dict.fromkeys([*key_columns, *prediction_columns]))
+    missing = [column for column in required if column not in submission.columns]
+    if missing:
+        raise ValueError("Private submission is missing required contract columns: " + ", ".join(missing))
+    if not len(submission) or len(submission) != len(truth):
+        raise ValueError("Private submission and truth must have equal nonzero row counts.")
+    if key_columns:
+        if any(column not in truth.columns for column in key_columns):
+            raise ValueError("Private truth is missing declared contract keys.")
+        for frame in (truth, submission):
+            if frame[key_columns].isna().any().any() or frame.duplicated(key_columns).any():
+                raise ValueError("Private evaluation keys must be present and unique.")
+        truth_keys = {tuple(row) for row in truth[key_columns].astype(str).to_numpy()}
+        predicted_keys = {tuple(row) for row in submission[key_columns].astype(str).to_numpy()}
+        if truth_keys != predicted_keys:
+            raise ValueError("Private submission keys do not match the sealed truth.")
     label_column = private_test.get("label_column")
     mask_column = private_test.get("mask_column")
     label_columns = [
@@ -742,13 +798,24 @@ def evaluate_private_outputs(
             prediction_spec,
         )
     if result:
+        if not math.isfinite(float(result["value"])):
+            raise ValueError("The requested private primary metric is not finite.")
+        # Optional secondary metrics may be undefined; expose that absence
+        # explicitly instead of serializing JSON NaN/Infinity as a number.
+        unavailable = []
+        for metric, value in result.get("metrics", {}).items():
+            if isinstance(value, (int, float)) and not math.isfinite(float(value)):
+                result["metrics"][metric] = None
+                unavailable.append(metric)
+        if unavailable:
+            result["unavailable_secondary_metrics"] = unavailable
         result["name"] = "private_test"
         result["source"] = source
         result["visible_to_agent"] = False
         results.append(result)
 
     if not results:
-        return None
+        raise ValueError("The requested private metric could not be computed from the final artifacts.")
     return {
         "visible_to_agent": False,
         "note": "Private metrics are for user inspection only and are not passed to the agent.",

@@ -260,8 +260,30 @@ def test_disabled_requires_explicit_original_manifest_not_catalog_inference(expe
         write_json(experiment[1], "run_manifest.json", {"config": {"final_retrain_enabled": False}})
     else:
         experiment[2]["options"] = {"final_retrain_enabled": False}
-    result = build(experiment)["final_retrain"]
-    assert result["state"] == ("disabled" if source == "manifest" else "unknown")
+    overview_result = build(experiment)
+    assert overview_result["final_retrain"]["state"] == ("disabled" if source == "manifest" else "unknown")
+    assert ("final_retrain_result_missing" in overview_result["warnings"]) is (source != "manifest")
+
+
+@pytest.mark.parametrize("missing", [None, "report.md", "journal.json"])
+def test_disabled_retrain_suppresses_only_the_optional_missing_receipt(experiment, missing):
+    seed(experiment)
+    write_json(experiment[1], "run_manifest.json", {"config": {"final_retrain_enabled": False}})
+    if missing:
+        (experiment[1] / missing).unlink()
+    result = build(experiment)
+    assert result["final_retrain"]["state"] == "disabled"
+    expected = [] if missing is None else [missing.rsplit(".", 1)[0] + "_missing"]
+    assert result["warnings"] == expected
+
+
+def test_disabled_manifest_with_retrain_activity_keeps_missing_receipt_warning(experiment):
+    seed(experiment)
+    write_json(experiment[1], "run_manifest.json", {"config": {"final_retrain_enabled": False}})
+    write_events(experiment[1], [{"event": "final_retrain_started", "node_id": "chosen"}])
+    result = build(experiment)
+    assert result["final_retrain"]["state"] == "unknown"
+    assert "final_retrain_result_missing" in result["warnings"]
 
 
 @pytest.mark.parametrize("origin", ["managed", "imported_snapshot"])
@@ -494,9 +516,10 @@ def test_unreadable_present_receipt_prevents_disabled_claim(experiment, monkeypa
     write_json(experiment[1], "run_manifest.json", {"config": {"final_retrain_enabled": False}})
     monkeypatch.setitem(overview.LIMITS, "final_retrain_result.json", 1)
     write_json(experiment[1], "final_retrain_result.json", {"ok": True})
-    result = build(experiment)["final_retrain"]
-    assert result["state"] == "unknown"
-    assert result["reason"] == "receipt_unavailable"
+    result = build(experiment)
+    assert result["final_retrain"]["state"] == "unknown"
+    assert result["final_retrain"]["reason"] == "receipt_unavailable"
+    assert "final_retrain_result_too_large" in result["warnings"]
 
 
 def test_snapshot_revision_captures_changed_run_state(experiment):
@@ -561,6 +584,7 @@ def test_unusable_events_cannot_prove_explicit_disabled_when_new_activity_is_hid
     result = build(experiment)
     assert result["final_retrain"]["state"] == "unknown"
     assert result["final_retrain"]["reason"] == "events_unavailable"
+    assert "final_retrain_result_missing" in result["warnings"]
 
 
 @pytest.mark.parametrize("failure", [

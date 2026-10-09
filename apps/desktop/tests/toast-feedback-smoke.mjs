@@ -62,12 +62,12 @@ async function showReport() {
   await modal().waitFor();
 }
 async function beginCopy(hold = false) {
-  await page.evaluate(hold => { window.__toastClipboard.hold = hold; window.__toastClipboard.release = null; }, hold);
+  await application.evaluate((_electron, hold) => { globalThis.__toastClipboard.hold = hold; globalThis.__toastClipboard.release = null; }, hold);
   await modal().getByRole('button', { name: /^(复制内容|Copy contents)$/ }).click();
-  if (hold) await until(() => page.evaluate(() => typeof window.__toastClipboard.release === 'function'), 'Clipboard completion was not held');
+  if (hold) await until(() => application.evaluate(() => typeof globalThis.__toastClipboard.release === 'function'), 'Clipboard completion was not held');
   else await expectToast(/已复制|Copied/);
 }
-async function releaseCopy() { await page.evaluate(() => window.__toastClipboard.release()); await frame(); }
+async function releaseCopy() { await application.evaluate(() => globalThis.__toastClipboard.release()); await frame(); }
 async function openSettings() { await closePreview(); await page.locator('.sidebar-settings').click(); await page.locator('.settings-modal').waitFor(); }
 async function language(value) {
   await page.locator('.settings-nav').getByRole('button', { name: /^(通用|General)$/ }).click();
@@ -199,13 +199,14 @@ try {
       return original(event, input);
     });
   }, initial);
-  await page.evaluate(() => {
-    const f = window.__toastClipboard = { hold: false, copies: 0, completions: 0, release: null };
-    Object.defineProperty(navigator.clipboard, 'writeText', { configurable: true, value: async () => {
+  await application.evaluate(({ ipcMain }) => {
+    const f = globalThis.__toastClipboard = { hold: false, copies: 0, completions: 0, release: null };
+    ipcMain.removeHandler('biomaker:write-clipboard');
+    ipcMain.handle('biomaker:write-clipboard', async () => {
       f.copies++;
       if (f.hold) { f.hold = false; await new Promise(resolve => { f.release = () => { f.release = null; resolve(); }; }); }
       f.completions++;
-    } });
+    });
   });
   checks.push('isolated-real-sidecar-and-native-storage-with-uninstalled-engine');
 
@@ -294,6 +295,7 @@ try {
       await application.evaluate(() => globalThis.__toastQA.releaseDelete());
     }
     await expectToast(mode === 'failure' ? /实验已加入队列，但未能移除已提交草稿/ : /^实验已加入队列/);
+    if (mode === 'failure') assert.equal(await page.getByTestId('draft-save-state').innerText(), '草稿删除异常');
     const after = await drafts();
     assert.equal(after.drafts.some(entry => entry.id === before.id), mode === 'failure', 'Native source-draft retention does not match the delete outcome');
     assert.deepEqual(after.drafts.filter(entry => entry.id !== before.id), before.before.drafts.filter(entry => entry.id !== before.id), 'Submission changed unrelated native drafts');
@@ -357,7 +359,7 @@ try {
   assert.deepEqual(rendererErrors, []);
   assert.equal(trace.submissions.length, 3);
   assert.deepEqual(trace.deletes.map(row => row.mode), ['fast', 'delayed', 'failure']);
-  observations.clipboard = await page.evaluate(() => ({ copies: window.__toastClipboard.copies, completions: window.__toastClipboard.completions, systemClipboardTouched: false }));
+  observations.clipboard = await application.evaluate(() => ({ copies: globalThis.__toastClipboard.copies, completions: globalThis.__toastClipboard.completions, systemClipboardTouched: false }));
   checks.push('no-renderer-errors-external-provider-runtime-or-real-experiment-writes');
 } catch (error) {
   failure = { message: String(error?.message || error), stack: String(error?.stack || error) };

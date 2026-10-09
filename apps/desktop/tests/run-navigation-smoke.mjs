@@ -47,7 +47,7 @@ async function seed() {
   for (const [kind, id] of Object.entries(ids)) {
     const target = directory(id);
     await mkdir(target, { recursive: true });
-    await writeFile(path.join(target, 'run_manifest.json'), JSON.stringify({ created_at: '2026-10-09T10:00:00Z', data_dir: path.join(temporary, 'synthetic-dataset'), task_description: 'Synthetic navigation and evidence acceptance. These records were not produced by model training.', config: { agent_steps: 32, final_retrain_enabled: false, model_for_all_agents: 'qa-never-called' } }));
+    await writeFile(path.join(target, 'run_manifest.json'), JSON.stringify({ created_at: '2026-10-09T10:00:00Z', data_dir: path.join(temporary, 'long-synthetic-dataset-directory-for-layout-regression'.repeat(4)), task_description: 'Synthetic navigation and evidence acceptance. These records were not produced by model training.', config: { agent_steps: 32, final_retrain_enabled: false, model_for_all_agents: 'qa-never-called' } }));
     const values = [event('run_started')];
     if (kind === 'complete') values.push(...Array.from({ length: 220 }, (_, step) => event('tool_observation', { step, message: `Synthetic recorded observation ${step}` })), event('step_saved', { node_id: nodes.at(-1).id, best_node_id: nodes.at(-1).id }), event('run_finished', { completed_steps: 32 }));
     if (kind === 'failed') values.push(event('run_failed', { error: unknownError }));
@@ -159,13 +159,42 @@ async function refresh() {
   await settled();
 }
 async function language(value) {
+  await assertShellFits(`before-settings-${value}`);
   await page.locator('.sidebar-settings').click();
   await page.getByRole('button', { name: /^(通用|General)$/ }).click();
   await page.getByLabel(/^(界面语言|Interface language)$/).selectOption(value);
   await until(() => page.evaluate(() => window.biomaker.getPreferences()).then(preferences => preferences.language === value), 'Language preference did not persist');
+  await frame();
+  await assertShellFits(`settings-language-${value}`);
   await page.keyboard.press('Escape');
   await page.getByRole('dialog').waitFor({ state: 'hidden' });
   await settled();
+  await assertShellFits(`returned-from-settings-${value}`);
+}
+async function assertShellFits(label) {
+  const value = await page.evaluate(() => {
+    const box = element => { const r = element.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, height: r.height }; };
+    const shell = document.querySelector('.app-shell');
+    const inspector = document.querySelector('.inspector');
+    const reader = document.querySelector('.inspector-scroll');
+    return { height: innerHeight, width: innerWidth, shell: box(shell), shellScroll: shell.scrollTop,
+      shellOverflow: shell.scrollHeight - shell.clientHeight, header: box(document.querySelector('.app-header')),
+      statusbar: box(document.querySelector('.workspace-statusbar')),
+      inspector: inspector && getComputedStyle(inspector).display !== 'none' ? box(inspector) : null,
+      reader: reader && inspector && getComputedStyle(inspector).display !== 'none' ? { ...box(reader), clientHeight: reader.clientHeight, scrollHeight: reader.scrollHeight } : null,
+      horizontalOverflow: document.documentElement.scrollWidth > innerWidth };
+  });
+  geometry.push({ label, ...value });
+  assert.equal(value.shellScroll, 0, label);
+  assert(value.shellOverflow <= 2, `${label}: app shell overflows`);
+  assert(value.header.top >= 0 && value.header.bottom <= value.height, `${label}: topbar is outside window`);
+  assert(value.statusbar.top >= 0 && value.statusbar.bottom <= value.height + 1, `${label}: statusbar is outside window`);
+  assert.equal(value.horizontalOverflow, false, label);
+  if (value.inspector) {
+    assert(value.inspector.top >= 0 && value.inspector.bottom <= value.height + 1, `${label}: inspector escapes window`);
+    assert(value.reader.top >= value.inspector.top && value.reader.bottom <= value.inspector.bottom + 1, `${label}: inspector scroller escapes panel`);
+    assert(value.reader.clientHeight > 100, `${label}: inspector has no usable scroll viewport`);
+  }
 }
 async function screenshot(name, introduction = false) {
   if (introduction) await scroller().evaluate(element => { element.scrollTop = 0; });
@@ -231,6 +260,22 @@ try {
   assert.equal(saved[ids.failed].status_reason, unknownError);
   checks.push('real-startup-discovers-three-readonly-fixtures-without-engine-or-provider');
   await openRun(ids.complete);
+  for (const [width, height] of [[1180, 780], [900, 620]]) {
+    await application.evaluate(({ BrowserWindow }, size) => BrowserWindow.getAllWindows()[0].setContentSize(...size), [width, height]);
+    await frame();
+    if (!await page.locator('.inspector').count()) await page.getByRole('button', { name: '显示实验信息', exact: true }).click();
+    await page.locator('.inspector-scroll').waitFor();
+    assert(await page.locator('.inspector-scroll').evaluate(element => element.scrollHeight > element.clientHeight + 100), 'Long-path inspector must actually overflow internally');
+    await page.locator('.inspector-scroll').evaluate(element => { element.scrollTop = element.scrollHeight; });
+    await language('en');
+    await page.locator('.inspector-scroll').waitFor();
+    await language('zh');
+    await page.locator('.inspector-scroll').waitFor();
+    await screenshot(`layout-settings-roundtrip-${width}-${height}.png`, true);
+  }
+  await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1360, 900));
+  await frame();
+  checks.push('small-and-minimum-windows-retain-topbar-statusbar-and-bounded-inspector-after-settings-language-roundtrips');
   await selectTab('results');
   await scroller().evaluate(element => { element.scrollTop = 0; });
   await selectTab('artifacts');

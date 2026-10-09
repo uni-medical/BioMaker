@@ -240,7 +240,7 @@ def _install_minimal_run(
     monkeypatch.setattr(
         run_module,
         "validate_working_outputs",
-        lambda *_args: SimpleNamespace(ok=True),
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True),
     )
     monkeypatch.setattr(
         run_module,
@@ -296,6 +296,7 @@ def _install_minimal_run(
 
     def final_retrain(*_args, **_kwargs):
         order.append("final_retrain")
+        (cfg.workspace_dir / "final_retrain").mkdir(exist_ok=True)
         return SimpleNamespace(
             ok=retrain_ok,
             workspace_dir=cfg.workspace_dir / "final_retrain",
@@ -679,3 +680,165 @@ def test_save_run_downgrades_tree_html_failure_but_keeps_facts(tmp_path, monkeyp
 
     assert saved == ["journal.json", "results.tsv", "config.yaml"]
     assert warnings == [("tree_export", "OSError", "tree destination unavailable")]
+
+
+@pytest.mark.parametrize("retrain_enabled,retrain_ok", [(False, True), (True, True), (True, False)])
+def test_private_evaluation_occurs_once_after_selection_and_optional_retrain(
+    tmp_path, monkeypatch, retrain_enabled, retrain_ok
+):
+    cfg, events, order, _ = _install_minimal_run(
+        monkeypatch, tmp_path, retrain_ok=retrain_ok, break_on_stop=False
+    )
+    cfg.final_retrain.enabled = retrain_enabled
+    cfg.agent.steps = 2
+    retrain_workspace = cfg.workspace_dir / "final_retrain"
+    retrain_workspace.mkdir()
+    executed = []
+    journals = []
+    private_calls = []
+    receipts = []
+
+    class TwoCandidateWorkflow(_MinimalWorkflow):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.workflow[0].steps_left = 2
+            journals.append(self.journal)
+
+        def update_steps_left(self):
+            return 2
+
+        def parse_round_result(self, round_node, exec_result, **kwargs):
+            super().parse_round_result(round_node, exec_result, **kwargs)
+            # First candidate wins validation; the later workspace must never be scored.
+            round_node.node.metric = MetricValue(0.9 if not self.journal.nodes else 0.1, maximize=True)
+
+    def prepare_workspace(_cfg, node):
+        workspace = cfg.workspace_dir / "candidates" / node.id
+        workspace.mkdir(parents=True)
+        executed.append((node.id, workspace))
+        return _set_execution_workspace(node, workspace)
+
+    def evaluate(workspace, private_dir, *, env_overrides):
+        names = [event for event, _payload in events]
+        assert names.count("step_saved") == 2
+        assert "selection_finalized" in names
+        assert "generation_shutdown" in order
+        assert "execution_shutdown" in order
+        if retrain_enabled:
+            assert "final_retrain_finished" in names
+        private_calls.append((workspace, env_overrides))
+        return {"results": [{"metric_name": "private_auc", "value": 0.314159265}], "visible_to_agent": False}
+
+    monkeypatch.setattr(run_module, "BioMakerWorkflow", TwoCandidateWorkflow)
+    monkeypatch.setattr(run_module, "prepare_node_workspace", prepare_workspace)
+    monkeypatch.setattr(run_module, "evaluate_private_outputs", evaluate)
+    monkeypatch.setattr(run_module, "_append_private_metrics_entry", lambda _cfg, entry: receipts.append(entry))
+    if retrain_enabled and not retrain_ok:
+        with pytest.raises(RuntimeError, match="Final retrain did not complete"):
+            run_module.run()
+        assert private_calls == []
+        assert receipts == []
+        return
+
+    run_module.run()
+    assert len(executed) == 2
+    assert len(private_calls) == len(receipts) == 1
+    assert private_calls[0][0] == (retrain_workspace if retrain_enabled else executed[0][1])
+    assert private_calls[0][0] != executed[-1][1]
+    receipt = receipts[0]
+    assert receipt["node_id"] == executed[0][0]
+    assert receipt["selection_source"] == "validation"
+    assert receipt["protocol"] == "post_selection_once"
+    assert receipt["stage"] == ("final_retrain" if retrain_enabled else "selected_candidate")
+    names = [event for event, _payload in events]
+    assert names.index("selection_finalized") < names.index("private_evaluation_started")
+    assert names.count("private_evaluation_started") == names.count("private_evaluation_finished") == 1
+    assert "0.314159265" not in repr(events)
+    assert "0.314159265" not in repr(journals[0])
+
+
+def test_private_finalizer_uses_final_slot_and_keeps_errors_private(tmp_path, monkeypatch):
+    cfg, events, _order, _ = _install_minimal_run(monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False)
+    node = Node(code="print('selected')")
+    node.metric = MetricValue(0.9, maximize=True)
+    node.step = 0
+    pool = ComputePool((ComputeSlot(index=0, backend="cuda", selector="GPU-final"),))
+    calls = []
+    receipts = []
+
+    def evaluate(workspace, private_dir, *, env_overrides):
+        calls.append(env_overrides)
+        raise ValueError("private score sentinel 0.271828")
+
+    monkeypatch.setattr(run_module, "evaluate_private_outputs", evaluate)
+    monkeypatch.setattr(run_module, "_append_private_metrics_entry", lambda _cfg, entry: receipts.append(entry))
+    run_module._evaluate_selected_private_outputs(cfg, node, tmp_path / "private_gt", cfg.workspace_dir, pool)
+    assert calls == [{"CUDA_VISIBLE_DEVICES": "GPU-final"}]
+    assert receipts[0]["status"] == "unavailable"
+    assert receipts[0]["private_metrics"] is None
+    assert receipts[0]["private_error"] == "private score sentinel 0.271828"
+    assert "0.271828" not in repr(events)
+    assert events[-1][1]["error_type"] == "ValueError"
+
+
+def test_private_finalizer_does_not_fall_back_to_shared_workspace(tmp_path, monkeypatch):
+    cfg, events, _order, _ = _install_minimal_run(monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False)
+    node = Node(code="print('selected')")
+    node.metric = MetricValue(0.9, maximize=True)
+    node.step = 0
+    receipts = []
+    monkeypatch.setattr(run_module, "evaluate_private_outputs", lambda *_a, **_k: pytest.fail("No selected workspace must not score shared artifacts"))
+    monkeypatch.setattr(run_module, "_append_private_metrics_entry", lambda _cfg, entry: receipts.append(entry))
+    pool = ComputePool((ComputeSlot(index=0, backend="cpu"),))
+    run_module._evaluate_selected_private_outputs(cfg, node, tmp_path / "private_gt", None, pool)
+    assert receipts[0]["status"] == "unavailable"
+    assert receipts[0]["artifact_workspace"] is None
+
+
+@pytest.mark.parametrize("submission_override", [None, "./working/predictions/final.csv"])
+def test_private_receipt_hashes_the_same_contract_artifact_it_scores(
+    tmp_path, monkeypatch, submission_override
+):
+    import hashlib
+    import json
+    from pathlib import Path
+    from biomaker.utils.private_evaluation import evaluate_private_outputs
+
+    cfg, _events, _order, _ = _install_minimal_run(
+        monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False
+    )
+    node = Node(code="print('selected')", metric=MetricValue(0.9, maximize=True), step=0)
+    spec = {
+        "key_columns": ["id"], "prediction_columns": ["prob_0", "prob_1"],
+        "class_labels": [0, 1], "primary_metric": "accuracy",
+    }
+    if submission_override is not None:
+        spec["test_submission"] = submission_override
+    (cfg.workspace_dir / "evaluator_prediction_spec.json").write_text(json.dumps(spec))
+    default_submission = cfg.workspace_dir / "working" / "submission.csv"
+    default_submission.parent.mkdir()
+    default_submission.write_text("stale file that must not be fingerprinted\n")
+    submission = cfg.workspace_dir / Path(submission_override or "working/submission.csv")
+    submission.parent.mkdir(parents=True, exist_ok=True)
+    submitted_bytes = b"id,prob_0,prob_1\n1,0.9,0.1\n2,0.1,0.9\n"
+    submission.write_bytes(submitted_bytes)
+    private_dir = tmp_path / "private_gt"
+    private_dir.mkdir()
+    (private_dir / "private_gt.json").write_text(json.dumps({
+        "test": {"file": "test.csv", "answer_columns": ["label"]}
+    }))
+    (private_dir / "test.csv").write_text("id,label\n1,0\n2,1\n")
+    receipts = []
+    monkeypatch.setattr(run_module, "evaluate_private_outputs", evaluate_private_outputs)
+    monkeypatch.setattr(run_module, "_append_private_metrics_entry", lambda _cfg, entry: receipts.append(entry))
+    pool = ComputePool((ComputeSlot(index=0, backend="cpu"),))
+
+    run_module._evaluate_selected_private_outputs(cfg, node, private_dir, cfg.workspace_dir, pool)
+
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["status"] == "evaluated"
+    assert receipt["private_metrics"]["results"][0]["value"] == 1.0
+    assert receipt["submission_sha256"] == hashlib.sha256(submitted_bytes).hexdigest()
+    if submission_override is not None:
+        assert receipt["submission_sha256"] != hashlib.sha256(default_submission.read_bytes()).hexdigest()

@@ -1,0 +1,19 @@
+# Strict evaluator and final private test protocol
+
+New runs use `post_selection_once`. Candidate search computes validation metrics only. After all candidate workers finish, the journal selects the best valid, finite validation result and emits `selection_finalized`. If final retraining is enabled, the selected code is retrained with the permitted merged training labels and its public artifacts are checked. Only then does the run finalizer invoke private test scoring once against the selected candidate workspace or successful retrain workspace. Failed final retraining performs no private test evaluation. A missing selected workspace never falls back to the shared workspace or another candidate's artifacts.
+
+Private metrics remain in `private_metrics.json` for the user's inspection. New files use version 2 and record the protocol, validation-selected node, artifact workspace, submission SHA-256, and `selected_candidate` or `final_retrain` stage. Public lifecycle events carry availability/status only; they do not contain private metric values or private error text. Private scoring failure is recorded as unavailable and does not replace the validation metric, select a different candidate, or invent a substitute test score. `FinalRetrainResult.private_metrics` remains as an empty compatibility field; final retraining no longer owns private scoring.
+
+Evaluator preparation now applies framework-owned negative tests in addition to the evaluator's own self-test. Both validation scoring and submission validation must reject missing required columns (including a declared `split` key), missing/duplicate/unexpected rows or keys, and NaN/Inf/nonnumeric predictions. Submission validation must explicitly confirm success. Evaluators may not repair candidate CSVs; runtime checks reject changes, including rewrites with identical content. Requested AUC that is undefined because a declared class/label is missing cannot become accuracy, a chance-level constant, NaN/Inf, or a marked fallback score. Errors and false validity cannot be consumed as valid primary metrics.
+
+## Compatibility and migration
+
+- Existing experiment directories, evaluator snapshots, reports, journals, and private metric histories are not scanned, rewritten, or retroactively validated. Their original protocol and numerical claims retain their original evidence limitations.
+- Evaluator cache version is now 3. Cache keys from the older permissive contract are not reused for new runs; new or reused version-3 evaluators must pass the strict preparation checks.
+- Historical journal deserialization remains supported. The retained final-retrain field and the existing private-metric history reader support older receipts without implying that those runs followed the new protocol.
+- To obtain results under this protocol, create a new experiment. This change does not re-score a prior experiment and does not launch a real model/API run as a migration step.
+- Low-level historical score-only evaluator fixtures without a frozen prediction specification remain readable; new prepared evaluators require `validate_submission()` and explicit success.
+
+## Regression evidence
+
+`tests/test_strict_evaluation_protocol.py` injects missing `split`, automatic in-memory/on-disk repair, unmarked finite AUC fallback, NaN/Inf, false validator responses, nested fallback markers, private key mismatches, and invalid/missing multilabel classes. `tests/test_presentation_failure_lifecycle.py` uses two completed candidates where the first wins validation to verify selection-before-test ordering, selected-workspace identity, successful/failed retrain behavior, one scoring invocation, final compute-slot propagation, and absence of private values in public events/journals. These are offline regressions, not a new scientific or real-dataset result.

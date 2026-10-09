@@ -1,5 +1,113 @@
 """Deterministic evaluator source templates."""
 
+# Owned by the framework, never supplied by the generated evaluator. This runs
+# only against disposable self-test artifacts and private temporary truth copies.
+_STRICT_ARTIFACT_CONTRACT_CHECK = r"""
+import importlib
+import math
+import os
+from pathlib import Path
+import tempfile
+import pandas as pd
+import evaluator
+
+SPEC = __BIOMAKER_SPEC__
+ANSWER_COLUMNS = __BIOMAKER_ANSWER_COLUMNS__
+KEYS = list(SPEC['key_columns'])
+PREDICTIONS = list(SPEC['prediction_columns'])
+
+def has_fallback(value):
+    if isinstance(value, dict):
+        return any(value.get(key) for key in ('fallback', 'fallback_used', 'used_fallback')) or any(has_fallback(child) for child in value.values())
+    return isinstance(value, list) and any(has_fallback(child) for child in value)
+
+def check_result(value, scoring):
+    if scoring:
+        if not isinstance(value, dict):
+            raise ValueError('score_val must return a metric dictionary')
+        metric = value.get('metric')
+        if isinstance(metric, bool) or not isinstance(metric, (int, float)) or not math.isfinite(metric):
+            raise ValueError('primary metric must be a finite number')
+        if not isinstance(value.get('maximize', True), bool):
+            raise ValueError('maximize must be a boolean when declared')
+        if has_fallback(value) or value.get('error') or value.get('valid') is False:
+            raise ValueError('primary metric must not be a fallback or error result')
+    elif value is not True:
+        if not isinstance(value, dict) or value.get('error') or value.get('valid') is False or value.get('ok') is False or has_fallback(value):
+            raise ValueError('submission validation returned an invalid or fallback result')
+        if value.get('valid') is not True and value.get('ok') is not True:
+            raise ValueError('submission validation did not explicitly succeed')
+
+def call_read_only(scoring, expect_rejection=False, case='valid'):
+    paths = [Path(SPEC[key]) for key in ('validation_artifact', 'test_submission')]
+    originals = {path: path.read_bytes() for path in paths}
+    rejected = False
+    try:
+        value = evaluator.score_val() if scoring else evaluator.validate_submission()
+        check_result(value, scoring)
+    except Exception:
+        rejected = True
+        if not expect_rejection:
+            raise
+    finally:
+        if any(not path.is_file() or path.read_bytes() != data for path, data in originals.items()):
+            raise RuntimeError('Evaluator modified an artifact during ' + case)
+    if expect_rejection and not rejected:
+        raise RuntimeError('Evaluator accepted corrupted contract case: ' + case)
+
+call_read_only(True)
+call_read_only(False)
+for artifact, scoring in (('validation_artifact', True), ('test_submission', False)):
+    path = Path(SPEC[artifact])
+    original = path.read_bytes()
+    frame = pd.read_csv(path)
+    cases = [('missing_column_' + column, frame.drop(columns=[column])) for column in KEYS + PREDICTIONS]
+    cases.append(('missing_row', frame.iloc[:-1].copy()))
+    if len(frame) and KEYS:
+        wrong = frame.copy()
+        wrong[KEYS[0]] = wrong[KEYS[0]].astype(str)
+        wrong.loc[wrong.index[0], KEYS[0]] = '__biomaker_unknown_key__'
+        cases.append(('unexpected_key', wrong))
+        if len(frame) > 1:
+            duplicate = frame.copy()
+            duplicate.loc[duplicate.index[1], KEYS] = duplicate.iloc[0][KEYS].to_numpy()
+            cases.append(('duplicate_key', duplicate))
+    if len(frame):
+        for bad_name, bad in [('nan', float('nan')), ('infinite', float('inf')), ('nonnumeric', 'not-a-number')]:
+            broken = frame.copy()
+            broken[PREDICTIONS[0]] = broken[PREDICTIONS[0]].astype(object)
+            broken.loc[broken.index[0], PREDICTIONS[0]] = bad
+            cases.append((bad_name, broken))
+    try:
+        for name, broken in cases:
+            broken.to_csv(path, index=False)
+            call_read_only(scoring, True, artifact + ':' + name)
+    finally:
+        path.write_bytes(original)
+
+# A finite 0.5/accuracy fallback is still invalid when the declared primary AUC
+# is undefined. Do not modify the real private truth or copy it into ./working.
+metric = str(SPEC.get('primary_metric', '')).lower()
+truth_path = Path(os.environ['BIOMAKER_SCORE_VAL_PATH'])
+if ANSWER_COLUMNS and ('auc' in metric or 'roc' in metric):
+    truth = pd.read_csv(truth_path)
+    if not truth.empty:
+        with tempfile.TemporaryDirectory(prefix='.metric-contract-', dir=truth_path.parent) as temporary:
+            invalid_path = Path(temporary) / 'undefined.csv'
+            invalid = truth.copy()
+            for column in ANSWER_COLUMNS:
+                invalid[column] = invalid[column].iloc[0]
+            invalid.to_csv(invalid_path, index=False)
+            os.environ['BIOMAKER_SCORE_VAL_PATH'] = str(invalid_path)
+            try:
+                importlib.reload(evaluator)
+                call_read_only(True, True, 'undefined_primary_auc')
+            finally:
+                os.environ['BIOMAKER_SCORE_VAL_PATH'] = str(truth_path)
+                importlib.reload(evaluator)
+print('STRICT_ARTIFACT_CONTRACT_OK')
+"""
+
 _FIXED_CLASSIFICATION_EVALUATOR = r"""
 import math
 import os
@@ -161,6 +269,10 @@ def score_val():
         raise RuntimeError(f"Hidden truth missing columns: {missing_truth}")
 
     truth_view = truth[key_columns + answer_columns].copy()
+    if truth_view.empty or truth_view.isna().any().any():
+        raise RuntimeError("Hidden validation truth contains missing keys or answers.")
+    if key_columns and truth_view.duplicated(key_columns).any():
+        raise RuntimeError("Hidden validation truth contains duplicate keys.")
     pred_view = pred[key_columns + prediction_columns].copy()
     truth_view = truth_view.rename(columns={column: f"__true_{column}" for column in answer_columns})
     if key_columns:
@@ -182,7 +294,10 @@ def score_val():
     result = {"maximize": True}
     if spec.get("task_type") == "multilabel":
         true_cols = [f"__true_{column}" for column in answer_columns]
-        y_true = merged[true_cols].to_numpy(dtype=int)
+        y_true = merged[true_cols].to_numpy(dtype=float)
+        if not np.isin(y_true, [0, 1]).all():
+            raise RuntimeError("Hidden multilabel truth must contain binary labels.")
+        y_true = y_true.astype(int)
         y_pred = (scores >= 0.5).astype(int)
         per_label_accuracy = (y_true == y_pred).mean(axis=0)
         metric = float(per_label_accuracy.mean())
@@ -203,10 +318,14 @@ def score_val():
                 result["metric"] = auc
         elif auc_error:
             result["mean_roc_auc_error"] = auc_error
+            if _wants_auc(spec):
+                raise RuntimeError("Requested primary ROC AUC is undefined: " + auc_error)
         return result
 
     labels = list(spec.get("class_labels") or [])
     y_true = merged[f"__true_{answer_columns[0]}"].astype(str).to_numpy()
+    if labels and not set(y_true).issubset({str(label) for label in labels}):
+        raise RuntimeError("Hidden validation truth contains an undeclared class.")
     if scores.shape[1] == 1:
         positive = str(spec.get("positive_class", labels[-1] if labels else "1"))
         negative = next((str(label) for label in labels if str(label) != positive), "0")
@@ -222,6 +341,8 @@ def score_val():
             result["metric"] = auc
     elif auc_error:
         result["macro_roc_auc_error"] = auc_error
+        if _wants_auc(spec):
+            raise RuntimeError("Requested primary ROC AUC is undefined: " + auc_error)
     return result
 
 

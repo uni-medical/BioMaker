@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('biomaker', Object.freeze({
   previewArtifact: (artifact: ArtifactTarget) => invoke('biomaker:preview-artifact', artifact),
   saveArtifact: (artifact: ArtifactSave) => invoke('biomaker:save-artifact', artifact),
   saveConsole: (input: ConsoleSave) => invoke('biomaker:save-console', input),
+  writeClipboardText: (text: string) => invoke('biomaker:write-clipboard', text),
   getAppInfo: () => invoke('biomaker:app-info'),
   getServiceState: () => invoke('biomaker:get-service-state'),
   retryService: () => invoke('biomaker:retry-service'),

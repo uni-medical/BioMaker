@@ -102,13 +102,24 @@ Completed experiments open on Results; running experiments initially open on
 Activity. The overview distinguishes an explicit recorded selection from a unique
 match to the saved solution code. It shows the selected candidate's recorded
 metric and direction, with a link to that candidate. Missing or conflicting
-evidence stays explicit. Generated report prose is a summary to read alongside
-the original records, and imported history represents only the copied files.
+evidence stays explicit. New reports render the saved journal directly, including
+failed attempts, nested validation metrics, recorded execution output and the
+source of resource measurements. Markdown tables render in the preview. Imported
+history represents only the copied files.
 
 Final retraining has its own status. A receipt, a completion event without a
 receipt, an explicit disabled setting and unavailable records have different
 meanings. Recorded candidate metrics and successful retraining do not establish
 independent test performance or clinical validity.
+
+New runs reject malformed prediction artifacts and undefined or fallback primary
+metrics. Private test scoring happens once after validation-based selection and
+any successful final retraining. Trained candidates must save a model manifest,
+checkpoints and portable inference assets; an independent relocated probe checks
+that the saved bundle reloads and reproduces its small example predictions.
+See the [evaluation protocol](docs/EVALUATION-PROTOCOL-MIGRATION-2026-10-09.md)
+and [model artifact contract](docs/MODEL-ARTIFACT-CONTRACT.md) for coverage and
+limits. Older experiment files retain their original evidence and protocol.
 
 Text previews are limited to 500,000 bytes and preserve the original UTF-8 content.
 Saving from a preview verifies the downloaded bytes against that preview's

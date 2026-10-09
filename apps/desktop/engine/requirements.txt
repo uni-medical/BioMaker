@@ -23,6 +23,7 @@ pandas
 Pillow>=12.3
 
 # Common packages available to generated solutions
+joblib
 lightgbm
 matplotlib
 numpy

@@ -1,6 +1,7 @@
 import atexit
 import copy
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -420,7 +421,8 @@ def _append_private_metrics_entry(cfg, entry: dict) -> None:
         "Private metrics are for user inspection only and are not passed to the agent."
     )
     payload = {
-        "version": 1,
+        "version": 2,
+        "protocol": "post_selection_once",
         "visible_to_agent": False,
         "note": note,
         "latest": None,
@@ -449,7 +451,51 @@ def _append_private_metrics_entry(cfg, entry: dict) -> None:
     payload["history"].append(entry)
     payload["latest"] = entry
     payload["summary"] = _private_metrics_summary(payload["history"])
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
+
+
+def _evaluate_selected_private_outputs(cfg, best_node, private_dir, workspace_dir, compute_pool, *, final_retrained=False):
+    """One sealed test evaluation after selection and optional final retrain.
+
+    Public events contain lifecycle state only. A private scoring failure does
+    not rewrite validation selection or turn into a substitute metric.
+    """
+    append_event(cfg.log_dir, "private_evaluation_started", node_id=best_node.id,
+                 protocol="post_selection_once", final_retrained=final_retrained)
+    metrics = None
+    error = None
+    error_type = None
+    try:
+        if workspace_dir is None or not Path(workspace_dir).is_dir():
+            raise ValueError("The selected candidate has no available execution workspace.")
+        with compute_pool.lease(final=True) as slot:
+            metrics = evaluate_private_outputs(workspace_dir, private_dir, env_overrides=slot.env_overrides)
+        if metrics is not None and (metrics.get("error") or not metrics.get("results")):
+            error = str(metrics.get("error") or "No private metric was produced.")
+            metrics = None
+    except Exception as exc:
+        error = str(exc)
+        error_type = type(exc).__name__
+        try:
+            logger.warning("Post-selection private evaluation unavailable (%s).", error_type)
+        except Exception:
+            pass  # Logging cannot invalidate the selected candidate or private receipt.
+    submission = load_experiment_contract(workspace_dir).prediction.test_submission if workspace_dir is not None else None
+    entry = {
+        "protocol": "post_selection_once", "selection_source": "validation",
+        "node_id": best_node.id, "node_step": best_node.step,
+        "stage": "final_retrain" if final_retrained else "selected_candidate",
+        "is_buggy": False, "metric": _metric_payload(best_node), "is_current_best": True,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "artifact_workspace": str(workspace_dir) if workspace_dir is not None else None,
+        "submission_sha256": hashlib.sha256(submission.read_bytes()).hexdigest() if submission is not None and submission.is_file() else None,
+        "private_metrics_available": metrics is not None, "private_metrics": metrics,
+        "private_error": error, "status": "evaluated" if metrics is not None else "unavailable",
+    }
+    _append_private_metrics_entry(cfg, entry)
+    append_event(cfg.log_dir, "private_evaluation_finished", node_id=best_node.id,
+                 protocol="post_selection_once", status=entry["status"], error_type=error_type,
+                 final_retrained=final_retrained)
 
 
 def _final_retrain_timeout_seconds(cfg: Config) -> int:
@@ -794,7 +840,9 @@ def _run(cfg: Config) -> int:
                             details={"messages": normalization_messages},
                         )
                     artifact_check = validate_working_outputs(
-                        execution_workspace, str(agent_task_desc)
+                        execution_workspace, str(agent_task_desc),
+                        candidate_code=str(args[0]) if args else None,
+                        model_probe=node_interpreter.run,
                     )
                     attach_artifact_validation_result(
                         res,
@@ -1311,41 +1359,6 @@ def _run(cfg: Config) -> int:
                 solution_workspace,
                 target_name="working_best",
             )
-        private_metrics = None
-        private_error = None
-        try:
-            with compute_pool.lease() as private_slot:
-                private_metrics = evaluate_private_outputs(
-                    solution_workspace,
-                    private_dir,
-                    env_overrides=private_slot.env_overrides,
-                )
-        except Exception as exc:
-            logger.warning("Private evaluation failed: %s", exc)
-            private_error = str(exc)
-        if (
-            private_metrics
-            or private_error
-            or (private_dir / "private_gt.json").is_file()
-        ):
-            _append_private_metrics_entry(
-                cfg,
-                {
-                    "workflow_step": global_step,
-                    "node_step": node.step,
-                    "node_id": node.id,
-                    "parent_id": node.parent.id if node.parent is not None else None,
-                    "stage": node.node_status,
-                    "is_buggy": bool(node.is_buggy),
-                    "outcome": node.outcome,
-                    "metric": _metric_payload(node),
-                    "is_current_best": node is best_node,
-                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "private_metrics_available": private_metrics is not None,
-                    "private_metrics": private_metrics,
-                    "private_error": private_error,
-                },
-            )
         try:
             tree = journal_to_rich_tree(journal)
         except Exception as exc:
@@ -1496,6 +1509,13 @@ def _run(cfg: Config) -> int:
             finally:
                 executor.shutdown(wait=True)
     best_node = journal.get_best_node(only_good=True)
+    selected_workspace = Path(best_node.execution_workspace) if best_node is not None and best_node.execution_workspace else None
+    if best_node is not None and not end_with_exception:
+        append_event(cfg.log_dir, "selection_finalized", node_id=best_node.id,
+                     node_step=best_node.step, selection_source="validation",
+                     validation_metric=_metric_payload(best_node),
+                     private_evaluation_protocol="post_selection_once",
+                     final_retrain_enabled=cfg.final_retrain.enabled)
     if cfg.final_retrain.enabled and best_node is not None and not end_with_exception:
         retrain_timeout = _final_retrain_timeout_seconds(cfg)
         with compute_pool.lease(final=True) as final_slot:
@@ -1524,44 +1544,22 @@ def _run(cfg: Config) -> int:
                 train_rows_before=retrain_result.train_rows_before,
                 score_rows_added=retrain_result.score_rows_added,
                 train_rows_after=retrain_result.train_rows_after,
-                private_metrics=retrain_result.private_metrics,
                 error=retrain_result.error,
                 compute_backend=final_slot.backend,
                 compute_slot=final_slot_payload,
             )
-        _append_private_metrics_entry(
-            cfg,
-            {
-                "workflow_step": global_step,
-                "node_step": best_node.step,
-                "node_id": best_node.id,
-                "parent_id": (
-                    best_node.parent.id if best_node.parent is not None else None
-                ),
-                "stage": "final_retrain",
-                "is_buggy": not retrain_result.ok,
-                "outcome": (
-                    "final_retrain" if retrain_result.ok else "final_retrain_failed"
-                ),
-                "metric": _metric_payload(best_node),
-                "is_current_best": True,
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "private_metrics_available": retrain_result.private_metrics is not None,
-                "private_metrics": retrain_result.private_metrics,
-                "private_error": retrain_result.error,
-                "train_rows_before": retrain_result.train_rows_before,
-                "score_rows_added": retrain_result.score_rows_added,
-                "train_rows_after": retrain_result.train_rows_after,
-            },
-        )
         if not retrain_result.ok:
             raise RuntimeError(
                 "Final retrain did not complete successfully: "
                 + (retrain_result.error or "unknown error")
             )
+        selected_workspace = retrain_result.workspace_dir
     elif cfg.final_retrain.enabled and best_node is None and not end_with_exception:
         append_event(cfg.log_dir, "final_retrain_skipped", reason="no_best_node")
         raise RuntimeError("Final retrain is enabled but no valid best node exists.")
+    if best_node is not None and not end_with_exception:
+        _evaluate_selected_private_outputs(cfg, best_node, private_dir, selected_workspace,
+                                          compute_pool, final_retrained=cfg.final_retrain.enabled)
     agent_loop_exit_handler(end_with_exception=end_with_exception)
     return global_step
 

@@ -1,6 +1,6 @@
 {
   "name": "biomaker-desktop",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "private": true,
   "description": "BioMaker — a desktop workspace for biomedical model development",
   "author": "BioMaker contributors",
@@ -15,7 +15,7 @@
     "prepare:runtime": "node scripts/prepare-runtime.mjs",
     "icons": "node scripts/build-icons.mjs",
     "start": "electron .",
-    "test": "npm run build:electron && node --test dist-electron/*.test.js scripts/check-package.test.cjs && npm run test:close-protection && npm run test:activity && npm run test:candidates",
+    "test": "npm run build:electron && node --test dist-electron/*.test.js scripts/check-package.test.cjs && npm run test:close-protection && npm run test:activity && npm run test:candidates && npm run test:report-ui",
     "test:close-protection": "node --experimental-strip-types --test tests/close-protection.test.mjs",
     "test:e2e": "node tests/electron-smoke.mjs",
     "package:mac": "npm run build && electron-builder --config electron-builder.yml --mac --arm64",
@@ -24,14 +24,16 @@
     "lock:engine": "node scripts/lock-engine.mjs",
     "verify:release": "node scripts/verify-release.mjs",
     "test:activity": "node --experimental-strip-types --test tests/event-presentation.test.mjs",
-    "test:candidates": "node --experimental-strip-types --test tests/candidate-records.test.mjs"
+    "test:candidates": "node --experimental-strip-types --test tests/candidate-records.test.mjs",
+    "test:report-ui": "node --experimental-strip-types --test tests/markdown.test.mjs tests/draft-errors.test.mjs"
   },
   "dependencies": {
     "json5": "2.2.3",
     "lucide-react": "1.53.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
-    "react-markdown": "10.1.0"
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
   },
   "devDependencies": {
     "@playwright/test": "1.64.0",

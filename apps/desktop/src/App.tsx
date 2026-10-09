@@ -1295,7 +1295,7 @@ export default function App() {
           <div className="header-actions">
             {drafts.ready && ((!selectedId && !history) || drafts.dirty || drafts.saving || drafts.operating || drafts.error) && <span className={`draft-save-state ${drafts.error ? 'failed' : ''}`} role="status" data-testid="draft-save-state">
               {drafts.saving || drafts.operating ? <Spinner size={12} /> : null}
-              {drafts.error ? t('草稿保存异常', 'Draft save issue')
+              {drafts.error ? drafts.errorTitle
                 : drafts.saving || drafts.operating ? t('正在保存…', 'Saving…')
                 : drafts.dirty ? t('等待保存', 'Unsaved changes') : t('草稿已保存', 'Drafts saved')}
             </span>}
@@ -1382,7 +1382,7 @@ export default function App() {
             }}>{t('另存为新草稿', 'Save as a new draft')}</button>}
             {(drafts.dirty || drafts.legacyRaw) && <button className="text-button" onClick={() => {
               const content = drafts.dirty ? JSON.stringify(draft, null, 2) : drafts.legacyRaw!;
-              void navigator.clipboard.writeText(content).then(() => toast(t('草稿内容已复制', 'Draft content copied'))).catch(() => toast(t('无法复制，请手动保留当前内容。', 'Could not copy. Preserve the content manually.')));
+              void window.biomaker.writeClipboardText(content).then(() => toast(t('草稿内容已复制', 'Draft content copied'))).catch(() => toast(t('无法复制，请手动保留当前内容。', 'Could not copy. Preserve the content manually.')));
             }}>{t('复制草稿内容', 'Copy draft content')}</button>}
           </div>
         </div>}

@@ -25,9 +25,11 @@ from PIL import Image
 
 from .. import backend
 from .environment import environment_manifest_text, validate_code_environment
+from .score_validity import has_invalid_result
 from .evaluator_templates import (
     _FIXED_CLASSIFICATION_EVALUATOR,
     _FIXED_SEGMENTATION_EVALUATOR,
+    _STRICT_ARTIFACT_CONTRACT_CHECK,
 )
 from .events import append_event
 from .exp_guide import (
@@ -55,7 +57,7 @@ _RESULT_PREFIX = "EVALUATOR_RESULT_JSON="
 _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 _SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
-_EVALUATOR_CACHE_VERSION = 2
+_EVALUATOR_CACHE_VERSION = 3
 
 
 class EvaluatorSetupError(RuntimeError):
@@ -107,11 +109,14 @@ def parse_external_validation(term_out: list[str] | str) -> tuple[float, bool] |
         payload = line[len(EXTERNAL_VALIDATION_PREFIX) :].strip()
         try:
             data = json.loads(payload)
-            metric = data.get("metric")
-            maximize = bool(data.get("maximize", True))
-            if isinstance(metric, bool) or metric is None:
+            if not isinstance(data, dict) or has_invalid_result(data):
                 return None
-            return float(metric), maximize
+            metric = data.get("metric")
+            maximize = data.get("maximize", True)
+            if isinstance(metric, bool) or not isinstance(metric, (int, float)):
+                return None
+            metric = float(metric)
+            return (metric, maximize) if math.isfinite(metric) else None
         except Exception:
             return None
     return None
@@ -193,11 +198,13 @@ def _evaluator_prompt(
             "For probability outputs, include class_labels when prediction_columns do not directly encode class names; for single-column binary probability outputs, include positive_class.",
             "The submission contract must preserve enough information for the requested user-only test metrics. For classification with AUC, require probabilities rather than only hard labels.",
             f"Define score_val() with no required arguments. It must read hidden score truth from os.environ['{_SCORE_ENV_VAR}'], read the candidate validation artifact from ./working, validate the contract, and return a dict containing numeric key 'metric' and boolean key 'maximize'. Add useful extra metric keys when appropriate.",
-            "Define validate_submission() with no required arguments. It must validate ./working/submission.csv and any referenced files against the same contract, returning a dict or raising a clear exception.",
+            "Define validate_submission() with no required arguments. It must validate ./working/submission.csv and any referenced files against the same contract, returning {'valid': True} only when valid and raising a clear exception or returning {'valid': False} otherwise.",
             "For tabular prediction artifacts, align rows by the declared key columns after normalizing keys to strings; reject missing keys, duplicate keys, extra keys, bad shapes, and invalid numeric values.",
             "For probability outputs, validate with numeric tolerance and return a clear error when rows are not valid probabilities.",
-            "If a primary metric is mathematically undefined on the current validation split, return a deterministic fallback metric with an explanatory field instead of crashing.",
+            "Reject missing required columns (including split), missing or duplicate keys, incomplete rows, NaN/Inf, and malformed probabilities. Never infer or fill a missing required column, silently repair a candidate artifact, or modify an artifact during validation or scoring.",
+            "If the requested primary metric is undefined (including missing classes for ROC AUC), raise a clear exception. Never substitute 0.5, accuracy, or any fallback score. Unsupported or invalid metrics are unavailable, not successful candidate results.",
             f"Define self_test() with no required arguments. It must derive dummy prediction artifacts from the real public score validation and agent_test split CSVs, exactly follow prediction_spec(), call score_val() with os.environ['{_SCORE_ENV_VAR}'] available, call validate_submission(), assert the returned metric is numeric, then print EVALUATOR_OK.",
+            "The framework independently tests valid predictions and corrupted versions with each required column removed, missing/duplicate/unexpected keys and invalid numeric values. Both score_val and validate_submission must reject these; a self_test success marker alone is not accepted.",
             "Keep the evaluator simple and deterministic. Use standard metrics from sklearn when directly applicable and small direct numpy/PIL implementations for image masks.",
             "For segmentation masks, support mask files referenced from CSV. The prediction spec should make this explicit with prediction_type='mask_file_path' or file_reference_columns for the mask path column. Binary Dice should treat nonzero pixels as foreground. AJI/instance metrics should use integer connected/instance labels if the task asks for them.",
         ],
@@ -491,6 +498,9 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
             "prediction_spec() must declare primary_metric, such as auc, accuracy, binary_dice, or aji."
         )
 
+    if "maximize" in spec and not isinstance(spec["maximize"], bool):
+        raise EvaluatorSetupError("prediction_spec() maximize must be a boolean when declared.")
+
     normalized: dict[str, Any] = {
         "validation_artifact": validation_artifact
         or "./working/validation_predictions.csv",
@@ -581,8 +591,8 @@ def _run_public_artifact_contract_test(
         spec = json.loads(prediction_spec)
     except Exception as exc:
         raise EvaluatorSetupError(f"Could not parse normalized prediction_spec: {exc}")
-    if not isinstance(spec, dict) or not _should_run_tabular_contract_test(spec):
-        return
+    if not isinstance(spec, dict):
+        raise EvaluatorSetupError("prediction_spec must be a dictionary.")
 
     key_columns = _list_of_strings(spec.get("key_columns"))
     prediction_columns = _list_of_strings(spec.get("prediction_columns"))
@@ -597,6 +607,17 @@ def _run_public_artifact_contract_test(
                 f"prediction_spec {artifact_key} must point under ./working for "
                 "public artifact contract tests."
             )
+
+    if not _should_run_tabular_contract_test(spec):
+        # File-reference tasks use the valid artifacts produced by self_test;
+        # synthesizing numeric CSV values would destroy their mask/volume paths.
+        code = _STRICT_ARTIFACT_CONTRACT_CHECK.replace("__BIOMAKER_SPEC__", repr(spec)).replace("__BIOMAKER_ANSWER_COLUMNS__", "[]")
+        completed = _run_python(workspace_dir, code, timeout=timeout,
+                                env=_hidden_score_env(workspace_dir, hidden_score_path))
+        if completed.returncode != 0:
+            output = _sanitize_private_paths((completed.stdout or "") + (completed.stderr or ""), hidden_score_path)
+            raise EvaluatorSetupError("Evaluator strict artifact contract test failed.\n" + output[-4000:])
+        return
 
     working_dir = workspace_dir / "working"
     original_working_existed = working_dir.exists()
@@ -629,13 +650,9 @@ def _run_public_artifact_contract_test(
             include_extra_label_like_columns=True,
         )
 
-        code = (
-            "import evaluator\n"
-            "score = evaluator.score_val()\n"
-            "if not isinstance(score.get('metric'), (int, float)):\n"
-            "    raise RuntimeError('score_val() metric must be numeric: ' + repr(score))\n"
-            "evaluator.validate_submission()\n"
-        )
+        score_path = Path(_hidden_score_env(workspace_dir, hidden_score_path)[_SCORE_ENV_VAR])
+        answer_columns = _truth_answer_columns(workspace_dir, {}, score_path, pd.read_csv(score_split))
+        code = _STRICT_ARTIFACT_CONTRACT_CHECK.replace("__BIOMAKER_SPEC__", repr(spec)).replace("__BIOMAKER_ANSWER_COLUMNS__", repr(answer_columns))
         completed = _run_python(
             workspace_dir,
             code,
@@ -649,7 +666,7 @@ def _run_public_artifact_contract_test(
                 "Evaluator public artifact contract test failed. "
                 "score_val() must accept validation predictions containing only "
                 "key_columns plus prediction_columns from prediction_spec(); it should "
-                f"load hidden score labels from ${_SCORE_ENV_VAR}.\n" + output[-4000:]
+                f"load hidden score labels from ${_SCORE_ENV_VAR}. Corrupted artifacts and undefined primary metrics must be rejected without modifying artifacts.\n" + output[-4000:]
             )
     finally:
         if working_dir.exists():
@@ -1429,13 +1446,12 @@ def _write_fixed_evaluator(
         prediction_spec = _normalize_prediction_spec_json(
             _load_prediction_spec(workspace_dir)
         )
-        if run_public_contract:
-            _run_public_artifact_contract_test(
-                workspace_dir,
-                prediction_spec,
-                timeout=timeout,
-                hidden_score_path=hidden_score_path,
-            )
+        _run_public_artifact_contract_test(
+            workspace_dir,
+            prediction_spec,
+            timeout=timeout,
+            hidden_score_path=hidden_score_path,
+        )
     except Exception:
         try:
             evaluator_path.unlink()
@@ -2061,6 +2077,22 @@ def prepare_evaluator(
     )
 
 
+def _artifact_fingerprints(workspace_dir: Path) -> dict[str, tuple | None]:
+    spec = _json_dict(workspace_dir / "evaluator_prediction_spec.json")
+    values = [spec.get("validation_artifact"), spec.get("test_submission", "./working/submission.csv")]
+    fingerprints = {}
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        relative = Path(value.removeprefix("./"))
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "working":
+            continue
+        path = workspace_dir / relative
+        info = path.stat() if path.is_file() else None
+        fingerprints[str(path)] = None if info is None else (info.st_size, info.st_mtime_ns, info.st_ctime_ns, _sha256_file(path))
+    return fingerprints
+
+
 def score_candidate_with_evaluator(
     workspace_dir: Path | str,
     timeout: int = 120,
@@ -2069,6 +2101,7 @@ def score_candidate_with_evaluator(
 ) -> EvaluatorRunResult:
     """Run the frozen evaluator against the current ./working artifacts."""
     workspace_dir = Path(workspace_dir)
+    artifacts_before = _artifact_fingerprints(workspace_dir)
     code = (
         "import json, evaluator\n"
         "validation = None\n"
@@ -2106,6 +2139,9 @@ def score_candidate_with_evaluator(
         (completed.stdout or "") + (completed.stderr or ""),
         hidden_score_path,
     )
+    if _artifact_fingerprints(workspace_dir) != artifacts_before:
+        return EvaluatorRunResult(ok=False, metric=None, maximize=True, details={}, output=output,
+                                  error="Evaluator modified a candidate artifact; validation must be read-only.")
     if completed.returncode != 0:
         return EvaluatorRunResult(
             ok=False,
@@ -2131,13 +2167,20 @@ def score_candidate_with_evaluator(
                 )
             )
             score = payload.get("score") or {}
+            validation = payload.get("submission_validation")
+            if validation is not None or (workspace_dir / "evaluator_prediction_spec.json").is_file():
+                _require_submission_success(validation)
+            if not isinstance(score, dict):
+                raise ValueError("score_val() did not return a metric dictionary.")
+            if has_invalid_result(score):
+                raise ValueError("score_val() returned a fallback or invalid metric result.")
             metric = score.get("metric")
-            if isinstance(metric, bool) or metric is None:
+            if isinstance(metric, bool) or not isinstance(metric, (int, float)):
                 raise ValueError("score_val() did not return numeric 'metric'.")
             metric = float(metric)
             if not math.isfinite(metric):
                 raise ValueError("score_val() returned a non-finite metric.")
-            maximize = bool(score.get("maximize", True))
+            maximize = score.get("maximize", True)
             spec_path = workspace_dir / "evaluator_prediction_spec.json"
             if spec_path.is_file():
                 try:
@@ -2145,7 +2188,9 @@ def score_candidate_with_evaluator(
                 except Exception:
                     spec = {}
                 if isinstance(spec, dict) and "maximize" in spec:
-                    expected_maximize = bool(spec["maximize"])
+                    expected_maximize = spec["maximize"]
+                    if not isinstance(expected_maximize, bool):
+                        raise ValueError("prediction_spec maximize must be a boolean.")
                     if maximize != expected_maximize:
                         raise ValueError(
                             "score_val() returned maximize="
@@ -2179,6 +2224,17 @@ def score_candidate_with_evaluator(
     )
 
 
+def _require_submission_success(value: Any) -> None:
+    if value is True:
+        return
+    if isinstance(value, dict):
+        if has_invalid_result(value):
+            raise ValueError("validate_submission() returned an invalid or fallback result.")
+        if value.get("valid") is True or value.get("ok") is True:
+            return
+    raise ValueError("validate_submission() did not explicitly confirm a valid submission.")
+
+
 def validate_submission_with_evaluator(
     workspace_dir: Path | str,
     timeout: int = 120,
@@ -2186,6 +2242,7 @@ def validate_submission_with_evaluator(
 ) -> EvaluatorRunResult:
     """Run only the frozen evaluator's public test-submission validation."""
     workspace_dir = Path(workspace_dir)
+    artifacts_before = _artifact_fingerprints(workspace_dir)
     code = (
         "import json, evaluator\n"
         "if not hasattr(evaluator, 'validate_submission'):\n"
@@ -2213,6 +2270,9 @@ def validate_submission_with_evaluator(
         )
 
     output = (completed.stdout or "") + (completed.stderr or "")
+    if _artifact_fingerprints(workspace_dir) != artifacts_before:
+        return EvaluatorRunResult(ok=False, metric=None, maximize=True, details={}, output=output,
+                                  error="Evaluator modified a candidate artifact; validation must be read-only.")
     if completed.returncode != 0:
         return EvaluatorRunResult(
             ok=False,
@@ -2230,6 +2290,7 @@ def validate_submission_with_evaluator(
             continue
         try:
             payload = json.loads(line[len(_RESULT_PREFIX) :])
+            _require_submission_success(payload.get("submission_validation"))
         except Exception as exc:
             return EvaluatorRunResult(
                 ok=False,

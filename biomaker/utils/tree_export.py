@@ -192,7 +192,7 @@ def _format_mb(value) -> str:
     if value is None:
         return ""
     try:
-        return f"{float(value):.0f} MB"
+        return f"{float(value):.0f} MiB"
     except Exception:
         return str(value)
 
@@ -379,7 +379,14 @@ def _node_summary(node, best_node) -> dict:
         "metric": "" if metric == "n/a" else metric,
         "runtime": _format_seconds(node.exec_time),
         "memory": _format_mb(resources.get("peak_rss_mb")),
-        "gpu_memory": _format_mb(resources.get("peak_gpu_memory_mb")),
+        "gpu_memory": (
+            "not independently measured (RSS proxy)"
+            if resources.get("gpu_memory_source") == "unified_memory_rss_proxy"
+            else _format_mb(resources.get("peak_gpu_memory_mb"))
+            + (" (total delta, approximate)" if resources.get("gpu_memory_source") == "nvidia-smi_total_used_delta_approx"
+               else " (process tree)" if resources.get("gpu_memory_source") == "nvidia-smi_compute_apps_process_tree"
+               else " (source unconfirmed)" if resources.get("peak_gpu_memory_mb") is not None else "")
+        ),
         "cpu": (
             ""
             if resources.get("avg_cpu_percent") is None

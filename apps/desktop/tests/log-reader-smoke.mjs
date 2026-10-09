@@ -155,7 +155,7 @@ try {
   page.on('pageerror', error => errors.push(error.message));
   await until(async () => { try { return (await page.evaluate(() => window.biomaker.getServiceState())).status === 'ready'; } catch { return false; } }, 'The real sidecar did not start', 60_000);
   await page.locator('.sidebar-settings').waitFor();
-  await page.evaluate(() => { window.__logReaderCopied = []; navigator.clipboard.writeText = async value => { window.__logReaderCopied.push(value); }; });
+  await application.evaluate(({ ipcMain }) => { globalThis.__logReaderCopied = []; ipcMain.removeHandler('biomaker:write-clipboard'); ipcMain.handle('biomaker:write-clipboard', async (_event, value) => { globalThis.__logReaderCopied.push(value); }); });
   const runs = await api('/api/runs');
   runIds = names.map(name => runs.find(run => run.id === name || run.name === name)?.id);
   assert(runIds.every(Boolean), 'Both synthetic histories must be cataloged');
@@ -217,7 +217,7 @@ try {
   await search.fill('needle');
   const copiedWindow = await text();
   await reader().getByRole('button', { name: '复制当前片段', exact: true }).click();
-  assert.equal(await page.evaluate(() => window.__logReaderCopied.at(-1)), copiedWindow);
+  assert.equal(await application.evaluate(() => globalThis.__logReaderCopied.at(-1)), copiedWindow);
   assert.equal(await text(), copiedWindow);
   await page.getByRole('tab', { name: '活动', exact: true }).click();
   await page.keyboard.press(`${modifier}+f`);

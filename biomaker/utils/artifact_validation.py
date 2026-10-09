@@ -5,11 +5,13 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 import pandas as pd
 from PIL import Image
 
 from .mask_io import load_mask
+from .model_artifacts import validate_model_artifacts
 from .prediction_contract import (
     load_prediction_contract,
     resolve_artifact_path,
@@ -20,6 +22,7 @@ from .prediction_contract import (
 class ArtifactValidationResult:
     ok: bool
     messages: list[str]
+    model_artifact: dict[str, Any] | None = None
 
 
 def _resolve_artifact_path(workspace_dir: Path, value: str) -> Path:
@@ -105,9 +108,33 @@ def normalize_working_outputs(workspace_dir: Path | str, task_desc: str) -> list
 
 
 def validate_working_outputs(
-    workspace_dir: Path | str, task_desc: str
+    workspace_dir: Path | str,
+    task_desc: str,
+    *,
+    candidate_code: str | None = None,
+    model_probe: Callable[[str], Any] | None = None,
 ) -> ArtifactValidationResult:
     """Check common generated artifacts before the agent accepts a run."""
+    predictions = _validate_prediction_outputs(workspace_dir, task_desc)
+    if not predictions.ok:
+        return predictions
+    contract = load_prediction_contract(workspace_dir)
+    model = validate_model_artifacts(
+        workspace_dir,
+        candidate_code=candidate_code,
+        required=contract.raw.get("model_artifact_required") is True,
+        model_probe=model_probe,
+    )
+    return ArtifactValidationResult(
+        ok=model.ok,
+        messages=predictions.messages + model.messages,
+        model_artifact=model.evidence,
+    )
+
+
+def _validate_prediction_outputs(
+    workspace_dir: Path | str, task_desc: str
+) -> ArtifactValidationResult:
     workspace_dir = Path(workspace_dir)
     input_dir = workspace_dir / "input"
     contract = load_prediction_contract(workspace_dir)

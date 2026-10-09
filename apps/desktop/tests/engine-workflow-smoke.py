@@ -79,8 +79,11 @@ print('Prepared the three explicit synthetic QA splits.')
 CANDIDATE = r"""
 import json
 import os
+import hashlib
 from pathlib import Path
+import joblib
 import pandas as pd
+import sklearn
 from sklearn.linear_model import LogisticRegression
 
 assert os.environ.get('BIOMAKER_QA_GUARD_ACTIVE') == str(os.getpid())
@@ -105,6 +108,28 @@ proof = {'synthetic': True, 'implementation': 'sklearn.linear_model.LogisticRegr
          'guard_active': True, 'classes': model.classes_.tolist(),
          'coefficients': model.coef_.tolist(), 'intercept': model.intercept_.tolist()}
 (output / 'synthetic_model.json').write_text(json.dumps(proof, indent=2))
+joblib.dump(model, output / 'model.joblib')
+probe_inputs = train[features].iloc[:2].values.tolist()
+(output / 'smoke_input.json').write_text(json.dumps(probe_inputs))
+(output / 'smoke_expected.json').write_text(json.dumps(model.predict_proba(pd.DataFrame(probe_inputs, columns=features)).tolist()))
+(output / 'inference.py').write_text(
+    'import joblib\nimport pandas as pd\n'
+    'def predict(inputs, artifact_dir):\n'
+    '    model = joblib.load(artifact_dir / "model.joblib")\n'
+    '    return model.predict_proba(pd.DataFrame(inputs, columns=["x0", "x1"]))\n'
+)
+artifact_files = []
+for name in ['model.joblib', 'inference.py', 'smoke_input.json', 'smoke_expected.json']:
+    artifact_files.append({'path': name, 'role': 'checkpoint' if name == 'model.joblib' else 'asset',
+        'format': 'joblib' if name == 'model.joblib' else None,
+        'sha256': hashlib.sha256((output / name).read_bytes()).hexdigest()})
+(output / 'model_manifest.json').write_text(json.dumps({
+    'schema_version': 1, 'framework': 'sklearn', 'files': artifact_files,
+    'inference': {'entrypoint': 'inference.py', 'input': 'smoke_input.json', 'expected_output': 'smoke_expected.json'},
+    'metadata': {'input_schema': {'features': features}, 'output_schema': {'columns': ['prob_0', 'prob_1']},
+        'preprocessing': 'numeric x0 and x1, no scaling', 'class_labels': [0, 1],
+        'dependencies': {'scikit-learn': sklearn.__version__, 'pandas': pd.__version__, 'joblib': joblib.__version__}}
+}, indent=2))
 print('BIO_MAKER_QA_CPU_FIT ' + json.dumps(proof))
 """
 
@@ -433,8 +458,15 @@ def verify(
             if item["event"] == "connect"
         )
     stages = [request["stage"] for request in fixture.requests_seen]
-    for stage in ("split_builder", "draft_plan", "candidate", "report"):
+    for stage in ("split_builder", "draft_plan", "candidate"):
         assert stages.count(stage) == 1, stages
+    assert stages.count("report") == 0, stages
+    model_check = node["execution"]["artifact_validation"]["model_artifact"]
+    assert model_check["ok"] and model_check["checkpoint_count"] == 1
+    assert model_check["relocated"] and model_check["probe_examples"] == 2
+    assert model_check["artifact_sha256"]["model.joblib"] == digest(
+        log / "working_best/model.joblib"
+    )
     assert not fixture.errors, fixture.errors
     proof.update(
         {
@@ -446,6 +478,7 @@ def verify(
             "completed_steps": 1,
             "synthetic_fixture_accuracy": node["metric"]["value"],
             "candidate_fit": fit,
+            "saved_model_check": model_check,
             "events": names,
             "local_api_calls": fixture.requests_seen,
             "guarded_python_processes": len(

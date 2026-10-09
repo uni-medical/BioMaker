@@ -441,6 +441,11 @@ changed snapshot suppresses every cross-file interpretation, without retries.
                 result["warnings"].append("snapshot_changed")
             result["artifacts"] = [{key: file[key] for key in ("name", "state", "revision")} for name in ARTIFACT_NAMES for file in [files[name]]]
             for name, file in files.items():
+                # A disabled retrain has no receipt by design. Keep unreadable,
+                # invalid and conflicting evidence visible, including histories
+                # whose original manifest cannot establish that it was disabled.
+                if name == "final_retrain_result.json" and file["state"] == "missing" and result["final_retrain"]["state"] == "disabled":
+                    continue
                 if file["state"] != "available":
                     result["warnings"].append(name.split(".")[0] + "_" + file["state"])
             return result

@@ -160,7 +160,8 @@ try {
   await page.getByRole('button', { name: '保存 report.md', exact: true }).click();
   await page.getByText('文件已保存', { exact: true }).waitFor();
   const report = await readFile(destination, 'utf8');
-  assert(report.includes('Synthetic workflow acceptance') && report.includes('software integration test'));
+  assert(report.includes('# BioMaker experiment report') && report.includes('Synthetic software acceptance only'));
+  assert(report.includes('Saved-model check') && report.includes('checkpoint_count'));
   await snapshot('06-exported-real-report');
   await page.getByRole('tab', { name: '运行日志', exact: true }).click();
   await page.getByText('Starting BioMaker workflow', { exact: false }).last().waitFor();

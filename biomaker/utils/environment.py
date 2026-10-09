@@ -32,6 +32,7 @@ PACKAGE_SPECS = [
     PackageSpec("numpy", "numpy", "numpy"),
     PackageSpec("pandas", "pandas", "pandas"),
     PackageSpec("sklearn", "scikit-learn", "scikit-learn"),
+    PackageSpec("joblib", "joblib", "joblib"),
     PackageSpec("scipy", "scipy", "scipy"),
     PackageSpec("matplotlib", "matplotlib", "matplotlib"),
     PackageSpec("torch", "torch", "torch"),

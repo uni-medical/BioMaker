@@ -508,15 +508,24 @@ def _format_usage_line(resource_usage: dict | None) -> str | None:
     parts = []
     peak_rss = resource_usage.get("peak_rss_mb")
     if isinstance(peak_rss, (int, float)):
-        parts.append(f"peak_rss={peak_rss:.1f} MB")
+        parts.append(f"peak_rss={peak_rss:.1f} MiB")
     avg_cpu = resource_usage.get("avg_cpu_percent")
     if isinstance(avg_cpu, (int, float)):
         parts.append(f"avg_cpu={avg_cpu:.1f}%")
     peak_gpu = resource_usage.get("peak_gpu_memory_mb")
     if isinstance(peak_gpu, (int, float)):
         backend = resource_usage.get("gpu_backend")
-        name = f"peak_{backend}_memory" if backend else "peak_gpu_memory"
-        parts.append(f"{name}={peak_gpu:.1f} MB")
+        source = resource_usage.get("gpu_memory_source")
+        if source == "unified_memory_rss_proxy":
+            parts.append("gpu_memory=not independently measured (unified-memory RSS proxy)")
+        else:
+            if source == "nvidia-smi_total_used_delta_approx":
+                name = "peak_gpu_total_delta_approx"
+            elif source == "nvidia-smi_compute_apps_process_tree":
+                name = "peak_gpu_process_tree"
+            else:
+                name = f"recorded_peak_{backend or 'gpu'}_memory_source_unconfirmed"
+            parts.append(f"{name}={peak_gpu:.1f} MiB")
     peak_processes = resource_usage.get("peak_process_count")
     if isinstance(peak_processes, (int, float)) and peak_processes > 1:
         parts.append(f"peak_processes={int(peak_processes)}")

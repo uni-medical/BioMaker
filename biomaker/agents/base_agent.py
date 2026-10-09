@@ -1,5 +1,6 @@
 import logging
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, cast
 
@@ -16,6 +17,8 @@ from ..utils.evaluator_setup import (
 )
 from ..utils.environment import environment_manifest_text
 from ..utils.metric import MetricValue, WorstMetricValue
+from ..utils.model_artifacts import MODEL_ARTIFACT_GUIDELINE
+from ..utils.score_validity import has_invalid_result
 from ..utils.response import (
     extract_code_blocks,
     extract_text_up_to_code,
@@ -63,17 +66,25 @@ def parse_factual_exec_result(
         score_details = {k: v for k, v in details.items() if k != "artifact_report"}
         node.evaluator_details = {
             "metric": evaluator_result.get("metric"),
-            "maximize": bool(evaluator_result.get("maximize", True)),
+            "maximize": evaluator_result.get("maximize", True),
             "details": score_details,
         }
         metric = evaluator_result.get("metric")
-        if evaluator_result.get("ok") and not isinstance(metric, bool):
+        invalid_score = has_invalid_result(evaluator_result)
+        if (
+            evaluator_result.get("ok") is True
+            and not invalid_score
+            and not isinstance(metric, bool)
+            and isinstance(metric, (int, float))
+        ):
             try:
-                external_metric = (
-                    float(metric),
-                    bool(evaluator_result.get("maximize", True)),
-                )
-            except (TypeError, ValueError):
+                value = float(metric)
+                if math.isfinite(value):
+                    external_metric = (
+                        value,
+                        evaluator_result.get("maximize", True),
+                    )
+            except (TypeError, ValueError, OverflowError):
                 external_metric = None
     else:
         node.evaluator_details = parse_external_validation_details(exec_result.term_out)
@@ -253,6 +264,7 @@ class BaseAgent:
             "A frozen evaluator is available as `./evaluator.py`; strictly follow `evaluator.prediction_spec()` for score-validation predictions and `./working/submission.csv`.",
             "BioMaker computes the final node score after your script exits using hidden score labels that are not available to generated code. You may call `evaluator.validate_submission()` yourself after writing the required files, but do not call `evaluator.score_val()` inside generated code because the hidden score labels are only supplied to BioMaker's external scoring process.",
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
+            MODEL_ARTIFACT_GUIDELINE,
         ]
         if self.acfg.expose_prediction:
             impl_guideline.append(

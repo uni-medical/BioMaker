@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, Notification, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from 'electron';
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -14,6 +14,7 @@ import { datasetInspectionBody } from './dataset-inspection';
 import { saveProviderSettings } from './provider-settings';
 import { artifactRequest, consoleRequest, artifactService, previewArtifact, createArtifactSaver } from './artifacts';
 import { DraftStore, DraftError, type DraftFlushResult } from './drafts';
+import { clipboardText } from './clipboard';
 
 app.setName('BioMaker');
 // Test/review installs can use a separate profile without touching real projects.
@@ -189,6 +190,7 @@ function installMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 function setupIPC() {
+  handle('biomaker:write-clipboard', value => clipboard.writeText(clipboardText(value)));
   const drafts = () => {
     if (quitting || !draftStore) throw new DraftError('unavailable');
     return draftStore;

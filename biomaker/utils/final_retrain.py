@@ -23,7 +23,6 @@ from .execution_record import (
     attach_evaluator_run_result,
 )
 from .experiment_contract import load_experiment_contract
-from .private_evaluation import evaluate_private_outputs
 
 logger = logging.getLogger("biomaker")
 
@@ -57,6 +56,8 @@ class FinalRetrainResult:
                 else self.exec_result.execution_record()
             ),
             "private_metrics": self.private_metrics,
+            "private_evaluation": {"protocol": "post_selection_once", "performed_here": False,
+                                   "owner": "run_finalization_after_retrain"},
             "error": self.error,
         }
 
@@ -331,7 +332,8 @@ def run_final_retrain(
                 "\n".join(normalization_messages),
                 details={"messages": normalization_messages},
             )
-        artifact_check = validate_working_outputs(retrain_workspace, "final retrain")
+        artifact_check = validate_working_outputs(retrain_workspace, "final retrain",
+                                                 candidate_code=best_node.code, model_probe=interpreter.run)
         attach_artifact_validation_result(
             exec_result,
             artifact_check,
@@ -362,15 +364,8 @@ def run_final_retrain(
             return result
 
         _copy_retrain_outputs_to_log(cfg, retrain_workspace)
-        try:
-            result.private_metrics = evaluate_private_outputs(
-                retrain_workspace,
-                private_dir,
-                env_overrides=env_overrides,
-            )
-        except Exception as exc:
-            result.error = f"Private evaluation failed after final retrain: {exc}"
-            return result
+        # The run finalizer evaluates the selected delivery exactly once. This
+        # function owns fitting and public artifact checks, never test scoring.
         result.ok = True
         return result
     except Exception as exc:

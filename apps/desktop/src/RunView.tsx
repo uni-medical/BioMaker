@@ -1,6 +1,7 @@
 import { runStatusExplanation, runTailExplanation } from "./runEvidence";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import { markdownOptions } from "./markdown";
 import Candidates from "./Candidates";
 import RunActivity from "./RunActivity";
 import RunLogViewer from "./RunLogViewer";
@@ -281,7 +282,7 @@ export default function RunView({
   }
   async function copy(value: string) {
     try {
-      await navigator.clipboard.writeText(value);
+      await window.biomaker.writeClipboardText(value);
       toast(t("已复制", "Copied"));
       return true;
     } catch {
@@ -358,7 +359,7 @@ export default function RunView({
               />
             </button>
             <div className={`task-markdown ${promptOpen ? "expanded" : ""}`}>
-              <ReactMarkdown>{run.project_snapshot.task_body}</ReactMarkdown>
+              <ReactMarkdown {...markdownOptions}>{run.project_snapshot.task_body}</ReactMarkdown>
             </div>
           </div>
         )}
@@ -575,7 +576,7 @@ export default function RunView({
           <div className="file-preview">
             {preview.name.endsWith(".md") ? (
               <div className="markdown">
-                <ReactMarkdown>{preview.content}</ReactMarkdown>
+                <ReactMarkdown {...markdownOptions}>{preview.content}</ReactMarkdown>
               </div>
             ) : (
               <pre tabIndex={0}>{preview.content}</pre>

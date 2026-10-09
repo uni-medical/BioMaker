@@ -8,6 +8,7 @@ The journal is the core datastructure in BioMaker that contains:
 """
 
 import json
+import math
 import random
 import time
 import uuid
@@ -18,6 +19,7 @@ from dataclasses_json import DataClassJsonMixin
 
 from .interpreter import ExecutionResult
 from .utils.metric import MetricValue
+from .utils.score_validity import has_invalid_result
 from .utils.response import (
     format_prompt_execution_output,
     redact_local_paths,
@@ -261,7 +263,7 @@ class Journal(DataClassJsonMixin):
         """Return one of the top-k best solutions found so far (randomly chosen)."""
 
         if only_good:
-            nodes = self.good_nodes
+            nodes = [node for node in self.good_nodes if _has_rankable_metric(node)]
             if not nodes:
                 return None
         else:
@@ -281,7 +283,10 @@ class Journal(DataClassJsonMixin):
 
     def _reference_nodes(self, topk: int) -> list[Node]:
         """Return deterministic high-scoring successful nodes for factual memory."""
-        good_nodes = sorted(self.good_nodes, key=lambda n: n.metric, reverse=True)
+        good_nodes = sorted(
+            (node for node in self.good_nodes if _has_rankable_metric(node)),
+            key=lambda n: n.metric, reverse=True,
+        )
         return good_nodes[:topk]
 
     def generate_tree_index(self) -> str:
@@ -483,6 +488,17 @@ class Journal(DataClassJsonMixin):
         )
 
 
+def _has_rankable_metric(node: Node) -> bool:
+    """Historical journals remain readable, but invalid scores cannot win."""
+    value = getattr(node.metric, "value", None)
+    if (
+        node.exc_type or isinstance(value, bool)
+        or not isinstance(value, (int, float)) or not math.isfinite(value)
+    ):
+        return False
+    return not has_invalid_result(node.evaluator_details)
+
+
 def _better_delta(current: float, baseline: float, maximize: bool) -> float:
     """Positive means current is better than baseline."""
     return current - baseline if maximize else baseline - current
@@ -515,17 +531,27 @@ def _format_resource_usage(resource_usage: dict | None) -> str:
     peak_rss = resource_usage.get("peak_rss_mb")
     if isinstance(peak_rss, (int, float)):
         if peak_rss >= 1024:
-            parts.append(f"peak_rss {peak_rss / 1024:.2f}GB")
+            parts.append(f"peak_rss {peak_rss / 1024:.2f} GiB")
         else:
-            parts.append(f"peak_rss {peak_rss:.0f}MB")
+            parts.append(f"peak_rss {peak_rss:.0f} MiB")
     peak_gpu = resource_usage.get("peak_gpu_memory_mb")
     if isinstance(peak_gpu, (int, float)):
         backend = resource_usage.get("gpu_backend")
-        label = f"peak_{backend}" if backend else "peak_gpu"
-        if peak_gpu >= 1024:
-            parts.append(f"{label} {peak_gpu / 1024:.2f}GB")
+        source = resource_usage.get("gpu_memory_source")
+        if source == "unified_memory_rss_proxy":
+            # The same RSS measurement is not independent MPS allocation.
+            parts.append("GPU memory not independently measured (unified-memory RSS proxy)")
+            return ", ".join(parts)
+        if source == "nvidia-smi_total_used_delta_approx":
+            label = "peak_gpu_total_delta_approx"
+        elif source == "nvidia-smi_compute_apps_process_tree":
+            label = "peak_gpu_process_tree"
         else:
-            parts.append(f"{label} {peak_gpu:.0f}MB")
+            label = f"recorded_peak_{backend or 'gpu'} (source unconfirmed)"
+        if peak_gpu >= 1024:
+            parts.append(f"{label} {peak_gpu / 1024:.2f} GiB")
+        else:
+            parts.append(f"{label} {peak_gpu:.0f} MiB")
     if not parts:
         return "n/a"
     return ", ".join(parts)
