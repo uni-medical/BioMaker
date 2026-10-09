@@ -157,10 +157,13 @@ cd ../webui
 uv run --group dev pytest
 ```
 
-Version 0.1.16 is a candidate with 932 source checks and 202 development checks
-across 16 distinct suites passed. Its source is not yet frozen, and package,
-upgrade, installed workflow, offline engine and normal native launch acceptance
-remain pending. See the [0.1.16 candidate record](docs/ACCEPTANCE-0.1.16.md).
+Version 0.1.16 passed 932 source checks, 202 development checks, 237 packaged
+checks and four offline engine checks. The actual Mac upgrade preserved the
+specified user records, installed a separate runtime and passed the synthetic
+CPU workflow and normal launch. It improves detail navigation, scoped operation
+feedback and explanations of saved status versus current log evidence.
+See the [0.1.16 acceptance record](docs/ACCEPTANCE-0.1.16.md) for exact scope,
+artifacts, remaining compact-layout observations and signing/platform limits.
 
 Version 0.1.15 has passed 918 source checks, 113 development checks, 206 packaged
 checks and four offline engine checks. Package verification, the actual upgrade,

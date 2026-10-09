@@ -1,13 +1,17 @@
-# BioMaker Desktop 0.1.16 candidate acceptance
+# BioMaker Desktop 0.1.16 acceptance
 
 Target: macOS Apple silicon / arm64. Date: 2026-10-09.
 
-This is a development candidate. 932 source checks and 202 development checks
-across 16 distinct suites passed; the release gates below remain open. The release
-source is not yet frozen. Earlier
-[0.1.15 acceptance](ACCEPTANCE-0.1.15.md) does not establish 0.1.16 acceptance.
+932 source checks, 202 development checks across 16 distinct suites, 237
+packaged checks across 19 suites and four offline engine checks passed. Package
+verification, actual upgrade, independent runtime setup, retained-record checks,
+installed synthetic CPU workflow and normal native launch passed on this Mac.
 
-## Behavior under review
+Frozen package source: `5236b37adf626f480c742818b9f93e5f3b155e3e`.
+Later acceptance documentation is separate from that frozen package. Earlier
+[0.1.15 acceptance](ACCEPTANCE-0.1.15.md) is retained as historical evidence.
+
+## Delivered behavior
 
 The persisted run ledger remains authoritative for lifecycle status, reasons,
 ownership and available actions. Current catalog evidence is returned separately
@@ -69,20 +73,84 @@ checks overlap the complete suites and are not added to the 932 total. Build
 output retains a bundle-size advisory; Python tests retain the existing
 Starlette TestClient deprecation warning.
 
-## Open release gates
+## Distribution and installed acceptance
 
-| Gate | 0.1.16 status |
+| Gate | 0.1.16 result and receipt under `output/` |
 | --- | --- |
-| Release source freeze | Pending |
-| Distribution build, package verification and packaged regression | Pending |
-| Actual installed upgrade and retained user records | Pending |
-| Independent installed engine setup | Pending |
-| Installed synthetic CPU training workflow and exported results | Pending |
-| Offline engine failure/recovery and original-profile preservation | Pending |
-| Normal native launch of the installed application | Pending |
+| Packaged regression | 237 checks, 19 suites; `packaged-acceptance-0.1.16.json` |
+| Build identity | Frozen Git tests, runtime envelope and receipt hashes agree; `packaged-provenance-review-0.1.16.json` |
+| DMG / ZIP / unpacked app | Complete bundle equality and strict deep signatures passed; `package-verification-0.1.16.json` |
+| Actual upgrade | 0.1.15 to 0.1.16; previous bundle backed up and fingerprint retained; `package-installation-0.1.16.json` |
+| Native runtime setup | Installed through Settings and observed ready; `native-engine-setup-0.1.16.json` |
+| Installed app / retained records | System-only PATH; read-only requests; success after shutdown and preservation checks; `installed-engine-acceptance-0.1.16.json` |
+| Installed synthetic CPU workflow | Passed in 23.097 s; `desktop-workflow-acceptance-0.1.16.json` |
+| Offline clone repair | Four checks passed in 110.331 s; `engine-health-packaged-0.1.16.json` |
+| Final package / profile / process checks | Passed; `post-workflow-verification-0.1.16.json` |
+| Normal native launch | Original blank saved draft visible, runtime ready, app left open; `native-launch-0.1.16.json` |
 
-Release checks must run against the frozen 0.1.16 source and its actual artifacts.
+The packaged runner binds the actual clean-source manifest and bundle fingerprint
+before and after the group, plus each frozen test, native receipt and runner
+record. An incomplete group cannot report aggregate success. The verified bundle
+has 2,819 regular files and fingerprint
+`cab45d6e1cb685a416a93638a5824301c60b1dd7c7f75ed74c26a94ad2a80b6c`.
+
+Deliverables under `release/`:
+
+| File | SHA256 |
+| --- | --- |
+| `BioMaker-0.1.16-mac-arm64.dmg` | `3cc9b58a678052555f878c94342feefd5cf7ad70350bf63089c211549a1db992` |
+| `BioMaker-0.1.16-mac-arm64.zip` | `48d1dca03269f29447ab624301a62150ecb12e3397133509d10597b1da37e985` |
+
+The pre-upgrade snapshot includes all tables, schema, `user_version` and
+`application_id` of both `runs.sqlite3` and `desktop-metadata.sqlite3`, including
+queue control and sequence state. After upgrade and workflow, those logical
+snapshots are unchanged. Configuration, preferences and original draft bytes
+are unchanged; the actual profile still has zero user runs. The previous engine's
+selected source/receipt files, interpreter link, resolved executable and bytes
+are retained. This is the stated preservation scope, not a whole-profile hash.
+
+The first upgrade-helper attempt stopped before writing the baseline or swapping
+the app because Apple's read-only SQLite could not open the metadata database
+in WAL format without sidecars after shutdown. The corrected helper uses a
+private database copy only after explicit app/profile quiescence, absent journal
+files and before/after source identity/content checks; live databases never use
+that fallback. The verified staging bundle was explicitly resumed. Twelve
+synthetic helper tests passed, separately from the source-check total; the failed
+attempt and successful retry logs remain preserved.
+
+The installed workflow exercised the actual queue, a one-step CPU logistic
+regression fit on 12 synthetic training rows, evaluator, result/candidate/log UI
+and native report export. Its five model-response stages used a deterministic
+localhost fixture under an inherited network restriction. It does not establish
+external-provider quality or medical model performance. The complete synthetic
+home was archived with symlink targets preserved under
+`output/qa/desktop-workflow-0.1.16/`; seven current screenshots and their hashes
+are retained there. No fixture was added to the actual user profile.
+
+Offline health acceptance removed a real dependency only in an APFS clone,
+confirmed failure survived reinitialization, performed a locked offline reinstall
+and passed another download-free check. Full original engine and cache hashes
+matched before, after and the release-owner recheck. Selected clone receipts,
+logs and network policy are archived under `output/qa/engine-health-0.1.16/`.
+Installed workflow and offline health ran sequentially. Package signatures and
+full installed/unpacked bundle fingerprints still matched after acceptance;
+all checked QA profile processes had exited before the final native launch.
+
+## Visual observations and remaining scope
+
+The independent packaged visual review inspected five current screenshots and
+recorded exact hashes in `packaged-interaction-visual-review-0.1.16.json`.
+One English evidence screenshot after a Settings/language round trip clips the
+top of the overall app, including the status badge, despite the inner content
+being reset. Its visible evidence text is legible and the automated status check
+passes, but this does not establish that the full introduction remains visible.
+Ancestor scrolling or compact-layout sizing needs targeted reproduction in the
+next iteration. A draft-removal failure also retains the existing broad draft
+save-issue banner alongside the precise queued-but-draft-retained toast; clearer
+operation-specific wording remains a follow-up.
+
 The current signing boundary remains ad-hoc; Developer ID signing and Apple
 notarization are not established. Windows and Linux have no platform acceptance
-claim. Synthetic software checks do not establish external-provider reliability,
-scientific validity or clinical suitability. See [release policy](RELEASE.md).
+claim. The actual user's provider and model remain unconfigured. Synthetic
+software checks do not establish external-provider reliability, scientific
+validity or clinical suitability. See [release policy](RELEASE.md).

@@ -362,10 +362,18 @@ independent dismissal timers, stale navigation/language/settings/service feedbac
 and held A-to-B-to-A context transitions. Settings must expose saving/saved/dirty
 feedback inline, and another edit must clear the saved indication.
 
-The [0.1.16 candidate record](ACCEPTANCE-0.1.16.md) tracks completed development
-evidence and remaining gates. Freeze source before distribution acceptance;
-repeat package verification, packaged regressions, actual installed upgrade,
-retained-record checks, independent engine setup, installed synthetic workflow,
-offline engine recovery and normal native launch for 0.1.16. Successful 0.1.15
-artifacts do not satisfy these gates. Keep signing and other-platform claims
-within their separately verified scope.
+The [0.1.16 acceptance record](ACCEPTANCE-0.1.16.md) binds the frozen package
+source `5236b37adf626f480c742818b9f93e5f3b155e3e` to 932 source, 202
+development, 237 packaged and four offline checks. Actual upgrade, independent
+engine setup, installed synthetic workflow, retained records and final normal
+native launch passed. The run and metadata database preservation snapshots
+include all tables, schema and SQLite version identifiers. A quiescent-only
+private-copy fallback handles Apple's read-only WAL database limitation without
+modifying the source database. Packaged acceptance envelopes bind the frozen
+suite bytes, native receipts and unchanged bundle bytes to the release.
+
+For subsequent releases, repeat these gates against the new frozen artifacts;
+0.1.16 results do not establish later-version acceptance. Reproduce the recorded
+compact English layout/top-clipping observation and improve draft-removal-fault
+wording. Keep Developer ID/notarization and other-platform claims within their
+separately verified scope.
