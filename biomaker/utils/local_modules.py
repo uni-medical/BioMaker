@@ -169,7 +169,7 @@ class LocalModuleDiscovery(ast.NodeVisitor):
             if isinstance(child, ast.Call):
                 name = ast.unparse(child.func)
                 leaf = name.rsplit(".", 1)[-1]
-                if leaf in {"globals", "locals", "vars", "eval", "exec", "__import__", "import_module"}:
+                if name in {"globals", "locals", "vars", "eval", "exec", "__import__"} or leaf == "import_module":
                     return False
                 if leaf in {"getattr", "hasattr", "setattr", "delattr"} and (
                     len(child.args) < 2

@@ -352,6 +352,12 @@ def test_real_subprocess_still_writes_and_imports_module_with_unused_wrapper(tmp
     assert (tmp_path / "working/inference.py").read_text() == "VALUE = 42\n"
 
 
+def test_normal_model_eval_method_is_not_builtin_code_evaluation(tmp_path):
+    code = _unused_artifact_wrapper() + "import torch\nmodel = torch.nn.Linear(1, 1)\nmodel.eval()\n"
+    assert _check(code, tmp_path).ok
+    assert not _check(_unused_artifact_wrapper() + "eval(dynamic_code)\n", tmp_path).ok
+
+
 @pytest.mark.parametrize("reference", [
     "read_artifact()", "read_artifact('/outside')", "read_artifact(artifact_dir='working')",
     "read_artifact(*args)", "read_artifact(**kwargs)", "alias = read_artifact",
