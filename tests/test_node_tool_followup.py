@@ -8,6 +8,7 @@ import biomaker.agents.base_agent as base_agent
 import biomaker.agents.proposal_agent as proposal_agent
 from biomaker.agents.proposal_agent import ProposalAgent, TOOL_OBSERVATION_TOTAL_CHARS
 from biomaker.journal import Journal
+from biomaker.monai_rag.query_rag_db import MED_KNOWLEDGE_RAG
 from biomaker.utils.response import truncate_text
 
 
@@ -24,7 +25,7 @@ def agent(tmp_path, monkeypatch):
             data_summary=False,
             enable_node_tools=True,
             max_node_tool_calls=4,
-            code=SimpleNamespace(model="test-model"),
+            code=SimpleNamespace(model="test-model", temp=0.7),
         ),
     )
     instance = ProposalAgent("test task", cfg, Journal())
@@ -79,6 +80,116 @@ def test_tool_observation_context_keeps_existing_total_cap(agent):
 
     assert len(context["Tool Observations"]) <= TOOL_OBSERVATION_TOTAL_CHARS
     assert len(context["Memory"]) <= 1200
+
+
+def test_rag_passages_reach_initial_plan_prompt(agent, tmp_path, monkeypatch):
+    index_dir = tmp_path / "rag"
+    index_dir.mkdir()
+    documents = [
+        {
+            "page_content": (
+                "Cache training images. "
+                + f"Unique documentation passage {index}. " * 60
+            ),
+            "metadata": {
+                "source": f"guide-{index}.html",
+                "title": f"Caching guide {index}",
+                "version": "test",
+            },
+        }
+        for index in range(5)
+    ]
+    (index_dir / "chunks.jsonl").write_text(
+        "\n".join(json.dumps(document) for document in documents), encoding="utf-8"
+    )
+    agent.acfg.enable_monai_knowledge_base = True
+    agent.acfg.enable_query2doc = False
+    agent.acfg.knowledge_base = SimpleNamespace(
+        model="test-model", retrieval_mode="keyword", topk=5, required=False
+    )
+    agent.knowledge_base = MED_KNOWLEDGE_RAG(persist_dir=index_dir)
+    monkeypatch.setattr(
+        agent.context_builder,
+        "build_draft",
+        lambda: {"Task Description": "test task", "Instructions": {}},
+    )
+    docs_request = {
+        "tool": "search_docs",
+        "query": "how to cache training images",
+        "reason": "Find documentation before choosing a data pipeline.",
+    }
+    query = Mock(
+        side_effect=[
+            response(docs_request),
+            response(),
+            {"plans": [{"name": "Cached input", "plan": "Use documented caching."}]},
+        ]
+    )
+    monkeypatch.setattr(proposal_agent, "query", query)
+
+    plans = agent.generate_draft_plan_batch(1)
+
+    assert plans == ["Cached input: Use documented caching."]
+    assert (
+        query.call_args_list[0].kwargs["system_message"]["Current context"]["Stage"]
+        == "plan"
+    )
+    assert (
+        query.call_args.kwargs["func_spec"] is proposal_agent.draft_plan_batch_func_spec
+    )
+    observations = query.call_args.kwargs["system_message"]["Tool Observations"]
+    assert len(observations) > 1600
+    for index in range(5):
+        assert f"Source: guide-{index}.html" in observations
+        assert f"Title: Caching guide {index}" in observations
+        assert f"Unique documentation passage {index}" in observations
+    followup = query.call_args_list[1].kwargs["system_message"]["Current context"]
+    assert followup["Tool Observations"] == observations
+    traces = trace_records(agent)
+    assert len(traces) == 1
+    assert traces[0]["stage"] == "plan"
+    assert traces[0]["query"] == docs_request["query"]
+
+
+def test_search_docs_uses_the_requested_query_without_unrelated_context(
+    agent, monkeypatch
+):
+    retrieve = Mock(return_value="Source: docs\nSnippet: useful documentation")
+    monkeypatch.setattr(agent, "query_knowledge_base", retrieve)
+
+    result = agent._execute_node_tool(
+        {"tool": "search_docs", "query": "how to cache training images"},
+        prompt={"Previous solution": "monai.losses.DiceLoss monai.networks.nets.UNet"},
+    )
+
+    retrieve.assert_called_once_with("how to cache training images")
+    assert "useful documentation" in result
+
+
+def test_large_rag_result_keeps_complete_passages_within_context_budget(agent):
+    passages = [
+        f"Source: guide-{index}.html\nTitle: Guide {index}\nSnippet: "
+        + "documentation " * 100
+        + f"\nEnd of passage {index}."
+        for index in range(20)
+    ]
+    record = {
+        "tool": "search_docs",
+        "query": "caching examples",
+        "result": "\n\n---\n\n".join(passages),
+    }
+
+    observations = agent._compact_tool_observations([record])
+
+    assert "Source: guide-0.html" in observations
+    assert "Additional documentation omitted" in observations
+    for index in range(20):
+        if f"Source: guide-{index}.html" in observations:
+            assert f"End of passage {index}." in observations
+    prompt = {"Tool Observations": "Node tool calls used: 1/4.\n\n" + observations}
+    context = agent._tool_decision_context("debug", prompt)
+    assert context["Tool Observations"] == prompt["Tool Observations"]
+    assert len(context["Tool Observations"]) <= TOOL_OBSERVATION_TOTAL_CHARS
 
 
 def test_followup_shares_budget_deduplication_and_trace(agent, monkeypatch):

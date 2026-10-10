@@ -111,7 +111,11 @@ and package inventories, SHA-256 hashes and task identity, then reruns the curre
 split verifier. An integrity inventory is not a cryptographic signature. Keep
 packages separate from source data and run outputs.
 
-### Optional MONAI retrieval
+### MONAI retrieval
+
+The `search_docs` tool retrieves local MONAI documentation for planning, drafting,
+improvement, and debugging. Retrieved passages and their sources are included in the agent's context.
+Use focused English queries or API names with the local keyword index.
 
 ```bash
 bash scripts/create_rag_db.sh

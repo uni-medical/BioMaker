@@ -247,7 +247,9 @@ def parse_monai_docs(root_dir="docs.monai.io/en/1.4.0") -> list[dict]:
 def parse_installed_monai_docs() -> list[dict]:
     """Build a small documentation corpus from the installed MONAI package."""
     import monai.data
+    import monai.inferers
     import monai.losses
+    import monai.metrics
     import monai.networks.nets
     import monai.transforms
 
@@ -256,6 +258,8 @@ def parse_installed_monai_docs() -> list[dict]:
         monai.transforms,
         monai.networks.nets,
         monai.losses,
+        monai.metrics,
+        monai.inferers,
     ]
     docs = []
     for module in modules:

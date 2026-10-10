@@ -171,6 +171,61 @@ class MonaiRagTests(unittest.TestCase):
             self.assertEqual(returned_count, 1)
             self.assertIn("monai.losses.DiceLoss", rendered)
 
+    def test_keyword_search_accepts_natural_language_without_api_names(self) -> None:
+        documents = [query_rag_db.RagDocument(**record) for record in _documents()]
+        with (
+            patch.object(query_rag_db, "_load_documents", return_value=documents),
+            patch.object(query_rag_db, "_embed_texts", side_effect=AssertionError),
+        ):
+            rag = MED_KNOWLEDGE_RAG(mode="keyword")
+            for query, expected_title in [
+                (
+                    "channel first layout for image tensors",
+                    "monai.transforms.EnsureChannelFirstd",
+                ),
+                (
+                    "soft dice objective for segmentation",
+                    "monai.losses.DiceLoss",
+                ),
+            ]:
+                with self.subTest(query=query):
+                    results = rag.search(query, k=1, convert_to_str=False)
+                    self.assertEqual(len(results), 1)
+                    self.assertEqual(results[0].metadata["title"], expected_title)
+
+    def test_keyword_search_returns_no_hits_for_missing_full_api(self) -> None:
+        documents = [query_rag_db.RagDocument(**record) for record in _documents()]
+        with patch.object(query_rag_db, "_load_documents", return_value=documents):
+            rag = MED_KNOWLEDGE_RAG(mode="keyword")
+            for query in [
+                "monai.metrics.DiceMetric",
+                "monai.inferers.sliding_window_inference",
+                "monai.losses.Dice",
+            ]:
+                with self.subTest(query=query):
+                    result, count = rag.search_with_count(query, k=5)
+                    self.assertEqual(result, "")
+                    self.assertEqual(count, 0)
+
+    def test_keyword_search_keeps_array_and_dictionary_transforms(self) -> None:
+        documents = [
+            query_rag_db.RagDocument(
+                page_content=f"{name} applies a random affine transformation.",
+                metadata={"title": f"monai.transforms.{name}"},
+            )
+            for name in ["RandAffine", "RandAffined", "RandAffineD", "RandAffineDict"]
+        ]
+        with patch.object(query_rag_db, "_load_documents", return_value=documents):
+            rag = MED_KNOWLEDGE_RAG(mode="keyword")
+            results = rag.search(
+                "random affine transformation", k=5, convert_to_str=False
+            )
+            self.assertEqual(len(results), 2)
+            self.assertEqual(
+                {doc.metadata["title"] for doc in results},
+                {"monai.transforms.RandAffine", "monai.transforms.RandAffined"},
+            )
+
     def test_keyword_smoke_receipt_is_successful_and_byte_stable(self) -> None:
         with (
             tempfile.TemporaryDirectory() as tmp,
@@ -343,6 +398,34 @@ class MonaiRagTests(unittest.TestCase):
 
             for index in range(5):
                 self.assertIn(f"monai.module.API{index}", result)
+
+    def test_large_result_budget_keeps_passages_with_their_sources(self) -> None:
+        documents = [
+            {
+                "page_content": f"PASSAGE_{index:02d} " * 200,
+                "metadata": {"source": f"guide-{index}.html", "title": f"API{index}"},
+            }
+            for index in range(20)
+        ]
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(create_monai_rag_db, "parse_monai_docs", lambda: documents),
+        ):
+            index_dir = Path(tmp)
+            create_monai_rag_db.parse_and_index_docs(persist_dir=index_dir)
+            rag = MED_KNOWLEDGE_RAG(persist_dir=index_dir)
+            with patch.object(rag, "_search_once", return_value=rag.documents):
+                result, count = rag.search_with_count("documentation", k=20)
+
+        self.assertEqual(count, 20)
+        self.assertLessEqual(len(result), 16000)
+        self.assertIn("Showing", result)
+        for index, passage in enumerate(result.split("\n\n---\n\n")):
+            self.assertIn(f"Source: guide-{index}.html", passage)
+            self.assertIn(f"PASSAGE_{index:02d}", passage)
+            for other in range(20):
+                if other != index:
+                    self.assertNotIn(f"PASSAGE_{other:02d}", passage)
 
     def test_default_config_uses_keyword_retrieval_and_top_five(self) -> None:
         with patch.dict(os.environ):

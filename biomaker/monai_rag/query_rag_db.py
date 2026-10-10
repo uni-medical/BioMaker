@@ -361,15 +361,32 @@ class MED_KNOWLEDGE_RAG:
         query_symbols = _extract_query_symbols(search_query)
         if not query_tokens:
             return []
-        if not query_symbols:
-            # This index is API/traceback oriented. Broad tutorial-style queries tend to
-            # retrieve unrelated API pages by shared words, which is worse than no hit.
-            return []
+
+        # An explicit API lookup must not turn into unrelated hits on "monai".
+        # Ordinary natural-language queries can use the existing keyword scorer.
+        api_names = re.findall(
+            r"\bmonai(?:\.[A-Za-z_][A-Za-z0-9_]*){2,}\b", search_query
+        )
+        api_pattern = (
+            re.compile(
+                r"\b(?:"
+                + "|".join(re.escape(name) for name in api_names)
+                + r")(?![A-Za-z0-9_])",
+                re.IGNORECASE,
+            )
+            if api_names
+            else None
+        )
 
         scored = [
             (self._score(query_tokens, query_symbols, doc), doc)
             for doc in self.documents
             if doc.page_content.strip()
+            and (
+                api_pattern is None
+                or api_pattern.search(str(doc.metadata.get("title", "")))
+                or api_pattern.search(doc.page_content)
+            )
         ]
         scored = [(score, doc) for score, doc in scored if score > 0]
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -439,7 +456,7 @@ class MED_KNOWLEDGE_RAG:
         title = str(doc.metadata.get("title", ""))
         module, _, name = title.rpartition(".")
         if module == "monai.transforms":
-            name = re.sub(r"(Dict|D|d)$", "", name)
+            name = re.sub(r"(Dict|D|d)$", "d", name)
         return f"{module}.{name}" if module else title or doc.page_content[:200]
 
     def _focused_snippet(
@@ -530,7 +547,7 @@ class MED_KNOWLEDGE_RAG:
         if not convert_to_str:
             return final_documents, len(final_documents)
 
-        result = "\n\n---\n\n".join(
+        passages = [
             (
                 "Source: "
                 f"{truncate_text(str(doc.metadata.get('source', '')), max_chars=240, marker='source trimmed')}\n"
@@ -541,16 +558,21 @@ class MED_KNOWLEDGE_RAG:
                 f"Snippet: {self._focused_snippet(doc, str(search_query))}"
             )
             for doc in final_documents
-        )
+        ]
         result_budget = max(2500, min(len(final_documents), 10) * 1600)
-        return (
-            truncate_text(
-                result,
-                max_chars=result_budget,
-                marker="MONAI RAG trimmed",
-            ),
-            len(final_documents),
-        )
+        visible = []
+        used = 0
+        for passage in passages:
+            if used + len(passage) + 7 > result_budget - 100:
+                break
+            visible.append(passage)
+            used += len(passage) + 7
+        result = "\n\n---\n\n".join(visible)
+        if len(visible) < len(passages):
+            result += (
+                f"\n[Showing {len(visible)} of {len(passages)} retrieved passages.]"
+            )
+        return result, len(final_documents)
 
     def search(self, search_query, k=5, enable_query2doc=False, convert_to_str=True):
         result, _ = self.search_with_count(
