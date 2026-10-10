@@ -48,7 +48,7 @@ tensorboard
 connected-components-3d
 torchio<2
 lifelines
-monai==1.4.0
+monai==1.6.0
 nibabel
 pydicom
 SimpleITK

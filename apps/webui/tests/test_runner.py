@@ -1367,7 +1367,9 @@ run_module._run_direct_entry()
         ],
         cwd=method_root,
     )
-    saved = wait_for_status(store, run["id"], {"failed"}, timeout=10)
+    # This real subprocess also imports the ML stack; allow its first cold
+    # import before checking the terminal fsync failure and queue pause.
+    saved = wait_for_status(store, run["id"], {"failed"}, timeout=30)
 
     assert saved["return_code"] != 0
     assert "Lifecycle mismatch" in saved["error"]

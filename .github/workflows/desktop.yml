@@ -44,6 +44,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.11.7'
+      - run: brew install libomp
       - run: npm ci
       - run: npm run icons
       - run: npm run prepare:runtime

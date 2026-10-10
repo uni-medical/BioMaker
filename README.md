@@ -11,6 +11,9 @@ validation performance. CPU, Apple MPS and CUDA are supported.
 
 ## Install and configure
 
+Use Python 3.11 or 3.12. On macOS, install the OpenMP runtime required by
+LightGBM with `brew install libomp` before creating the environment.
+
 ```bash
 git clone https://github.com/uni-medical/BioMaker.git
 cd BioMaker

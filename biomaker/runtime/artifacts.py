@@ -94,9 +94,11 @@ def list_artifacts(settings: Settings, run: dict[str, Any]) -> list[dict[str, An
         return []
     artifacts = []
     for path in sorted(log_dir.iterdir(), key=lambda item: item.name.lower()):
-        if path.name.startswith(".") or not path.is_file() or path.is_symlink():
+        if path.name.startswith("."):
             continue
         try:
+            if not path.is_file() or path.is_symlink():
+                continue
             stat = path.stat()
         except OSError:
             continue

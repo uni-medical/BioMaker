@@ -293,11 +293,15 @@ def test_service_lifespan_cancels_install_but_leaves_queue_policy_intact(config)
 
 
 def test_cancellation_also_stops_environment_verification(config):
+    verification_script = (
+        f"#!{sys.executable}\n"
+        'import time; print("verification active", flush=True); time.sleep(90)\n'
+    )
     fake_uv(
         config,
         "import pathlib\np = pathlib.Path('.venv/bin/python')\n"
         "p.parent.mkdir(parents=True, exist_ok=True)\n"
-        f"p.write_text({('#!' + sys.executable + chr(10) + 'import time; print(\"verification active\", flush=True); time.sleep(90)' + chr(10))!r})\n"
+        f"p.write_text({verification_script!r})\n"
         "p.chmod(0o755)\n",
     )
     engine = EngineInstaller(config)
