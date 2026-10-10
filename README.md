@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/BioMaker_logo.png" alt="BioMaker" width="480">
+  <img src="assets/BioMaker_logo.png" alt="BioMaker" width="720">
 </p>
 
 # BioMaker
