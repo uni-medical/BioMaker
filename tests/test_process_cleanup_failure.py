@@ -108,14 +108,19 @@ def test_uncaptured_group_wait_uses_budget_and_never_signals_after_reap():
 
 
 def test_uncaptured_wait_timeout_is_fatal_not_a_clean_result():
+    clock = Clock()
+    waits = []
     def wait(timeout):
-        assert 0 < timeout <= .1
+        waits.append(timeout)
         raise subprocess.TimeoutExpired("synthetic child", timeout)
     process = SimpleNamespace(pid=50, returncode=None, wait=wait)
     with pytest.raises(ProcessTreeCleanupError, match="did not exit after group kill"):
         drain_uncaptured_process_group(
             process, group_reader=lambda _: [], group_signal_sender=lambda *_: None, timeout=.1,
+            # Exercise the wait failure, not scheduler delay between empty-group reads.
+            sleeper=clock.sleep, monotonic=clock,
         )
+    assert waits == [pytest.approx(.05)]
 
 
 def test_fatal_cleanup_quarantines_slot_and_wakes_all_acquisition_kinds():
