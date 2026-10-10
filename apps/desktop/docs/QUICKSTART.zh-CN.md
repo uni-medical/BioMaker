@@ -4,7 +4,7 @@
 
 ## 安装与首次配置
 
-1. 打开 `BioMaker-<version>-mac-arm64.dmg`，将 BioMaker 拖入 Applications。
+1. 从 [Google Drive 下载 BioMaker 0.2.0 测试版](https://drive.google.com/drive/folders/1W-5JySmOb21Tp4SwtEOetSOQsicKQ1zH)（Apple 芯片 Mac）。文件夹内附安装说明和 SHA-256 校验文件；打开 DMG，将 BioMaker 拖入 Applications。
 2. 从应用程序文件夹打开 BioMaker。
 3. 在首次引导中点击「安装」准备运行环境。Python 已随应用提供，训练依赖会自动下载；无需自行安装 Python、Node 或 Homebrew。
 4. 打开「设置 → 模型服务」，填写你的 API 地址、API Key 和模型名称。可以获取模型列表，或手动填写模型 ID；使用 OpenAI 时 API 地址可留空。

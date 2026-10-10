@@ -8,7 +8,9 @@ UI are portable; Linux and Windows release targets still require platform accept
 
 ## Use the macOS app
 
-1. Open the BioMaker DMG and drag **BioMaker** into **Applications**.
+1. [Download the BioMaker 0.2.0 test build from Google Drive](https://drive.google.com/drive/folders/1W-5JySmOb21Tp4SwtEOetSOQsicKQ1zH)
+   (Apple silicon). The folder includes installation instructions and SHA-256
+   checksums. Open the DMG and drag **BioMaker** into **Applications**.
 2. Open BioMaker. Settings guides you through installing the model development
    environment and configuring an OpenAI-compatible model provider.
 3. Choose a local dataset folder, describe your task and validation criteria,
