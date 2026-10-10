@@ -1,0 +1,5 @@
+# Lightweight sidecar only. Scientific packages are installed into the engine venv.
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+psutil>=6,<8
+python-dotenv>=1,<2

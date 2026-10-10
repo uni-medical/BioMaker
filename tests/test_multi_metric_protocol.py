@@ -222,3 +222,12 @@ def test_frozen_custom_evaluator_rescores_without_rewriting_source(tmp_path, ver
     assert result.metric_specs == (definitions if version == 3 else definitions[:1])
     assert evaluator.read_text() == source
     assert json.loads((tmp_path / 'evaluator_prediction_spec.json').read_text()) == spec
+
+
+def test_typed_score_log_diagnostics_are_not_legacy_failure_markers():
+    from biomaker.utils.evaluator_setup import parse_external_validation
+    score = {'score_schema_version': 1, 'status': 'ok', 'metrics': {'accuracy': .8},
+             'metric_specs': [{'name': 'accuracy', 'maximize': True}],
+             'diagnostics': {'error': 'observational label', 'fallback': 'not a status field'}}
+    result = EvaluatorRunResult(True, .8, True, {'score': score}, '')
+    assert parse_external_validation(result.log_line()) == (.8, True)

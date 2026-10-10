@@ -1,0 +1,5 @@
+{
+  "baseRequirementsSha256": "6ff4de3a8eddc24dd179ccf7ac44ef3219b66e6ca17cedcd492d7515dc5a3a29",
+  "basePyprojectSha256": "b86ef0ee1050792f8614629cf4531e0bc06e65ed1ae49ddea6ef668336ebb352",
+  "purpose": "Generated distribution copies of the unified core dependencies and universal lock."
+}

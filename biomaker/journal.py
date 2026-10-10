@@ -375,7 +375,7 @@ class Journal(DataClassJsonMixin):
             "best_before": copy.deepcopy(current["nodes"].get(best_before_id)),
         }
         if record is None:
-            if node.outcome != "unscored":
+            if node.outcome not in {"unscored", "generation_format_failed"}:
                 node.outcome = "bug" if node.is_buggy else "invalid_metrics"
             return
         node.metric_deltas = {}
@@ -467,7 +467,7 @@ class Journal(DataClassJsonMixin):
             top_nodes = self.ranked_nodes()[:topk]
             return random.choice(top_nodes) if top_nodes else None
         if only_good:
-            nodes = self.good_nodes
+            nodes = [n for n in self.good_nodes if completed_candidate(n) and n.metric is not None and finite_metric(n.metric.value) is not None]
             if not nodes:
                 return None
         else:
@@ -762,17 +762,27 @@ def _format_resource_usage(resource_usage: dict | None) -> str:
     peak_rss = resource_usage.get("peak_rss_mb")
     if isinstance(peak_rss, (int, float)):
         if peak_rss >= 1024:
-            parts.append(f"peak_rss {peak_rss / 1024:.2f}GB")
+            parts.append(f"peak_rss {peak_rss / 1024:.2f} GiB")
         else:
-            parts.append(f"peak_rss {peak_rss:.0f}MB")
+            parts.append(f"peak_rss {peak_rss:.0f} MiB")
     peak_gpu = resource_usage.get("peak_gpu_memory_mb")
     if isinstance(peak_gpu, (int, float)):
         backend = resource_usage.get("gpu_backend")
-        label = f"peak_{backend}" if backend else "peak_gpu"
-        if peak_gpu >= 1024:
-            parts.append(f"{label} {peak_gpu / 1024:.2f}GB")
+        source = resource_usage.get("gpu_memory_source")
+        if source == "unified_memory_rss_proxy":
+            # The same RSS measurement is not independent MPS allocation.
+            parts.append("GPU memory not independently measured (unified-memory RSS proxy)")
+            return ", ".join(parts)
+        if source == "nvidia-smi_total_used_delta_approx":
+            label = "peak_gpu_total_delta_approx"
+        elif source == "nvidia-smi_compute_apps_process_tree":
+            label = "peak_gpu_process_tree"
         else:
-            parts.append(f"{label} {peak_gpu:.0f}MB")
+            label = f"recorded_peak_{backend or 'gpu'} (source unconfirmed)"
+        if peak_gpu >= 1024:
+            parts.append(f"{label} {peak_gpu / 1024:.2f} GiB")
+        else:
+            parts.append(f"{label} {peak_gpu:.0f} MiB")
     if not parts:
         return "n/a"
     return ", ".join(parts)

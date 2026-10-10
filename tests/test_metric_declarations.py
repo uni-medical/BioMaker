@@ -60,13 +60,3 @@ def test_repeated_declarations_and_generic_metric_lines():
         "mean_dice/iou_across_cardiac_structures", [])
     assert requested_metrics("Secondary metric: AUC.\nSecondary metric: F1.") == (None, ["auc", "f1"])
     assert requested_metrics("Metric: F1.\nPrimary metric: accuracy.") == ("accuracy", [])
-
-
-def test_existing_workspace_task_declarations():
-    experiments = Path(__file__).resolve().parents[2] / "experiments"
-    if not experiments.is_dir():
-        pytest.skip("Workspace-level experiment definitions are not part of the method repository.")
-    assert requested_metrics((experiments / "rsna_bone_age/task.md").read_text()) == ("mae", [])
-    assert requested_metrics((experiments / "monuseg/task.md").read_text()) == ("aji", ["binary_dice"])
-    assert requested_metrics((experiments / "kvasirseg/task.md").read_text()) == ("binary_dice", ["binary_iou"])
-    assert requested_metrics((experiments / "camus/task.md").read_text())[0] != "binary_dice"

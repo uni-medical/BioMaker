@@ -2,236 +2,138 @@
   <img src="assets/BioMaker_logo.png" alt="BioMaker" width="720">
 </p>
 
-# Introduction
-**BioMaker** is an agentic development system for biomedical image analysis.
+# BioMaker
 
-BioMaker uses a collaborative multi-agent workflow: an Orchestrator coordinates a Data Analyzer, Researcher, Programmer, and Summarizer through shared Memory. Together, they analyze the data, retrieve implementation knowledge, generate and refine candidate solutions, and package the selected result. The workflow can use a lightweight MONAI knowledge index and web search when extra biomedical implementation context is useful.
+BioMaker develops biomedical image analysis models from a task description and
+local data. It prepares and verifies data splits, freezes an evaluation contract,
+generates and refines candidate programs, and delivers the model selected by
+validation performance. CPU, Apple MPS and CUDA are supported.
 
-# Quick Start
+## Install and configure
 
-## Setup environment
+```bash
+git clone https://github.com/uni-medical/BioMaker.git
+cd BioMaker
+uv sync --python 3.11
+```
 
-We recommend using `uv` to manage the environment and dependencies.
+Create a local `.env` file with your OpenAI-compatible provider credentials:
 
-1. **Install uv** (if you haven't already):
-     ```bash
-     pip install uv
-     ```
-     or using the standalone installer:
-     ```bash
-     curl -LsSf https://astral.sh/uv/install.sh | sh
-     ```
+```dotenv
+OPENAI_BASE_URL=https://your-provider.example/v1
+OPENAI_API_KEY=your-key
+```
 
-2. **Clone the repository**:
-     ```bash
-     git clone https://github.com/uni-medical/BioMaker
-     cd BioMaker
-     ```
+`BIOMAKER_ENV_FILE` can select another credential file. Existing shell environment
+variables take precedence for direct CLI runs. Keep credentials out of Git.
+The default model is `deepseek-v4-flash`; override it per task with
+`model_for_all_agents=<model>`. Optional `SERPER_API_KEY` and `JINA_API_KEY` enable
+web search and page reading.
 
-3. **Create and sync a Python 3.11 environment**:
-     ```bash
-     uv sync --python 3.11
-     ```
+## Run a task
 
-4. **Set up API keys**:
-Create `.env` in the repository root. BioMaker, its RAG tools, and the WebUI use this same file regardless of their launch directory. Serper and Jina are optional but recommended for web search: Serper finds relevant pages, and Jina reads those pages into cleaner text.
-     ```dotenv
-     OPENAI_BASE_URL="<your base url>" # (e.g. https://api.openai.com/v1)
-     OPENAI_API_KEY="<your key>"
-     BIOMAKER_EMBEDDING_BASE_URL="<your embedding base url>" # optional
-     BIOMAKER_EMBEDDING_API_KEY="<your embedding key>"       # optional
-     SERPER_API_KEY="<your serper key>"
-     JINA_API_KEY="<your jina key>"
-     ```
-Set `BIOMAKER_ENV_FILE` to an absolute path, or a path relative to the repository root, to use a different file explicitly. Existing shell environment variables still take precedence when running the BioMaker CLI directly.
-The repository default is `deepseek-v4-flash` for every model role. The WebUI Settings dialog can store a default model in `.env`; a task-level model override takes precedence. For CLI runs, pass `model_for_all_agents=<model>` explicitly.
-The embedding variables are only needed when the embedding endpoint differs from the main OpenAI-compatible endpoint. If `SERPER_API_KEY` is missing, BioMaker warns and disables web search for that run. If `JINA_API_KEY` is missing, BioMaker warns and falls back to Serper snippets only.
+```bash
+uv run biomaker data_dir=/absolute/path/to/data \
+  desc_file=/absolute/path/to/task.md \
+  log_dir=/absolute/path/to/logs workspace_dir=/absolute/path/to/workspaces \
+  model_for_all_agents=your-model
+```
 
-5. **Set up the MONAI RAG index**
-BioMaker keeps the RAG index local instead of storing generated index files in git. The default `keyword` mode works locally without an embedding API. Build it once before running tasks:
-     ```bash
-     bash scripts/create_rag_db.sh
-     ```
+A direct run stays in the foreground. `biomaker --queue` submits the same task to
+a durable FIFO and follows its console log. Closing the client does not terminate
+a queued experiment. Failed runs pause the queue until resumed. CLI, WebUI and
+Desktop use the shared application service and queue runtime.
 
-     To use the paper-described embedding retrieval with `text-embedding-3-large`:
-     ```bash
-     BIOMAKER_RAG_MODE=embedding bash scripts/create_rag_db.sh
-     ```
-     At run time, select it with `BIOMAKER_RAG_MODE=embedding` (or `agent.knowledge_base.retrieval_mode=embedding`). Both modes share `chunks.jsonl`; embedding mode additionally requires matching vectors and a compatible embedding endpoint.
+`exec.parallel_workers=auto` assigns one candidate slot per visible CUDA GPU,
+or one on MPS/CPU. Set `CUDA_VISIBLE_DEVICES` before submission to select GPUs;
+an empty mask disables CUDA. Each queued run retains its selection. Independent
+processes and other users remain responsible for sharing the same devices.
+Candidate execution and trusted CPU scoring have separate bounded concurrency.
+A slot is released only after process cleanup is confirmed; uncertain slots are
+quarantined.
 
-     Check whether the index is usable:
-     ```bash
-     uv run python -m biomaker.monai_rag.query_rag_db
-     ```
-If the index is missing, BioMaker warns and disables MONAI RAG for that run.
+### WebUI and Desktop
 
-## Web interface
-
-Start the local WebUI from the repository root:
 ```bash
 cd apps/webui
 uv run python -m webui.server --host 127.0.0.1 --port 7860
 ```
-Open <http://127.0.0.1:7860>, configure the endpoint and API key in Settings, then select a local dataset folder to start an experiment. The experiment list is read directly from `logs/`, grouped by dataset, and uses the existing log directory names.
 
-## Command line runs
+Open <http://127.0.0.1:7860> to configure the provider, submit tasks and inspect
+candidates, logs and results. See [WebUI documentation](apps/webui/README.md).
+The Electron application adds local dataset selection, runtime installation and
+native result browsing; see [Desktop documentation](apps/desktop/README.md).
 
-`uv run biomaker ...` runs directly in the foreground by default, independently
-of the WebUI queue and its pause state. Ctrl+C interrupts that run; use a terminal
-session manager if it needs to outlive the terminal.
+## Evaluation and model delivery
 
-To submit through the same workspace-level `.biomaker/` durable FIFO as the WebUI,
-use `uv run biomaker --queue ...` (requires a complete source checkout). The
-command follows the durable console log and returns the experiment process's
-exit code; closing the terminal or WebUI does not terminate the queued experiment.
-A failed queued run pauses subsequent queued runs until the queue is resumed.
-Direct runs do not reserve GPUs against queued or other independently launched runs.
+1. The task defines sample identities, input/answer encodings, split roles and
+   named metrics. Preparation verifies these declarations and freezes the scorer.
+2. Candidates train using visible labels and generate the declared prediction
+   artifacts. Supported metrics use shared trusted implementations across
+   validation, private evaluation and explicit rescoring.
+3. Only complete, finite validation scores participate in selection. Invalid
+   predictions are candidate errors; scoring infrastructure failures preserve the
+   candidate as `unscored` and stop new work without turning the fault into model
+   feedback.
+4. The selected candidate can be retrained with the permitted additional labels.
+   The private test is evaluated once after selection and successful retraining
+   when enabled. Its answers and scores never feed search or selection. Tasks
+   without a test split require no test predictions.
+5. Model artifacts, a manifest and reload checks are required by default. A
+   prediction CSV alone does not establish that a model can be delivered.
 
-`exec.parallel_workers=auto` assigns one candidate per visible CUDA GPU: one on
-a single-GPU workstation and up to four on a four-GPU server. Select a subset
-before submitting a run with `CUDA_VISIBLE_DEVICES`; each queued run and retry
-keeps its own selection, even when a supervisor is already running. An empty
-mask disables CUDA. GPU selection does not reserve a device against other users
-or independently launched jobs.
+`final_retrain.enabled=false` keeps the selected candidate's original model.
+`exec.timeout`, `exec.evaluator_timeout`, `exec.evaluator_workers` and
+`agent.total_time_limit` control execution budgets. Provider transport defaults
+to at most two total attempts, with explicit request and elapsed-time limits.
+Authentication and quota failures are not repeated candidate repair loops.
 
-The method-specific preparation and external queue scripts in `scripts/` use
-the checkout's parent as their workspace by default. Their task registries and
-descriptions live in that workspace's `experiments/main9/` and
-`experiments/fig2_medmnist/`, alongside `datasets/`, `logs/`, and `workspaces/`.
-Use their `--help` options and `--dry-run` queue mode to check a deployment before
-starting experiments. These experiment protocols require their prepared data
-and registry files; synchronizing source code alone does not supply datasets.
-Preparation verifies artifact SHA-256 checksums before reusing an existing package;
-older packages without an integrity inventory need an explicit `--replace` rebuild.
-This check does not prevent queues from reading previously prepared packages.
-The external queues request `private_evaluation.per_node=false` so private test
-metrics are computed only after final retraining. Ordinary runs retain per-node
-user-only evaluation by default. Both modes select candidates using validation
-metrics.
+The [evaluation contract](docs/evaluation_contract.md) documents supported
+metrics, prediction formats, scoring outcomes and recovery. Existing frozen
+runtimes and historical results retain their original protocol.
 
-The suite preflight also checks evaluator support. Main9 currently supports
-segmentation through the fixed evaluator; its detection (`coco_map`) and
-enhancement (`psnr`) tasks are blocked. The Figure 2 registry's RetinaMNIST
-`ordinal_accuracy` protocol is also blocked until that metric has a fixed public
-and private evaluator. Use `--only` to select supported tasks; the queues do not
-substitute a different metric or silently skip unsupported tasks.
+### Prepared split packages
 
-## Workflow
+By default an agent prepares splits. A task can instead provide an external,
+verified package using `split_builder.source=verified_package` and
+`split_builder.package_dir=/absolute/path/to/package`. Use
+`biomaker.utils.verified_split_package.seal_split_package` to validate and record
+the package against its source data and exact task text before distribution.
 
-The default run is intentionally simple:
+The package contains `biomaker_splits/`, `private_gt/`, `split_manifest.json`,
+optional derived `public/` files, and `package_integrity.json`. File columns must
+be explicitly declared and use logical `input/...` or `public/...` paths; inline
+answers declare an empty file-column list. Admission checks the complete source
+and package inventories, SHA-256 hashes and task identity, then reruns the current
+split verifier. An integrity inventory is not a cryptographic signature. Keep
+packages separate from source data and run outputs.
 
-```text
-prepare workspace and data
--> Orchestrator coordinates specialized agents through shared Memory
-   -> Data Analyzer profiles the dataset
-   -> Researcher retrieves relevant knowledge when needed
-   -> Programmer generates and refines executable candidates
--> execute and evaluate candidates in the solution tree
--> Summarizer packages the best-observed solution and optional final report
+### Optional MONAI retrieval
+
+```bash
+bash scripts/create_rag_db.sh
+uv run python -m biomaker.monai_rag.query_rag_db
 ```
 
-The multi-agent workflow uses a lightweight solution tree search. BioMaker generates candidate solutions, debugs failed nodes, and refines promising ones based on execution results recorded in shared Memory. When the configured budget ends, the Summarizer packages the best-observed solution.
+Keyword retrieval is local and requires no embedding endpoint. Opt into embedding
+retrieval with `BIOMAKER_RAG_MODE=embedding`; build and query with the same mode.
+`BIOMAKER_EMBEDDING_BASE_URL` and `BIOMAKER_EMBEDDING_API_KEY` can select a separate
+embedding provider. Missing indexes disable retrieval with a warning.
 
-Generated code runs under a strict dependency policy. BioMaker tells the model which installed packages are allowed, blocks package installation, and performs a preflight import check before execution. If code imports an unavailable package such as `cv2` or `albumentations`, the run fails fast with a policy error so the next debug step can replace it with an allowed package.
+## Repository boundary
 
-### Scoring contract
+- `biomaker/`: core engine, shared application service, durable runtime and CLI.
+- `apps/webui/`, `apps/desktop/`: product interfaces and distribution tooling.
+- `tests/`, `docs/`, `scripts/`: generic tests, maintained documentation and tools.
+- Dependency locks, package metadata and third-party notices are versioned.
 
-New runs freeze one evaluator implementing `score(prediction_path, truth_path,
-expected_path)` for both validation and private test evaluation. The harness
-selects the files, aligns sample keys, and computes supported metrics with trusted
-implementations. When a fixed reader cannot interpret the data, the preparation
-agent writes a thin adapter containing `prediction_spec()`, `load_sample()`, and
-`write_dummy_predictions()`. The Harness owns scoring, aggregation, and artifact
-validation. It checks representative samples, then bundles the adapter and metric
-source into one frozen, standalone evaluator. See the [evaluation interface](docs/evaluation_contract.md).
-Private evaluation uses the same formulas and never supplies test answers to search.
-All five standard task families (classification, regression, segmentation,
-detection, and restoration) use this shared runtime. Regression includes
-MAE/MSE/RMSE for scalar or vector targets without rounding; segmentation also
-includes foreground IoU. A machine-readable metric
-catalog supplies aliases, directions, canonical sample schemas and parameter
-settings to both preparation agents and the compiler. A separate reader catalog
-describes available column/file mappings; custom adapters can use other encodings.
-Candidate prompts include the complete frozen `evaluation_protocol`, while model,
-loss, training strategy and preprocessing choices remain with the agent.
+Datasets, experiment recipes, cross-method benchmarks, competition implementations,
+weights, run outputs, audit reports and release acceptance receipts belong in
+separate workspaces. Machines synchronize this source tree while keeping their
+own credentials, data, environments and historical runtime snapshots.
 
-`prediction_spec()` declares `evaluator_api_version: 2`, the primary metric,
-boolean `maximize`, and `secondary_metrics`. It also preserves task-specific
-format and metric parameters. Scoring returns a `metrics` mapping containing
-every requested metric; the harness selects the named primary value for search.
-Missing, undefined, or non-finite requested metrics fail explicitly instead of
-substituting a different metric. For detection, Recall's confidence threshold or
-operating-point rule must be frozen along with IoU and the box convention.
+## Acknowledgements
 
-The fixed detection template supports class-aware `mAP@0.5` (`ap50`) using
-VOC all-point interpolated AP, averaged across classes with ground truth in the
-scored split, and micro `recall` at IoU >= 0.5. Recall defaults to confidence >= 0
-with no detection cap; `metric_contract.recall_confidence_threshold` can freeze a
-different operating point before search. AP always uses all submitted scored
-boxes. Matching chooses the highest-IoU ground truth of the same class; duplicate
-matches are false positives. Score ties use expected image order then box order.
-The split must declare detection, coordinate units, and unambiguous JSON object
-boxes. Named coordinate fields are recognized; generic `bbox` arrays require an
-explicit `xyxy`, `xywh`, or `cxcywh` declaration. The public prediction schema
-requires an integer class ID and a finite `score` in [0,1] for every box; no
-confidence is invented for old unscored predictions. Other encodings use the
-adapter route. Unsupported semantics, including crowd / ignore annotations,
-must be reported explicitly; adapters cannot silently drop them. Empty images
-are valid, but an entirely unannotated scoring split is an
-explicit error. Frozen detection parameters are included in `prediction_spec()`.
-
-The fixed grayscale restoration template computes PSNR and SSIM through the
-same `score()` entry point for validation and private test. The preparation agent
-chooses column names, sample keys and prediction columns, and declares them in
-`split_manifest.json`. The template reads evaluation semantics from
-`metric_contract`: `input_column`, `target_column`, `data_range`, `crop_size`
-(null for whole images, otherwise four corner crops), `group_column`, `groups`
-(both null for no grouping), and `aggregation` (`mean_images` or `mean_groups`).
-An optional legacy `restoration-evaluation` task block is still supported; users
-do not need to write it. Unmapped data encodings use a generated adapter with the
-same trusted metric backend. Unsupported settings fail explicitly. A custom
-metric evaluator is generated only for metrics without a registered implementation;
-it can reuse the supplied trusted kernels for any additional standard metrics.
-
-Sample keys may be independent IDs, observed input paths or composite columns;
-only the complete declared key must be unique. Hidden targets and predicted
-outputs cannot serve as keys. Prediction columns come from the agent's declared
-contract, defaulting to `restored_image_path` only when no output is declared.
-Grayscale image files and numeric 2D `.npy` arrays are supported, including float
-predictions without mandatory uint8 quantization. NumPy pickle loading is disabled.
-
-SSIM defaults to a uniform 7x7 window, sample covariance, K1=0.01 and K2=0.03.
-Its supported explicit settings are normalized and frozen; `window_size` and
-`win_size` identify the same parameter, and conflicting values are rejected.
-Predictions are clipped to the declared range; image dimensions must
-match the input/reference. Scores are averaged over crops, then images within
-each group; `mean_groups` weights groups equally. Per-group metrics survive in
-private reports. Zero-MSE PSNR raises an explicit error under the finite-score
-contract rather than using a cap or arbitrary epsilon. Crop-wise inference is a
-task requirement that cannot be proved from stitched outputs. The frozen
-`prediction_spec()` records the resolved protocol for every candidate. Reference
-tests additionally use scikit-image when available. Preparation fixtures and their
-referenced files remain available until every Harness probe completes; cleanup
-belongs to the Harness. Private probe answers remain outside the agent workspace.
-
-Private test results stay outside candidate feedback and selection. Final
-retraining uses the same scorer and reports failure if private scoring fails.
-Old frozen evaluators and existing running processes are not rewritten: API-v1
-artifacts require a new run to prepare API-v2 scoring, and evaluator caches were
-versioned accordingly. Workspace-side cross-method benchmark scripts remain
-separate tools; this contract governs BioMaker's own runtime scoring.
-
-## Test with Example Dataset
-You can download the example dataset from [Huggingface](https://huggingface.co/datasets/blueyo0/organmnist3d).
-Download command:
-```
-uv run hf download blueyo0/organmnist3d --local-dir dataset/organmnist3d --repo-type dataset
-```
-Then run `quick_start.sh` to test. BioMaker adapts the model and training scale to the available hardware (CPU, Apple MPS, or CUDA GPU):
-```
-bash quick_start.sh
-```
-
-# 🙏 Acknowledgement
-- We thank all medical workers and dataset owners for making public datasets available to the community.
-- Thanks to the open-source projects that make biomedical AI development easier, especially [MONAI](https://github.com/Project-MONAI) and [aideml](https://github.com/WecoAI/aideml).
+Thanks to medical workers and dataset owners, and to open-source projects
+including [MONAI](https://github.com/Project-MONAI) and
+[aideml](https://github.com/WecoAI/aideml).

@@ -60,6 +60,30 @@ does not affect selection. Full values, directions and individual ranks remain
 available in the detail tables and exports. Ranking snapshots include their
 candidate count and version; raw values are never overwritten by ranks.
 
+## Scoring outcomes and final delivery
+
+A completed score must contain every declared finite metric and explicitly
+successful result semantics. New envelopes use `score_schema_version: 1`,
+`status: "ok"` and `failure: null`; diagnostics are observations, not status
+flags. Legacy error, invalid and fallback markers are interpreted only at the
+compatibility boundary. The internal `ScoringOutcome` distinguishes `valid`,
+`invalid_prediction` and `evaluator_unavailable`; failed outcomes cannot publish
+ranking metrics. Evaluator faults never become candidate debugging feedback.
+
+Selection writes `selection.json` with the validation ranking, selected node,
+code, contract, evaluator and artifact identities. Final retraining is optional
+and may use only permitted labels. It does not run private scoring itself.
+Private test evaluation then runs once on the delivered artifact, using the same
+frozen scorer. `private_metrics.json` reserves the attempt before execution and
+records its result; repeated calls cannot silently rescore failed or changed
+artifacts. A private scoring failure preserves the model and validation evidence
+but reports the run as failed. An absent test role or absent private-answer
+declaration is skipped explicitly; missing declared answers are errors.
+
+By default, delivery requires saved model files, a manifest and reload/inference
+checks against the frozen output contract. Prediction CSVs alone do not satisfy
+this requirement. Historical runtimes remain unchanged when the source updates.
+
 ## Three separate contracts
 
 | Contract | Authority | What it specifies |
@@ -203,11 +227,6 @@ private scoring job. Final model retraining is controlled by the requested
 finalization settings, independently of test presence. Declared prediction
 artifacts and their sample coverage are still checked on every candidate.
 
-The shared `experiments/_shared/biomaker_prenode_smoke.py --prepare-only` workflow
-runs split preparation and production evaluator compilation/scoring probes,
-then stops before proposal generation. Metric-kernel or resource preflights are
-separate checks and do not establish that this preparation chain can complete.
-
 ## Scoring execution and recovery
 
 Trusted scoring execution is Harness-owned and separate from the frozen metric
@@ -247,6 +266,11 @@ python -m biomaker.score --workspace /absolute/run/workspace \
   --timeout 3600 --workers 2 --output /absolute/private/rescore.json
 ```
 
+The CLI and `RunService.rescore(...)` call the same
+`biomaker.score.rescore_saved_predictions(...)` operation. The service accepts
+the same explicit workspace, prediction, truth, expected, output, timeout and
+worker arguments and returns the receipt status, output path and exit code.
+
 The timeout and worker values above are examples to calibrate, not universal
 budgets. Choose a new private output path; the command preserves existing
 evidence, does not resume search and does not retrofit saved frozen evaluators
@@ -257,7 +281,7 @@ already contains the updated runtime.
 User-only private-test failures preserve their error and failure kind and are
 never reported as available metrics. They do not alter validation ranking or
 turn a validation-successful candidate into `unscored`. Final private evaluation
-failure still prevents reporting final retraining as fully successful.
+failure is reported independently from successful model retraining.
 
 ## Data adapter API
 
@@ -691,8 +715,9 @@ of candidates to execute during scoring without an unbounded scoring backlog.
 Only fully scored results (or explicit failure outcomes) enter the journal and
 ranking. A scoring infrastructure failure stops new admission and drains work
 already admitted; reaching the search deadline also drains admitted scoring.
-Final retraining waits for that drain. Per-node private test evaluation remains
-on its existing path; it is disabled for train/validation-only ATM26 runs.
+Final retraining waits for that drain. Private test evaluation runs once on the
+selected artifact, after successful final retraining when enabled. Tasks without
+private test answers have no private scoring job.
 
 `execution_finished.exec_time` now excludes Harness scoring. Separate
 `scoring_started` / `scoring_finished` events record scoring wall time. This timing

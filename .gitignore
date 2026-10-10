@@ -16,3 +16,18 @@ logs/
 workspaces/
 apps/webui/state/
 biomaker/monai_rag/monai_rag_db/
+
+# Machine-local inputs, experiments, receipts and model outputs
+.env.*
+!.env.example
+.biomaker/
+.cache/
+data/
+dataset/
+datasets/
+experiments/
+recipes/
+benchmarks/
+checkpoints/
+node_modules/
+*.log

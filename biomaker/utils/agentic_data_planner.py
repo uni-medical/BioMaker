@@ -15,6 +15,7 @@ to the builder script generated from the observed data and task description.
 from __future__ import annotations
 
 import json
+import errno
 import hashlib
 import math
 import re
@@ -54,7 +55,7 @@ GENERATED_DIR_NAMES = {
     "private_gt",
     "_split_builder",
 }
-SPLIT_BUILDER_CACHE_VERSION = 12
+SPLIT_BUILDER_CACHE_VERSION = 13
 
 
 @dataclass(frozen=True)
@@ -142,8 +143,13 @@ def _path_candidates(value: Any, input_dir: Path, base_dir: Path) -> list[Path]:
 
 def _resolve_path(value: Any, input_dir: Path, base_dir: Path) -> Path | None:
     for candidate in _path_candidates(value, input_dir, base_dir):
-        if candidate.exists():
-            return candidate
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError as exc:
+            # Inline JSON boxes/masks are values, not filesystem paths.
+            if exc.errno not in {errno.ENAMETOOLONG, errno.EINVAL}:
+                raise
     return None
 
 
@@ -462,7 +468,7 @@ def _builder_user_prompt(
         "Installed Reader Environment": environment_manifest_text(include_medical=True),
         "Observed Data Facts": json.dumps(facts, indent=2, ensure_ascii=False),
         "Required Output Files": [
-            "biomaker_splits/agent_train.csv: public training rows; may include training answers.",
+            "biomaker_splits/agent_train.csv: public training rows with every declared training answer column and genuine source supervision. Hide answers only in held-out public score_val/agent_test inputs; never omit training targets or backfill them from held-out answers. Keep legitimate empty annotations explicitly encoded (for example JSON [] for no detections).",
             "biomaker_splits/score_val.csv: public validation-input rows; must not include validation answers.",
             "biomaker_splits/agent_test.csv: public test-input rows when a test source exists; must not include private test answers.",
             "private_gt/score_val.csv: matching validation key_columns plus answer_columns. Public input/metadata columns may be omitted: Harness supplies those separately as expected_row. Row order may differ when keys are declared.",
@@ -1064,6 +1070,95 @@ def _check_split_lifecycle(
     return paths
 
 
+def _inline_empty_annotation_columns(
+    split_manifest: dict[str, Any], hidden_answers: dict[str, Any]
+) -> set[str]:
+    """Keep declared inline detection/segmentation empty annotations legal."""
+    from .metric_declarations import declared_metric_names
+    from .metric_registry import metric_info
+
+    try:
+        primary, secondary = declared_metric_names(split_manifest, "")
+    except (ValueError, TypeError):
+        return set()
+    metrics = [metric_info(name) for name in [primary, *secondary] if name]
+    if not metrics or any(
+        info is None or info.task_family not in {"detection", "segmentation"}
+        for info in metrics
+    ):
+        return set()
+    role_errors: list[str] = []
+    roles = split_file_reference_roles(split_manifest, hidden_answers, role_errors)
+    if role_errors:
+        return set()
+    allowed: set[str] = set()
+    for column in set().union(*roles["answer_columns"].values()):
+        scopes = [role for role, columns in roles["answer_columns"].items() if column in columns]
+        if scopes and all(
+            roles["answer_files"][role] is not None
+            and column not in roles["answer_files"][role]
+            for role in scopes
+        ):
+            allowed.add(column)
+    return allowed
+
+
+def validate_training_answers(
+    train_df: pd.DataFrame | None,
+    hidden_answers: dict[str, Any],
+    errors: list[str],
+    *,
+    split_manifest: dict[str, Any] | None = None,
+) -> list[str]:
+    """Require usable training targets without exposing held-out answer values.
+
+    The builder already declares the target columns in its hidden-answer index.
+    These same targets supervise training; only score/test answers are hidden.
+    Keeping a common schema also covers vector targets and file-based masks.
+    Explicit empty collections and zero-valued answers remain valid. Blank
+    encodings are also retained for declared inline detection/segmentation
+    annotations; missing columns and missing file-backed labels still fail.
+    No column-name heuristic chooses which targets are required.
+    """
+    required_columns: set[str] = set()
+    for split in ("score_val", "test"):
+        entry = hidden_answers.get(split)
+        columns = entry.get("answer_columns") if isinstance(entry, dict) else None
+        if isinstance(columns, list):
+            required_columns.update(column for column in columns if isinstance(column, str) and column.strip())
+    required = sorted(required_columns)
+    if not required:
+        errors.append("Training supervision requires declared non-empty answer_columns in private_gt/private_gt.json.")
+        return required
+    if train_df is None:
+        return required  # The required CSV read already reports this failure.
+    empty_annotation_columns = _inline_empty_annotation_columns(
+        split_manifest or {}, hidden_answers
+    )
+    missing = sorted(set(required) - set(train_df.columns))
+    if missing:
+        errors.append(
+            "agent_train.csv is missing required training answer columns: "
+            f"{missing}. Retain genuine training answers; hide answers only in "
+            "score_val.csv and agent_test.csv."
+        )
+    for column in required:
+        if column not in train_df:
+            continue
+        values = train_df[column]
+        missing_values = values.isna()
+        if column not in empty_annotation_columns:
+            missing_values = missing_values | values.astype(str).str.strip().eq("")
+        missing_count = int(missing_values.sum())
+        if missing_count:
+            errors.append(
+                f"agent_train.csv training answer column {column!r} has "
+                f"{missing_count} missing/blank rows. Preserve source training "
+                "answers; do not fill placeholders or copy held-out answers."
+            )
+    return required
+
+
 def verify_split_package(
     output_dir: Path,
     source_input_dir: Path | None = None,
@@ -1103,6 +1198,9 @@ def verify_split_package(
     except SplitContractError as exc:
         errors.append(f"Invalid split manifest: {exc}")
         split_manifest = {}
+    training_answer_columns = validate_training_answers(
+        train_df, manifest, errors, split_manifest=split_manifest
+    )
     constraints = parse_split_constraints(task_text)
     public_paths = _check_split_lifecycle(
         split_manifest, {"train": train_df, "score_val": score_df, "test": test_df},
@@ -1281,6 +1379,7 @@ def verify_split_package(
         "errors": errors + metric_errors,
         "warnings": warnings,
         "row_counts": row_counts,
+        "training_answer_columns": training_answer_columns,
         "hidden_answers": manifest,
         "private_gt": manifest,
         "split_manifest": _manifest_summary_for_verifier(split_manifest),

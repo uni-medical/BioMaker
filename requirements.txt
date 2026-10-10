@@ -10,8 +10,9 @@ jsonschema==4.19.2
 omegaconf>=2.3.0
 openai>=1.69.0
 python-dotenv
+pydantic>=2,<3
 psutil>=6,<8
-requests==2.31.0
+requests>=2.34.2,<3
 rich==13.7.0
 shutup>=0.2.0
 
@@ -20,9 +21,10 @@ beautifulsoup4
 huggingface_hub
 openpyxl
 pandas
-Pillow
+Pillow>=12.3
 
 # Common packages available to generated solutions
+joblib
 lightgbm
 matplotlib
 numpy<2
@@ -50,3 +52,11 @@ monai==1.4.0
 nibabel
 pydicom
 SimpleITK
+
+# Shared distribution security floors
+anyio>=4.14.2
+fsspec>=2026.6.0
+idna>=3.15
+setuptools>=83
+soupsieve>=2.9
+urllib3>=2.8

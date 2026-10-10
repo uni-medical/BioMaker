@@ -19,6 +19,7 @@ def attach_artifact_validation_result(
     exec_result.artifact_validation = {
         "ok": artifact_check.ok,
         "messages": artifact_check.messages,
+        "model_artifact": getattr(artifact_check, "model_artifact", None),
     }
     if artifact_check.messages:
         exec_result.append_system_output(
@@ -44,6 +45,7 @@ def attach_evaluator_run_result(
     """Attach frozen evaluator facts to an execution."""
     details = {
         "ok": evaluator_result.ok,
+        "outcome": evaluator_result.outcome.status,
         "metric": evaluator_result.metric,
         "maximize": evaluator_result.maximize,
         "metrics": evaluator_result.metrics,
@@ -74,9 +76,7 @@ def attach_evaluator_run_result(
         )
         return
 
-    infrastructure_failure = evaluator_result.failure_kind in {
-        "timeout", "resource", "interrupted", "execution", "protocol",
-    }
+    infrastructure_failure = evaluator_result.outcome.status == "evaluator_unavailable"
     exec_result.exc_type = "EvaluatorInfrastructureError" if infrastructure_failure else failure_type
     exec_result.exc_info = {
         "reason": evaluator_result.error,

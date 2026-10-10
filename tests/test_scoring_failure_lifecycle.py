@@ -371,7 +371,7 @@ def test_runner_stops_new_work_but_saves_inflight_results_on_scoring_failure(tmp
     assert 2 <= len(scoring_workspaces) <= 4
     assert len(saved_nodes) == len(scoring_workspaces)
     assert sum(node.outcome == "unscored" for node in saved_nodes) == 1
-    assert set(private_workspaces) == set(scoring_workspaces[1:])
+    assert private_workspaces == []  # Search never evaluates private test labels.
     for workspace in scoring_workspaces:
         assert (workspace / "working/model.bin").read_bytes() == b"trained weights"
         assert (workspace / "working/validation_predictions.csv").is_file()
@@ -391,67 +391,46 @@ def test_runner_stops_new_work_but_saves_inflight_results_on_scoring_failure(tmp
         assert round_finished < unavailable, "late timeout must be discovered after the deadline exit"
 
 
-def test_private_timeout_retains_kind_and_is_not_reported_as_available(tmp_path, monkeypatch):
+def test_selected_private_timeout_preserves_validation_and_reports_run_failure(tmp_path, monkeypatch):
     import biomaker.run as run_module
-    from biomaker.utils import private_evaluation
+    from biomaker.utils import final_selection
     from test_presentation_failure_lifecycle import _install_minimal_run
-
     cfg, events, _order, _live = _install_minimal_run(
-        monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False,
-    )
+        monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False)
     cfg.final_retrain.enabled = False
-    submission, hidden, expected = [tmp_path / name for name in ("submission.csv", "test.csv", "expected.csv")]
-    for path in (submission, hidden, expected):
-        path.write_text("case\na\n")
-    contract = SimpleNamespace(
-        hidden_answers={"test": SimpleNamespace(path=hidden)},
-        prediction_jobs={"test": SimpleNamespace(artifact=submission, expected=expected)},
-    )
-    monkeypatch.setattr(private_evaluation, "load_experiment_contract", lambda *_a, **_k: contract)
-    monkeypatch.setattr(private_evaluation, "score_artifacts_with_evaluator", lambda *_a, **_kw:
-        evaluator_setup.EvaluatorRunResult(False, None, True, {}, "", "private evaluator timed out", failure_kind="timeout"))
-    monkeypatch.setattr(run_module, "evaluate_private_outputs", private_evaluation.evaluate_private_outputs)
-    entries = []
-    monkeypatch.setattr(run_module, "_append_private_metrics_entry", lambda _cfg, entry, **_kw: entries.append(entry))
-
-    run_module._run_direct_entry()
-
-    assert len(entries) == 1
-    entry = entries[0]
-    assert entry["private_metrics_available"] is False
-    assert entry["private_error"] == "private evaluator timed out"
-    assert entry["private_failure_kind"] == entry["private_metrics"]["failure_kind"] == "timeout"
-    assert entry["private_metrics"]["results"] == []
-    assert entry["metric"]["value"] == 0.9
-    assert entry["is_buggy"] is False
-    assert entry["outcome"] == "first_success"
-    failures = [payload for event, payload in events if event == "private_scoring_failed"]
-    assert len(failures) == 1 and failures[0]["failure_kind"] == "timeout"
-    assert events[-1] == ("run_finished", {"completed_steps": 1})
+    hidden = tmp_path / "truth.csv"
+    hidden.write_text("case,label\na,1\n")
+    contract = SimpleNamespace(prediction=SimpleNamespace(raw={}),
+        hidden_answers={"test": SimpleNamespace(path=hidden)}, prediction_jobs={"test": object()})
+    monkeypatch.setattr(final_selection, "load_experiment_contract", lambda *_a, **_k: contract)
+    monkeypatch.setattr(run_module, "freeze_selection", final_selection.freeze_selection)
+    monkeypatch.setattr(run_module, "evaluate_selected_delivery", final_selection.evaluate_selected_delivery)
+    calls = []
+    def fail(*_a, **_k):
+        calls.append(True)
+        return {"error": "private evaluator timed out", "failure_kind": "timeout", "results": []}
+    monkeypatch.setattr(final_selection, "evaluate_private_outputs", fail)
+    with pytest.raises(evaluator_setup.EvaluatorInfrastructureError, match="private evaluator timed out"):
+        run_module._run_direct_entry()
+    assert len(calls) == 1
+    receipt = json.loads((cfg.log_dir / "private_metrics.json").read_text())
+    assert len(receipt["history"]) == 1
+    assert receipt["latest"]["private_failure_kind"] == "timeout"
+    assert receipt["latest"]["private_metrics_available"] is False
+    saved = [payload for name, payload in events if name == "step_saved"]
+    assert saved[0]["best_node_id"] == saved[0]["node_id"]
+    assert receipt["validation_selection"]["best_node_id"] == saved[0]["node_id"]
+    assert events[-1][0] == "run_failed"
 
 
-def test_final_private_timeout_is_not_reported_as_available_or_run_complete(tmp_path, monkeypatch):
+def test_failed_final_retrain_does_not_attempt_private_evaluation(tmp_path, monkeypatch):
     import biomaker.run as run_module
     from test_presentation_failure_lifecycle import _install_minimal_run
-
     cfg, events, _order, _live = _install_minimal_run(
-        monkeypatch, tmp_path, retrain_ok=False, break_on_stop=False,
-    )
-    monkeypatch.setattr(run_module, "run_final_retrain", lambda *_a, **_kw: SimpleNamespace(
-        ok=False, workspace_dir=cfg.workspace_dir / "final_retrain",
-        train_rows_before=10, score_rows_added=2, train_rows_after=12,
-        private_metrics={"results": [], "error": "private scoring timed out", "failure_kind": "timeout"},
-        error="Private evaluation failed after final retrain: private scoring timed out",
-    ))
-    entries = []
-    monkeypatch.setattr(run_module, "_append_private_metrics_entry", lambda _cfg, entry, **_kw: entries.append(entry))
-
+        monkeypatch, tmp_path, retrain_ok=False, break_on_stop=False)
+    monkeypatch.setattr(run_module, "evaluate_selected_delivery", lambda *_a, **_k:
+        pytest.fail("Failed retraining cannot enter private evaluation"))
     with pytest.raises(RuntimeError, match="Final retrain did not complete successfully"):
         run_module._run_direct_entry()
-    assert len(entries) == 1
-    assert entries[0]["stage"] == "final_retrain"
-    assert entries[0]["outcome"] == "final_retrain_failed"
-    assert entries[0]["private_metrics_available"] is False
-    assert entries[0]["private_failure_kind"] == "timeout"
-    assert "private scoring timed out" in entries[0]["private_error"]
+    assert not (cfg.log_dir / "private_metrics.json").exists()
     assert events[-1][0] == "run_failed"

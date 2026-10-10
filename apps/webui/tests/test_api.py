@@ -331,6 +331,9 @@ def test_run_updates_exposes_revisions_and_terminal_barrier(settings):
 def test_reimported_unmanaged_terminal_event_updates_api_status(settings):
     log_dir = settings.logs_root / "orphan-history"
     log_dir.mkdir()
+    (log_dir / "run_manifest.json").write_text(
+        json.dumps({"data_dir": str(settings.datasets_root / "fixture")}), encoding="utf-8"
+    )
     app = create_app(settings, process_factory=ImmediateProcess)
 
     with TestClient(app) as client:
@@ -343,6 +346,9 @@ def test_reimported_unmanaged_terminal_event_updates_api_status(settings):
                 "log_dir": str(log_dir),
                 "timestamps": {"finished_at": None},
             }
+        )
+        (log_dir / "events.jsonl").write_text(
+            json.dumps({"event": "run_finished", "ts": "2026-08-21T15:38:00Z"}) + "\n", encoding="utf-8"
         )
         app.state.manager.import_log_record(
             {
@@ -784,7 +790,7 @@ def test_cli_lifecycle_events_drive_status_and_special_names_are_routable(settin
         assert runs[running_name]["status"] == "incomplete"
         assert runs[running_name]["detailed_status"] == "orphaned"
         assert runs[running_name]["terminal_event"] is None
-        assert "no terminal lifecycle event" in runs[running_name]["status_reason"]
+        assert "no terminal lifecycle event" in runs[running_name]["status_reason"].lower()
         assert runs[failed_name]["status"] == "incomplete"
         assert runs[failed_name]["detailed_status"] == "failed"
         assert runs[failed_name]["terminal_event"] == "run_failed"

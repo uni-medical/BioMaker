@@ -24,7 +24,6 @@ from biomaker.tools.python_probe import python_probe
 from biomaker.run import (
     _freeze_generation_inputs,
     _final_retrain_timeout_seconds,
-    _private_metrics_summary,
     _remaining_schedule_budget,
     _run_overview_text,
     journal_to_rich_tree,
@@ -454,6 +453,7 @@ class ContractConsistencyTests(unittest.TestCase):
                 details={},
                 output="evaluator raw output",
                 error="bad submission",
+                failure_kind="prediction_contract",
             ),
             failure_phase="evaluator_scoring",
             failure_type="EvaluatorValidationError",
@@ -1387,33 +1387,6 @@ class ContractConsistencyTests(unittest.TestCase):
                 private_result["metric_name"], "private_mean_binary_accuracy"
             )
             self.assertEqual(private_result["value"], 1.0)
-
-    def test_private_summary_excludes_buggy_entries_from_best(self) -> None:
-        history = [
-            {
-                "node_id": "buggy",
-                "is_buggy": True,
-                "metric": {"value": 0.1, "maximize": True},
-                "private_metrics": {
-                    "results": [
-                        {"name": "private_test", "value": 0.99, "maximize": True}
-                    ]
-                },
-            },
-            {
-                "node_id": "good",
-                "is_buggy": False,
-                "metric": {"value": 0.8, "maximize": True},
-                "private_metrics": {
-                    "results": [
-                        {"name": "private_test", "value": 0.8, "maximize": True}
-                    ]
-                },
-            },
-        ]
-        summary = _private_metrics_summary(history)
-        self.assertEqual(summary["private_test_best"]["node_id"], "good")
-        self.assertEqual(summary["eligible_history_count"], 1)
 
     def test_environment_policy_ignores_comments_and_strings_for_installs(self) -> None:
         safe = "\n".join(

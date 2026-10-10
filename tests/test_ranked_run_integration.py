@@ -9,7 +9,6 @@ from rich.console import Console
 
 from biomaker.journal import Journal, Node
 from biomaker.run import (
-    _append_private_metrics_entry,
     _ranking_payload,
     _sync_selected_best,
     best_metrics_table,
@@ -39,7 +38,7 @@ def append_candidate(journal, tmp_path, node_id, values):
     return node
 
 
-def test_old_winner_promotion_updates_artifacts_terminal_and_private_summary(tmp_path):
+def test_old_winner_promotion_updates_artifacts_terminal_and_frozen_selection(tmp_path, monkeypatch):
     cfg = SimpleNamespace(workspace_dir=tmp_path / "run", log_dir=tmp_path / "logs")
     cfg.log_dir.mkdir()
     journal = Journal(
@@ -51,40 +50,19 @@ def test_old_winner_promotion_updates_artifacts_terminal_and_private_summary(tmp
     _, initial = _sync_selected_best(cfg, journal, None)
     assert initial["best_node_id"] == "A"
     assert (cfg.workspace_dir / "working_best" / "model.txt").read_text() == "A"
-    for node, private_score in ((a, 100), (b, 0)):
-        _append_private_metrics_entry(
-            cfg,
-            {
-                "node_id": node.id,
-                "is_buggy": False,
-                **_ranking_payload(journal, node),
-                "private_metrics": {
-                    "results": [
-                        {"name": "private_test", "metrics": {"x": private_score}}
-                    ]
-                },
-            },
-            ranking=initial,
-        )
     c = append_candidate(journal, tmp_path, "C", {"x": 3, "y": 4})
     winner, current = _sync_selected_best(cfg, journal, initial["best_node_id"])
     assert winner is b
     assert current["version"] != initial["version"]
     assert current["nodes"]["A"]["average_rank"] == 2
     assert (cfg.workspace_dir / "working_best" / "model.txt").read_text() == "B"
-    _append_private_metrics_entry(
-        cfg,
-        {
-            "node_id": c.id,
-            "is_buggy": False,
-            **_ranking_payload(journal, c),
-        },
-        ranking=current,
-    )
-    summary = json.loads((cfg.log_dir / "private_metrics.json").read_text())["summary"]
-    assert summary["val_best"]["node_id"] == "B"
-    assert summary["val_best"]["private_test_metrics"] == {"x": 0}
-    assert summary["val_best"]["ranking"]["average_rank"] == 1.5
+    from biomaker.utils import final_selection
+    monkeypatch.setattr(final_selection, "load_experiment_contract", lambda *_a, **_k:
+        SimpleNamespace(prediction=SimpleNamespace(raw={"metrics": journal.metric_specs})))
+    frozen = final_selection.freeze_selection(cfg, journal, winner)
+    assert frozen["node_id"] == "B"
+    assert frozen["validation_selection"]["nodes"]["B"]["average_rank"] == 1.5
+    assert not (cfg.log_dir / "private_metrics.json").exists()
     assert "1: x 5 · y 5 (best)" in render(journal_to_rich_tree(journal))
     assert "3 candidates" in " ".join(render(best_metrics_table(journal)).split())
 

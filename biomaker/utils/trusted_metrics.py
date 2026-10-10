@@ -59,7 +59,7 @@ _METRIC_DEFINITIONS = {
     'accuracy': dict(family='classification', maximize=True, aliases=['acc'],
                      description='Mean correct single-label predictions, or mean binary decisions for multilabel.'),
     'auc': dict(family='classification', maximize=True,
-                aliases=['roc_auc', 'macro_auc', 'macro_roc_auc', 'ovr_auc'],
+                aliases=['roc_auc', 'auroc', 'macro_auc', 'macro_roc_auc', 'ovr_auc', 'macro_auroc', 'macro_auroc_ovr', 'macro_roc_auc_ovr', 'macro_ovr_roc_auc', 'macro_one_vs_rest_auroc', 'macro one-vs-rest auroc', 'macro_auroc_one_versus_rest'],
                 description='Binary ROC AUC, macro OVR multiclass AUC, or macro multilabel ROC AUC.'),
     'mean_roc_auc': dict(family='classification', maximize=True, aliases=[],
                          description='Macro binary ROC AUC for multilabel classification.', task_types=['multilabel']),

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dist-electron/
+build/runtime/
+release/
+test-results/
+playwright-report/
+build/*.png
+build/*.icns
+build/*.ico
+build/*.iconset/
+.runtime-venv/

@@ -1,5 +1,109 @@
 """Deterministic evaluator source templates."""
 
+# Harness-owned probes run only on disposable preparation fixtures.
+_STRICT_PROBE_HELPERS = r'''
+import hashlib
+import math
+import json
+from pathlib import Path
+import pandas as pd
+
+def _fingerprint(paths):
+    result = {}
+    for p in paths:
+        p = Path(p)
+        if not p.exists():
+            result[str(p)] = None
+        else:
+            stat = p.stat()
+            result[str(p)] = (stat.st_mtime_ns, stat.st_ctime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
+    return result
+
+def _legacy_failure(value):
+    if isinstance(value, dict):
+        return any(value.get(k) for k in ('error','fallback','fallback_used','used_fallback')) or value.get('valid') is False or value.get('ok') is False or any(_legacy_failure(v) for v in value.values())
+    return isinstance(value, list) and any(_legacy_failure(v) for v in value)
+
+def _check_probe_result(value, spec, scoring):
+    if not scoring:
+        if value is True or (isinstance(value, dict) and not _legacy_failure(value) and (value.get('valid') is True or value.get('ok') is True)):
+            return
+        raise ValueError('Submission validation must explicitly succeed')
+    if not isinstance(value, dict):
+        raise ValueError('Scoring must return a dictionary')
+    if value.get('score_schema_version') == 1:
+        if value.get('status') != 'ok' or value.get('failure') is not None or any(value.get(k) for k in ('error','fallback','fallback_used','used_fallback')):
+            raise ValueError('Scoring did not explicitly succeed')
+    elif _legacy_failure(value):
+        raise ValueError('Scoring returned failure/fallback markers')
+    declared = spec.get('metrics')
+    if declared:
+        wanted = [m['name'] for m in declared]
+        metrics = value.get('metrics')
+        if not isinstance(metrics, dict) or not set(wanted).issubset(metrics):
+            raise ValueError('Scoring must return every frozen metric')
+        values = list(metrics.values())
+    else:
+        values = [value.get('metric')]
+        if not isinstance(value.get('maximize', True), bool):
+            raise ValueError('maximize must be a boolean')
+        if 'maximize' in spec and value.get('maximize', True) != spec['maximize']:
+            raise ValueError('maximize disagrees with the frozen metric contract')
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
+        raise ValueError('All ranking metrics must be finite numbers')
+
+def _probe_call(call, paths, spec, scoring=True, reject=False, case='valid', allow_undefined=False):
+    before = _fingerprint(paths)
+    rejected = False
+    try:
+        _check_probe_result(call(), spec, scoring)
+    except Exception as exc:
+        undefined = isinstance(exc, getattr(evaluator, 'UndefinedMetricError', ()))
+        if undefined and reject:
+            raise RuntimeError('Corrupt predictions reached metric computation: ' + case) from exc
+        if not reject and not (allow_undefined and undefined):
+            raise
+        rejected = True
+    finally:
+        if before != _fingerprint(paths):
+            raise RuntimeError('Evaluator modified an artifact during ' + case)
+    if reject and not rejected:
+        raise RuntimeError('Evaluator accepted corrupted contract case: ' + case)
+
+def _negative_prediction_probes(path, call, watched, spec, scoring=True, allow_undefined=False):
+    path = Path(path)
+    original = path.read_bytes()
+    frame = pd.read_csv(path)
+    keys = list(spec.get('key_columns', []))
+    predictions = list(spec.get('prediction_columns', []))
+    refs = list(spec.get('file_reference_columns', []))
+    required = list(dict.fromkeys(keys + predictions + refs))
+    _probe_call(call, watched, spec, scoring, allow_undefined=allow_undefined)
+    cases = [('missing_column_' + c, frame.drop(columns=[c])) for c in required if c in frame]
+    cases.append(('missing_row', frame.iloc[:-1].copy()))
+    if len(frame) and keys:
+        wrong = frame.copy()
+        wrong[keys[0]] = wrong[keys[0]].astype(object)
+        wrong.loc[wrong.index[0], keys[0]] = '__biomaker_unknown_key__'
+        cases.append(('unexpected_key', wrong))
+        if len(frame) > 1:
+            duplicate = frame.copy()
+            duplicate.loc[duplicate.index[1], keys] = duplicate.iloc[0][keys].to_numpy()
+            cases.append(('duplicate_key', duplicate))
+    if len(frame) and predictions:
+        for label, bad in [('nan', float('nan')), ('infinite', float('inf')), ('nonnumeric', 'not-a-number')]:
+            corrupt = frame.copy()
+            corrupt[predictions[0]] = corrupt[predictions[0]].astype(object)
+            corrupt.loc[corrupt.index[0], predictions[0]] = bad
+            cases.append((label, corrupt))
+    try:
+        for case, corrupt in cases:
+            corrupt.to_csv(path, index=False)
+            _probe_call(call, watched, spec, scoring, reject=True, case=case)
+    finally:
+        path.write_bytes(original)
+'''
+
 _FIXED_CLASSIFICATION_EVALUATOR = r"""
 import math
 import os

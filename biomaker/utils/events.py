@@ -57,12 +57,13 @@ def _write_event(
                 os.fsync(handle.fileno())
 
 
-def append_event(log_dir: Path, event: str, **payload: Any) -> None:
+def append_event(log_dir: Path, event: str, **payload: Any) -> bool:
     """Append one non-terminal lifecycle fact on a best-effort basis."""
     try:
         _write_event(log_dir, event, payload, durable=False)
+        return True
     except Exception:
-        return
+        return False
 
 
 def append_terminal_event(log_dir: Path, event: str, **payload: Any) -> None:

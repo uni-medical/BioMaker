@@ -175,12 +175,6 @@ def test_builder_receives_constraints_and_actual_reader_environment(monkeypatch)
     assert "directory named validation may be reserved for final private test" in text
 
 
-def test_rsna_task_preserves_explicit_source_roles():
-    task = Path(__file__).resolve().parents[2] / "experiments/rsna_bone_age/task.md"
-    if not task.is_file():
-        pytest.skip("Workspace experiment declarations are separate from the method repository.")
-    assert parse_split_constraints(task.read_text()) == CONSTRAINTS
-
 
 def compact_private_answers(output):
     for role in ("score_val", "test"):
@@ -296,6 +290,16 @@ def test_identity_only_prediction_columns_still_fail(split_package):
 def test_source_coverage_counts_hidden_answer_files_without_public_exposure(split_package):
     source, output = split_package
     compact_private_answers(output)
+    train_path = output / "biomaker_splits/agent_train.csv"
+    train = pd.read_csv(train_path, dtype=str)
+    train_masks = []
+    for index in range(len(train)):
+        mask = source / "training_masks" / f"train_{index}.bin"
+        mask.parent.mkdir(parents=True, exist_ok=True)
+        mask.write_text("genuine training target")
+        train_masks.append("input/training_masks/" + mask.name)
+    train["target_mask"] = train_masks
+    train.to_csv(train_path, index=False)
     hidden = json.loads((output / "private_gt/private_gt.json").read_text())
     for role in ("score_val", "test"):
         path = output / "private_gt" / (role + ".csv")

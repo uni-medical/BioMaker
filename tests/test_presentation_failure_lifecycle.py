@@ -204,6 +204,7 @@ def _install_minimal_run(
 
     def record_event(_log_dir, event, **payload):
         events.append((event, payload))
+        return True
 
     monkeypatch.setattr(run_module, "append_event", record_event)
     monkeypatch.setattr(run_module, "append_terminal_event", record_event)
@@ -251,7 +252,7 @@ def _install_minimal_run(
     monkeypatch.setattr(
         run_module,
         "validate_working_outputs",
-        lambda *_args: SimpleNamespace(ok=True),
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True),
     )
     monkeypatch.setattr(
         run_module,
@@ -301,9 +302,8 @@ def _install_minimal_run(
     monkeypatch.setattr(run_module.logger, "addHandler", lambda *_args: None)
     monkeypatch.setattr(run_module.backend.logger, "addHandler", lambda *_args: None)
     monkeypatch.setattr(run_module.signal, "signal", lambda *_args: None)
-    monkeypatch.setattr(
-        run_module, "_append_private_metrics_entry", lambda *_args, **_kwargs: None
-    )
+    monkeypatch.setattr(run_module, "freeze_selection", lambda *_a, **_k: {"selection_id": "fixed-selection"})
+    monkeypatch.setattr(run_module, "evaluate_selected_delivery", lambda *_a, **_k: {"status": "completed"})
 
     def final_retrain(*_args, **_kwargs):
         order.append("final_retrain")
@@ -333,7 +333,7 @@ def _set_execution_workspace(node, workspace):
 
 
 @pytest.mark.parametrize("evaluator_timeout", [None, 900])
-def test_run_uses_independent_budget_for_preparation_candidate_and_private_scoring(
+def test_run_uses_independent_budget_for_preparation_and_candidate_scoring(
     tmp_path, monkeypatch, evaluator_timeout
 ):
     cfg, events, _order, _live = _install_minimal_run(
@@ -363,57 +363,42 @@ def test_run_uses_independent_budget_for_preparation_candidate_and_private_scori
     monkeypatch.setattr(run_module, "evaluate_private_outputs", private)
     run_module.run()
 
-    assert observed == dict(prepare=expected, candidate=expected, private=expected)
+    assert observed == dict(prepare=expected, candidate=expected)
     assert events[-1] == ("run_finished", {"completed_steps": 1})
 
 
-@pytest.mark.parametrize("per_node", [None, True, False])
 @pytest.mark.parametrize("final_retrain_enabled", [False, True])
-def test_private_evaluation_policy_preserves_search_and_controls_private_history(
-    tmp_path, monkeypatch, per_node, final_retrain_enabled
+def test_private_evaluation_runs_once_after_selection_and_delivery(
+    tmp_path, monkeypatch, final_retrain_enabled
 ):
-    write_private_metrics = run_module._append_private_metrics_entry
     cfg, events, order, _live = _install_minimal_run(
         monkeypatch, tmp_path, retrain_ok=True, break_on_stop=False
     )
-    if per_node is not None:
-        cfg.private_evaluation = SimpleNamespace(per_node=per_node)
+    cfg.private_evaluation = SimpleNamespace(protocol="post_selection_once")
     cfg.final_retrain.enabled = final_retrain_enabled
-    private_dir = cfg.log_dir / "private_gt"
-    private_dir.mkdir()
-    (private_dir / "private_gt.json").write_text("{}", encoding="utf-8")
     private_calls = []
-
-    def evaluate_private(workspace, hidden_dir, **_kwargs):
-        private_calls.append((workspace, hidden_dir))
-        # A poor private score must never replace the validation metric.
-        return {"results": [{"name": "private_test", "value": 0.1}]}
-
-    monkeypatch.setattr(run_module, "evaluate_private_outputs", evaluate_private)
-    monkeypatch.setattr(run_module, "_append_private_metrics_entry", write_private_metrics)
-
+    def freeze(_cfg, journal, best):
+        assert len(journal.nodes) == 1
+        assert any(name == "step_saved" for name, _ in events)
+        return {"selection_id": best.id}
+    def evaluate(_cfg, best, workspace, hidden, selection, *, stage):
+        private_calls.append((best, workspace, selection, stage))
+        assert ("final_retrain" in order) is final_retrain_enabled
+        assert selection["selection_id"] == best.id
+        # The private score cannot replace validation selection evidence.
+        return {"status": "completed", "private_metrics": {"accuracy": 0.1}}
+    monkeypatch.setattr(run_module, "freeze_selection", freeze)
+    monkeypatch.setattr(run_module, "evaluate_selected_delivery", evaluate)
     run_module._run_direct_entry()
-
-    assert len(private_calls) == int(per_node is not False)
-    assert ("final_retrain" in order) is final_retrain_enabled
+    assert len(private_calls) == 1
+    best, workspace, _selection, stage = private_calls[0]
+    assert best.metric.value == 0.9
+    assert stage == ("final_retrain" if final_retrain_enabled else "selected_candidate")
+    assert workspace == (cfg.workspace_dir / "final_retrain" if final_retrain_enabled else cfg.workspace_dir)
     saved = [payload for name, payload in events if name == "step_saved"]
     assert len(saved) == 1
-    assert saved[0]["step"] == saved[0]["scheduled_step"] == 0
-    assert saved[0]["best_node_id"] == saved[0]["node_id"]
+    assert saved[0]["best_node_id"] == saved[0]["node_id"] == best.id
     assert events[-1] == ("run_finished", {"completed_steps": 1})
-
-    metrics_path = cfg.log_dir / "private_metrics.json"
-    if per_node is False and not final_retrain_enabled:
-        assert not metrics_path.exists()
-        return
-    payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-    history = payload["history"]
-    assert payload["visible_to_agent"] is False
-    assert len(history) == int(per_node is not False) + int(final_retrain_enabled)
-    assert all(entry["metric"]["value"] == 0.9 for entry in history)
-    if final_retrain_enabled:
-        assert history[-1]["stage"] == "final_retrain"
-        assert history[-1]["node_id"] == saved[0]["best_node_id"]
 
 
 def test_broken_pipe_during_final_live_stop_does_not_skip_terminal_work(

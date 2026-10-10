@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -12,12 +13,14 @@ from .mask_io import load_mask
 from .experiment_contract import load_experiment_contract
 from .prediction_contract import PredictionContract, resolve_artifact_path
 from .split_contract import SplitContractError
+from .model_artifacts import validate_model_artifacts
 
 
 @dataclass(frozen=True)
 class ArtifactValidationResult:
     ok: bool
     messages: list[str]
+    model_artifact: dict[str, Any] | None = None
 
 
 def _resolve_artifact_path(workspace_dir: Path, value: str) -> Path:
@@ -76,7 +79,7 @@ def normalize_working_outputs(workspace_dir: Path | str, task_desc: str) -> list
     return messages
 
 
-def validate_working_outputs(
+def _validate_prediction_outputs(
     workspace_dir: Path | str, task_desc: str
 ) -> ArtifactValidationResult:
     """Check common generated artifacts before the agent accepts a run."""
@@ -102,6 +105,29 @@ def validate_working_outputs(
             len(pd.read_csv(job.expected)),
         ))
     return ArtifactValidationResult(ok=not messages, messages=messages)
+
+
+def validate_working_outputs(
+    workspace_dir: Path | str,
+    task_desc: str,
+    *,
+    candidate_code: str | None = None,
+    model_probe: Callable[[str], Any] | None = None,
+    model_artifact_required: bool = False,
+) -> ArtifactValidationResult:
+    """Validate declared prediction jobs and the independent model delivery."""
+    predictions = _validate_prediction_outputs(workspace_dir, task_desc)
+    if not predictions.ok:
+        return predictions
+    contract = load_experiment_contract(workspace_dir)
+    model = validate_model_artifacts(
+        workspace_dir,
+        candidate_code=candidate_code,
+        required=model_artifact_required or contract.prediction.raw.get("model_artifact_required") is True,
+        model_probe=model_probe,
+        expected_class_labels=contract.prediction.raw.get("class_labels"),
+    )
+    return ArtifactValidationResult(model.ok, predictions.messages + model.messages, model.evidence)
 
 
 def _validate_prediction_artifact(

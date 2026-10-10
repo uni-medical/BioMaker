@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import re
@@ -303,53 +304,137 @@ class ProposalAgent(BaseAgent):
         )
 
     def query_knowledge_base(self, query: str, topk: int | None = None) -> str:
-        result = ""
-        if self.acfg.enable_monai_knowledge_base:
-            if not self._is_monai_query(query):
-                logger.debug("Skipping MONAI RAG for non-MONAI query: %s", query)
-                return ""
-            knowledge_cfg = self.acfg.knowledge_base
-            retrieval_mode = str(getattr(knowledge_cfg, "retrieval_mode", "keyword"))
-            embedding_model = str(
-                getattr(
-                    knowledge_cfg,
-                    "embedding_model",
-                    "text-embedding-3-large",
-                )
-            )
-            retrieval_topk = (
-                int(topk)
-                if topk is not None
-                else int(getattr(knowledge_cfg, "topk", 5))
-            )
-            logger.debug(
-                "Querying MONAI %s index (topk=%d) with query: %s",
-                retrieval_mode,
-                retrieval_topk,
-                query,
-            )
-            try:
-                if self.knowledge_base is None:
-                    from ..monai_rag.query_rag_db import MED_KNOWLEDGE_RAG
+        from ..monai_rag.evidence import (
+            MONAI_RAG_QUERY_EVENT,
+            MonaiRagEvidenceError,
+        )
+        from ..monai_rag.query_rag_db import INDEX_FILE, MED_KNOWLEDGE_RAG
 
-                    self.knowledge_base = MED_KNOWLEDGE_RAG(
-                        model=knowledge_cfg.model,
-                        mode=retrieval_mode,
-                        embedding_model=embedding_model,
-                    )
-                result = self.knowledge_base.search(
-                    query,
+        query_text = str(query)
+        knowledge_cfg = self.acfg.knowledge_base
+        required = bool(getattr(knowledge_cfg, "required", False))
+        retrieval_mode = str(getattr(knowledge_cfg, "retrieval_mode", "keyword"))
+        retrieval_topk = (
+            int(topk) if topk is not None else int(getattr(knowledge_cfg, "topk", 5))
+        )
+        status: dict[str, Any] = {
+            "mode": retrieval_mode,
+            "required": required,
+            "index_available": INDEX_FILE.is_file(),
+            "index_usable": False,
+            "query_attempted": False,
+            "query_succeeded": False,
+            "returned_count": 0,
+            "topk": retrieval_topk,
+            "query_sha256": hashlib.sha256(query_text.encode("utf-8")).hexdigest(),
+            "outcome": "not_started",
+            "error_type": None,
+            "error": None,
+        }
+
+        def record_evidence() -> None:
+            try:
+                written = append_event(
+                    self.cfg.log_dir,
+                    MONAI_RAG_QUERY_EVENT,
+                    **status,
+                )
+            except Exception:
+                written = False
+            if required and not written:
+                raise MonaiRagEvidenceError(
+                    "Required MONAI RAG runtime evidence could not be written."
+                )
+
+        if not self.acfg.enable_monai_knowledge_base:
+            status["outcome"] = "skipped_disabled"
+            record_evidence()
+            return ""
+
+        if not self._is_monai_query(query_text):
+            logger.debug("Skipping MONAI RAG for non-MONAI query: %s", query_text)
+            status["outcome"] = "skipped_non_monai"
+            record_evidence()
+            return ""
+
+        result = ""
+        failure: Exception | None = None
+        embedding_model = str(
+            getattr(
+                knowledge_cfg,
+                "embedding_model",
+                "text-embedding-3-large",
+            )
+        )
+        logger.debug(
+            "Querying MONAI %s index (topk=%d) with query: %s",
+            retrieval_mode,
+            retrieval_topk,
+            query_text,
+        )
+        try:
+            if self.knowledge_base is None:
+                self.knowledge_base = MED_KNOWLEDGE_RAG(
+                    model=knowledge_cfg.model,
+                    mode=retrieval_mode,
+                    embedding_model=embedding_model,
+                )
+            status["index_available"] = True
+            status["index_usable"] = True
+            status["query_attempted"] = True
+            if hasattr(self.knowledge_base, "search_with_count"):
+                result, returned_count = self.knowledge_base.search_with_count(
+                    query_text,
                     k=retrieval_topk,
                     enable_query2doc=self.acfg.enable_query2doc,
                 )
-            except Exception as e:
-                logger.warning(
-                    "Failed to query the configured MONAI %s index: %s. "
-                    "No fallback retrieval mode was used.",
-                    retrieval_mode,
-                    e,
+            else:
+                result = self.knowledge_base.search(
+                    query_text,
+                    k=retrieval_topk,
+                    enable_query2doc=self.acfg.enable_query2doc,
                 )
-            logger.debug(f"Querying knowledge base get result:\n {result[:200]}")
+                returned_count = (
+                    len(result)
+                    if isinstance(result, (list, tuple))
+                    else int(bool(result))
+                )
+            if (
+                isinstance(returned_count, bool)
+                or not isinstance(returned_count, int)
+                or returned_count < 0
+            ):
+                raise ValueError(
+                    f"RAG returned an invalid document count: {returned_count!r}"
+                )
+            status["query_succeeded"] = True
+            status["returned_count"] = returned_count
+            status["outcome"] = "hit" if returned_count else "zero_hits"
+        except Exception as exc:
+            failure = exc
+            status["outcome"] = (
+                "query_error" if status["query_attempted"] else "index_error"
+            )
+            status["error_type"] = type(exc).__name__
+            status["error"] = type(exc).__name__
+            logger.warning(
+                "Failed to query the configured MONAI %s index: %s. "
+                "No fallback retrieval mode was used.",
+                retrieval_mode,
+                type(exc).__name__,
+            )
+
+        record_evidence()
+        if required and failure is not None:
+            raise MonaiRagEvidenceError(
+                "Required MONAI RAG query failed; see the runtime evidence event."
+            ) from failure
+        if required and status["query_succeeded"] and not status["returned_count"]:
+            raise MonaiRagEvidenceError(
+                "Required MONAI RAG query returned no documents; see the runtime "
+                "evidence event."
+            )
+        logger.debug("Querying knowledge base result preview:\n%s", str(result)[:200])
         return result
 
     def query_web(self, query: str, topk: int | None = None) -> str:
@@ -475,6 +560,7 @@ class ProposalAgent(BaseAgent):
                 func_spec=tool_request_func_spec,
                 model=self.acfg.code.model,
                 temperature=0.0,
+                **self._provider_request_options("node_tool_decision"),
             )
         except Exception as exc:
             logger.warning("Node tool request failed: %s", exc)
@@ -704,6 +790,7 @@ class ProposalAgent(BaseAgent):
                 func_spec=draft_plan_batch_func_spec,
                 model=self.acfg.code.model,
                 temperature=max(float(self.acfg.code.temp or 0.0), 0.7),
+                **self._provider_request_options("draft_plan_batch"),
             )
         except Exception as exc:
             logger.warning("Draft plan batch generation failed: %s", exc)

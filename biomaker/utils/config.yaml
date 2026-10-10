@@ -30,6 +30,8 @@ evaluator_cache:
 # verifier errors are fed back to the builder before retrying.
 split_builder:
   attempts: 5
+  source: agentic
+  package_dir: null
 
 # After the search selects the best node, rerun that code once with the hidden
 # score-validation labels merged into the training table. This is a final-only
@@ -37,14 +39,24 @@ split_builder:
 final_retrain:
   enabled: True
 
-# User-only private evaluation after each search node. Set false for suites
-# that evaluate the private test only after final retraining; this never changes
-# the validation scores used to select the best node.
+# Private test is evaluated once after validation-only model selection and,
+# when enabled, successful final retraining. It never feeds back into search.
 private_evaluation:
-  per_node: True
+  protocol: post_selection_once
+
+# A selected model must ship reloadable artifacts and their manifest.
+model_artifacts:
+  required: True
+
+# Total transport attempts, including the first request.
+provider:
+  request_timeout_seconds: 600.0
+  max_attempts: 2
+  max_elapsed_seconds: 1250.0
 
 # agent hyperparams
 agent:
+  code_generation_attempts: 1
   # how many proposal/debug/improve iterations to run
   steps: 35
   # Hard safety limit for the whole run in seconds. Step count and this limit both apply; whichever is reached first stops the run.
@@ -76,6 +88,7 @@ agent:
     model: deepseek-v4-flash
     temp: 0.0
     # Retrieval backend for the local MONAI documentation index: embedding or keyword.
+    required: False
     retrieval_mode: ${oc.env:BIOMAKER_RAG_MODE,keyword}
     embedding_model: ${oc.env:BIOMAKER_EMBEDDING_MODEL,text-embedding-3-large}
     topk: ${oc.decode:${oc.env:BIOMAKER_RAG_TOPK,5}}

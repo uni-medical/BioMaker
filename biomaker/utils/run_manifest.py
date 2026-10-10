@@ -6,10 +6,14 @@ does not make decisions for the search agent.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import json
 import os
 import platform
+import subprocess
 import sys
+import tomllib
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +30,84 @@ def _read_json(path: Path) -> Any:
     except Exception:
         return None
     return None
+
+
+def _engine_identity() -> dict[str, Any]:
+    """Bind a receipt to its package sources and available dependency manifests."""
+    package = Path(__file__).resolve().parents[1]
+    root = package.parent
+    identity: dict[str, Any] = {
+        "version": None,
+        "source_commit": None,
+        "source_modified": None,
+    }
+    try:
+        identity["version"] = tomllib.loads((root / "pyproject.toml").read_text())[
+            "project"
+        ]["version"]
+    except (OSError, KeyError, ValueError):
+        try:
+            identity["version"] = importlib.metadata.version("biomaker")
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    digest = hashlib.sha256()
+    try:
+        for path in sorted(package.rglob("*")):
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.suffix not in {".py", ".yaml", ".html", ".js", ".css"}
+            ):
+                continue
+            name = path.relative_to(package).as_posix().encode()
+            content = path.read_bytes()
+            digest.update(len(name).to_bytes(8, "big") + name)
+            digest.update(len(content).to_bytes(8, "big") + content)
+        identity["package_source_sha256"] = digest.hexdigest()
+    except OSError:
+        identity["package_source_sha256"] = None
+    for filename, field in (
+        ("requirements.txt", "requirements_sha256"),
+        ("uv.lock", "lock_sha256"),
+    ):
+        try:
+            identity[field] = hashlib.sha256((root / filename).read_bytes()).hexdigest()
+        except OSError:
+            identity[field] = None
+    if (root / ".git").exists():
+        try:
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            modified = subprocess.run(
+                [
+                    "git",
+                    "status",
+                    "--porcelain",
+                    "--",
+                    "biomaker",
+                    "pyproject.toml",
+                    "requirements.txt",
+                    "uv.lock",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            identity.update(
+                source_commit=revision.stdout.strip(),
+                source_modified=bool(modified.stdout.strip()),
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return identity
 
 
 def _split_files(workspace_dir: Path) -> dict[str, str]:
@@ -80,8 +162,8 @@ def _selected_cfg(cfg: Config) -> dict[str, Any]:
         "effective_parallel_workers": effective_workers,
         "compute_slots": getattr(cfg.exec, "compute_slots", None),
         "final_retrain_enabled": cfg.final_retrain.enabled,
-        "private_evaluation_per_node": getattr(
-            getattr(cfg, "private_evaluation", None), "per_node", True
+        "private_evaluation_protocol": getattr(
+            getattr(cfg, "private_evaluation", None), "protocol", "post_selection_once"
         ),
         "model_for_all_agents": cfg.model_for_all_agents,
         "main_model": cfg.agent.code.model,
@@ -121,6 +203,7 @@ def write_run_manifest(
     )
     manifest = {
         "created_at": created_at,
+        "engine": _engine_identity(),
         "launch_token": os.getenv("BIOMAKER_LAUNCH_TOKEN") or None,
         "exp_name": cfg.exp_name,
         "data_dir": str(cfg.data_dir),

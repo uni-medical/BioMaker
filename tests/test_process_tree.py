@@ -161,7 +161,7 @@ def test_root_exit_probe_reads_state_without_polling_or_reaping():
         def poll(self):
             raise AssertionError("poll would reap the process")
 
-        def wait(self):
+        def wait(self, timeout=None):
             raise AssertionError("wait would reap the process")
 
     tracker = ProcessTreeTracker(
@@ -283,7 +283,7 @@ def test_uncaptured_group_is_not_released_until_every_member_is_gone(monkeypatch
     class Process:
         pid = 50
 
-        def wait(self):
+        def wait(self, timeout=None):
             assert observations[-2:] == [[], []]
             waits.append(True)
             processes.discard(50)
@@ -347,7 +347,7 @@ def test_tracker_reaps_only_after_two_empty_reads_and_never_reenters_reused_grou
         returncode = None
         waits = 0
 
-        def wait(self):
+        def wait(self, timeout=None):
             assert observations[-2:] == [[], []]
             self.waits += 1
             self.returncode = -signal.SIGKILL

@@ -140,6 +140,7 @@ def test_no_test_final_retrain_keeps_model_and_merges_all_rows(tmp_path, monkeyp
     cfg = SimpleNamespace(
         workspace_dir=workspace, log_dir=log_dir,
         final_retrain=SimpleNamespace(enabled=True),
+        model_artifacts=SimpleNamespace(required=False),
         exec=SimpleNamespace(format_tb_ipython=False, agent_file_name="runfile.py",
                              enforce_environment=False, include_medical_packages=False),
     )
@@ -222,7 +223,7 @@ def test_canonical_row_order_final_retrain_uses_positions_and_preserves_train_on
             final_retrain._write_retrain_training_table(workspace, private)
         assert train.read_bytes() == original
     else:
-        assert final_retrain._write_retrain_training_table(workspace, private) == (1, 2, 3)
+        assert final_retrain._write_retrain_training_table(workspace, private)[:3] == (1, 2, 3)
         merged = pd.read_csv(train)
         assert list(merged) == ["signal", "answer"]
         assert merged.to_dict("records") == [

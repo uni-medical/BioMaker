@@ -1356,15 +1356,11 @@ events.os.fsync = lambda _fd: (_ for _ in ()).throw(
 )
 run_module._run_direct_entry()
 """
-    method_root = Path(runner_module.__file__).resolve().parents[3]
+    method_root = Path(runner_module.__file__).resolve().parents[2]
 
     run = manager.enqueue_command(
         [
-            settings.uv_executable,
-            "run",
-            "--project",
-            str(method_root),
-            "python",
+            os.environ.get("BIOMAKER_TEST_ENGINE_PYTHON", sys.executable),
             "-c",
             script,
             str(log_dir),

@@ -14,13 +14,9 @@ import pytest
 import biomaker.run as run_module
 from biomaker.utils import queue_client
 
-WEBUI_ROOT = Path(__file__).resolve().parents[1] / "apps" / "webui"
-if str(WEBUI_ROOT) not in sys.path:
-    sys.path.insert(0, str(WEBUI_ROOT))
-
-from webui.run_store import MemoryRunStore  # noqa: E402
-from webui.runner import RunManager  # noqa: E402
-from webui.settings import Settings  # noqa: E402
+from biomaker.runtime.run_store import MemoryRunStore
+from biomaker.runtime.runner import RunManager
+from biomaker.runtime.settings import Settings
 
 
 class _ClientStore:
@@ -416,13 +412,14 @@ def test_explicit_queue_returns_exit_code_and_consumes_flag(monkeypatch, entrypo
     assert exc_info.value.code == 23
 
 
-def test_explicit_queue_fails_closed_when_queue_sidecar_is_missing(
-    tmp_path, monkeypatch
-):
+def test_explicit_queue_failure_does_not_fall_back_to_direct(monkeypatch):
     monkeypatch.delenv("BIOMAKER_QUEUE_DIRECT", raising=False)
     monkeypatch.delenv("BIOMAKER_DISABLE_RUN_QUEUE", raising=False)
     monkeypatch.setattr(run_module.sys, "argv", ["biomaker", "--queue"])
-    monkeypatch.setattr(run_module, "__file__", str(tmp_path / "biomaker" / "run.py"))
+    def unavailable():
+        raise RuntimeError("durable run queue is unavailable")
+
+    monkeypatch.setattr(queue_client, "submit_cli_and_wait", unavailable)
     monkeypatch.setattr(
         run_module,
         "_run_direct_entry",

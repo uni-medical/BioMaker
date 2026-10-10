@@ -9,10 +9,13 @@ import hashlib
 import json
 import math
 from typing import Any, Iterable
+from .score_validity import require_valid_score_payload
 
 
 def finite_metric(value: Any) -> float | None:
     if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
         return None
     try:
         result = float(value)
@@ -54,12 +57,22 @@ def validated_metric_specs(specs: list[dict]) -> list[dict]:
 
 def completed_candidate(node: Any) -> bool:
     """A live node cannot enter the population before its result is committed."""
+    details = getattr(node, "evaluator_details", None)
+    if isinstance(details, dict):
+        if details.get("ok") is False or details.get("outcome") in {"invalid_prediction", "evaluator_unavailable"}:
+            return False
+        score = details.get("details", details)
+        score = score.get("score") if isinstance(score, dict) else None
+        try:
+            require_valid_score_payload(score if isinstance(score, dict) and score.get("score_schema_version") == 1 else details)
+        except ValueError:
+            return False
     return (
         node.step is not None
         and node.is_buggy is False
         and node.exc_type is None
         and node.tag
-        not in {"generating", "generated", "running", "evaluating", "queued"}
+        not in {"generating", "generated", "running", "evaluating", "queued", "scoring"}
     )
 
 

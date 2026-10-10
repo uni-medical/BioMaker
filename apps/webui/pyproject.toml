@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Local sidecar web interface for BioMaker"
 requires-python = ">=3.11"
 dependencies = [
+    "biomaker",
     "fastapi>=0.115,<1",
     "psutil>=6,<8",
     "python-dotenv>=1.0,<2",
@@ -21,7 +22,10 @@ testpaths = ["tests"]
 # The workspace may set TMPDIR to a Windows mount under WSL; pytest's fd capture
 # cannot reliably truncate its temporary file there.
 addopts = "-q -s"
-pythonpath = ["."]
+pythonpath = [".", "../.."]
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+biomaker = {path = "../..", editable = true}

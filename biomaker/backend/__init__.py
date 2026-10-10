@@ -1,5 +1,6 @@
 import logging
 import re
+from typing import Any
 
 from . import backend_openai
 from .utils import FunctionSpec, OutputType, PromptType, compile_prompt_to_md
@@ -39,6 +40,11 @@ def query(
     max_completion_tokens: int | None = None,
     func_spec: FunctionSpec | None = None,
     return_metadata: bool = False,
+    request_timeout_seconds: float | None = None,
+    request_max_attempts: int | None = None,
+    request_max_elapsed_seconds: float | None = None,
+    request_event_callback=None,
+    request_event_context: dict[str, Any] | None = None,
     **model_kwargs,
 ) -> OutputType | tuple[OutputType, dict]:
     """
@@ -99,6 +105,11 @@ def query(
         system_message=compiled_system,
         user_message=compiled_user,
         func_spec=func_spec,
+        request_timeout_seconds=request_timeout_seconds,
+        request_max_attempts=request_max_attempts,
+        request_max_elapsed_seconds=request_max_elapsed_seconds,
+        request_event_callback=request_event_callback,
+        request_event_context=request_event_context,
         **model_kwargs,
     )
 

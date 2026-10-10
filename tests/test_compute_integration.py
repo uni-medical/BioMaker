@@ -29,7 +29,7 @@ def test_default_config_uses_auto_workers_and_explicit_integer_is_valid():
     default_cfg = config_module._load_cfg(use_cli_args=False)
 
     assert default_cfg.exec.parallel_workers == "auto"
-    assert default_cfg.private_evaluation.per_node is True
+    assert default_cfg.private_evaluation.protocol == "post_selection_once"
     config_module._validate_exec_config(default_cfg)
     config_module._validate_exec_config(SimpleNamespace(exec=_minimal_exec_config(3)))
 
@@ -66,13 +66,13 @@ def test_structured_config_accepts_runtime_compute_slots(slots, tmp_path):
 
 
 @pytest.mark.parametrize("invalid", ["false", 0, 1, None])
-def test_private_evaluation_config_rejects_non_boolean_policy(invalid):
+def test_private_evaluation_config_rejects_other_protocols(invalid):
     cfg = SimpleNamespace(
         exec=_minimal_exec_config("auto"),
-        private_evaluation=SimpleNamespace(per_node=invalid),
+        private_evaluation=SimpleNamespace(protocol=invalid),
     )
     with pytest.raises(
-        ValueError, match="private_evaluation.per_node must be a boolean"
+        ValueError, match="private_evaluation.protocol must be post_selection_once"
     ):
         config_module._validate_exec_config(cfg)
 
@@ -129,7 +129,7 @@ def test_interpreter_merges_cuda_env_and_waits_for_process_tree(tmp_path, monkey
 
     def popen(command, **kwargs):
         popen_calls.append((command, kwargs))
-        kwargs["stdout"].write("candidate output\n")
+        kwargs["stdout"].write(b"candidate output\n")
         return process
 
     monkeypatch.setenv("BIOMAKER_TEST_PARENT_ENV", "preserved")
@@ -188,7 +188,7 @@ def test_single_slot_stays_leased_until_process_tree_drain_finishes(
     process_tree = BlockingProcessTree()
 
     def popen(_command, **kwargs):
-        kwargs["stdout"].write("candidate output\n")
+        kwargs["stdout"].write(b"candidate output\n")
         return process
 
     monkeypatch.setattr(interpreter_module.subprocess, "Popen", popen)
@@ -582,7 +582,7 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(
     monkeypatch.setattr(
         final_retrain_module,
         "validate_working_outputs",
-        lambda *_: SimpleNamespace(ok=True),
+        lambda *_a, **_kw: SimpleNamespace(ok=True),
     )
     monkeypatch.setattr(
         final_retrain_module,
@@ -604,11 +604,6 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(
         final_retrain_module, "_copy_retrain_outputs_to_log", lambda *_: None
     )
 
-    def private(workspace, private_path, *, timeout, env_overrides, **_kwargs):
-        calls["private"] = (workspace, private_path, timeout, env_overrides)
-        return {"metric": 0.9}
-
-    monkeypatch.setattr(final_retrain_module, "evaluate_private_outputs", private)
     monkeypatch.setattr(final_retrain_module, "_write_result", lambda *_: None)
 
     result = final_retrain_module.run_final_retrain(
@@ -632,28 +627,8 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(
         },
     )
     assert calls["evaluator"] == (retrain_workspace, scoring_timeout, expected_env)
-    assert calls["private"] == (
-        retrain_workspace, private_dir, scoring_timeout, {
-            **expected_env,
-            "BIOMAKER_EVALUATOR_WORKERS": "1",
-            "BIOMAKER_EVALUATOR_PROGRESS_PATH": str(log_dir / "final-private-scoring.jsonl"),
-        }
-    )
-
-    monkeypatch.setattr(
-        final_retrain_module,
-        "evaluate_private_outputs",
-        lambda *_args, **_kwargs: {"results": [], "error": "requested metric missing"},
-    )
-    scoring_failure = final_retrain_module.run_final_retrain(
-        cfg,
-        best_node,
-        private_dir,
-        timeout=300,
-        env_overrides=expected_env,
-    )
-    assert scoring_failure.ok is False
-    assert "requested metric missing" in scoring_failure.error
+    assert "private" not in calls
+    assert result.private_metrics is None
 
     monkeypatch.setattr(
         final_retrain_module,
@@ -669,25 +644,3 @@ def test_final_retrain_forwards_slot_env_to_all_subprocess_paths(
     )
     assert copy_failure.ok is False
     assert copy_failure.error == "copy failed"
-
-    monkeypatch.setattr(
-        final_retrain_module, "_copy_retrain_outputs_to_log", lambda *_: None
-    )
-    monkeypatch.setattr(
-        final_retrain_module,
-        "evaluate_private_outputs",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("private evaluation failed")
-        ),
-    )
-    private_failure = final_retrain_module.run_final_retrain(
-        cfg,
-        best_node,
-        private_dir,
-        timeout=300,
-        env_overrides=expected_env,
-    )
-    assert private_failure.ok is False
-    assert private_failure.error == (
-        "Private evaluation failed after final retrain: private evaluation failed"
-    )

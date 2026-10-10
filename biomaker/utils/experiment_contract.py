@@ -35,6 +35,7 @@ class HiddenAnswerContract:
     split: str
     path: Path
     answer_columns: list[str]
+    file_reference_columns: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -259,10 +260,24 @@ def _load_hidden_answers(
             continue
         default_file = "score_val.csv" if split == "score_val" else "test.csv"
         file_name = str(entry.get("file") or default_file)
+        answer_columns = list_of_strings(entry.get("answer_columns"))
+        file_columns = entry.get("file_reference_columns")
+        if "file_reference_columns" in entry:
+            if (
+                not isinstance(file_columns, list)
+                or any(not isinstance(value, str) or not value for value in file_columns)
+                or len(set(file_columns)) != len(file_columns)
+                or not set(file_columns).issubset(answer_columns)
+            ):
+                raise ValueError(
+                    f"Hidden {split} file_reference_columns must be a unique list "
+                    "of declared answer columns."
+                )
         result[split] = HiddenAnswerContract(
             split=split,
             path=private_dir / file_name,
-            answer_columns=list_of_strings(entry.get("answer_columns")),
+            answer_columns=answer_columns,
+            file_reference_columns=file_columns,
         )
     return result
 

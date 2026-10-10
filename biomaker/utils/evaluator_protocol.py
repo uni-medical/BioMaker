@@ -10,6 +10,7 @@ from typing import Any
 from pathlib import Path
 
 import pandas as pd
+from .score_validity import require_valid_score_payload
 
 EVALUATOR_API_VERSION = 3
 
@@ -291,6 +292,7 @@ def validate_task_metric_contract(actual: dict[str, Any], task: str) -> None:
 
 def validate_score(score: Any, spec: dict[str, Any]) -> dict[str, Any]:
     """Reject missing metrics and silent substitutions identically for all splits."""
+    require_valid_score_payload(score)
     if not isinstance(score, dict) or not isinstance(score.get("metrics"), dict):
         raise ValueError("score() must return a dict with a named metrics mapping.")
     legacy = spec.get('evaluator_api_version', 2) == 2 and 'primary_metric' in spec

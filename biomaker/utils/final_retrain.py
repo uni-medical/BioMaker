@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -23,7 +24,6 @@ from .execution_record import (
     attach_evaluator_run_result,
 )
 from .experiment_contract import load_experiment_contract
-from .private_evaluation import evaluate_private_outputs
 
 logger = logging.getLogger("biomaker")
 
@@ -202,10 +202,114 @@ def _merge_visible_score_with_hidden_labels(
     return score_labeled[list(train_df.columns)]
 
 
+def _is_file_answer_column(column: str) -> bool:
+    normalized = str(column).strip().casefold()
+    if not normalized or "json" in normalized:
+        return False
+    return "path" in normalized or normalized.endswith(("_file", "_filename"))
+
+
+def _resolve_private_answer_file(
+    workspace_dir: Path,
+    private_dir: Path,
+    value: Any,
+) -> Path:
+    text = str(value).strip()
+    if not text or text.startswith(("[", "{")):
+        raise ValueError(f"Hidden file answer is not a path: {value!r}")
+    raw = Path(text.removeprefix("./"))
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        if raw.parts and raw.parts[0].casefold() == "private_gt":
+            tail = Path(*raw.parts[1:])
+            candidates.extend([private_dir / tail, private_dir.parent / raw])
+        candidates.extend(
+            [
+                private_dir / raw,
+                workspace_dir / raw,
+                workspace_dir / "input" / raw,
+            ]
+        )
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError, RuntimeError):
+            continue
+        if resolved.is_file():
+            return resolved
+    raise FileNotFoundError(
+        f"Hidden score-validation file answer is unavailable: {value!r}"
+    )
+
+
+def _materialize_score_file_answers(
+    workspace_dir: Path,
+    private_dir: Path,
+    score_labeled_df: pd.DataFrame,
+    answer_columns: list[str],
+    *,
+    file_reference_columns: list[str] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Copy file-valued score answers into the selected-node retrain workspace."""
+
+    materialized = score_labeled_df.copy()
+    root = workspace_dir / "input" / "final_retrain_score_answers"
+    copied_by_source: dict[Path, Path] = {}
+    rewritten_values = 0
+    file_columns: list[str] = []
+
+    for column in answer_columns:
+        is_file = (
+            column in file_reference_columns
+            if file_reference_columns is not None
+            else _is_file_answer_column(column)
+        )
+        if column not in materialized.columns or not is_file:
+            continue
+        values = materialized[column]
+        non_null = values[values.notna()]
+        if non_null.empty:
+            continue
+        file_columns.append(column)
+        column_dir = root / "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in str(column)
+        )
+        rewritten: dict[Any, str] = {}
+        for index, value in non_null.items():
+            source = _resolve_private_answer_file(
+                workspace_dir,
+                private_dir,
+                value,
+            )
+            destination = copied_by_source.get(source)
+            if destination is None:
+                digest = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:12]
+                destination = column_dir / f"{digest}-{source.name}"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                copied_by_source[source] = destination
+            rewritten[index] = destination.relative_to(workspace_dir).as_posix()
+        for index, value in rewritten.items():
+            materialized.at[index, column] = value
+            rewritten_values += 1
+
+    return materialized, {
+        "columns": file_columns,
+        "unique_files_copied": len(copied_by_source),
+        "values_rewritten": rewritten_values,
+        "workspace_root": (
+            root.relative_to(workspace_dir).as_posix() if file_columns else None
+        ),
+    }
+
+
 def _write_retrain_training_table(
     workspace_dir: Path,
     private_dir: Path,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, dict[str, Any]]:
     contract = load_experiment_contract(workspace_dir, hidden_answers_dir=private_dir)
     train_path = contract.split_path("train")
     hidden = contract.hidden_answers.get("score_val")
@@ -224,6 +328,18 @@ def _write_retrain_training_table(
     score_labeled_df = _merge_visible_score_with_hidden_labels(
         workspace_dir, train_df, score_gt_df
     )
+    declared_file_columns = hidden.file_reference_columns
+    if declared_file_columns is None and contract.split_manifest.get("manifest_version") == 2:
+        declared_file_columns = []
+    score_labeled_df, file_materialization = _materialize_score_file_answers(
+        workspace_dir,
+        private_dir,
+        score_labeled_df,
+        _score_answer_columns(
+            workspace_dir, train_df, pd.read_csv(contract.split_path("score_val"))
+        ),
+        file_reference_columns=declared_file_columns,
+    )
     retrain_train = pd.concat(
         [train_df, score_labeled_df], ignore_index=True, sort=False
     )
@@ -232,7 +348,10 @@ def _write_retrain_training_table(
         encoding="utf-8",
     )
     retrain_train.to_csv(train_path, index=False)
-    return int(len(train_df)), int(len(score_labeled_df)), int(len(retrain_train))
+    return (
+        int(len(train_df)), int(len(score_labeled_df)), int(len(retrain_train)),
+        file_materialization,
+    )
 
 
 def _copy_retrain_outputs_to_log(cfg: Config, retrain_workspace: Path) -> None:
@@ -302,7 +421,9 @@ def prepare_final_retrain_workspace(
         if src.exists():
             _replace_path_with_symlink(retrain_workspace / filename, src)
 
-    before, added, after = _write_retrain_training_table(retrain_workspace, private_dir)
+    before, added, after, file_materialization = _write_retrain_training_table(
+        retrain_workspace, private_dir
+    )
     retrain_contract = load_experiment_contract(retrain_workspace, hidden_answers_dir=private_dir)
     manifest = {
         "mode": "final_retrain_after_node_selection",
@@ -312,6 +433,7 @@ def prepare_final_retrain_workspace(
         "train_rows_before": before,
         "score_rows_added": added,
         "train_rows_after": after,
+        "score_file_answers": file_materialization,
         "note": (
             "Hidden score-validation labels are merged into training only after "
             "the best node has already been selected."
@@ -370,7 +492,11 @@ def run_final_retrain(
                 "\n".join(normalization_messages),
                 details={"messages": normalization_messages},
             )
-        artifact_check = validate_working_outputs(retrain_workspace, "final retrain")
+        artifact_check = validate_working_outputs(
+            retrain_workspace, "final retrain", candidate_code=best_node.code,
+            model_probe=interpreter.run,
+            model_artifact_required=getattr(getattr(cfg, "model_artifacts", None), "required", True),
+        )
         attach_artifact_validation_result(
             exec_result,
             artifact_check,
@@ -402,25 +528,6 @@ def run_final_retrain(
                 return result
 
         _copy_retrain_outputs_to_log(cfg, retrain_workspace)
-        try:
-            result.private_metrics = evaluate_private_outputs(
-                retrain_workspace,
-                private_dir,
-                timeout=evaluator_timeout_seconds(cfg),
-                env_overrides={
-                    **(env_overrides or {}),
-                    "BIOMAKER_EVALUATOR_WORKERS": str(evaluator_workers(cfg)),
-                    "BIOMAKER_EVALUATOR_PROGRESS_PATH": str(cfg.log_dir / "final-private-scoring.jsonl"),
-                },
-            )
-            if result.private_metrics and result.private_metrics.get("error"):
-                result.error = "Private evaluation failed after final retrain: " + str(
-                    result.private_metrics["error"]
-                )
-                return result
-        except Exception as exc:
-            result.error = f"Private evaluation failed after final retrain: {exc}"
-            return result
         result.ok = True
         return result
     except Exception as exc:

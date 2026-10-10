@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import csv
 import math
+import os
 import platform
 import plistlib
 import shutil
@@ -13,6 +14,8 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 CACHE_TTL_SECONDS = 1.0
@@ -43,6 +46,45 @@ def _load_psutil() -> Any | None:
     except ImportError:
         return None
     return psutil
+
+
+def _probe_mps_with_python(
+    python_executable: Path,
+    *,
+    command_runner: Callable[..., Any] = subprocess.run,
+) -> bool:
+    result = command_runner(
+        [
+            str(python_executable),
+            "-c",
+            "import torch; print(int(torch.backends.mps.is_available()))",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    output = str(getattr(result, "stdout", "")).strip()
+    if getattr(result, "returncode", 1) != 0 or output not in {"0", "1"}:
+        raise RuntimeError("BioMaker's Python runtime could not report MPS support")
+    return output == "1"
+
+
+@lru_cache(maxsize=1)
+def _default_mps_probe() -> bool:
+    """Probe the BioMaker runtime, not the intentionally small WebUI environment."""
+
+    try:
+        import torch
+    except Exception:
+        method_root = Path(os.environ.get("BIOMAKER_WEBUI_METHOD_ROOT", Path(__file__).resolve().parents[3]))
+        method_python = method_root / ".venv" / "bin" / "python"
+        if not method_python.is_file():
+            raise RuntimeError("BioMaker's Python runtime is unavailable") from None
+        return _probe_mps_with_python(method_python)
+    else:
+        backend = getattr(getattr(torch, "backends", None), "mps", None)
+        return bool(backend is not None and backend.is_available())
 
 
 def _timestamp(clock: Callable[[], datetime]) -> str:
@@ -187,6 +229,7 @@ class SystemResourceSampler:
         command_runner: Callable[..., Any] = subprocess.run,
         command_resolver: Callable[[str], str | None] = shutil.which,
         system_name: str | None = None,
+        mps_probe: Callable[[], bool] = _default_mps_probe,
         wall_clock: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
         cache_ttl_seconds: float = CACHE_TTL_SECONDS,
@@ -209,6 +252,7 @@ class SystemResourceSampler:
         self._command_runner = command_runner
         self._command_resolver = command_resolver
         self._system_name = system_name or platform.system()
+        self._mps_probe = mps_probe
         self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         self._monotonic_clock = monotonic_clock
         self._cache_ttl_seconds = cache_ttl_seconds
@@ -298,8 +342,14 @@ class SystemResourceSampler:
         if nvidia_error:
             errors.append(nvidia_error)
 
+        apple_mps = {"available": False}
         apple_gpu = None
         if self._system_name == "Darwin":
+            try:
+                apple_mps["available"] = bool(self._mps_probe())
+            except Exception:
+                apple_mps["available"] = None
+                errors.append("Apple MPS availability could not be determined.")
             apple_gpu, apple_gpu_error = self._apple_gpu()
             if apple_gpu_error:
                 errors.append(apple_gpu_error)
@@ -311,6 +361,7 @@ class SystemResourceSampler:
             "cpu": cpu,
             "memory": memory,
             "nvidia_gpus": nvidia_gpus,
+            "apple_mps": apple_mps,
             "apple_gpu": apple_gpu,
         }
 
@@ -381,6 +432,7 @@ class SystemResourceSampler:
                 "utilization_percent": None,
             },
             "nvidia_gpus": [],
+            "apple_mps": {"available": None},
             "apple_gpu": None,
         }
 

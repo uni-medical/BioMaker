@@ -1,0 +1,62 @@
+# BioMaker runtime
+backoff
+black
+coolname>=2.2.0
+dataclasses_json>=0.6.4
+funcy==2.0
+genson>=1.2.0
+humanize==4.8.0
+jsonschema==4.19.2
+omegaconf>=2.3.0
+openai>=1.69.0
+python-dotenv
+pydantic>=2,<3
+psutil>=6,<8
+requests>=2.34.2,<3
+rich==13.7.0
+shutup>=0.2.0
+
+# Data inspection and lightweight documentation indexing
+beautifulsoup4
+huggingface_hub
+openpyxl
+pandas
+Pillow>=12.3
+
+# Common packages available to generated solutions
+joblib
+lightgbm
+matplotlib
+numpy<2
+scikit-learn
+# Centerline metrics and reproducible tree-reference skeletonization
+scikit-image==0.22.0
+scipy
+timm
+torch
+torchvision
+xgboost
+
+# General candidate utilities (also exposed by the environment contract)
+einops
+tqdm
+networkx
+h5py
+tensorboard
+
+# Biomedical imaging packages
+connected-components-3d
+torchio<2
+lifelines
+monai==1.4.0
+nibabel
+pydicom
+SimpleITK
+
+# Shared distribution security floors
+anyio>=4.14.2
+fsspec>=2026.6.0
+idna>=3.15
+setuptools>=83
+soupsieve>=2.9
+urllib3>=2.8

@@ -15,6 +15,7 @@ from webui.system_resources import (
     MEBIBYTE,
     SystemResourceSampler,
     _parse_apple_gpu_plist,
+    _probe_mps_with_python,
 )
 
 
@@ -101,6 +102,7 @@ def test_samples_system_cpu_ram_nvidia_and_apple_gpu_fields():
         }.get(name)
 
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=psutil,
         command_runner=run,
         command_resolver=resolve,
@@ -138,6 +140,7 @@ def test_samples_system_cpu_ram_nvidia_and_apple_gpu_fields():
                 "temperature_celsius": None,
             },
         ],
+        "apple_mps": {"available": True},
         "apple_gpu": {
             "source": "ioreg",
             "utilization_percent": 97.0,
@@ -279,6 +282,7 @@ def test_apple_gpu_probe_timeout_is_non_fatal_and_reported():
         raise subprocess.TimeoutExpired(command, timeout=kwargs["timeout"])
 
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=FakePsutil(),
         command_runner=time_out,
         command_resolver=lambda name: ("/usr/sbin/ioreg" if name == "ioreg" else None),
@@ -311,6 +315,7 @@ def test_apple_gpu_probe_timeout_is_non_fatal_and_reported():
 
 def test_apple_gpu_probe_missing_executable_is_non_fatal():
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=FakePsutil(),
         command_runner=lambda *_args, **_kwargs: pytest.fail(
             "missing commands must not run"
@@ -333,6 +338,7 @@ def test_apple_gpu_probe_nonzero_exit_is_non_fatal():
         return _completed(b"permission denied", returncode=1)
 
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=FakePsutil(),
         command_runner=fail,
         command_resolver=lambda name: ("/usr/sbin/ioreg" if name == "ioreg" else None),
@@ -364,6 +370,7 @@ def test_gpu_command_resolution_failure_preserves_cpu_and_ram(
         return None
 
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=FakePsutil(),
         command_resolver=resolve,
         system_name=system_name,
@@ -383,6 +390,7 @@ def test_gpu_command_resolution_failure_preserves_cpu_and_ram(
 def test_primes_psutil_before_returning_the_first_public_cpu_sample():
     psutil = SequencedCpuPsutil([0.0, 37.5])
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=psutil,
         command_resolver=lambda _name: None,
         system_name="Linux",
@@ -399,6 +407,7 @@ def test_cache_is_thread_safe_expires_after_one_second_and_returns_copies():
     psutil = FakePsutil()
     monotonic = [10.0]
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=psutil,
         command_resolver=lambda _name: None,
         system_name="Linux",
@@ -441,6 +450,7 @@ def test_cache_ttl_starts_after_slow_collection_and_waiters_reuse_result():
 
     psutil = SlowPsutil()
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=psutil,
         command_resolver=lambda _name: None,
         system_name="Linux",
@@ -470,6 +480,7 @@ def test_metric_and_command_failures_are_non_fatal_and_reported():
         raise subprocess.TimeoutExpired("nvidia-smi", timeout=1)
 
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=psutil,
         command_runner=time_out,
         command_resolver=lambda _name: "nvidia-smi",
@@ -495,6 +506,7 @@ def test_metric_and_command_failures_are_non_fatal_and_reported():
 
 def test_missing_optional_collectors_are_safe_and_malformed_gpu_csv_is_rejected():
     without_collectors = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=None,
         command_resolver=lambda _name: None,
         system_name="Linux",
@@ -507,6 +519,7 @@ def test_missing_optional_collectors_are_safe_and_malformed_gpu_csv_is_rejected(
     assert without_collectors["error"] == "CPU and RAM metrics require psutil."
 
     malformed_gpu = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=FakePsutil(),
         command_runner=lambda *_args, **_kwargs: _completed("0, too, short\n"),
         command_resolver=lambda _name: "nvidia-smi",
@@ -528,6 +541,7 @@ def test_unexpected_refresh_failure_serves_previous_snapshot_as_stale():
 
     monotonic = [1.0]
     sampler = SystemResourceSampler(
+        mps_probe=lambda: True,
         psutil_provider=FakePsutil(),
         command_resolver=lambda _name: None,
         system_name="Linux",
@@ -542,3 +556,49 @@ def test_unexpected_refresh_failure_serves_previous_snapshot_as_stale():
     assert stale["sampled_at"] == first["sampled_at"]
     assert stale["stale"] is True
     assert stale["error"] == "System resource refresh failed."
+
+
+def test_mps_probe_uses_biomaker_python_and_accepts_only_boolean_output(tmp_path):
+    python_executable = tmp_path / "python"
+    python_executable.touch()
+    calls = []
+
+    def available(command, **kwargs):
+        calls.append((command, kwargs))
+        return _completed("1\n")
+
+    assert (
+        _probe_mps_with_python(
+            python_executable,
+            command_runner=available,
+        )
+        is True
+    )
+    assert calls[0][0][0] == str(python_executable)
+    assert calls[0][1]["timeout"] == 5
+
+    with pytest.raises(RuntimeError, match="could not report MPS"):
+        _probe_mps_with_python(
+            python_executable,
+            command_runner=lambda *_args, **_kwargs: _completed("maybe\n"),
+        )
+
+
+
+def test_apple_gpu_probe_is_independent_of_pytorch_mps_support():
+    sampler = SystemResourceSampler(
+        psutil_provider=FakePsutil(),
+        command_runner=lambda *_args, **_kwargs: _completed(_apple_gpu_plist()),
+        command_resolver=lambda name: ("/usr/sbin/ioreg" if name == "ioreg" else None),
+        system_name="Darwin",
+        mps_probe=lambda: False,
+    )
+
+    result = sampler.sample()
+
+    assert result["apple_mps"] == {"available": False}
+    assert result["apple_gpu"] == {
+        "source": "ioreg",
+        "utilization_percent": 97.0,
+        "shared_memory_used_bytes": 1_204_289_536,
+    }

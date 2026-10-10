@@ -489,10 +489,21 @@ class MED_KNOWLEDGE_RAG:
             snippet = snippet + " ..."
         return snippet
 
-    def search(self, search_query, k=5, enable_query2doc=False, convert_to_str=True):
+    def search_with_count(
+        self,
+        search_query,
+        k=5,
+        enable_query2doc=False,
+        convert_to_str=True,
+    ):
+        """Return the rendered result and the exact number of retrieved documents.
+
+        Keeping the count alongside the result avoids a second retrieval solely for
+        evidence logging.  ``search`` remains the backwards-compatible public API.
+        """
         k = int(k)
         if k <= 0:
-            return [] if not convert_to_str else ""
+            return ([] if not convert_to_str else ""), 0
         candidate_k = max(k * 5, k + 5)
         documents = self._search_once(str(search_query), candidate_k)
 
@@ -514,10 +525,10 @@ class MED_KNOWLEDGE_RAG:
 
         final_documents = deduped[:k]
         if not final_documents:
-            return [] if not convert_to_str else ""
+            return ([] if not convert_to_str else ""), 0
 
         if not convert_to_str:
-            return final_documents
+            return final_documents, len(final_documents)
 
         result = "\n\n---\n\n".join(
             (
@@ -532,11 +543,23 @@ class MED_KNOWLEDGE_RAG:
             for doc in final_documents
         )
         result_budget = max(2500, min(len(final_documents), 10) * 1600)
-        return truncate_text(
-            result,
-            max_chars=result_budget,
-            marker="MONAI RAG trimmed",
+        return (
+            truncate_text(
+                result,
+                max_chars=result_budget,
+                marker="MONAI RAG trimmed",
+            ),
+            len(final_documents),
         )
+
+    def search(self, search_query, k=5, enable_query2doc=False, convert_to_str=True):
+        result, _ = self.search_with_count(
+            search_query,
+            k=k,
+            enable_query2doc=enable_query2doc,
+            convert_to_str=convert_to_str,
+        )
+        return result
 
 
 def _manifest_cli_defaults(persist_dir: Path) -> tuple[str, str]:

@@ -24,7 +24,7 @@ from rich.tree import Tree
 
 from . import backend
 from .agent import BioMakerWorkflow, RoundNode, WorkflowAgent
-from .agents.base_agent import RoundTask
+from .agents.base_agent import RoundTask, CandidateGenerationError
 from .agents.proposal_agent import ProposalAgent
 from .interpreter import Interpreter
 from .journal import Journal, Node
@@ -62,6 +62,10 @@ from .utils.exp_guide import write_exp_guide
 from .utils.experiment_contract import load_experiment_contract
 from .utils.evaluator_protocol import metric_definitions
 from .utils.final_retrain import run_final_retrain
+from .utils.final_selection import freeze_selection, evaluate_selected_delivery
+from .utils.candidate_snapshot import write_candidate_snapshot
+from .utils.process_tree import ProcessTreeCleanupError
+from .utils.metric import WorstMetricValue
 from .utils.private_evaluation import evaluate_private_outputs
 from .utils.run_manifest import write_run_manifest
 from .utils.split_protocol import prepare_split_protocol
@@ -547,192 +551,8 @@ def _run_overview_text(
     return "\n".join(lines), overview
 
 
-def _append_private_metrics_entry(
-    cfg, entry: dict, *, ranking: dict | None = None
-) -> None:
-    path = cfg.log_dir / "private_metrics.json"
-    note = (
-        "Private metrics are for user inspection only and are not passed to the agent."
-    )
-    payload = {
-        "version": 1,
-        "visible_to_agent": False,
-        "note": note,
-        "latest": None,
-        "history": [],
-    }
-    if path.is_file():
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                payload.update(
-                    {
-                        "version": existing.get("version", payload["version"]),
-                        "visible_to_agent": False,
-                        "note": existing.get("note", note),
-                        "latest": existing.get("latest"),
-                        "history": existing.get("history", []),
-                    }
-                )
-        except json.JSONDecodeError:
-            logger.warning(
-                "Existing private metrics history is invalid JSON; rewriting."
-            )
-
-    if not isinstance(payload["history"], list):
-        payload["history"] = []
-    payload["history"].append(entry)
-    payload["latest"] = entry
-    payload["summary"] = _private_metrics_summary(payload["history"], ranking=ranking)
-    if ranking is not None:
-        payload["version"] = 2
-        payload["validation_selection"] = ranking
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
 def _final_retrain_timeout_seconds(cfg: Config) -> int:
     return (cfg.exec.timeout * 3 + 1) // 2
-
-
-def _finite_number(value) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        value = float(value)
-        if math.isfinite(value):
-            return value
-    return None
-
-
-def _entry_val_metric(entry: dict) -> tuple[float | None, bool]:
-    metric = entry.get("metric")
-    if not isinstance(metric, dict):
-        return None, True
-    value = _finite_number(metric.get("value"))
-    maximize = metric.get("maximize")
-    return value, bool(maximize) if maximize is not None else True
-
-
-def _entry_private_test_metric(entry: dict) -> tuple[float | None, bool, dict | None]:
-    private_metrics = entry.get("private_metrics")
-    if not isinstance(private_metrics, dict):
-        return None, True, None
-    results = private_metrics.get("results")
-    if not isinstance(results, list):
-        return None, True, None
-    preferred = None
-    for result in results:
-        if not isinstance(result, dict):
-            continue
-        if result.get("name") == "official_test":
-            preferred = result
-            break
-        if preferred is None:
-            preferred = result
-    if preferred is None:
-        return None, True, None
-    value = _finite_number(preferred.get("value"))
-    maximize = preferred.get("maximize")
-    return value, bool(maximize) if maximize is not None else True, preferred
-
-
-def _compact_private_summary_entry(entry: dict | None) -> dict | None:
-    if entry is None:
-        return None
-    val_value, _val_maximize = _entry_val_metric(entry)
-    test_value, _test_maximize, test_result = _entry_private_test_metric(entry)
-    test_metrics = None
-    test_metric_name = None
-    test_n = None
-    if isinstance(test_result, dict):
-        test_metrics = test_result.get("metrics")
-        test_metric_name = test_result.get("metric_name")
-        test_n = test_result.get("n")
-    return {
-        "workflow_step": entry.get("workflow_step"),
-        "node_step": entry.get("node_step"),
-        "node_id": entry.get("node_id"),
-        "parent_id": entry.get("parent_id"),
-        "stage": entry.get("stage"),
-        "outcome": entry.get("outcome"),
-        "is_buggy": entry.get("is_buggy"),
-        "val_metric": val_value,
-        "val_metric_maximize": _entry_val_metric(entry)[1],
-        "val_metrics": entry.get("metrics"),
-        "metric_specs": entry.get("metric_specs"),
-        "ranking": entry.get("ranking"),
-        "private_test_metric": test_value,
-        "private_test_metric_name": test_metric_name,
-        "private_test_metrics": test_metrics,
-        "private_test_n": test_n,
-        "created_at": entry.get("created_at"),
-    }
-
-
-def _private_metrics_summary(history: list, *, ranking: dict | None = None) -> dict:
-    entries = [entry for entry in history if isinstance(entry, dict)]
-    eligible_entries = [entry for entry in entries if entry.get("is_buggy") is not True]
-    if ranking is not None:
-        best_id = ranking.get("best_node_id")
-        best_entry = next(
-            (
-                entry
-                for entry in reversed(eligible_entries)
-                if entry.get("node_id") == best_id
-            ),
-            None,
-        )
-        compact = _compact_private_summary_entry(best_entry)
-        if compact is not None:
-            compact["ranking"] = ranking.get("nodes", {}).get(best_id)
-        return {
-            "selection_policy": "average_rank",
-            "val_best": compact,
-            "best_node_id": best_id,
-            "ranking_version": ranking.get("version"),
-            "candidate_count": ranking.get("candidate_count"),
-            "history_count": len(entries),
-            "eligible_history_count": len(eligible_entries),
-        }
-
-    def better_by_val(entry: dict):
-        value, maximize = _entry_val_metric(entry)
-        if value is None:
-            return None
-        return value if maximize else -value
-
-    def better_by_private_test(entry: dict):
-        value, maximize, _result = _entry_private_test_metric(entry)
-        if value is None:
-            return None
-        return value if maximize else -value
-
-    val_candidates = [
-        entry for entry in eligible_entries if better_by_val(entry) is not None
-    ]
-    test_candidates = [
-        entry for entry in eligible_entries if better_by_private_test(entry) is not None
-    ]
-    val_best = (
-        max(val_candidates, key=lambda entry: better_by_val(entry))
-        if val_candidates
-        else None
-    )
-    private_test_best = (
-        max(test_candidates, key=lambda entry: better_by_private_test(entry))
-        if test_candidates
-        else None
-    )
-    return {
-        "val_best": _compact_private_summary_entry(val_best),
-        "private_test_best": _compact_private_summary_entry(private_test_best),
-        "same_node": (
-            bool(val_best is not None and private_test_best is not None)
-            and val_best.get("node_id") == private_test_best.get("node_id")
-        ),
-        "history_count": len(entries),
-        "eligible_history_count": len(eligible_entries),
-    }
 
 
 def _run(cfg: Config) -> int:
@@ -831,6 +651,7 @@ def _run(cfg: Config) -> int:
         temperature=0.0,
         attempts=cfg.split_builder.attempts,
         cache_root=cfg.resource_dir / "split_builder",
+        package_dir=getattr(cfg.split_builder, "package_dir", None),
     )
     append_event(
         cfg.log_dir,
@@ -932,7 +753,7 @@ def _run(cfg: Config) -> int:
     global_step = len(journal)
 
     def cleanup():
-        if global_step == 0 and cfg.workspace_dir.exists():
+        if global_step == 0 and not getattr(compute_pool, "has_cleanup_failure", False) and cfg.workspace_dir.exists():
             shutil.rmtree(cfg.workspace_dir)
 
     atexit.register(cleanup)
@@ -966,6 +787,7 @@ def _run(cfg: Config) -> int:
                 )
                 res = node_interpreter.run(*args, **kwargs)
                 if res.exc_type is None:
+                    append_event(cfg.log_dir, "candidate_validation_started", node_id=node.id if node else None)
                     normalization_messages = normalize_working_outputs(
                         execution_workspace, str(agent_task_desc)
                     )
@@ -976,7 +798,10 @@ def _run(cfg: Config) -> int:
                             details={"messages": normalization_messages},
                         )
                     artifact_check = validate_working_outputs(
-                        execution_workspace, str(agent_task_desc)
+                        execution_workspace, str(agent_task_desc),
+                        candidate_code=str(args[0]) if args else None,
+                        model_probe=node_interpreter.run,
+                        model_artifact_required=getattr(getattr(cfg, "model_artifacts", None), "required", True),
                     )
                     attach_artifact_validation_result(
                         res,
@@ -1015,6 +840,7 @@ def _run(cfg: Config) -> int:
         node = round_node.node
         execution_workspace = Path(node.execution_workspace or cfg.workspace_dir)
         started = time.monotonic()
+        append_event(cfg.log_dir, "candidate_evaluation_started", node_id=node.id)
         append_event(cfg.log_dir, "scoring_started", node_id=node.id,
                      execution_workspace=str(execution_workspace))
         try:
@@ -1087,6 +913,10 @@ def _run(cfg: Config) -> int:
     def save_live_tree(extra_nodes: list[Node] | None = None) -> Journal:
         """Best-effort tree export for completed and transient nodes."""
         display_journal = live_display_journal(extra_nodes)
+        try:
+            write_candidate_snapshot(cfg.log_dir, display_journal.nodes)
+        except Exception as exc:
+            record_presentation_warning("candidate_snapshot", exc)
         try:
             tree_export.generate(
                 cfg,
@@ -1232,6 +1062,8 @@ def _run(cfg: Config) -> int:
         return scheduler.remaining_budget(total_steps, global_step)
 
     def submit_ready_nodes(executor: ThreadPoolExecutor) -> None:
+        if getattr(compute_pool, "has_cleanup_failure", False):
+            raise RuntimeError("Compute pool is quarantined after unverified process cleanup.")
         if scheduling_stopped or scoring_failures or total_timer.is_timeout():
             return
         changed = False
@@ -1412,29 +1244,31 @@ def _run(cfg: Config) -> int:
             placeholder = meta["placeholder"]
             try:
                 node = future.result()
-            except Exception as exc:
+            except CandidateGenerationError as exc:
                 if placeholder in generating_nodes:
                     generating_nodes.remove(placeholder)
-                append_event(
-                    cfg.log_dir,
-                    "node_generation_failed",
-                    round_index=meta["round_index"],
-                    round_item_index=meta["item_index"],
-                    round_item_count=meta["item_count"],
-                    scheduled_step=meta.get("scheduled_step"),
-                    placeholder_id=placeholder.id,
-                    stage=placeholder.node_status,
-                    parent_id=(
-                        placeholder.parent.id
-                        if placeholder.parent is not None
-                        else None
-                    ),
-                    exc_type=type(exc).__name__,
-                    error=str(exc),
-                )
-                refresh_live_tree(log_tree=True)
+                placeholder.plan = "Code generation failed before execution."
+                for field, source in (("prompt", "prompt"), ("prompt_messages", "messages"), ("prompt_stats", "stats")):
+                    if source in exc.prompt_capture:
+                        setattr(placeholder, field, exc.prompt_capture[source])
+                placeholder.is_buggy = True
+                placeholder.metric = WorstMetricValue()
+                placeholder.outcome = "generation_format_failed"
+                placeholder.exc_type = type(exc).__name__
+                placeholder.exc_info = {"reason": exc.reason, "attempts": exc.attempts, "response_chars": exc.response_chars, "execution_skipped": True}
+                placeholder.mark_status("completed")
+                reattach_generated_node_to_live_parent(placeholder, meta["task"].parent)
+                round_node = RoundNode(workflow_agent=workflow_agent, node=placeholder,
+                    round_index=meta["round_index"], round_item_index=meta["item_index"], round_item_count=meta["item_count"])
+                round_nodes_by_round.setdefault(meta["round_index"], []).append(round_node)
+                parsed_node_ids.add(placeholder.id)
+                append_event(cfg.log_dir, "node_generation_failed", node_id=placeholder.id, scheduled_step=meta.get("scheduled_step"), **placeholder.exc_info)
+                append_result_for_round_node(round_node)
                 changed = True
                 continue
+            except Exception as exc:
+                append_event(cfg.log_dir, "node_generation_failed", node_id=placeholder.id, exc_type=type(exc).__name__, error=str(exc), infrastructure_failure=True)
+                raise
             task = meta["task"]
             reattach_generated_node_to_live_parent(node, task.parent)
             node.id = placeholder.id
@@ -1562,71 +1396,10 @@ def _run(cfg: Config) -> int:
         appended_node_ids_by_round.setdefault(round_node.round_index, []).append(
             node.id
         )
-        sync_node_working_to_run_workspace(
-            cfg,
-            solution_workspace,
-            target_name="working_latest",
-        )
-        sync_node_working_to_run_workspace(cfg, solution_workspace)
+        if node.execution_workspace and node.outcome != "generation_format_failed":
+            sync_node_working_to_run_workspace(cfg, solution_workspace, target_name="working_latest")
+            sync_node_working_to_run_workspace(cfg, solution_workspace)
         best_node, ranking = _sync_selected_best(cfg, journal, previous_best_id)
-        if node.outcome != "unscored" and getattr(getattr(cfg, "private_evaluation", None), "per_node", True):
-            private_metrics = None
-            private_error = None
-            private_failure_kind = None
-            try:
-                with compute_pool.lease() as private_slot:
-                    private_metrics = evaluate_private_outputs(
-                        solution_workspace,
-                        private_dir,
-                        timeout=evaluator_timeout_seconds(cfg),
-                        env_overrides={
-                            **private_slot.env_overrides,
-                            "BIOMAKER_EVALUATOR_WORKERS": str(evaluator_workers(cfg)),
-                            "BIOMAKER_EVALUATOR_PROGRESS_PATH": str(cfg.log_dir / ("private-scoring-" + node.id + ".jsonl")),
-                        },
-                    )
-                if private_metrics and private_metrics.get("error"):
-                    private_error = str(private_metrics["error"])
-                    private_failure_kind = private_metrics.get("failure_kind")
-            except Exception as exc:
-                logger.warning("Private evaluation failed: %s", exc)
-                private_error = str(exc)
-                private_failure_kind = getattr(exc, "failure_kind", "execution")
-            if private_error:
-                append_event(cfg.log_dir, "private_scoring_failed", node_id=node.id,
-                    failure_kind=private_failure_kind, error=private_error)
-            if (
-                private_metrics
-                or private_error
-                or (private_dir / "private_gt.json").is_file()
-            ):
-                _append_private_metrics_entry(
-                    cfg,
-                    {
-                        "workflow_step": global_step,
-                        "node_step": node.step,
-                        "node_id": node.id,
-                        "parent_id": (
-                            node.parent.id if node.parent is not None else None
-                        ),
-                        "stage": node.node_status,
-                        "is_buggy": bool(node.is_buggy),
-                        "outcome": node.outcome,
-                        "metric": _metric_payload(node),
-                        **_ranking_payload(journal, node, ranking),
-                        "is_current_best": node is best_node,
-                        "created_at": time.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                        ),
-                        "private_metrics_available": bool(
-                            private_metrics and not private_error and private_metrics.get("results")
-                        ),
-                        "private_metrics": private_metrics,
-                        "private_error": private_error,
-                        "private_failure_kind": private_failure_kind,
-                    },
-                    ranking=ranking,
-                )
         try:
             tree = journal_to_rich_tree(journal)
         except Exception as exc:
@@ -1813,79 +1586,27 @@ def _run(cfg: Config) -> int:
             failure_kind=scoring_failures[0]["failure_kind"] or "execution",
         )
     best_node = journal.get_best_node(only_good=True)
-    if cfg.final_retrain.enabled and best_node is not None and not end_with_exception:
+    selection = freeze_selection(cfg, journal, best_node)
+    delivery_workspace = Path(best_node.execution_workspace)
+    delivery_stage = "selected_candidate"
+    if cfg.final_retrain.enabled and not end_with_exception:
         retrain_timeout = _final_retrain_timeout_seconds(cfg)
         with compute_pool.lease(final=True) as final_slot:
             final_slot_payload = final_slot.as_dict()
-            append_event(
-                cfg.log_dir,
-                "final_retrain_started",
-                node_id=best_node.id,
-                node_step=best_node.step,
-                timeout_seconds=retrain_timeout,
-                compute_backend=final_slot.backend,
-                compute_slot=final_slot_payload,
-            )
-            retrain_result = run_final_retrain(
-                cfg,
-                best_node,
-                private_dir,
-                timeout=retrain_timeout,
-                env_overrides=final_slot.env_overrides,
-            )
-            append_event(
-                cfg.log_dir,
-                "final_retrain_finished",
-                ok=retrain_result.ok,
-                workspace_dir=str(retrain_result.workspace_dir),
-                train_rows_before=retrain_result.train_rows_before,
-                score_rows_added=retrain_result.score_rows_added,
-                train_rows_after=retrain_result.train_rows_after,
-                private_metrics=retrain_result.private_metrics,
-                error=retrain_result.error,
-                compute_backend=final_slot.backend,
-                compute_slot=final_slot_payload,
-            )
-        _append_private_metrics_entry(
-            cfg,
-            {
-                "workflow_step": global_step,
-                "node_step": best_node.step,
-                "node_id": best_node.id,
-                "parent_id": (
-                    best_node.parent.id if best_node.parent is not None else None
-                ),
-                "stage": "final_retrain",
-                "is_buggy": not retrain_result.ok,
-                "outcome": (
-                    "final_retrain" if retrain_result.ok else "final_retrain_failed"
-                ),
-                "metric": _metric_payload(best_node),
-                **_ranking_payload(journal, best_node),
-                "is_current_best": True,
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "private_metrics_available": bool(
-                    retrain_result.private_metrics
-                    and not retrain_result.private_metrics.get("error")
-                    and retrain_result.private_metrics.get("results")
-                ),
-                "private_metrics": retrain_result.private_metrics,
-                "private_error": retrain_result.error,
-                "private_failure_kind": (retrain_result.private_metrics or {}).get("failure_kind"),
-                "train_rows_before": retrain_result.train_rows_before,
-                "score_rows_added": retrain_result.score_rows_added,
-                "train_rows_after": retrain_result.train_rows_after,
-            },
-            ranking=journal.ranking_snapshot(),
-        )
+            append_event(cfg.log_dir, "final_retrain_started", node_id=best_node.id,
+                node_step=best_node.step, timeout_seconds=retrain_timeout,
+                compute_backend=final_slot.backend, compute_slot=final_slot_payload)
+            retrain_result = run_final_retrain(cfg, best_node, private_dir,
+                timeout=retrain_timeout, env_overrides=final_slot.env_overrides)
+            append_event(cfg.log_dir, "final_retrain_finished", ok=retrain_result.ok,
+                workspace_dir=str(retrain_result.workspace_dir), train_rows_before=retrain_result.train_rows_before,
+                score_rows_added=retrain_result.score_rows_added, train_rows_after=retrain_result.train_rows_after,
+                error=retrain_result.error, compute_backend=final_slot.backend, compute_slot=final_slot_payload)
         if not retrain_result.ok:
-            raise RuntimeError(
-                "Final retrain did not complete successfully: "
-                + (retrain_result.error or "unknown error")
-            )
-    elif cfg.final_retrain.enabled and best_node is None and not end_with_exception:
-        append_event(cfg.log_dir, "final_retrain_skipped", reason="no_best_node")
-        raise RuntimeError("Final retrain is enabled but no valid best node exists.")
+            raise RuntimeError("Final retrain did not complete successfully: " + (retrain_result.error or "unknown error"))
+        delivery_workspace = retrain_result.workspace_dir
+        delivery_stage = "final_retrain"
+    evaluate_selected_delivery(cfg, best_node, delivery_workspace, private_dir, selection, stage=delivery_stage)
     try:
         SHARED_CONSOLE.print(best_metrics_table(journal))
     except Exception as exc:
@@ -1934,6 +1655,9 @@ def _run_direct_entry() -> None:
             manifest_path = write_run_manifest(cfg, None)
             append_event(cfg.log_dir, "run_manifest_written", path=manifest_path)
             completed_steps = _run(cfg)
+        except ProcessTreeCleanupError as exc:
+            emit_terminal("run_failed", exc_type=type(exc).__name__, error=str(exc), **exc.as_dict())
+            raise
         except KeyboardInterrupt:
             emit_terminal("run_interrupted", reason="keyboard_interrupt")
             raise
@@ -1967,13 +1691,6 @@ def run() -> None:
     if "--queue" in sys.argv[1:]:
         sys.argv = [sys.argv[0], *(arg for arg in sys.argv[1:] if arg != "--queue")]
     if use_queue:
-        queue_sidecar = Path(__file__).resolve().parents[1] / "apps" / "webui"
-        if not (queue_sidecar / "webui" / "runner.py").is_file():
-            raise RuntimeError(
-                "The durable run queue is unavailable in this installation. "
-                "Run BioMaker from the source checkout to use --queue, "
-                "or omit --queue to run directly."
-            )
         from .utils.queue_client import submit_cli_and_wait
 
         raise SystemExit(submit_cli_and_wait())

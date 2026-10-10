@@ -75,11 +75,15 @@ from .metric_registry import (
     metric_maximize,
 )
 from .process_tree import (
+    ProcessTreeCleanupError,
     ProcessTreeInspectionError,
     ProcessTreeTracker,
     drain_uncaptured_process_group,
 )
 from .response import extract_code, truncate_text
+from .score_validity import ScoringOutcome, require_valid_score_payload, require_submission_success
+from .artifact_integrity import artifact_snapshot
+from .evaluator_templates import _STRICT_PROBE_HELPERS
 
 logger = logging.getLogger("biomaker")
 
@@ -89,7 +93,7 @@ _SPEC_PREFIX = "EVALUATOR_SPEC_JSON="
 _ARTIFACT_REPORT_PREFIX = "EVALUATOR_ARTIFACT_REPORT_JSON="
 _FAILURE_PREFIX = "EVALUATOR_FAILURE_JSON="
 _SCORE_ENV_VAR = "BIOMAKER_SCORE_VAL_PATH"
-_EVALUATOR_CACHE_VERSION = 7
+_EVALUATOR_CACHE_VERSION = 8
 _PREPARATION_ENV: ContextVar[dict[str, str] | None] = ContextVar('evaluator_preparation_env', default=None)
 
 
@@ -139,8 +143,13 @@ class EvaluatorRunResult:
     failure_kind: str | None = None
 
     @property
+    def outcome(self) -> ScoringOutcome:
+        status = "valid" if self.ok else ("invalid_prediction" if self.failure_kind == "prediction_contract" else "evaluator_unavailable")
+        return ScoringOutcome(status, self.metrics if self.ok else {}, self.failure_kind, self.error)
+
+    @property
     def metrics(self) -> dict[str, float]:
-        return dict(self.details.get('score', {}).get('metrics', {}))
+        return dict(self.details.get('score', {}).get('metrics', {})) if self.ok else {}
 
     @property
     def metric_specs(self) -> list[dict[str, Any]]:
@@ -150,6 +159,11 @@ class EvaluatorRunResult:
         details = dict(self.details)
         details.pop("artifact_report", None)
         payload = {
+            "score_schema_version": 1,
+            "status": "ok" if self.ok else "error",
+            "failure": None if self.ok else {"kind": self.failure_kind},
+            "ok": self.ok,
+            "outcome": self.outcome.status,
             "metric": self.metric,
             "maximize": self.maximize,
             "metrics": self.metrics,
@@ -179,8 +193,9 @@ def parse_external_validation(term_out: list[str] | str) -> tuple[float, bool] |
         try:
             data = json.loads(payload)
             metric = data.get("metric")
-            maximize = bool(data.get("maximize", True))
-            if isinstance(metric, bool) or metric is None:
+            maximize = data.get("maximize", True)
+            require_valid_score_payload(data)
+            if not isinstance(maximize, bool) or isinstance(metric, bool) or not isinstance(metric, (int, float)) or not math.isfinite(metric):
                 return None
             return float(metric), maximize
         except Exception:
@@ -447,8 +462,8 @@ def _run_python(
         try:
             process_tree = ProcessTreeTracker.capture(process.pid)
         except (OSError, ProcessLookupError, ProcessTreeInspectionError, ValueError):
-            drain_uncaptured_process_group(process)
             uncaptured_drained = True
+            drain_uncaptured_process_group(process)
             raise RuntimeError("Could not capture evaluator process identity") from None
 
         started_at = time.monotonic()
@@ -537,7 +552,7 @@ def _run_self_test(
     timeout: int,
     hidden_score_path: Path | str | None = None,
 ) -> str:
-    code = """
+    code = _STRICT_PROBE_HELPERS + """
 import evaluator
 import json
 import os
@@ -576,6 +591,7 @@ try:
         os.environ.pop('BIOMAKER_SCORE_VAL_PATH', None)
         expected_error = probe.get('score_error') if spec.get('adapter_api_version') == 1 else None
         score_error = None
+        relocated_before = _fingerprint(paths)
         try:
             score = evaluator.score(*paths)
         except Exception as exc:
@@ -584,8 +600,11 @@ try:
                 raise
             score = None
             score_error = expected_error
+        if relocated_before != _fingerprint(paths):
+            raise RuntimeError('Evaluator modified a relocated self-test artifact')
         if spec.get('adapter_api_version') == 1 and (score != probe['score'] or score_error != expected_error):
             raise RuntimeError('Adapter probe changed when paths were relocated or test fixtures were written; preserve all referenced files and split-independent interpretation.')
+        _negative_prediction_probes(paths[0], lambda: evaluator.score(*paths), paths, spec, allow_undefined=bool(expected_error))
         print('EVALUATOR_PROBE_JSON=' + json.dumps({'spec': spec, 'score': score,
             'score_error': score_error, 'structural_probe': probe.get('structural_probe') if isinstance(probe, dict) else None}))
 finally:
@@ -730,6 +749,9 @@ def _normalize_prediction_spec_json(prediction_spec: str) -> str:
         raise EvaluatorSetupError(f"prediction_spec() did not return valid JSON: {exc}")
     if not isinstance(spec, dict):
         raise EvaluatorSetupError("prediction_spec() must return a JSON object.")
+
+    if "maximize" in spec and not isinstance(spec["maximize"], bool):
+        raise EvaluatorSetupError("maximize must be a boolean")
 
     validation_artifact = _path_from_spec_value(
         spec.get("validation_artifact")
@@ -899,6 +921,7 @@ def _run_public_artifact_contract_test(
         tempfile.mkdtemp(prefix=".evaluator_contract_test_", dir=workspace_dir)
     )
     backup_working = backup_root / "working"
+    cleanup_unverified = False
     try:
         if original_working_existed:
             shutil.move(str(working_dir), str(backup_working))
@@ -912,13 +935,31 @@ def _run_public_artifact_contract_test(
                 include_extra_label_like_columns=True,
             )
 
-        code = (
-            "import evaluator\n"
-            "score = evaluator.score_val()\n"
-            "if not isinstance(score.get('metric'), (int, float)):\n"
-            "    raise RuntimeError('score_val() metric must be numeric: ' + repr(score))\n"
-            "evaluator.validate_submission()\n"
-        )
+        code = _STRICT_PROBE_HELPERS + "\nimport evaluator, os, tempfile, importlib\n" + "SPEC = " + repr(spec) + "\nJOBS = " + repr(jobs) + "\n" + r"""
+watched = [job['artifact'] for job in JOBS.values()]
+for role, job in JOBS.items():
+    call = evaluator.score_val if role == 'score_val' else evaluator.validate_submission
+    _negative_prediction_probes(job['artifact'], call, watched, SPEC, scoring=role == 'score_val')
+metrics = [str(m['name']).lower() for m in SPEC.get('metrics', [])] or [str(SPEC.get('primary_metric', '')).lower()]
+answers = SPEC.get('answer_columns', [])
+if answers and any('auc' in name or 'roc' in name for name in metrics):
+    truth_path = Path(os.environ['BIOMAKER_SCORE_VAL_PATH'])
+    truth = pd.read_csv(truth_path)
+    if not truth.empty:
+        with tempfile.TemporaryDirectory(prefix='.metric-contract-', dir=truth_path.parent) as tmp:
+            invalid = truth.copy()
+            for col in answers:
+                invalid[col] = invalid[col].iloc[0]
+            target = Path(tmp) / 'undefined.csv'
+            invalid.to_csv(target, index=False)
+            os.environ['BIOMAKER_SCORE_VAL_PATH'] = str(target)
+            try:
+                importlib.reload(evaluator)
+                _probe_call(evaluator.score_val, watched, SPEC, reject=True, case='undefined_primary_auc')
+            finally:
+                os.environ['BIOMAKER_SCORE_VAL_PATH'] = str(truth_path)
+                importlib.reload(evaluator)
+"""
         completed = _run_python(
             workspace_dir,
             code,
@@ -934,12 +975,16 @@ def _run_public_artifact_contract_test(
                 "key_columns plus prediction_columns from prediction_spec(); it should "
                 f"load hidden score labels from ${_SCORE_ENV_VAR}.\n" + output[-4000:]
             )
+    except ProcessTreeCleanupError:
+        cleanup_unverified = True
+        raise
     finally:
-        if working_dir.exists():
-            shutil.rmtree(working_dir)
-        if original_working_existed:
-            shutil.move(str(backup_working), str(working_dir))
-        shutil.rmtree(backup_root, ignore_errors=True)
+        if not cleanup_unverified:
+            if working_dir.exists():
+                shutil.rmtree(working_dir)
+            if original_working_existed:
+                shutil.move(str(backup_working), str(working_dir))
+            shutil.rmtree(backup_root, ignore_errors=True)
 
 
 def _resolve_candidate_path(
@@ -2368,6 +2413,10 @@ def _evaluator_cache_metadata(
         "restoration_contract.py": _sha256_file(utils_dir / "restoration_contract.py"),
         "restoration_evaluator_template.py": _sha256_file(utils_dir / "restoration_evaluator_template.py"),
         "evaluator_protocol.py": _sha256_file(utils_dir / "evaluator_protocol.py"),
+        "score_validity.py": _sha256_file(utils_dir / "score_validity.py"),
+        "prediction_contract.py": _sha256_file(utils_dir / "prediction_contract.py"),
+        "metric_registry.py": _sha256_file(utils_dir / "metric_registry.py"),
+        "artifact_integrity.py": _sha256_file(utils_dir / "artifact_integrity.py"),
         "evaluator_adapter.py": _sha256_file(utils_dir / "evaluator_adapter.py"),
         "experiment_contract.py": _sha256_file(utils_dir / "experiment_contract.py"),
         "split_contract.py": _sha256_file(utils_dir / "split_contract.py"),
@@ -2908,7 +2957,7 @@ def _captured_output(stdout: str | bytes | None, stderr: str | bytes | None) -> 
     )
 
 
-def score_artifacts_with_evaluator(
+def _score_artifacts_with_evaluator(
     workspace_dir: Path | str,
     prediction_path: Path | str,
     truth_path: Path | str,
@@ -3060,7 +3109,7 @@ def score_artifacts_with_evaluator(
     )
 
 
-def validate_submission_with_evaluator(
+def _validate_submission_with_evaluator(
     workspace_dir: Path | str,
     timeout: int = 3600,
     env_overrides: dict[str, str] | None = None,
@@ -3119,6 +3168,7 @@ def validate_submission_with_evaluator(
             continue
         try:
             payload = json.loads(line[len(_RESULT_PREFIX) :])
+            require_submission_success(payload.get("submission_validation"))
         except Exception as exc:
             return EvaluatorRunResult(
                 ok=False,
@@ -3145,3 +3195,32 @@ def validate_submission_with_evaluator(
         error="Evaluator did not emit submission validation JSON.",
         failure_kind="protocol",
     )
+
+
+def _read_only_result(workspace_dir, explicit_paths, invoke):
+    try:
+        before = artifact_snapshot(Path(workspace_dir), explicit_paths)
+    except Exception as exc:
+        return EvaluatorRunResult(False, None, True, {}, "", f"Cannot verify artifact integrity: {exc}", failure_kind="protocol")
+    result = invoke()
+    try:
+        after = artifact_snapshot(Path(workspace_dir), explicit_paths)
+    except Exception as exc:
+        return EvaluatorRunResult(False, None, True, {}, result.output, f"Cannot verify artifact integrity: {exc}", failure_kind="protocol")
+    if before != after:
+        return EvaluatorRunResult(False, None, True, {}, result.output,
+            "Frozen evaluator modified a prediction, model, input, or evaluator artifact.", failure_kind="protocol")
+    return result
+
+
+def score_artifacts_with_evaluator(workspace_dir, prediction_path, truth_path, expected_path, *, timeout=3600, env_overrides=None, include_artifact_report=False):
+    """Score explicit artifacts and reject any evaluator-side artifact mutation."""
+    return _read_only_result(workspace_dir, [prediction_path, truth_path, expected_path], lambda: _score_artifacts_with_evaluator(
+        workspace_dir, prediction_path, truth_path, expected_path, timeout=timeout,
+        env_overrides=env_overrides, include_artifact_report=include_artifact_report))
+
+
+def validate_submission_with_evaluator(workspace_dir, timeout=3600, env_overrides=None):
+    """Require explicit validation success without modifying delivered artifacts."""
+    return _read_only_result(workspace_dir, [], lambda: _validate_submission_with_evaluator(
+        workspace_dir, timeout=timeout, env_overrides=env_overrides))

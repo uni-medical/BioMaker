@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from biomaker.score import main
+from biomaker.application import RunService
+from biomaker.score import RescoreRequestError, main, rescore_saved_predictions
 from biomaker.utils.evaluator_adapter import compile_adapter
 from biomaker.utils import evaluator_setup
 
@@ -48,11 +50,23 @@ def command(inputs, output, *options):
             '--expected', str(expected), '--output', str(output), *options]
 
 
-def test_frozen_evaluator_parallel_rescore_logs_private_progress_and_preserves_inputs(frozen_run, tmp_path):
+@pytest.mark.parametrize('entrypoint', ['cli', 'service'])
+def test_frozen_evaluator_parallel_rescore_logs_private_progress_and_preserves_inputs(frozen_run, tmp_path, entrypoint):
     workspace, pred, truth, expected = frozen_run
+    (workspace / 'journal.json').write_text('{"nodes": []}')
+    (workspace / 'private_metrics.json').write_text('{"status": "previous evidence"}')
     before = {p: p.read_bytes() for p in workspace.rglob('*') if p.is_file()}
     output = tmp_path / 'private/result.json'
-    assert main(command(frozen_run, output, '--workers', '2', '--timeout', '30')) == 0
+    def invoke():
+        if entrypoint == 'cli':
+            return main(command(frozen_run, output, '--workers', '2', '--timeout', '30'))
+        service = RunService(SimpleNamespace(settings=None, store=object()))
+        result = service.rescore(workspace=workspace, prediction=pred, truth=truth,
+                                 expected=expected, output=output, workers=2, timeout=30)
+        assert result == {'status': 'completed', 'output': str(output), 'exit_code': 0}
+        return result['exit_code']
+
+    assert invoke() == 0
     payload = json.loads(output.read_text())
     assert payload['result']['details']['score']['metrics'] == {'binary_dice': pytest.approx(2 / 3)}
     assert payload['result']['details']['score']['n'] == 3
@@ -63,8 +77,21 @@ def test_frozen_evaluator_parallel_rescore_logs_private_progress_and_preserves_i
     assert all('prediction' not in e and 'target' not in e for e in events)
     assert not payload['training_started'] and not payload['journal_updated']
     assert all(p.read_bytes() == value for p, value in before.items())
-    with pytest.raises(SystemExit):
-        main(command(frozen_run, output))
+    receipt_before = output.read_bytes()
+    with pytest.raises(SystemExit if entrypoint == 'cli' else RescoreRequestError):
+        invoke()
+    assert output.read_bytes() == receipt_before
+
+
+@pytest.mark.parametrize('invalid', [{'timeout': 0}, {'workers': 0}, {'workers': True}])
+def test_rescore_api_rejects_invalid_budget_before_reserving_receipt(frozen_run, tmp_path, invalid):
+    workspace, prediction, truth, expected = frozen_run
+    output = tmp_path / 'result.json'
+    with pytest.raises(RescoreRequestError, match='positive integer'):
+        rescore_saved_predictions(workspace=workspace, prediction=prediction, truth=truth,
+                                 expected=expected, output=output, **invalid)
+    assert not output.exists()
+    assert not output.with_suffix('.json.progress.jsonl').exists()
 
 
 @pytest.mark.parametrize('temporary_input', ['prediction', 'truth', 'expected', None])

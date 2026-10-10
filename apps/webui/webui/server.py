@@ -13,10 +13,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from biomaker.application import AdmissionError, RunService
+from biomaker.runtime.queries import CANONICAL_TERMINAL_STATUSES
+
 from .artifacts import (
     ArtifactError,
     artifact_collection_revision,
-    detailed_run,
     file_revision,
     list_artifacts,
     opaque_revision,
@@ -42,27 +44,15 @@ from .models import (
     QueueResumeRequest,
     RunCreate,
 )
-from .run_catalog import list_log_runs, run_from_log_dir
+from .run_catalog import list_log_runs
 from .run_store import SQLiteRunStore
-from .runner import TERMINAL_STATUSES, RunManager
+from .runner import RunManager
 from .settings import Settings
 from .system_resources import get_system_resources
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-CANONICAL_STATUS = {
-    "queued": "queued",
-    "running": "running",
-    "stopping": "stopping",
-    "succeeded": "complete",
-    "complete": "complete",
-    "failed": "incomplete",
-    "cancelled": "incomplete",
-    "stopped": "incomplete",
-    "interrupted": "incomplete",
-    "incomplete": "incomplete",
-}
-CANONICAL_TERMINAL_STATUSES = {"complete", "incomplete"}
+
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -72,42 +62,6 @@ def _inside(path: Path, root: Path) -> bool:
     except ValueError:
         return False
 
-
-def _normalized_experiment(
-    settings: Settings,
-    payload: ExperimentInput,
-) -> dict[str, Any]:
-    dataset_path = Path(payload.dataset_path).expanduser()
-    if not dataset_path.is_absolute():
-        dataset_path = settings.workspace_root / dataset_path
-    dataset_path = dataset_path.resolve()
-    if not dataset_path.is_dir():
-        raise HTTPException(
-            status_code=422,
-            detail=f"Dataset directory does not exist: {dataset_path}",
-        )
-
-    template_path = None
-    if payload.task_template_path:
-        candidate = Path(payload.task_template_path).expanduser()
-        if not candidate.is_absolute():
-            candidate = settings.workspace_root / candidate
-        candidate = candidate.resolve()
-        experiments_root = settings.experiments_root.resolve()
-        if (
-            not _inside(candidate, experiments_root)
-            or not candidate.is_file()
-            or candidate.name != "task.md"
-        ):
-            raise HTTPException(status_code=422, detail="Invalid task template path")
-        template_path = str(candidate)
-
-    return {
-        "dataset_path": str(dataset_path),
-        "task_template_path": template_path,
-        "task_body": payload.task_body,
-        "advanced_defaults": payload.advanced_defaults.model_dump(),
-    }
 
 
 def _task_templates(settings: Settings) -> list[dict[str, Any]]:
@@ -230,18 +184,27 @@ def create_app(
     settings: Settings | None = None,
     *,
     process_factory: Callable[..., Any] | None = None,
+    admission_policy: Callable | None = None,
+    env_handler: Callable | None = None,
 ) -> FastAPI:
     app_settings = settings or Settings.default()
     app_settings.ensure_directories()
     run_store = SQLiteRunStore(app_settings.state_dir / "runs.sqlite3")
     manager = RunManager(app_settings, run_store, process_factory=process_factory)
+    service = RunService(manager, app_settings, admission_policy=admission_policy)
+    observations = service.observations
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         manager.import_history(list_log_runs(app_settings))
         manager.start()
-        yield
-        manager.shutdown()
+        try:
+            yield
+        finally:
+            try:
+                manager.shutdown()
+            finally:
+                observations.clear()
 
     app = FastAPI(
         title="BioMaker WebUI",
@@ -253,6 +216,8 @@ def create_app(
     app.state.settings = app_settings
     app.state.run_store = run_store
     app.state.manager = manager
+    app.state.run_service = service
+    app.state.observations = observations
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.middleware("http")
@@ -263,6 +228,13 @@ def create_app(
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
+
+    @app.exception_handler(AdmissionError)
+    async def admission_error(_: Request, exc: AdmissionError):
+        payload = {"detail": exc.detail}
+        if exc.code is not None:
+            payload["code"] = exc.code
+        return JSONResponse(payload, status_code=exc.status_code)
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(_: Request, exc: RequestValidationError):
@@ -306,20 +278,26 @@ def create_app(
     def resume_queue(request: Request, payload: QueueResumeRequest) -> dict[str, Any]:
         _require_loopback(request)
         try:
-            return manager.resume_queue(payload.pause_generation)
+            return service.resume_queue(payload.pause_generation)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @app.get("/api/env")
-    def get_env() -> dict[str, Any]:
-        return _environment_response(app_settings)
+    if env_handler is not None:
+        @app.api_route("/api/env", methods=["GET", "PUT"])
+        @app.api_route("/api/env/", methods=["GET", "PUT"], include_in_schema=False)
+        async def configured_env(request: Request):
+            return await env_handler(request)
+    else:
+        @app.get("/api/env")
+        def get_env() -> dict[str, Any]:
+            return _environment_response(app_settings)
 
-    @app.put("/api/env")
-    def put_env(request: Request, payload: EnvUpdate) -> dict[str, Any]:
-        _require_loopback(request)
-        updates = {key: getattr(payload, key) for key in payload.model_fields_set}
-        update_env_file(app_settings.env_file, updates)
-        return _environment_response(app_settings)
+        @app.put("/api/env")
+        def put_env(request: Request, payload: EnvUpdate) -> dict[str, Any]:
+            _require_loopback(request)
+            updates = {key: getattr(payload, key) for key in payload.model_fields_set}
+            update_env_file(app_settings.env_file, updates)
+            return _environment_response(app_settings)
 
     @app.post("/api/env/reveal")
     def reveal_env(request: Request, payload: EnvRevealRequest) -> dict[str, Any]:
@@ -338,7 +316,11 @@ def create_app(
     ) -> dict[str, Any]:
         _require_loopback(request)
         values = read_env_values(app_settings.env_file)
-        configured_base_url = values.get("OPENAI_BASE_URL")
+        # OpenAI's client defaults to this URL when the setting is blank. Use
+        # the same effective provider when deciding whether to reuse its key.
+        configured_base_url = (
+            values.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        )
         base_url = payload.base_url or configured_base_url
         if payload.api_key:
             api_key = payload.api_key
@@ -372,97 +354,16 @@ def create_app(
     def datasets() -> list[dict[str, str]]:
         return _datasets(app_settings)
 
-    def session_run(record: dict[str, Any]) -> dict[str, Any]:
-        result = dict(record)
-        result.setdefault("source", "run_ledger")
-        result.setdefault("read_only", False)
-        result["status_source"] = "ledger"
-        snapshot = result.get("project_snapshot") or {}
-        dataset_path = str(snapshot.get("dataset_path") or "")
-        result["dataset_path"] = dataset_path or None
-        result["dataset_name"] = Path(dataset_path).name if dataset_path else None
-        detailed_status = str(
-            result.get("detailed_status") or result.get("status") or "incomplete"
-        ).lower()
-        status_value = CANONICAL_STATUS.get(detailed_status, "incomplete")
-        actions = []
-        if result["read_only"]:
-            actions = []
-        elif detailed_status == "queued":
-            actions.append("cancel")
-        elif detailed_status == "running":
-            actions.append("stop")
-        elif detailed_status in TERMINAL_STATUSES:
-            actions.append("requeue")
-        result["detailed_status"] = detailed_status
-        result["status"] = status_value
-        if status_value == "incomplete" and not result.get("status_reason"):
-            result["status_reason"] = result.get("error") or {
-                "cancelled": "Cancelled before the run started.",
-                "stopped": "Stopped by the user.",
-                "interrupted": "The run was interrupted before completion.",
-                "failed": "The run failed before completion.",
-            }.get(detailed_status, "The run did not record successful completion.")
-        result["allowed_actions"] = actions
-        result["controllable"] = bool(actions)
-        return result
-
-    def all_runs() -> list[dict[str, Any]]:
-        merged: list[dict[str, Any]] = []
-        for raw_session in run_store.list_records("runs"):
-            current = session_run(raw_session)
-            raw_log_dir = current.get("log_dir")
-            base = (
-                run_from_log_dir(app_settings, Path(str(raw_log_dir)))
-                if raw_log_dir
-                else None
-            )
-            if base is not None:
-                combined = dict(current)
-                # The ledger owns lifecycle state. Manifest/events enrich only
-                # immutable run metadata and observable progress.
-                for key in (
-                    "progress",
-                    "project_snapshot",
-                    "dataset_path",
-                    "dataset_name",
-                    "actual_exp_name",
-                    "options",
-                    "log_modified_at",
-                    "terminal_event",
-                ):
-                    if base.get(key) is not None:
-                        combined[key] = base[key]
-                if not combined.get("status_reason") and base.get("status_reason"):
-                    combined["status_reason"] = base["status_reason"]
-                merged.append(combined)
-            else:
-                merged.append(current)
-        return sorted(
-            merged,
-            key=lambda item: (
-                str(item.get("timestamps", {}).get("created_at") or ""),
-                float(item.get("log_modified_at") or 0.0),
-                str(
-                    item.get("actual_exp_name") or item.get("requested_exp_name") or ""
-                ),
-            ),
-            reverse=True,
-        )
-
-    def find_run(run_id: str) -> dict[str, Any] | None:
-        return next((run for run in all_runs() if run.get("id") == run_id), None)
-
     @app.get("/api/runs")
     def list_runs() -> list[dict[str, Any]]:
-        return all_runs()
+        return service.list_runs()
 
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
-        run = find_run(run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found")
-        return detailed_run(app_settings, run)
+        try:
+            return service.detail(run_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Run not found") from None
 
     @app.get("/api/runs/{run_id}/updates")
     def run_updates(run_id: str) -> dict[str, Any]:
@@ -473,7 +374,7 @@ def create_app(
         apply this response once before stopping their update scheduler.
         """
 
-        run = find_run(run_id)
+        run = service.status(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
 
@@ -515,15 +416,8 @@ def create_app(
     @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
     def create_run(request: Request, payload: RunCreate) -> dict[str, Any]:
         _require_loopback(request)
-        experiment = _normalized_experiment(app_settings, payload.experiment)
         try:
-            return session_run(
-                manager.enqueue_experiment(
-                    experiment,
-                    requested_exp_name=payload.requested_exp_name,
-                    option_patch=payload.options,
-                )
-            )
+            return service.present_run(service.submit(payload))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -531,9 +425,9 @@ def create_app(
     def cancel_run(request: Request, run_id: str) -> dict[str, Any]:
         _require_loopback(request)
         try:
-            return session_run(manager.cancel(run_id))
+            return service.present_run(service.cancel(run_id))
         except KeyError:
-            if find_run(run_id) is not None:
+            if service.status(run_id) is not None:
                 raise HTTPException(
                     status_code=409, detail="This run is view-only"
                 ) from None
@@ -545,9 +439,9 @@ def create_app(
     def stop_run(request: Request, run_id: str) -> dict[str, Any]:
         _require_loopback(request)
         try:
-            return session_run(manager.stop(run_id))
+            return service.present_run(service.stop(run_id))
         except KeyError:
-            if find_run(run_id) is not None:
+            if service.status(run_id) is not None:
                 raise HTTPException(
                     status_code=409, detail="This run is view-only"
                 ) from None
@@ -559,9 +453,9 @@ def create_app(
     def requeue_run(request: Request, run_id: str) -> dict[str, Any]:
         _require_loopback(request)
         try:
-            return session_run(manager.requeue(run_id))
+            return service.present_run(service.retry(run_id))
         except KeyError:
-            if find_run(run_id) is not None:
+            if service.status(run_id) is not None:
                 raise HTTPException(
                     status_code=409, detail="This run is view-only"
                 ) from None
@@ -573,7 +467,7 @@ def create_app(
     def run_events(
         run_id: str, tail: int = Query(default=200, ge=1, le=2000)
     ) -> dict[str, Any]:
-        run = find_run(run_id)
+        run = service.status(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return read_events(app_settings, run, tail=tail)
@@ -582,14 +476,14 @@ def create_app(
     def run_log(
         run_id: str, tail: int = Query(default=400, ge=1, le=10_000)
     ) -> PlainTextResponse:
-        run = find_run(run_id)
+        run = service.status(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return PlainTextResponse(tail_text(_console_path(app_settings, run), tail))
 
     @app.get("/artifacts/runs/{run_id}/tree_plot.html", include_in_schema=False)
     def tree_plot(run_id: str) -> FileResponse:
-        run = find_run(run_id)
+        run = service.status(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         try:
@@ -602,7 +496,7 @@ def create_app(
 
     @app.get("/artifacts/runs/{run_id}/{artifact_name}", include_in_schema=False)
     def artifact(run_id: str, artifact_name: str) -> FileResponse:
-        run = find_run(run_id)
+        run = service.status(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         try:

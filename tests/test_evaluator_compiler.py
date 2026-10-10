@@ -493,10 +493,15 @@ class DeterministicEvaluatorCompilerTests(unittest.TestCase):
                 "\n".join(
                     [
                         "from pathlib import Path",
+                        "import pandas as pd, numpy as np",
                         "def prediction_spec():",
                         "    return {'evaluator_api_version': 3, 'metrics': [{'name': 'accuracy', 'maximize': True}], 'validation_artifact': './working/validation_predictions.csv', 'test_submission': './working/submission.csv', 'key_columns': [], 'prediction_columns': ['prob_0']}",
                         "def score(prediction_path, truth_path, expected_path):",
-                        "    return {'metric': 1.0, 'maximize': True, 'metrics': {'accuracy': 1.0}}",
+                        "    pred, truth, rows = (pd.read_csv(path) for path in (prediction_path, truth_path, expected_path))",
+                        "    if len(pred) != len(rows) or 'prob_0' not in pred or not np.isfinite(pd.to_numeric(pred['prob_0'], errors='coerce')).all():",
+                        "        raise ValueError('invalid predictions')",
+                        "    accuracy = float((truth['class'] == 0).mean())",
+                        "    return {'metrics': {'accuracy': accuracy}}",
                         "def score_val():",
                         "    return {'metric': 1.0, 'maximize': True}",
                         "def validate_submission():",

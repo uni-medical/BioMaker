@@ -41,14 +41,25 @@ def resolve_queue_paths(
 
     ``BIOMAKER_WEBUI_STATE_DIR`` directly selects the ledger directory. Without
     it, the ledger is ``.biomaker`` under ``BIOMAKER_WEBUI_WORKSPACE_ROOT`` or,
-    by default, the parent of the method repository. Relative state and artifact
+    by default, the parent of the method repository. Installed wheels instead
+    use ``$XDG_DATA_HOME/biomaker`` (or ``~/.local/share/biomaker``). Relative state and artifact
     paths are anchored to that shared workspace; explicit absolute paths remain
     unchanged.
     """
 
     env = os.environ if environment is None else environment
     resolved_method_root = Path(method_root).expanduser().resolve()
-    default_workspace_root = resolved_method_root.parent
+    # Installed wheels live in a shared interpreter directory, which must never
+    # receive user queue state or experiment artifacts.
+    if resolved_method_root.name in {"site-packages", "dist-packages"}:
+        data_home = Path(
+            env.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+        ).expanduser()
+        if not data_home.is_absolute():
+            data_home = Path.home() / ".local" / "share"
+        default_workspace_root = (data_home / "biomaker").resolve()
+    else:
+        default_workspace_root = resolved_method_root.parent
     raw_workspace_root = env.get(WORKSPACE_ROOT_ENV)
     workspace_root = (
         _resolve_path(raw_workspace_root, anchor=default_workspace_root)

@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import shutil
 import sys
@@ -43,6 +44,38 @@ class RichLogHandler(RichHandler):
         super().__init__(*args, **kwargs)
 
     def emit(self, record):
+        if not self.console.is_terminal:
+            # Desktop/file logs have their own scrolling and wrapping. Rich's
+            # terminal-width layout inserts 80-column line breaks into long paths
+            # and makes a captured log look truncated. Preserve plain text here.
+            try:
+                if isinstance(record.msg, Text):
+                    message = record.msg.plain
+                elif isinstance(record.msg, Tree):
+                    from rich.segment import Segment
+
+                    message = "".join(
+                        segment.text
+                        for segment in Segment.filter_control(
+                            self.console.render(record.msg)
+                        )
+                    ).rstrip("\n")
+                else:
+                    message = record.getMessage()
+                timestamp = (
+                    self.formatter.formatTime(record, "[%H:%M:%S]")
+                    if self.formatter
+                    else logging.Formatter().formatTime(record, "[%H:%M:%S]")
+                )
+                self.console.file.write(f"{timestamp} {record.levelname} {message}\n")
+                if record.exc_info:
+                    self.console.file.write(
+                        logging.Formatter().formatException(record.exc_info) + "\n"
+                    )
+                self.console.file.flush()
+            except Exception:
+                self.handleError(record)
+            return
         # Check if the message is a Rich object
         if isinstance(record.msg, (Tree, Text)):
             # Add padding to match the log message indentation (11 spaces)
@@ -81,6 +114,7 @@ class KnowledgeBaseConfig:
     retrieval_mode: str = "keyword"
     embedding_model: str = "text-embedding-3-large"
     topk: int = 5
+    required: bool = False
 
 
 @dataclass
@@ -106,6 +140,8 @@ class AgentConfig:
     web_search_topk: int
     enable_node_tools: bool
     max_node_tool_calls: int
+
+    code_generation_attempts: int
 
     code: StageConfig
     feedback: StageConfig
@@ -135,6 +171,8 @@ class EvaluatorCacheConfig:
 @dataclass
 class SplitBuilderConfig:
     attempts: int
+    source: str = "agentic"
+    package_dir: str | None = None
 
 
 @dataclass
@@ -144,7 +182,19 @@ class FinalRetrainConfig:
 
 @dataclass
 class PrivateEvaluationConfig:
-    per_node: bool
+    protocol: str = "post_selection_once"
+
+
+@dataclass
+class ProviderConfig:
+    request_timeout_seconds: float = 600.0
+    max_attempts: int = 2
+    max_elapsed_seconds: float = 1250.0
+
+
+@dataclass
+class ModelArtifactsConfig:
+    required: bool = True
 
 
 @dataclass
@@ -169,6 +219,8 @@ class Config(Hashable):
     split_builder: SplitBuilderConfig
     final_retrain: FinalRetrainConfig
     private_evaluation: PrivateEvaluationConfig
+    provider: ProviderConfig
+    model_artifacts: ModelArtifactsConfig
     generate_report: bool
     report: StageConfig
     agent: AgentConfig
@@ -222,14 +274,40 @@ def _validate_exec_config(cfg: Config) -> None:
                 f"split_builder.attempts must be an integer >= 1, got {attempts!r}."
             )
 
-    private_cfg = getattr(cfg, "private_evaluation", None)
-    if private_cfg is not None and not isinstance(private_cfg.per_node, bool):
-        raise ValueError(
-            "private_evaluation.per_node must be a boolean, "
-            f"got {private_cfg.per_node!r}."
-        )
+    if split_builder_cfg is not None:
+        source = getattr(split_builder_cfg, "source", "agentic")
+        package = getattr(split_builder_cfg, "package_dir", None)
+        if source not in {"agentic", "verified_package"}:
+            raise ValueError("split_builder.source must be agentic or verified_package.")
+        if (source == "verified_package") != bool(package):
+            raise ValueError("split_builder.package_dir is required only for verified_package.")
 
+    private_cfg = getattr(cfg, "private_evaluation", None)
+    if private_cfg is not None:
+        if getattr(private_cfg, "per_node", False):
+            raise ValueError("Per-node private evaluation is unsupported; use post_selection_once.")
+        if getattr(private_cfg, "protocol", "post_selection_once") != "post_selection_once":
+            raise ValueError("private_evaluation.protocol must be post_selection_once.")
+    artifact_cfg = getattr(cfg, "model_artifacts", None)
+    if artifact_cfg is not None and not isinstance(artifact_cfg.required, bool):
+        raise ValueError("model_artifacts.required must be a boolean.")
+    provider_cfg = getattr(cfg, "provider", None)
+    if provider_cfg is not None:
+        timeout = provider_cfg.request_timeout_seconds
+        elapsed = provider_cfg.max_elapsed_seconds
+        attempts = provider_cfg.max_attempts
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError("provider.request_timeout_seconds must be positive and finite.")
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or not 1 <= attempts <= 2:
+            raise ValueError("provider.max_attempts must be an integer in [1, 2].")
+        if (isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
+                or not math.isfinite(elapsed) or elapsed < timeout):
+            raise ValueError("provider.max_elapsed_seconds must be finite and at least request_timeout_seconds.")
     agent_cfg = getattr(cfg, "agent", None)
+    attempts = getattr(agent_cfg, "code_generation_attempts", 1)
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+        raise ValueError("agent.code_generation_attempts must be an integer >= 1.")
     knowledge_cfg = getattr(agent_cfg, "knowledge_base", None)
     if knowledge_cfg is None:
         return

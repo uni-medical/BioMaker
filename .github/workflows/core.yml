@@ -1,0 +1,29 @@
+name: Core checks
+
+on:
+  pull_request:
+    paths: ['biomaker/**', 'tests/**', 'apps/webui/**', 'pyproject.toml', 'requirements.txt', 'uv.lock', '.github/workflows/core.yml']
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.11.7'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: uv sync --frozen --python 3.11
+      - run: uv pip install --python .venv/bin/python pytest==9.1.1
+      - run: .venv/bin/python -I -B -c "import pytest; raise SystemExit(pytest.main(['-q', 'tests', '--tb=short']))"
+      - run: node --test apps/webui/tests/*.test.js tests/*.test.js
+      - run: uv build --wheel

@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import tempfile
 import time
+from typing import Any
 
 from .utils.evaluator_setup import score_artifacts_with_evaluator
 
@@ -24,33 +25,48 @@ def positive_integer(value):
     return parsed
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--workspace', required=True, type=Path)
-    parser.add_argument('--prediction', required=True, type=Path)
-    parser.add_argument('--truth', required=True, type=Path)
-    parser.add_argument('--expected', required=True, type=Path)
-    parser.add_argument('--output', required=True, type=Path,
-                        help='New private result file; existing files are never overwritten')
-    parser.add_argument('--timeout', type=positive_integer, default=3600)
-    parser.add_argument('--workers', type=positive_integer, default=1)
-    args = parser.parse_args(argv)
-    output = args.output.resolve()
+class RescoreRequestError(ValueError):
+    """The requested rescore cannot safely reserve its output evidence."""
+
+
+def rescore_saved_predictions(
+    *,
+    workspace: Path | str,
+    prediction: Path | str,
+    truth: Path | str,
+    expected: Path | str,
+    output: Path | str,
+    timeout: int = 3600,
+    workers: int = 1,
+) -> dict[str, Any]:
+    """Score frozen artifacts and write a new receipt without changing the run.
+
+    This explicit recovery operation never trains, updates the journal, or
+    replaces the run's post-selection private evaluation receipt.
+    """
+    for name, value in (("timeout", timeout), ("workers", workers)):
+        if type(value) is not int or value < 1:
+            raise RescoreRequestError(f"{name} must be a positive integer")
+    workspace = Path(workspace).resolve()
+    prediction = Path(prediction).resolve()
+    truth = Path(truth).resolve()
+    expected = Path(expected).resolve()
+    output = Path(output).resolve()
     progress = output.with_suffix(output.suffix + '.progress.jsonl')
     if output.exists() or progress.exists():
-        parser.error('Choose a new output path; previous scoring evidence is preserved')
-    protected = [args.prediction, args.truth, args.expected,
-                 args.workspace / 'evaluator.py',
-                 args.workspace / 'evaluator_prediction_spec.json']
+        raise RescoreRequestError('Choose a new output path; previous scoring evidence is preserved')
+    protected = [prediction, truth, expected,
+                 workspace / 'evaluator.py',
+                 workspace / 'evaluator_prediction_spec.json']
     if output in [p.resolve() for p in protected] or progress in [p.resolve() for p in protected]:
-        parser.error('Result paths must not overwrite scoring inputs')
+        raise RescoreRequestError('Result paths must not overwrite scoring inputs')
     output.parent.mkdir(parents=True, exist_ok=True)
     # Reserve both paths, so retry never overwrites a previous interrupted attempt.
     progress.touch(exist_ok=False)
     metadata = dict(started_at=datetime.now(timezone.utc).isoformat(),
-                    workspace=str(args.workspace.resolve()),
-                    prediction=str(args.prediction.resolve()),
-                    timeout_seconds=args.timeout, workers=args.workers,
+                    workspace=str(workspace),
+                    prediction=str(prediction),
+                    timeout_seconds=timeout, workers=workers,
                     progress_path=str(progress), training_started=False,
                     journal_updated=False)
     with output.open('x') as handle:
@@ -58,9 +74,9 @@ def main(argv=None):
     started = time.monotonic()
     try:
         result = score_artifacts_with_evaluator(
-            args.workspace.resolve(), args.prediction.resolve(), args.truth.resolve(),
-            args.expected.resolve(), timeout=args.timeout,
-            env_overrides={'BIOMAKER_EVALUATOR_WORKERS': str(args.workers),
+            workspace, prediction, truth,
+            expected, timeout=timeout,
+            env_overrides={'BIOMAKER_EVALUATOR_WORKERS': str(workers),
                            'BIOMAKER_EVALUATOR_PROGRESS_PATH': str(progress)},
         )
         payload = dict(metadata, status='completed' if result.ok else 'failed',
@@ -83,8 +99,26 @@ def main(argv=None):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    print(json.dumps(dict(status=payload['status'], output=str(output), exit_code=exit_code)))
-    return exit_code
+    return dict(status=payload['status'], output=str(output), exit_code=exit_code)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--workspace', required=True, type=Path)
+    parser.add_argument('--prediction', required=True, type=Path)
+    parser.add_argument('--truth', required=True, type=Path)
+    parser.add_argument('--expected', required=True, type=Path)
+    parser.add_argument('--output', required=True, type=Path,
+                        help='New private result file; existing files are never overwritten')
+    parser.add_argument('--timeout', type=positive_integer, default=3600)
+    parser.add_argument('--workers', type=positive_integer, default=1)
+    args = parser.parse_args(argv)
+    try:
+        result = rescore_saved_predictions(**vars(args))
+    except RescoreRequestError as error:
+        parser.error(str(error))
+    print(json.dumps(result))
+    return result['exit_code']
 
 
 if __name__ == '__main__':

@@ -256,6 +256,11 @@ def _h_align(path, expected, columns, label):
         raise error_type(label + ' missing rows.')
     if keys and (frame[keys] == '').any().any():
         raise error_type(label + ' contains empty sample keys.')
+    if label == 'Predictions' and _h_spec.get('prediction_type') in {
+            'probability_columns', 'numeric_columns', 'continuous_scalar', 'continuous_vector'}:
+        values = frame[columns].apply(_h_pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise PredictionValidationError('Declared numeric predictions must contain finite numeric values.')
     # Empty encoded values can mean a valid negative image (boxes/RLE), or a
     # dataset-defined missing value. The adapter interprets cells; canonical
     # sample validation determines whether the decoded values are admissible.
@@ -325,6 +330,8 @@ def score(prediction_path, truth_path, expected_path):
                            progress_callback=report if progress_path else None,
                            workers=workers)
     result['n'] = len(expected)
+    result['score_schema_version'] = 1
+    result['status'] = 'ok'
     return result
 
 

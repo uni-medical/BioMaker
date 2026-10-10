@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "biomaker"
-version = "0.0.3"
+version = "0.1.0"
 authors = [
     {name = "Haoyu Wang", email = "haoyu.wang.8023@gmail.com"},
 ]

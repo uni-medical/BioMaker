@@ -65,7 +65,9 @@ def test_run_manifest_preserves_identity_across_atomic_updates(
     assert updated["config"]["main_model"] == "main-model"
     assert updated["config"]["knowledge_base_model"] == "helper-model"
     assert updated["config"]["report_model"] == "report-model"
-    assert updated["config"]["private_evaluation_per_node"] is (
-        private_per_node is not False
-    )
+    assert updated["config"]["private_evaluation_protocol"] == "post_selection_once"
+    assert "private_evaluation_per_node" not in updated["config"]
+    assert len(updated["engine"]["package_source_sha256"]) == 64
+    assert updated["engine"]["version"]
+    assert len(updated["engine"]["lock_sha256"]) == 64
     assert not list(log_dir.glob("*.tmp"))

@@ -11,6 +11,9 @@ def resolve_env_file(method_root: Path | str | None = None) -> Path:
     """Return BioMaker's configured environment file without depending on cwd."""
 
     root = Path(method_root or DEFAULT_METHOD_ROOT).expanduser().resolve()
+    if root.name in {"site-packages", "dist-packages"}:
+        from .queue_paths import resolve_queue_paths
+        root = resolve_queue_paths(root).workspace_root
     override = os.environ.get(ENV_FILE_VARIABLE)
     path = Path(override).expanduser() if override else root / ".env"
     if not path.is_absolute():

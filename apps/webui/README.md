@@ -1,7 +1,8 @@
 # BioMaker WebUI
 
-A local launcher and viewer that runs the same `biomaker` CLI and reads its
-standard outputs.
+A local launcher and viewer over the shared `biomaker.application.RunService`
+and `biomaker.runtime` queue, ledger and artifact readers. `uv run` installs the
+local core package through the path dependency in this directory.
 
 ## Start
 
@@ -34,8 +35,7 @@ items until **Resume Queue** is explicitly selected.
 
 Experiment artifacts remain in `logs/` and `workspaces/`. Existing log
 directories are imported idempotently into the ledger for display without
-rewriting their event history. From a complete source checkout,
-`uv run biomaker --queue ...` uses this same queue, follows its console log, and
+rewriting their event history. `biomaker --queue ...` uses this same queue, follows its console log, and
 returns the experiment process's exit code. Without `--queue`, CLI launches run
 directly in the foreground and are unaffected by the queue's pause state.
 

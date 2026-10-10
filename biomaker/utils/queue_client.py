@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from biomaker.application import RunService
 from .config import _load_cfg, _validate_exec_config
 from .queue_paths import resolve_queue_paths
 
@@ -45,14 +46,9 @@ def _dataset_path(raw_cfg: Any, launch_cwd: Path) -> Path:
 
 
 def _load_queue_types(method_root: Path):
-    webui_root = method_root / "apps" / "webui"
-    if not (webui_root / "webui" / "runner.py").is_file():
-        raise RuntimeError("The durable queue sidecar is not installed.")
-    if str(webui_root) not in sys.path:
-        sys.path.insert(0, str(webui_root))
-    from webui.run_catalog import list_log_runs
-    from webui.runner import RunManager
-    from webui.settings import Settings
+    from biomaker.runtime.run_catalog import list_log_runs
+    from biomaker.runtime.runner import RunManager
+    from biomaker.runtime.settings import Settings
 
     return RunManager, Settings, list_log_runs
 
@@ -173,6 +169,7 @@ def submit_cli_and_wait(argv: list[str] | None = None) -> int:
     RunManager, list_log_runs, settings = _settings(raw_cfg, method_root)
     settings.ensure_directories()
     manager = RunManager(settings)
+    service = RunService(manager, settings)
     try:
         manager.import_history(list_log_runs(settings))
         manager.start()
@@ -191,7 +188,7 @@ def submit_cli_and_wait(argv: list[str] | None = None) -> int:
             f"log_dir={settings.logs_root}",
             f"workspace_dir={settings.workspaces_root}",
         ]
-        record = manager.enqueue_command(
+        record = service.submit_command(
             [sys.executable, "-m", "biomaker.run", *child_arguments],
             cwd=launch_cwd,
             project_snapshot={

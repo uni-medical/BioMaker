@@ -17,7 +17,9 @@ from ..utils.evaluator_setup import (
 )
 from ..utils.environment import environment_manifest_text
 from ..utils.metric import MetricValue, WorstMetricValue
+from ..utils.model_artifacts import MODEL_ARTIFACT_GUIDELINE
 from ..utils.ranking import finite_metric, validated_metric_specs
+from ..utils.score_validity import require_valid_score_payload
 from ..utils.response import (
     extract_code_blocks,
     extract_text_up_to_code,
@@ -41,6 +43,33 @@ class RoundTask:
     selection_reason: str
     draft_plan: str | None = None
     selection_snapshot: dict[str, Any] | None = None
+
+
+class CandidateGenerationError(RuntimeError):
+    """A successful model response did not contain one executable candidate.
+
+    This is deliberately narrower than provider or framework failures.  It
+    carries only bounded audit facts and the already-sanitized prompt capture;
+    the raw model response is never retained on the exception.
+    """
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        attempts: int,
+        response_chars: int,
+        prompt_capture: dict[str, Any],
+    ) -> None:
+        self.reason = str(reason)
+        self.attempts = int(attempts)
+        self.response_chars = int(response_chars)
+        self.prompt_capture = prompt_capture
+        super().__init__(
+            "Plan + code extraction failed after "
+            f"{self.attempts} attempts ({self.reason}). Last response length: "
+            f"{self.response_chars} chars."
+        )
 
 
 def parse_factual_exec_result(
@@ -69,6 +98,7 @@ def parse_factual_exec_result(
     external_metric = None
     external_metrics = None
     metric_specs = []
+    receipt_valid = True
     if evaluator_result is not None:
         details = evaluator_result.get("details")
         if not isinstance(details, dict):
@@ -79,11 +109,31 @@ def parse_factual_exec_result(
         score_details = {k: v for k, v in details.items() if k != "artifact_report"}
         node.evaluator_details = {
             "metric": evaluator_result.get("metric"),
-            "maximize": bool(evaluator_result.get("maximize", True)),
+            "maximize": evaluator_result.get("maximize", True),
             "details": score_details,
+            "outcome": evaluator_result.get("outcome"),
             "failure_kind": evaluator_result.get("failure_kind"),
             "error": evaluator_result.get("error"),
         }
+        receipt_valid = (
+            evaluator_result.get("ok") is True
+            and isinstance(evaluator_result.get("maximize", True), bool)
+            and evaluator_result.get("outcome", "valid") == "valid"
+        )
+        score_payload = score_details.get("score")
+        try:
+            if isinstance(score_payload, dict) and "score_schema_version" in score_payload:
+                # New diagnostics are opaque; only the canonical envelope may
+                # determine validity. Legacy recursive markers stop here.
+                require_valid_score_payload(score_payload)
+                if evaluator_result.get("error") or any(
+                    evaluator_result.get(key) for key in ("fallback", "fallback_used", "used_fallback")
+                ) or evaluator_result.get("valid") is False:
+                    receipt_valid = False
+            else:
+                require_valid_score_payload(evaluator_result)
+        except ValueError:
+            receipt_valid = False
         values = evaluator_result.get("metrics")
         if not isinstance(values, dict):
             legacy_score = score_details.get("score", {})
@@ -117,7 +167,7 @@ def parse_factual_exec_result(
             node.evaluator_details["metrics"] = node.metrics
             node.evaluator_details["metric_specs"] = metric_specs
         metric = evaluator_result.get("metric")
-        if evaluator_result.get("ok") and not isinstance(metric, bool):
+        if receipt_valid and not isinstance(metric, bool) and isinstance(metric, (int, float)):
             try:
                 external_metric = (
                     finite_metric(metric),
@@ -133,10 +183,13 @@ def parse_factual_exec_result(
     node.analysis = ""
     if (
         evaluator_result is not None
-        and not evaluator_result.get("ok")
-        and evaluator_result.get("failure_kind") in {
-            "timeout", "resource", "interrupted", "execution", "protocol",
-        }
+        and evaluator_result.get("ok") is not True
+        and (
+            evaluator_result.get("outcome") == "evaluator_unavailable"
+            or (evaluator_result.get("outcome") is None and evaluator_result.get("failure_kind") in {
+                "timeout", "resource", "interrupted", "execution", "protocol",
+            })
+        )
         and exec_result.candidate_exc_type is None
         and exec_result.candidate_returncode in (None, 0)
         and (exec_result.artifact_validation or {}).get("ok", True)
@@ -154,7 +207,7 @@ def parse_factual_exec_result(
             external_metrics
         )
         valid_result = (
-            bool(evaluator_result.get("ok"))
+            receipt_valid
             and bool(declared_names)
             and all(external_metrics.get(name) is not None for name in declared_names)
         )
@@ -165,6 +218,7 @@ def parse_factual_exec_result(
         )
     node.is_buggy = node.exc_type is not None or not valid_result
     if node.is_buggy:
+        node.metrics = {}
         node.metric = WorstMetricValue()
         if not record_context:
             node.outcome = "bug"
@@ -212,6 +266,48 @@ class BaseAgent:
             include_medical=self.cfg.exec.include_medical_packages
         )
         self.profile = "You are a factual biomedical machine learning assistant. "
+
+    def _provider_request_event(self, event: str, payload: dict[str, Any]) -> None:
+        append_event(self.cfg.log_dir, event, **payload)
+
+    def _provider_request_options(self, operation: str) -> dict[str, Any]:
+        """Attach the run's bounded provider policy and safe event context."""
+
+        options: dict[str, Any] = {
+            "request_event_callback": self._provider_request_event,
+            "request_event_context": {
+                "operation": operation,
+                "agent": type(self).__name__,
+            },
+        }
+        provider_cfg = getattr(self.cfg, "provider", None)
+        if provider_cfg is not None:
+            options.update(
+                {
+                    "request_timeout_seconds": float(
+                        provider_cfg.request_timeout_seconds
+                    ),
+                    "request_max_attempts": int(provider_cfg.max_attempts),
+                    "request_max_elapsed_seconds": float(
+                        provider_cfg.max_elapsed_seconds
+                    ),
+                }
+            )
+        generation_context = getattr(self, "generation_context", None)
+        if callable(generation_context):
+            context = generation_context()
+            if isinstance(context, dict):
+                safe_context = {
+                    key: context.get(key)
+                    for key in (
+                        "round_item_index",
+                        "round_item_count",
+                        "scheduled_step",
+                    )
+                    if context.get(key) is not None
+                }
+                options["request_event_context"].update(safe_context)
+        return options
 
     def has_empty_journal(self) -> bool:
         """Check if the journal is empty."""
@@ -325,7 +421,14 @@ class BaseAgent:
             if per_node_timeout is not None
             else "the configured per-node timeout"
         )
+        model_artifacts_required = getattr(
+            getattr(self.cfg, "model_artifacts", None), "required", True
+        ) is not False
         impl_guideline = [
+            MODEL_ARTIFACT_GUIDELINE,
+            "This run is configured with model_artifacts.required="
+            + str(model_artifacts_required).lower()
+            + ".",
             "The code should **implement the proposed solution** and write final validation predictions in the format required by `./evaluator.py`.",
             "The code should be a single-file python program that is self-contained and can be executed as-is.",
             "No parts of the code should be skipped. Do not terminate before finishing the script.",
@@ -449,8 +552,14 @@ class BaseAgent:
             },
         }
 
-    def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str, dict[str, Any]]:
+    def plan_and_code_query(
+        self, prompt, retries: int | None = None
+    ) -> tuple[str, str, dict[str, Any]]:
         """Generate a natural language plan + code in the same LLM call and split them apart."""
+        if retries is None:
+            retries = int(getattr(self.acfg, "code_generation_attempts", 1))
+        if isinstance(retries, bool) or retries < 1:
+            raise ValueError("code generation retries must be an integer >= 1")
         completion_text = None
         query_prompt, budget_notes = self._budget_code_prompt(prompt)
         if budget_notes:
@@ -471,6 +580,7 @@ class BaseAgent:
                     model=self.acfg.code.model,
                     temperature=self.acfg.code.temp,
                     return_metadata=True,
+                    **self._provider_request_options("candidate_code_generation"),
                 ),
             )
             prompt_capture = self._prompt_capture(query_prompt, metadata)
@@ -504,10 +614,11 @@ class BaseAgent:
                 retries,
                 last_reason,
             )
-        raise RuntimeError(
-            "Plan + code extraction failed after "
-            f"{retries} attempts ({last_reason}). Last response length: "
-            f"{len(completion_text or '')} chars."
+        raise CandidateGenerationError(
+            reason=last_reason,
+            attempts=retries,
+            response_chars=len(completion_text or ""),
+            prompt_capture=prompt_capture,
         )
 
     def wrap_execution_output(self, node: Node) -> str:

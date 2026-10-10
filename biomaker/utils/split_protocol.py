@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import tempfile
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +22,12 @@ from .agentic_data_planner import (
     verify_split_package,
 )
 from .split_contract import resolve_public_splits
-from .split_manifest import MANIFEST_NAME, load_split_manifest
+from .split_manifest import (
+    MANIFEST_NAME,
+    load_split_manifest,
+    split_file_reference_roles,
+    file_columns_for_frame,
+)
 
 
 @dataclass(frozen=True)
@@ -111,6 +119,39 @@ def _workspace_relative_input_path(
     )
 
 
+def _declared_file_roles(csv_dir: Path, input_dir: Path) -> dict[str, Any]:
+    """Load role declarations from either a builder package or a prepared run."""
+    manifest: dict[str, Any] = {}
+    for root in (csv_dir, csv_dir.parent, input_dir / "biomaker_splits"):
+        manifest = load_split_manifest(root)
+        if manifest:
+            break
+    hidden = manifest.get("hidden_answers", {})
+    for path in (
+        csv_dir / "private_gt.json",
+        csv_dir.parent / "private_gt" / "private_gt.json",
+    ):
+        if path.is_file():
+            hidden = json.loads(path.read_text(encoding="utf-8"))
+            break
+    if not isinstance(hidden, dict):
+        raise ValueError("Private answer index must be an object.")
+    errors: list[str] = []
+    roles = split_file_reference_roles(manifest, hidden, errors)
+    if errors:
+        raise ValueError("Invalid split file roles: " + "; ".join(errors))
+    return roles
+
+
+def _role_for_csv(path: Path) -> str:
+    return {
+        "agent_train.csv": "train",
+        "score_val.csv": "score_val",
+        "agent_test.csv": "test",
+        "test.csv": "test",
+    }.get(path.name, "train")
+
+
 def _normalize_split_paths_in_dir(
     csv_dir: Path,
     input_dir: Path,
@@ -120,15 +161,15 @@ def _normalize_split_paths_in_dir(
 ) -> None:
     if not csv_dir.is_dir():
         return
+    roles = _declared_file_roles(csv_dir, input_dir)
+    private = (csv_dir / "private_gt.json").is_file()
     for csv_path in sorted(csv_dir.glob("*.csv")):
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception:
-            continue
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        required, legacy = file_columns_for_frame(
+            roles, df.columns, role=_role_for_csv(csv_path), private=private
+        )
         changed = False
-        for column in df.columns:
-            if df[column].dtype != object:
-                continue
+        for column in (required | legacy) & set(df.columns):
             normalized = []
             column_changed = False
             for value in df[column].tolist():
@@ -138,6 +179,24 @@ def _normalize_split_paths_in_dir(
                     base_dir=base_dir,
                     generated_output_dir=generated_output_dir,
                 )
+                if replacement is None and column in required and value:
+                    raw = Path(value)
+                    candidates = [raw] if raw.is_absolute() else [input_dir / raw]
+                    if not raw.is_absolute():
+                        candidates.extend(
+                            root / raw
+                            for root in (base_dir, generated_output_dir)
+                            if root is not None
+                        )
+                    for candidate in candidates:
+                        if candidate.is_file():
+                            replacement = _input_relative(
+                                candidate, input_dir
+                            ) or _generated_public_relative(
+                                candidate, generated_output_dir
+                            )
+                            if replacement is not None:
+                                break
                 if replacement is not None:
                     normalized.append(replacement)
                     column_changed = column_changed or replacement != value
@@ -154,48 +213,84 @@ def _evaluator_visible_path(value: Any, input_dir: Path, base_dir: Path) -> str 
     return cpaths.evaluator_visible_path(value, input_dir, base_dir)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _retain_private_answer(source: Path, private_dir: Path) -> Path:
+    """Copy an answer before the workspace input view is replaced or pruned."""
+    source = source.resolve()
+    if not source.is_file():
+        raise ValueError(
+            f"Private answer must reference an existing regular file: {source}"
+        )
+    digest = _sha256_file(source)
+    destination = private_dir / "answer_files" / digest / source.name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if destination.is_symlink() or _sha256_file(destination) != digest:
+            raise ValueError("Retained private answer content changed.")
+        return destination.resolve()
+    fd, temporary = tempfile.mkstemp(prefix=".answer-", dir=destination.parent)
+    os.close(fd)
+    try:
+        shutil.copy2(source, temporary)
+        if _sha256_file(Path(temporary)) != digest:
+            raise ValueError("Private answer changed while being retained.")
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return destination.resolve()
+
+
 def _make_private_paths_evaluator_visible(csv_dir: Path, input_dir: Path) -> None:
     if not csv_dir.is_dir():
         return
-    answer_columns_by_file: dict[str, set[str]] = {}
-    manifest_path = csv_dir / "private_gt.json"
-    if manifest_path.is_file():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            manifest = {}
-        if isinstance(manifest, dict):
-            for split_name, entry in manifest.items():
-                if not isinstance(entry, dict):
-                    continue
-                file_name = "score_val.csv" if split_name == "score_val" else "test.csv"
-                answer_columns_by_file[file_name] = set(
-                    map(str, entry.get("answer_columns") or [])
-                )
+    roles = _declared_file_roles(csv_dir, input_dir)
     for csv_path in sorted(csv_dir.glob("*.csv")):
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception:
-            continue
-        answer_columns = answer_columns_by_file.get(csv_path.name)
+        df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        role = _role_for_csv(csv_path)
+        answers = roles["answer_columns"].get(role, set())
+        declared = roles["answer_files"].get(role)
+        file_columns = answers if declared is None else declared
         changed = False
-        for column in df.columns:
-            if answer_columns is not None and str(column) not in answer_columns:
-                continue
-            if df[column].dtype != object:
-                continue
+        for column in file_columns & set(df.columns):
             values = []
-            column_changed = False
             for value in df[column].tolist():
-                replacement = _evaluator_visible_path(value, input_dir, csv_dir)
-                if replacement is not None:
-                    values.append(replacement)
-                    column_changed = column_changed or replacement != value
-                else:
+                if declared is None and not _looks_like_path(value):
                     values.append(value)
-            if column_changed:
-                df[column] = values
-                changed = True
+                    continue
+                replacement = _evaluator_visible_path(value, input_dir, csv_dir)
+                # Explicit declarations are authoritative even for extensionless
+                # files that the legacy path heuristic would not recognize.
+                if replacement is None and declared is not None:
+                    raw = Path(value)
+                    candidates = (
+                        [raw]
+                        if raw.is_absolute()
+                        else [input_dir / raw, csv_dir / raw, csv_dir.parent / raw]
+                    )
+                    if raw.parts and raw.parts[0] == "input":
+                        candidates.append(input_dir / Path(*raw.parts[1:]))
+                    replacement = next(
+                        (str(path.resolve()) for path in candidates if path.is_file()),
+                        None,
+                    )
+                if replacement is None:
+                    if declared is not None:
+                        raise ValueError(
+                            f"Missing declared private answer file: {csv_path.name}:{column}"
+                        )
+                    values.append(value)
+                    continue
+                retained = _retain_private_answer(Path(replacement), csv_dir)
+                values.append(str(retained))
+                changed = changed or str(retained) != value
+            df[column] = values
         if changed:
             df.to_csv(csv_path, index=False)
 
@@ -211,11 +306,17 @@ def _collect_private_file_answers(input_dir: Path, private_dir: Path) -> set[Pat
     if not isinstance(manifest, dict):
         return set()
 
+    roles = _declared_file_roles(private_dir, input_dir)
     hidden_paths: set[Path] = set()
     for split_name, entry in manifest.items():
         if not isinstance(entry, dict):
             continue
-        answer_columns = [str(column) for column in entry.get("answer_columns", [])]
+        declared = roles["answer_files"].get(split_name)
+        answer_columns = list(
+            roles["answer_columns"].get(split_name, set())
+            if declared is None
+            else declared
+        )
         if not answer_columns:
             continue
         csv_name = "score_val.csv" if split_name == "score_val" else "test.csv"
@@ -225,7 +326,12 @@ def _collect_private_file_answers(input_dir: Path, private_dir: Path) -> set[Pat
         try:
             import pandas as pd
 
-            df = pd.read_csv(csv_path, usecols=lambda column: column in answer_columns)
+            df = pd.read_csv(
+                csv_path,
+                dtype=str,
+                keep_default_na=False,
+                usecols=lambda column: column in answer_columns,
+            )
         except Exception:
             continue
         for column in answer_columns:
@@ -368,8 +474,15 @@ _SAFE_TOP_LEVEL_INFO_FILES = {
 }
 
 
-def _existing_input_reference(value: Any, input_dir: Path) -> tuple[str, Path] | None:
+def _existing_input_reference(
+    value: Any, input_dir: Path, *, declared: bool = False
+) -> tuple[str, Path] | None:
     workspace_rel = _workspace_relative_input_path(value, input_dir)
+    if workspace_rel is None and declared and isinstance(value, str) and value:
+        raw = Path(value)
+        source = raw if raw.is_absolute() else input_dir / raw
+        if source.is_file():
+            workspace_rel = _input_relative(source, input_dir)
     if workspace_rel is None:
         return None
     rel = Path(workspace_rel)
@@ -468,21 +581,29 @@ def sanitize_agent_visible_input(
     if not split_dir.is_dir():
         raise FileNotFoundError(f"split directory does not exist: {split_dir}")
 
+    roles = _declared_file_roles(split_dir, input_dir)
     visible_paths: dict[str, Path] = {}
     for filename in _AGENT_VISIBLE_SPLIT_FILES:
         csv_path = split_dir / filename
         if not csv_path.is_file():
             continue
         try:
-            df = pd.read_csv(csv_path)
+            df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
         except Exception:
             continue
-        for column in df.columns:
-            if df[column].dtype != object:
-                continue
+        required, legacy = file_columns_for_frame(
+            roles, df.columns, role=_role_for_csv(csv_path)
+        )
+        for column in (required | legacy) & set(df.columns):
             for value in df[column].dropna().tolist():
-                reference = _existing_input_reference(value, input_dir)
+                reference = _existing_input_reference(
+                    value, input_dir, declared=column in required
+                )
                 if reference is None:
+                    if column in required:
+                        raise ValueError(
+                            f"Missing declared public input file: {filename}:{column}"
+                        )
                     continue
                 workspace_rel, source = reference
                 visible_paths.setdefault(workspace_rel, source)
@@ -520,8 +641,12 @@ def sanitize_agent_visible_input(
 
 
 def _copy_split_package_from_cache(
-    cache_entry: Path, split_dir: Path, private_dir: Path, input_dir: Path,
-    *, task_text: str = "",
+    cache_entry: Path,
+    split_dir: Path,
+    private_dir: Path,
+    input_dir: Path,
+    *,
+    task_text: str = "",
 ) -> dict[str, Any] | None:
     cached_split = cache_entry / "biomaker_splits"
     cached_private = cache_entry / "private_gt"
@@ -532,18 +657,46 @@ def _copy_split_package_from_cache(
         or not cached_verifier.is_file()
     ):
         return None
-    # A previously saved "ok" flag is not evidence that files still satisfy the
-    # current task/source contract. Revalidate before admitting cached splits.
-    verifier = verify_split_package(cache_entry, source_input_dir=input_dir, task_text=task_text)
-    if not verifier.get("ok"):
-        return None
-    _copytree_replace(cached_split, split_dir)
-    _copytree_replace(cached_private, private_dir)
-    cached_manifest = cache_entry / MANIFEST_NAME
-    if cached_manifest.is_file():
-        shutil.copy2(cached_manifest, split_dir / MANIFEST_NAME)
-    _copy_generated_public_assets(cache_entry, input_dir)
-    return verifier
+    # Current validation may normalize compatibility manifests. Run it on a
+    # private copy so inspecting a cache never changes the cached evidence.
+    with tempfile.TemporaryDirectory(prefix="biomaker-split-cache-") as temporary:
+        staged = Path(temporary) / "package"
+        try:
+            shutil.copytree(cache_entry, staged)
+            verifier = verify_split_package(
+                staged, source_input_dir=input_dir, task_text=task_text
+            )
+        except (OSError, ValueError):
+            return None
+        if not verifier.get("ok"):
+            return None
+        _copytree_replace(staged / "biomaker_splits", split_dir)
+        _copytree_replace(staged / "private_gt", private_dir)
+        manifest_path = staged / MANIFEST_NAME
+        if manifest_path.is_file():
+            shutil.copy2(manifest_path, split_dir / MANIFEST_NAME)
+        _copy_generated_public_assets(staged, input_dir)
+        return verifier
+
+
+def _require_visible_training_answers(split_dir: Path, private_dir: Path) -> None:
+    """Check materialized training supervision before and after input pruning."""
+    from .agentic_data_planner import validate_training_answers
+
+    train_df = pd.read_csv(
+        split_dir / "agent_train.csv", dtype=str, keep_default_na=False
+    )
+    hidden_answers = json.loads(
+        (private_dir / "private_gt.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(hidden_answers, dict):
+        raise RuntimeError("Invalid hidden-answer index for training supervision.")
+    errors: list[str] = []
+    validate_training_answers(
+        train_df, hidden_answers, errors, split_manifest=load_split_manifest(split_dir)
+    )
+    if errors:
+        raise RuntimeError("Invalid supervised training split: " + "; ".join(errors))
 
 
 def _store_split_package_cache(
@@ -591,18 +744,24 @@ def prepare_split_protocol(
     temperature: float = 0.0,
     attempts: int = 3,
     cache_root: Path | str | None = None,
+    package_dir: Path | str | None = None,
 ) -> SplitProtocol:
-    """Prepare BioMaker public splits and private ground truth using an LLM-built splitter."""
+    """Prepare public splits and hidden answers from generated or verified inputs."""
     input_dir = Path(input_dir).resolve()
     private_dir = (
         Path(private_dir).resolve()
         if private_dir is not None
         else input_dir.parent / "private_gt"
     )
+    if (
+        private_dir == input_dir
+        or input_dir in private_dir.parents
+        or private_dir in input_dir.parents
+    ):
+        raise ValueError(
+            "Private answers must be outside and separate from the agent input directory."
+        )
     split_dir = input_dir / "biomaker_splits"
-    _remove_path(split_dir)
-    _remove_path(private_dir)
-
     if isinstance(task_desc, str):
         task_text = task_desc
     else:
@@ -614,7 +773,44 @@ def prepare_split_protocol(
     cache_entry = None
     result_verifier: dict[str, Any] | None = None
     cache_reused = False
-    if cache_root is not None:
+    run_root = private_dir.parent
+    build_dir = run_root / "_split_builder"
+    if package_dir is not None:
+        from .verified_split_package import verify_package_identity
+
+        package = Path(package_dir).resolve()
+        for output in (input_dir, private_dir, build_dir):
+            if (
+                package == output
+                or output in package.parents
+                or package in output.parents
+            ):
+                raise ValueError(
+                    "Verified split package must be outside run input/output directories."
+                )
+        # Verify before touching existing run outputs. Re-run the current verifier
+        # on an isolated copy: its compatibility normalization must not mutate
+        # the supplied sealed package.
+        verify_package_identity(package, input_dir, task_text=task_text)
+        _remove_path(build_dir)
+        staged = build_dir / "package"
+        shutil.copytree(package, staged)
+        result_verifier = verify_split_package(
+            staged, source_input_dir=input_dir, task_text=task_text
+        )
+        if not result_verifier.get("ok"):
+            raise ValueError(
+                "Verified split package failed current validation: "
+                + "; ".join(result_verifier.get("errors", []))
+            )
+        _copytree_replace(staged / "biomaker_splits", split_dir)
+        _copytree_replace(staged / "private_gt", private_dir)
+        shutil.copy2(staged / MANIFEST_NAME, split_dir / MANIFEST_NAME)
+        _copy_generated_public_assets(staged, input_dir)
+    else:
+        _remove_path(split_dir)
+        _remove_path(private_dir)
+    if cache_root is not None and package_dir is None:
         cache_key, _facts = split_builder_cache_key(
             input_dir=input_dir,
             task_text=task_text,
@@ -660,8 +856,10 @@ def prepare_split_protocol(
             result.output_dir, source_input_dir=input_dir, task_text=task_text
         )
         if not result_verifier.get("ok"):
-            raise RuntimeError("Normalized split package failed verification: "
-                               + "; ".join(result_verifier.get("errors", [])))
+            raise RuntimeError(
+                "Normalized split package failed verification: "
+                + "; ".join(result_verifier.get("errors", []))
+            )
         _copytree_replace(result.split_dir, split_dir)
         _copytree_replace(result.private_gt_dir, private_dir)
         manifest_path = result.output_dir / MANIFEST_NAME
@@ -673,15 +871,19 @@ def prepare_split_protocol(
                 cache_entry, result.output_dir, split_dir, private_dir, result_verifier
             )
 
+    _require_visible_training_answers(split_dir, private_dir)
     _normalize_split_paths_in_dir(split_dir, input_dir)
     _make_private_paths_evaluator_visible(private_dir, input_dir)
     _hide_private_file_answers(input_dir, private_dir)
     agent_visible_input = sanitize_agent_visible_input(input_dir, split_dir)
+    _require_visible_training_answers(split_dir, private_dir)
 
     prepared_manifest = load_split_manifest(split_dir)
     public_splits = resolve_public_splits(prepared_manifest)
     split_plan = {
-        "strategy": "agentic_builder",
+        "strategy": (
+            "verified_package" if package_dir is not None else "agentic_builder"
+        ),
         "agent_visible": public_splits,
         "hidden_answers": prepared_manifest.get("hidden_answers", {}),
         "metric_split": "score_val",
