@@ -123,6 +123,65 @@ def test_uncaptured_wait_timeout_is_fatal_not_a_clean_result():
     assert waits == [pytest.approx(.05)]
 
 
+@pytest.mark.parametrize("observation", ["empty", "live", "unavailable"])
+def test_permission_denied_group_signal_still_requires_verified_empty_group(observation):
+    clock = Clock()
+    reads, waits = [], []
+    process = SimpleNamespace(pid=50, returncode=None)
+
+    def wait(timeout):
+        assert reads[-2:] == [[], []]
+        waits.append(timeout)
+        process.returncode = 0
+
+    def denied(_pgid, _signal):
+        raise PermissionError("synthetic group signal denied")
+
+    def inspect(_pgid):
+        if observation == "unavailable":
+            raise ProcessTreeInspectionError("synthetic group inspection denied")
+        members = [] if observation == "empty" else [50, 51]
+        reads.append(members)
+        return members
+
+    process.wait = wait
+    kwargs = dict(group_reader=inspect, group_signal_sender=denied,
+                  sleeper=clock.sleep, monotonic=clock, timeout=.1)
+    if observation == "empty":
+        drain_uncaptured_process_group(process, **kwargs)
+        assert reads == [[], []]
+        assert waits == [pytest.approx(.05)]
+        assert process.returncode == 0
+    else:
+        reason = "signal denied" if observation == "live" else "inspection denied"
+        with pytest.raises(ProcessTreeCleanupError, match=reason):
+            drain_uncaptured_process_group(process, **kwargs)
+        assert waits == []
+        assert process.returncode is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS zombie session and signal semantics")
+def test_uncaptured_real_macos_zombie_group_is_verified_before_reaping():
+    import psutil
+    from biomaker.utils.process_tree import read_process_tree_identity
+
+    process = subprocess.Popen([sys.executable, "-I", "-B", "-c", "pass"], process_group=0)
+    try:
+        deadline = time.monotonic() + 5
+        while psutil.Process(process.pid).status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "synthetic child did not exit"
+            time.sleep(.01)
+        assert process.returncode is None
+        with pytest.raises(ProcessLookupError):
+            read_process_tree_identity(process.pid)
+        drain_uncaptured_process_group(process)
+        assert process.returncode == 0
+    finally:
+        # This known child never forks; the test owns its final reap even if a
+        # regression prevents the production cleanup from reaching wait().
+        process.wait(timeout=5)
+
+
 def test_fatal_cleanup_quarantines_slot_and_wakes_all_acquisition_kinds():
     pool = ComputePool((ComputeSlot(index=0, backend="cpu"),))
     failure = ProcessTreeCleanupError(50, (50, 51), "inspection unavailable")
@@ -220,11 +279,16 @@ started = time.monotonic()
 seen = []
 if {inspection_failure!r}:
     original = e.ProcessTreeTracker.capture
+    original_drain = e.drain_uncaptured_process_group
+    def unavailable(_):
+        raise ProcessTreeInspectionError('injected process inspection failure')
+    # The real child may become a zombie before capture finishes on macOS.
+    # Inject the same inspection failure into both cleanup paths in advance.
+    e.drain_uncaptured_process_group = lambda process: original_drain(
+        process, group_reader=unavailable, timeout=.05)
     def capture(pid):
-        tracker = original(pid)
         seen.append(pid)
-        def unavailable(_):
-            raise ProcessTreeInspectionError('injected process inspection failure')
+        tracker = original(pid)
         tracker._group_reader = unavailable
         terminate = tracker.terminate_and_wait
         tracker.terminate_and_wait = lambda **kw: terminate(timeout=.05, **kw)

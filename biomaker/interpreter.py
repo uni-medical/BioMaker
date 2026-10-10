@@ -1225,9 +1225,13 @@ class Interpreter:
             process = subprocess.Popen(command, **popen_kwargs)
             try:
                 process_tree = ProcessTreeTracker.capture(process.pid)
+            except ProcessLookupError:
+                # A fast child may exit before macOS exposes its full identity.
+                # Keep the real exit result only after its group is drained.
+                uncaptured_drained = True
+                drain_uncaptured_process_group(process)
             except (
                 OSError,
-                ProcessLookupError,
                 ProcessTreeInspectionError,
                 ValueError,
             ):
@@ -1243,9 +1247,11 @@ class Interpreter:
             while True:
                 live_stdout.read_available(stdout_capture)
                 live_stderr.read_available(stderr_capture)
-                process_tree.refresh_best_effort()
-                if process_tree.root_has_exited(process):
-                    process_tree.terminate_and_wait(root_process=process)
+                if process_tree is not None:
+                    process_tree.refresh_best_effort()
+                if uncaptured_drained or process_tree.root_has_exited(process):
+                    if process_tree is not None:
+                        process_tree.terminate_and_wait(root_process=process)
                     live_stdout.read_available(stdout_capture, final=True)
                     live_stderr.read_available(stderr_capture, final=True)
                     stdout = _decode_process_output(os.pread(stdout_capture.fileno(), os.fstat(stdout_capture.fileno()).st_size, 0))

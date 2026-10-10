@@ -326,8 +326,12 @@ def drain_uncaptured_process_group(
             try:
                 sender(pid, signal.SIGKILL)
                 empty = not group_reader(pid)
-            except ProcessLookupError:
-                # The group vanished; verify that in the same inspection path.
+            except (ProcessLookupError, PermissionError) as exc:
+                # macOS can return EPERM for a group containing only the
+                # unreaped zombie leader. A failed signal is never evidence of
+                # emptiness: require the same independent live-member checks.
+                if isinstance(exc, PermissionError):
+                    reason = f"{type(exc).__name__}: {exc}"
                 try:
                     empty = not group_reader(pid)
                 except (ProcessTreeInspectionError, OSError, ValueError) as exc:

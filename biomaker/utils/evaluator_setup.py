@@ -461,16 +461,23 @@ def _run_python(
         process = subprocess.Popen(command, **popen_kwargs)
         try:
             process_tree = ProcessTreeTracker.capture(process.pid)
-        except (OSError, ProcessLookupError, ProcessTreeInspectionError, ValueError):
+        except ProcessLookupError:
+            # macOS can stop exposing an exited, unreaped child's session.
+            # Confirm group cleanup and reap before reading its actual result.
+            uncaptured_drained = True
+            drain_uncaptured_process_group(process)
+        except (OSError, ProcessTreeInspectionError, ValueError):
             uncaptured_drained = True
             drain_uncaptured_process_group(process)
             raise RuntimeError("Could not capture evaluator process identity") from None
 
         started_at = time.monotonic()
         while True:
-            process_tree.refresh_best_effort()
-            if process_tree.root_has_exited(process):
-                process_tree.terminate_and_wait(root_process=process)
+            if process_tree is not None:
+                process_tree.refresh_best_effort()
+            if uncaptured_drained or process_tree.root_has_exited(process):
+                if process_tree is not None:
+                    process_tree.terminate_and_wait(root_process=process)
                 stdout_capture.seek(0)
                 stderr_capture.seek(0)
                 stdout = stdout_capture.read()
